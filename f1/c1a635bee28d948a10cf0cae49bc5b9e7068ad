@@ -1,0 +1,43 @@
+src/syscall/mem.c
+  2f23f35352d874ec 35-38,40-46
+  9268377665274d6d 148,155,767-770,840-843,983-986,1207-1210
+src/core/guest.h
+  9268377665274d6d 147-152
+src/syscall/sys.c
+  9268377665274d6d 49-57
+src/core/guest.c
+  9268377665274d6d 799-800
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "f1c1a635bee28d948a10cf0cae49bc5b9e7068ad",
+  "prompts": {
+    "2f23f35352d874ec": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019df4e6-bde7-7271-91d0-ab11db72a38f",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 11,
+      "total_deletions": 11,
+      "accepted_lines": 11,
+      "overriden_lines": 0
+    },
+    "9268377665274d6d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "75f06a7a-3f11-4539-9896-ffa0b2efe226",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 62,
+      "total_deletions": 52,
+      "accepted_lines": 588,
+      "overriden_lines": 0
+    }
+  }
+}

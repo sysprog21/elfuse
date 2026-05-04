@@ -1,0 +1,21 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d8cea142cb8f231b3da2cbb475e3e377f1842ef8",
+  "prompts": {
+    "466a5e2e620b7b45": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5215be7b-df68-48e4-a13f-6e0a41d785d6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 46,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  }
+}

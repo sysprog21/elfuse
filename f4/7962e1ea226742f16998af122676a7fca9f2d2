@@ -1,0 +1,36 @@
+tests/test-static-bins.sh
+  3ae568a49aff400b 78,80-83,112,114-117,146,148-151,192,340,345-348,364,369-373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "f47962e1ea226742f16998af122676a7fca9f2d2",
+  "prompts": {
+    "3ae568a49aff400b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cea46a32-6a87-409a-9ebc-d4b66e7d1520",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 27,
+      "total_deletions": 11,
+      "accepted_lines": 47,
+      "overriden_lines": 0
+    },
+    "5b99cebc668b7d47": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019df553-6d03-77c0-b10e-50acc48304de",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    }
+  }
+}

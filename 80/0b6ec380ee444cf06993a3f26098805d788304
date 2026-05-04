@@ -1,0 +1,23 @@
+.github/workflows/main.yml
+  d504ceabd13ae5f7 237-239,243-244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "800b6ec380ee444cf06993a3f26098805d788304",
+  "prompts": {
+    "d504ceabd13ae5f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "25478fb5-6147-438b-b653-5e3d0b885dee",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 5,
+      "total_deletions": 1,
+      "accepted_lines": 287,
+      "overriden_lines": 0
+    }
+  }
+}

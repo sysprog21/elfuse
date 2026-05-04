@@ -1,0 +1,49 @@
+Makefile
+  45fc2920cd1667eb 40-56
+src/syscall/proc-pidfd.h
+  45fc2920cd1667eb 1-21
+src/syscall/fs-xattr.c
+  45fc2920cd1667eb 1-299
+src/syscall/proc-state.h
+  45fc2920cd1667eb 1-9
+src/syscall/net.c
+  45fc2920cd1667eb 37-38
+src/syscall/net-absock.c
+  45fc2920cd1667eb 1-294
+src/syscall/proc.c
+  45fc2920cd1667eb 43-44
+src/syscall/net-abi.c
+  45fc2920cd1667eb 1-405
+src/syscall/net-abi.h
+  45fc2920cd1667eb 1-37
+src/syscall/proc-state.c
+  45fc2920cd1667eb 1-481
+src/syscall/net-absock.h
+  45fc2920cd1667eb 1-26
+src/runtime/forkipc.c
+  45fc2920cd1667eb 41
+src/syscall/net-msg.c
+  45fc2920cd1667eb 24
+src/syscall/proc-pidfd.c
+  45fc2920cd1667eb 1-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "de3f77f0c20cae95751e9ab388f2ebbec3a6cbf8",
+  "prompts": {
+    "45fc2920cd1667eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "038914a2-c17d-4231-bd5f-341f4a0b8f6f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 1837,
+      "total_deletions": 19,
+      "accepted_lines": 1833,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,35 @@
+.ci/check-format.sh
+  d504ceabd13ae5f7 1-38
+.ci/check-newline.sh
+  d504ceabd13ae5f7 1-17
+src/syscall/io.c
+  d504ceabd13ae5f7 92-93
+.ci/check-cppcheck.sh
+  d504ceabd13ae5f7 1-50
+src/runtime/proctitle.c
+  d504ceabd13ae5f7 82-83
+.ci/check-security.sh
+  d504ceabd13ae5f7 1-46
+.github/workflows/main.yml
+  d504ceabd13ae5f7 3-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d21b96478c98771ea5969eba223849d9af71ee53",
+  "prompts": {
+    "d504ceabd13ae5f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "25478fb5-6147-438b-b653-5e3d0b885dee",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 451,
+      "total_deletions": 94,
+      "accepted_lines": 632,
+      "overriden_lines": 0
+    }
+  }
+}

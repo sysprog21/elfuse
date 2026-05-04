@@ -1,0 +1,67 @@
+src/syscall/mem.c
+  efa13d0913ee97f9 1119,1135-1136
+  d2ef14d6e8dc5d8d 1021,1024-1043,1057-1061,1064-1075,1077-1078,1089-1090,1097-1112,1118,1124-1134,1137-1141,1150-1156
+tests/test-madvise.c
+  52a0e277532733f1 7-9
+  efa13d0913ee97f9 438,440-476,693
+  d2ef14d6e8dc5d8d 1,14,25-40,335-437,439,477-677,680,690-692,694-699
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b0e1ed92dea8bbda20c4f7c2eac994104a898bf3",
+  "prompts": {
+    "52a0e277532733f1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019df4a9-0228-7933-ab5e-3712410ebbbd",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 4,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    },
+    "c58c0355a6a2cc42": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "898494b6-9559-48af-a099-d36717e2cf9f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 6,
+      "total_deletions": 4,
+      "accepted_lines": 6,
+      "overriden_lines": 0
+    },
+    "d2ef14d6e8dc5d8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ec9d12b-fffc-4bdd-aac7-5cd3ef5ba259",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 443,
+      "total_deletions": 55,
+      "accepted_lines": 422,
+      "overriden_lines": 6
+    },
+    "efa13d0913ee97f9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019df4a1-1c58-7742-8b55-b275266958c4",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 43,
+      "total_deletions": 3,
+      "accepted_lines": 42,
+      "overriden_lines": 1
+    }
+  }
+}

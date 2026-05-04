@@ -1,0 +1,48 @@
+.ci/check-security.sh
+  d504ceabd13ae5f7 1-46
+.ci/check-cppcheck.sh
+  d504ceabd13ae5f7 1-50
+.ci/check-newline.sh
+  d504ceabd13ae5f7 1-17
+src/syscall/io.c
+  d504ceabd13ae5f7 92-93
+.github/workflows/main.yml
+  d504ceabd13ae5f7 3,7-200
+src/runtime/proctitle.c
+  d504ceabd13ae5f7 82-83
+.ci/check-format.sh
+  d504ceabd13ae5f7 1-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5843b3ba0f09d1a6d87e56b6348be0a6a9f39782",
+  "prompts": {
+    "466a5e2e620b7b45": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5215be7b-df68-48e4-a13f-6e0a41d785d6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 82,
+      "total_deletions": 61,
+      "accepted_lines": 85,
+      "overriden_lines": 0
+    },
+    "d504ceabd13ae5f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "25478fb5-6147-438b-b653-5e3d0b885dee",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 451,
+      "total_deletions": 94,
+      "accepted_lines": 278,
+      "overriden_lines": 1
+    }
+  }
+}

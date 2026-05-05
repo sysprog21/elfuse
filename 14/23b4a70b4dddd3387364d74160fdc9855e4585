@@ -1,0 +1,48 @@
+Makefile
+  ea7517f375a2388f 156-161
+tests/manifest.txt
+  ea7517f375a2388f 113-114
+src/syscall/syscall.c
+  ea7517f375a2388f 1450
+tests/test-futex-waitv.c
+  8f8c89f5e5808793 206-223
+  ea7517f375a2388f 1-205,224-418
+src/runtime/futex.h
+  ea7517f375a2388f 54-55,62-63
+src/runtime/futex.c
+  ea7517f375a2388f 82-85,93-94,97-109,168-179,182-183,392,475,610,654,954,1028-1042,1045-1066,1092-1096,1103-1106,1139-1140,1142-1153,1156,1159-1164,1172-1196,1209-1214,1258-1259,1268-1271,1290-1291,1293-1296,1300,1306-1321,1328-1329
+  8f8c89f5e5808793 180-181,184-185,189-190,200-201,237-238,240-241,713-715,717-718,1170-1171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1423b4a70b4dddd3387364d74160fdc9855e4585",
+  "prompts": {
+    "8f8c89f5e5808793": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019df6d7-bec0-73a3-a5a1-8dfd4aaf1dbe",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 38,
+      "total_deletions": 4,
+      "accepted_lines": 37,
+      "overriden_lines": 0
+    },
+    "ea7517f375a2388f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "465b5174-365b-47d3-b2c5-5d000249441e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 747,
+      "total_deletions": 150,
+      "accepted_lines": 664,
+      "overriden_lines": 0
+    }
+  }
+}

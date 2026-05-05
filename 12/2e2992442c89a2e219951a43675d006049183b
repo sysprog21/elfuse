@@ -1,0 +1,52 @@
+src/syscall/fs-xattr.c
+  458718201f6001a6 224-227,236,291-296
+  808e22d7a96536c6 222-223
+src/syscall/io.c
+  458718201f6001a6 464-474,479
+src/syscall/syscall.c
+  458718201f6001a6 1016-1018,1042-1044
+tests/test-opath.c
+  458718201f6001a6 1-292
+tests/manifest.txt
+  458718201f6001a6 89-91
+src/syscall/fs.c
+  458718201f6001a6 709-714,919-921,1443-1454
+src/syscall/abi.h
+  458718201f6001a6 164-165,167,169-170,173,176
+src/syscall/internal.h
+  808e22d7a96536c6 240-243,245-247
+  458718201f6001a6 238-239,244,248-261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "122e2992442c89a2e219951a43675d006049183b",
+  "prompts": {
+    "458718201f6001a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8b067ddb-8120-4ec5-aaf3-5c6d71d21322",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 422,
+      "total_deletions": 39,
+      "accepted_lines": 413,
+      "overriden_lines": 0
+    },
+    "808e22d7a96536c6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019df64e-8c33-7483-8734-906ef8a8c8f3",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 9,
+      "total_deletions": 9,
+      "accepted_lines": 9,
+      "overriden_lines": 0
+    }
+  }
+}

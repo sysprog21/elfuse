@@ -1,0 +1,27 @@
+src/syscall/fs.c
+  eec1497f62db3f13 69
+src/syscall/io.c
+  eec1497f62db3f13 522-532,539,1453-1454,1460-1461,1552-1553,1559-1560
+src/runtime/procemu.c
+  eec1497f62db3f13 214,221-223,593-596,603-604,608,612-617,623,626,630,632,634-638,1119,1139,1164,1172,1193,1196-1199,1202-1205,1232,1371,1432,1740-1742,1744,1748,1750,2036-2039,2154-2157,2335-2340,2342
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "ea689a09550d625b41393747381971af2146e2f4",
+  "prompts": {
+    "eec1497f62db3f13": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f355f4e2-5866-46a9-9227-c9ff655b7a7e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 95,
+      "total_deletions": 96,
+      "accepted_lines": 145,
+      "overriden_lines": 8
+    }
+  }
+}

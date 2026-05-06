@@ -1,0 +1,25 @@
+src/runtime/procemu.c
+  eec1497f62db3f13 1748-1751,1753
+tests/test-tier-b.c
+  eec1497f62db3f13 978-980,982,984,1014-1019
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a15f074a6c4da90c79accae694a0b7d8f5bf52f6",
+  "prompts": {
+    "eec1497f62db3f13": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f355f4e2-5866-46a9-9227-c9ff655b7a7e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 21,
+      "total_deletions": 12,
+      "accepted_lines": 77,
+      "overriden_lines": 1
+    }
+  }
+}

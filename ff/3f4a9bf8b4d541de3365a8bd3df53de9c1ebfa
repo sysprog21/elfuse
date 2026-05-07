@@ -1,0 +1,20 @@
+src/syscall/syscall.c
+  s_8a2e4b7f957e5f::t_c274661eb08712 72-76,78
+  s_8a2e4b7f957e5f::t_b082851c56957b 66-71,77,79-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "ff3f4a9bf8b4d541de3365a8bd3df53de9c1ebfa",
+  "prompts": {},
+  "sessions": {
+    "s_8a2e4b7f957e5f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea47a94d-978f-4b28-a356-50ddef3150d3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

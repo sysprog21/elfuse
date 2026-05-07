@@ -1,0 +1,36 @@
+tests/test-futex-pi.c
+  s_f93c7e4949f332::t_957e716e53aaeb 242-243
+  s_f93c7e4949f332::t_0782b4900eb989 45,238-241,244-285,294
+src/runtime/futex.c
+  s_532754593da562::t_1fe932cb0b1f42 1493-1494,1499-1500
+  s_532754593da562::t_281acf790692eb 1495-1498
+  s_f93c7e4949f332::t_128c451530c1fd 131-135,236-237,387-388,436-438,538-540,719-721,914-916,942-944,1239
+  s_532754593da562::t_7c237d40981333 37-38
+  s_532754593da562::t_d132050a444b81 1455-1456,1461-1462
+  s_532754593da562::t_aa04a8538476c1 1431-1436,1457-1460
+  s_532754593da562::t_ef8311a872c141 1483-1485
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "ba27787f3e5b56b6a01a5e9a2c524bfea5bb45c4",
+  "prompts": {},
+  "sessions": {
+    "s_532754593da562": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "749d6870-9ad9-4ea1-9cae-46b53fcf64c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_f93c7e4949f332": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e037b-9f34-79c0-b671-e7c8880c318c",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

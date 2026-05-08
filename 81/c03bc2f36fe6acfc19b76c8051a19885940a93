@@ -1,0 +1,125 @@
+src/syscall/syscall.c
+  s_a3d8c0dfae3678::t_b0a265f7629cbf 305
+  s_a3d8c0dfae3678::t_f283d73fc2707c 1522-1523
+src/runtime/thread.c
+  s_a3d8c0dfae3678::t_db49d82b1ed15a 37-39,540,566,593-645,751-769
+  s_ff64bfb0b3bf21::t_12b3e91d32eebe 518-523,534-539,557-559
+  s_a5675d0c2c16a1::t_772185890a6243 651-654,672-709
+  s_ff64bfb0b3bf21::t_6d3a8d83015de0 541-542,585
+  s_ff64bfb0b3bf21::t_2c11d2396f5338 719-730,732-739,742-743,745,747-749
+  s_a3d8c0dfae3678::t_21dd68af05a0d7 508-514,524-529,770-771
+  s_a3d8c0dfae3678::t_12a9c8855eb969 121-123,142-145,415,503-507,544-555,648
+  s_a3d8c0dfae3678::t_bfb5800914c3c8 34-36,543,556,646-647,649-650,655-671,710-718,731,740-741,744,746,750
+tests/test-mmap-hint.c
+  s_a3d8c0dfae3678::t_95bf65d6f815e6 12,19-22,24-30,32-48,54-60
+  s_a3d8c0dfae3678::t_a070098197e728 1-11,13-18,23,31,49-53,61-77
+src/runtime/fork-state.c
+  s_a3d8c0dfae3678::t_2ad18d50a8e95d 62-64,70-81,83-87,89-93,95,97-99,101-102,104-105,107-133,137,139-142,144-147
+  s_a3d8c0dfae3678::t_70be6f95b7c3c6 405-410,412,420-421,423,425
+  s_a3d8c0dfae3678::t_2ee6eb0ad9a4f7 422,426,525-526,528-532,535,562,565
+src/syscall/sys.h
+  s_a3d8c0dfae3678::t_c8323b7ea7bb0c 25-28
+src/syscall/dispatch.tbl
+  s_a3d8c0dfae3678::t_dc688c4dbdd2d6 178
+src/main.c
+  s_a3d8c0dfae3678::t_e7db56ccf15a54 83,139-146,177-178
+  s_a3d8c0dfae3678::t_664b447676c5e9 106,127
+src/syscall/sys.c
+  s_a3d8c0dfae3678::t_a43e436ce04b95 225-243
+tests/test-thread.c
+  s_a3d8c0dfae3678::t_af5bd534b3dbe3 23-26,39,63-73,219-273,283
+src/syscall/exec.c
+  s_a3d8c0dfae3678::t_bfb5800914c3c8 730-732
+  s_a3d8c0dfae3678::t_87f587a533df52 29
+  s_a3d8c0dfae3678::t_f0e042d72e8fb3 172-175,299-302,470
+  s_a3d8c0dfae3678::t_d3f38bf444c5fc 35,119-121,169-171,176,182,186,295-298,304
+  s_a3d8c0dfae3678::t_868a4ce516ed1f 495,500,681-682,787
+docs/usage.md
+  s_a3d8c0dfae3678::t_664b447676c5e9 19,28
+src/runtime/forkipc.c
+  s_a3d8c0dfae3678::t_13954699d00033 929,934-939,960-961,968-973,995-997,1010-1013,1019-1020,1237-1253,1279-1282
+  s_a3d8c0dfae3678::t_f283d73fc2707c 324-349,357-358,368-372,627-628,638-642,891-892,900-902,918-919,1413-1414
+  s_ff64bfb0b3bf21::t_c40da58c736d11 571-574,576,581,590-592
+  s_a3d8c0dfae3678::t_48a12a96218b6c 834-839
+  s_ff64bfb0b3bf21::t_b29f2c01a095b4 824-828,833,842-844
+  s_a3d8c0dfae3678::t_9cf9c0231aa42e 910-917,920
+  s_a3d8c0dfae3678::t_7c0862669331af 49-68,79
+  s_a3d8c0dfae3678::t_7375750d892862 1163-1164
+  s_a3d8c0dfae3678::t_4fef86fd431d4f 186,192,199,1182-1183,1185,1203-1204,1206,1210-1211,1213
+src/syscall/mem.c
+  s_a3d8c0dfae3678::t_9c51e460de9371 24
+  s_a3d8c0dfae3678::t_a9821f6175f46e 2402-2455,2503,2509-2537
+  s_a3d8c0dfae3678::t_ff087f6b898e19 1024,1040-1043,1045,1047-1051
+  s_a5675d0c2c16a1::t_0d4cfeec700dc5 2466,2474-2476,2479,2481
+  s_a3d8c0dfae3678::t_48a12a96218b6c 2456-2464,2468-2473,2477-2478,2480,2482-2485
+  s_a3d8c0dfae3678::t_f75fc7f20cd4c8 1449-1464,1466-1467
+  s_a3d8c0dfae3678::t_ce3b6878e55b52 2504-2506
+  s_a3d8c0dfae3678::t_36cd19dbddf244 1046
+  s_a5675d0c2c16a1::t_6e4e8068298852 2467
+mk/tests.mk
+  s_a3d8c0dfae3678::t_da401df211a2cb 59
+  s_a3d8c0dfae3678::t_7813e6f3b7eca1 55
+  s_a3d8c0dfae3678::t_e1511a05cb62b8 22-23,50-54
+  s_a3d8c0dfae3678::t_0e43ee335b646a 9,24-25,56-58
+src/syscall/mem.h
+  s_a3d8c0dfae3678::t_bfb5800914c3c8 50-52
+src/runtime/forkipc.h
+  s_a3d8c0dfae3678::t_f283d73fc2707c 38-39
+  s_a3d8c0dfae3678::t_e7db56ccf15a54 24-29
+src/runtime/procemu.c
+  s_a3d8c0dfae3678::t_7f7e4d88e80a05 581-599,601-604,609-611,670,675-676
+  s_a3d8c0dfae3678::t_d4dcdd0abbac26 2030-2031,2044,2055,2060,2076,2088,2092,2101-2102,2110,2123,2159
+src/syscall/abi.h
+  s_a3d8c0dfae3678::t_d19165f48719aa 191
+tests/test-tier-b.c
+  s_a3d8c0dfae3678::t_d44c1eb478870f 46-49,73-83
+  s_a3d8c0dfae3678::t_b7d269bdc94025 1444
+  s_a3d8c0dfae3678::t_95bf65d6f815e6 34-37,1406-1426
+  s_a3d8c0dfae3678::t_f75fc7f20cd4c8 1402-1405,1427-1436,1488
+src/runtime/thread.h
+  s_a3d8c0dfae3678::t_6be98fad3d1dbf 116-123,270-279
+  s_a3d8c0dfae3678::t_12a9c8855eb969 160-162,280-284
+  s_a5675d0c2c16a1::t_b4d3d7dbb11e82 309-327
+  s_a3d8c0dfae3678::t_bfb5800914c3c8 27,124-126
+tests/manifest.txt
+  s_a3d8c0dfae3678::t_a070098197e728 94
+tests/test-clone3.c
+  s_a3d8c0dfae3678::t_abdf0bc5e1af6c 15,448,450-486,665-669,687
+  s_a3d8c0dfae3678::t_185a881a0f729e 25-26,53,73,370-403,659-664,670-672,685
+  s_a3d8c0dfae3678::t_b46f28bc08ea81 74,87-101,446-447,488-542,544-547,688
+  s_a3d8c0dfae3678::t_e1511a05cb62b8 543
+  s_a3d8c0dfae3678::t_a9a9d90b884a49 557-587,589,611,621-622,624-625,627-636,638-639,651-654,656-658
+  s_a3d8c0dfae3678::t_0b56ec85bca7d0 102-108,404-445,487,548-556,588,590-610,612-620,623,626,637,640-650,655,686,689
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "81c03bc2f36fe6acfc19b76c8051a19885940a93",
+  "prompts": {},
+  "sessions": {
+    "s_a3d8c0dfae3678": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e03a8-4339-7551-acd3-497ba4b97bcb",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_a5675d0c2c16a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0824d71c-a1d3-4c45-a1bb-2ab7b1b892c7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    },
+    "s_ff64bfb0b3bf21": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81162a59-2c74-4d61-a809-52a743fec641",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

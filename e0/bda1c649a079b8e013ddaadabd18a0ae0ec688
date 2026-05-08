@@ -1,0 +1,25 @@
+src/runtime/futex.c
+  s_c8899dbf726634::t_3d469b6c4ef952 106-107,117
+  s_c8899dbf726634::t_471eb19d7fdb4a 381,388-390,411-417
+  s_c8899dbf726634::t_e457ca450c5d52 773
+  s_c8899dbf726634::t_30368afae254a8 21,46-56,97-98,103-105,108-115,197-200,269-304,308,312-316,318-339,342-345,349-366,368-380,391-410,418-448,452-453,610,618-621,650-654,768-772,878,880,887,921,952-962,1275,1277-1278,1283,1304,1325,1736,1774
+  s_c8899dbf726634::t_2ab77b9fe76129 41-45
+  s_c8899dbf726634::t_b1f6dc01bc790b 116
+  s_c8899dbf726634::t_44bf2360886643 367,449-451
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "e0bda1c649a079b8e013ddaadabd18a0ae0ec688",
+  "prompts": {},
+  "sessions": {
+    "s_c8899dbf726634": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "49f2249b-dc07-43f6-9b88-da8c7c0fab08",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

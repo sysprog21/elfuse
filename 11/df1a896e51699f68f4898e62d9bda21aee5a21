@@ -1,0 +1,19 @@
+src/runtime/futex.c
+  s_c8899dbf726634::t_c4e2cad09725d4 277-288,297-301,305-306
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "11df1a896e51699f68f4898e62d9bda21aee5a21",
+  "prompts": {},
+  "sessions": {
+    "s_c8899dbf726634": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "49f2249b-dc07-43f6-9b88-da8c7c0fab08",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

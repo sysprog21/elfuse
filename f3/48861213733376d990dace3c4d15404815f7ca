@@ -1,0 +1,41 @@
+tests/test-matrix.sh
+  s_55dcbcb3fc0eb6::t_f8a9732f65d25f 188
+  s_55dcbcb3fc0eb6::t_6241a31e909c78 361
+  s_55dcbcb3fc0eb6::t_2f786ef25e5a26 183-187
+tests/test-sysfs-cpu.c
+  s_55dcbcb3fc0eb6::t_19371cb864ba5f 57-68
+  s_55dcbcb3fc0eb6::t_887f8f34a754e5 76-77,80-81,84-85
+  s_55dcbcb3fc0eb6::t_d7a69100d824e7 1-5,7-8,11-56,69-75,78-79,82-83,86-145,230-232
+  s_55dcbcb3fc0eb6::t_7a8b46373b3d3f 146-229
+  s_55dcbcb3fc0eb6::t_00bab7c187f846 6
+src/syscall/path.h
+  s_55dcbcb3fc0eb6::t_00b8ed725a2f0a 16-17
+tests/manifest.txt
+  s_55dcbcb3fc0eb6::t_4e119da577e2bf 60
+src/runtime/procemu.c
+  s_55dcbcb3fc0eb6::t_dacd68639be5e8 2342-2343
+  s_55dcbcb3fc0eb6::t_c7039d0b6c8c67 2540-2541
+  s_55dcbcb3fc0eb6::t_c6a31d5bf078dc 80-100,632-633,700-701,1125-1183,1187-1397,2312-2341,2509-2539
+src/syscall/path.c
+  s_55dcbcb3fc0eb6::t_ad13b407b01758 124-126,134,142,145
+  s_55dcbcb3fc0eb6::t_ce64eb19c9730d 41-42,52,72
+  s_55dcbcb3fc0eb6::t_728d09ac564aec 34,37
+  s_55dcbcb3fc0eb6::t_ed377f2ebb3a2c 43,46,49,51,53,56,58,60,63,66,69,71,73-75
+  s_55dcbcb3fc0eb6::t_079339f915460f 29-31,33,35-36,38-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "f348861213733376d990dace3c4d15404815f7ca",
+  "prompts": {},
+  "sessions": {
+    "s_55dcbcb3fc0eb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20d18e89-ce05-4326-b47e-18a3bc72c8f8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

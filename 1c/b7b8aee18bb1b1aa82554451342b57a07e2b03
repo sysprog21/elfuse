@@ -1,0 +1,44 @@
+src/syscall/sys.h
+  s_1a94ac2ae616ae::t_1ac399c49c68ee 33-42
+src/syscall/syscall.c
+  s_1a94ac2ae616ae::t_c3f95b507af98c 316-323
+Makefile
+  s_1a94ac2ae616ae::t_f0c637d5a85a4d 150-154
+src/syscall/dispatch.tbl
+  s_1a94ac2ae616ae::t_0af216a18bc232 167
+  s_1a94ac2ae616ae::t_406d43e790fb58 166,168-169,173-175
+tests/manifest.txt
+  s_1a94ac2ae616ae::t_39412ba0f7748f 150-152
+src/syscall/abi.h
+  s_1a94ac2ae616ae::t_80ff3738acd5d0 90-93,97-99
+  s_1a94ac2ae616ae::t_68996a4c01eca3 489-502
+tests/test-sched-policy.c
+  s_1a94ac2ae616ae::t_de99e43b13d81c 16
+  s_1a94ac2ae616ae::t_e04229d82b412f 10-12,15
+  s_1a94ac2ae616ae::t_fe361ccde06105 139,144,147,149-164,168-193,197-201
+  s_1a94ac2ae616ae::t_db826875e6f28f 1-9,13-14,17-42,73-138,140-143,145-146,148,165-167,196,202-260,262-264,268-272,303-306
+  s_1a94ac2ae616ae::t_2545ffbd443221 261,265-267,273-302
+  s_1a94ac2ae616ae::t_535d1833b70e50 43-72
+src/syscall/sys.c
+  s_1a94ac2ae616ae::t_841425e87c4c9f 295-296,317,319,325-326,363-366,368-375,377-393,397-405,409-421,423-437,439-451,453-455,461,463-467
+  s_1a94ac2ae616ae::t_dad1b316132e71 328-332,338-341
+  s_1a94ac2ae616ae::t_d14b31323e7efd 297-302,307-316,318,320-324,327,333-335,346,348-349,351-362,367,376,394-396,406-408,452,456-460,462
+  s_1a94ac2ae616ae::t_6ec1c549c22e99 77-82
+  s_1a94ac2ae616ae::t_73183e092b02ea 258-261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "1cb7b8aee18bb1b1aa82554451342b57a07e2b03",
+  "prompts": {},
+  "sessions": {
+    "s_1a94ac2ae616ae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5c8538-2745-4cf2-be49-0c1e848327e8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+tests/manifest.txt
+  s_3daee608020094::t_b63db585bf08df 97
+tests/test-brk-overlap.c
+  s_3daee608020094::t_7a1ae457d72dab 1-6,12-28,30-48,52,54,56-63,72-82,86-112,255-258,262-264
+  s_3daee608020094::t_80e3f458e09e2c 259
+  s_3daee608020094::t_0095d8b9459cdc 53,55
+  s_3daee608020094::t_401b61862a9d5d 116-137,140-153
+  s_3daee608020094::t_04d094964f33fe 64-65,67-71,83-85
+src/syscall/mem.c
+  s_3daee608020094::t_5118c51aec56f1 1149,1151,1154,1158-1162
+  s_3daee608020094::t_908f155c74029c 1195
+  s_3daee608020094::t_000559e724d071 1150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "17cddf6ccdf7b403c27e1ab280164a9dc0bf0eb9",
+  "prompts": {},
+  "sessions": {
+    "s_3daee608020094": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fa323e8a-161e-4745-86e1-4e94f4a82919",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

@@ -1,0 +1,49 @@
+src/runtime/procemu.c
+  s_4483ebf8ffb432::t_b386487033d3ed 2563-2567,2574-2582
+  s_4483ebf8ffb432::t_bda8eeca68d0f5 602-608
+src/runtime/procemu.h
+  s_4483ebf8ffb432::t_1775b991766bc6 79-88
+src/syscall/fs.c
+  s_4483ebf8ffb432::t_dbc574337fd7da 1606-1617,1619
+  s_4483ebf8ffb432::t_db72624774bd08 1663,1675-1684
+  s_4483ebf8ffb432::t_7fdc0a635138c7 1558-1569,1571
+  s_4483ebf8ffb432::t_55f8dfebe2fb1c 1231-1238,1241,1251
+  s_4483ebf8ffb432::t_d1769eb9dcff37 857-863,865-867
+  s_4483ebf8ffb432::t_c9c7c7208bce68 817-822
+  s_4483ebf8ffb432::t_4ffb02500a0261 979-980,982
+  s_4483ebf8ffb432::t_aeddb341274f01 1018,1020-1021
+src/syscall/proc-state.c
+  s_4483ebf8ffb432::t_21cebda4771eca 43,46-47
+  s_4483ebf8ffb432::t_c993310f654545 502-503
+  s_4483ebf8ffb432::t_67a76861edf315 349,355-357,361,366,370,374-390
+  s_4483ebf8ffb432::t_aa827c30109354 461,467-468
+  s_4483ebf8ffb432::t_ba0aae4e0638f2 393-394,399,418-424,427-434
+src/syscall/fs-xattr.c
+  s_4483ebf8ffb432::t_1328f9c3344a39 77,83-89,93,102
+  s_4483ebf8ffb432::t_a5465a72da139c 117,123-129,146
+  s_4483ebf8ffb432::t_1f47eaaa9bbe7d 17
+  s_4483ebf8ffb432::t_4b45d7ac123df7 158,162-168,172,181
+  s_4483ebf8ffb432::t_63d259bbf0923c 193,199-205,207
+src/runtime/fork-state.c
+  s_4483ebf8ffb432::t_48be517b7331f7 443
+src/syscall/exec.c
+  s_4483ebf8ffb432::t_e0884011f4028e 351-354
+src/syscall/proc.h
+  s_4483ebf8ffb432::t_42031b74a2972a 192-198,201-206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "62b5d30026fd317ba07d10b02336c471bead4b2b",
+  "prompts": {},
+  "sessions": {
+    "s_4483ebf8ffb432": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d975a7d8-21b6-4938-9daa-4b1f7fda5d35",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

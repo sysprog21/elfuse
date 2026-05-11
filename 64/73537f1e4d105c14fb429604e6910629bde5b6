@@ -1,0 +1,19 @@
+src/syscall/mem.c
+  s_0a9bde0315ec3a::t_765b1b8c99406d 231-250,266-274
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "6473537f1e4d105c14fb429604e6910629bde5b6",
+  "prompts": {},
+  "sessions": {
+    "s_0a9bde0315ec3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82569fb3-480d-4a5c-8a15-3f8f8d5bd55d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

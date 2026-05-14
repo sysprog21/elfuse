@@ -1,0 +1,122 @@
+tests/lib/coreutils-suite.sh
+  s_179a8dada47da7::t_af122fbbf808e3 2,4,9-42,44-289
+  s_179a8dada47da7::t_dc58250c87945e 43
+src/syscall/syscall.c
+  s_179a8dada47da7::t_b57dd03c1a30a1 1284-1287,1291-1292
+  s_bd485201209822::t_57822c35a44cc9 1288,1303
+  s_179a8dada47da7::t_21e324f687c57f 1289-1290
+  s_179a8dada47da7::t_e0d24576ef5398 1305-1306
+tests/test-fd-lifecycle.c
+  s_179a8dada47da7::t_b57dd03c1a30a1 48,50
+  s_bd485201209822::t_4184f4d61c3fa4 55-58
+  s_179a8dada47da7::t_e0d24576ef5398 27-28,52
+  s_179a8dada47da7::t_cdc44af35797c5 19-22,47,49,51,53-54,238
+  s_bd485201209822::t_755e5938916f7d 59-60
+tests/test-syscall-smoke.c
+  s_6ffac114ad1804::t_85d365eee8a37d 48-51,297-358,360-361,636
+  s_bd485201209822::t_e5fc1c9457fecd 187,195,207-214
+  s_bd485201209822::t_576e5a460b48f2 221-223
+  s_179a8dada47da7::t_889819a3d38fa0 224,277-278,370,392,418-419
+  s_bd485201209822::t_9bc78d5d610c44 232-239
+  s_6ffac114ad1804::t_8cde8d1f433138 359
+  s_bd485201209822::t_b69df4cac47e5f 280-282
+  s_bd485201209822::t_e9f133423f07eb 423
+  s_bd485201209822::t_f47e0c921ff388 441-442,444-451
+  s_bd485201209822::t_b3afb581c99c81 566-569,586-595
+  s_179a8dada47da7::t_63016b5cbda5d3 114,121,151-176,499,501-511,514-516,632,641
+  s_179a8dada47da7::t_7b33a861a28bc3 9,21,66-70,72-77,279,483,487
+  s_bd485201209822::t_4c093464aecb40 406-410
+  s_179a8dada47da7::t_da4120494ded2d 369,386-391
+  s_179a8dada47da7::t_b57dd03c1a30a1 1-8,11-20,22-30,32-47,52-65,71,78-113,115-120,122-150,177-186,188-194,196-197,205,215-220,225-231,240-260,267-270,283-296,362-368,371-385,393-405,411-417,420-422,424-440,443,452-482,484-486,488-498,500,512-513,517-565,570-571,584-585,596-631,633-635,637-640,642-648
+  s_bd485201209822::t_ca59a233e12a3d 572-583
+  s_bd485201209822::t_d7e400ed7616da 261-266
+  s_bd485201209822::t_2be7e62a62a124 271-276
+  s_bd485201209822::t_879ac664a8cb4f 198-204,206
+  s_179a8dada47da7::t_d30f9206cf2fd0 31
+  s_bd485201209822::t_49f2e0282e1246 10
+tests/driver.sh
+  s_bd485201209822::t_85abff87186652 95-108,110-114
+  s_179a8dada47da7::t_21e324f687c57f 30,109,115-119
+  s_179a8dada47da7::t_b57dd03c1a30a1 301-314,316,322,324
+mk/tests.mk
+  s_179a8dada47da7::t_af122fbbf808e3 131,277
+  s_bd485201209822::t_4ad9e15b76ce6e 18-21,23
+  s_179a8dada47da7::t_b57dd03c1a30a1 3
+src/syscall/abi.h
+  s_179a8dada47da7::t_e0d24576ef5398 641
+  s_bd485201209822::t_9ec0bdfb9a7a51 642-643
+tests/test-coreutils.sh
+  s_179a8dada47da7::t_af122fbbf808e3 2,10,35,42,45
+  s_ac1ff1a8436231::t_a38fe14d442c1a 22,29-32,43
+mk/config.mk
+  s_6ffac114ad1804::t_8cde8d1f433138 19-20,28,30
+tests/lib/test-runner.sh
+  s_179a8dada47da7::t_af122fbbf808e3 257-270
+tests/test-dynamic-coreutils.sh
+  s_6ffac114ad1804::t_85d365eee8a37d 41-45
+  s_179a8dada47da7::t_af122fbbf808e3 10,32
+  s_ac1ff1a8436231::t_a38fe14d442c1a 22,26-29,40
+tests/lib/coreutils-common.sh
+  s_179a8dada47da7::t_ce83170cff55ca 70,72-78,90-98,104-112
+  s_179a8dada47da7::t_af122fbbf808e3 31-32,35,37-41,44,46-69,79-83,85-89,99-103,113-117,119-120
+  s_bd485201209822::t_5791f799d39da1 71
+  s_bd485201209822::t_e995bc91b30718 84
+  s_bd485201209822::t_a683b873429954 118
+  s_bd485201209822::t_5ddcbf7736d119 33-34,36,42-43,45
+Makefile
+  s_6ffac114ad1804::t_85d365eee8a37d 174-186
+scripts/check-syscall-coverage.py
+  s_bd485201209822::t_514951e030173f 48
+  s_bd485201209822::t_15d6fe0290e93a 63-64,67,79-81,85-87,89-92,94-96,99,107,109-112,116-118,122,126,129-130
+  s_179a8dada47da7::t_b57dd03c1a30a1 1-18,29-42,51-62,88,97-98,113-115,119-121,123-125,127-128,131-150
+  s_bd485201209822::t_21d5b01faadd22 43-44
+  s_bd485201209822::t_eb7b13605131c9 19-21,24-28
+  s_bd485201209822::t_767bf281629382 49-50
+  s_bd485201209822::t_db63a627953a27 22-23
+  s_bd485201209822::t_bc52e44c26b510 45-47
+  s_bd485201209822::t_914dee12bc1177 65-66,68-78,82-84,93
+  s_bd485201209822::t_cda6284d05dc95 100-106,108
+tests/manifest.txt
+  s_179a8dada47da7::t_b57dd03c1a30a1 47
+  s_6ffac114ad1804::t_85d365eee8a37d 99-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "684654f4c6938c967a2c4216e381948784e4ff38",
+  "prompts": {},
+  "sessions": {
+    "s_179a8dada47da7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e233b-5fe1-7543-a15b-b794b99cb971",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_6ffac114ad1804": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2612-fbd2-7142-a266-f20a43d90d3b",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_ac1ff1a8436231": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2501-bb13-7e23-8841-459051741eeb",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_bd485201209822": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b998fcbb-ddc0-4b5a-818b-66911fb54882",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    }
+  }
+}

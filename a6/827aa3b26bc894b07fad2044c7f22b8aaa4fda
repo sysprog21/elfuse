@@ -1,0 +1,37 @@
+src/syscall/fs.c
+  s_224cf6569ce32a::t_49779b73793a86 886-888
+src/syscall/fuse.h
+  s_224cf6569ce32a::t_eeabd9de2e7d04 23-30
+src/syscall/fuse.c
+  s_224cf6569ce32a::t_ec881840bc16b2 1329
+  s_224cf6569ce32a::t_307814adb94ee2 1108-1120
+  s_d8a42c7382c90e::t_07f8cde1a2da76 1546-1547
+  s_224cf6569ce32a::t_ab7feadbfcd38f 10
+  s_224cf6569ce32a::t_fed48f1a5bce23 1302-1310,1312,1320-1321
+src/syscall/fs-stat.c
+  s_224cf6569ce32a::t_a1c79cf0bbee04 187,201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a6827aa3b26bc894b07fad2044c7f22b8aaa4fda",
+  "prompts": {},
+  "sessions": {
+    "s_224cf6569ce32a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4b9616c5-1a2a-4648-aaee-a3d61d397062",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    },
+    "s_d8a42c7382c90e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2d14-b190-7603-b895-99ceb027faa6",
+        "model": "gpt-5.4"
+      },
+      "human_author": null
+    }
+  }
+}

@@ -1,0 +1,21 @@
+src/syscall/fuse.c
+  s_56bc1fb6fa3c58::t_d33f4f417fd34e 972-984,986
+src/syscall/signal.c
+  s_56bc1fb6fa3c58::t_a6d2a3355c3d11 448-457
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "dc07ef71be4f79b731c2b1246c381d9e667ce825",
+  "prompts": {},
+  "sessions": {
+    "s_56bc1fb6fa3c58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bd275b9f-1f35-44dd-acfd-1c0c5c762055",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

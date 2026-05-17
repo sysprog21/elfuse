@@ -1,0 +1,90 @@
+tests/lib/coreutils-suite.sh
+  s_eb1964386b2f7c::t_49e6c2b43effcf 50-56,58,61,63,65,67
+  s_eb1964386b2f7c::t_3d40de36c7a3c0 161-164
+tests/test-fd-family.c
+  s_eb1964386b2f7c::t_55ecdb5426d121 1-75
+tests/test-matrix.sh
+  s_eb1964386b2f7c::t_542843603cee3c 551,555,559-560,567-568,579,583
+  s_eb1964386b2f7c::t_9a67524b475bb2 265-274,278
+  s_eb1964386b2f7c::t_4e02b13765a554 570,573,576,587,590,593
+  s_eb1964386b2f7c::t_0ae96bc8e2fc69 2,6-7,10
+  s_eb1964386b2f7c::t_f4a4e3602676b2 642-643,646-649,652,659-660,665,672-673
+  s_eb1964386b2f7c::t_28b5a2eb84d0fd 334-342,346
+  s_eb1964386b2f7c::t_e64c6022b7b46a 220-246
+  s_eb1964386b2f7c::t_85800e1b4f4c60 485-489,494,498
+tests/test-perf.sh
+  s_eb1964386b2f7c::t_3392b3742fff0b 106,112,118,139
+  s_eb1964386b2f7c::t_6ccd21d6c8ce83 148-152
+  s_eb1964386b2f7c::t_0ae96bc8e2fc69 2
+  s_eb1964386b2f7c::t_06318bab3734d8 52-53,56-60,68,70-71,73-78
+  s_eb1964386b2f7c::t_8ea3885154a176 132
+  s_eb1964386b2f7c::t_9b78557efe3c7e 19-22
+  s_5b794459c3132a::t_718b4790e01590 133-136
+  s_eb1964386b2f7c::t_c42864899b7041 124
+mk/tests.mk
+  s_eb1964386b2f7c::t_aee6cdb98b4059 10
+  s_eb1964386b2f7c::t_9b8cb54b263081 40-41
+  s_eb1964386b2f7c::t_d9b46f9c9fdda0 448,450-452
+  s_eb1964386b2f7c::t_6ef6f860006f60 80-81
+  s_eb1964386b2f7c::t_3392b3742fff0b 120,177,261,282,326,360,386,399,437,444,449
+  s_eb1964386b2f7c::t_f7715ff06e7070 26-27
+tests/test-proc-fidelity.c
+  s_eb1964386b2f7c::t_95535a93a3238c 1,6-13,19,26,38-51,142-148,188-192,250-257,261-263,314-320,472-492,739,889,926-927,951-955
+  s_eb1964386b2f7c::t_fa8d7002f73993 471
+  s_eb1964386b2f7c::t_fe0fef38c64501 888
+  s_eb1964386b2f7c::t_76eaafc4d1549a 956-957
+  s_eb1964386b2f7c::t_6d392bbb327534 738
+  s_eb1964386b2f7c::t_ce4ddf5f2d76e8 53
+tests/manifest.txt
+  s_eb1964386b2f7c::t_0ae96bc8e2fc69 1
+  s_eb1964386b2f7c::t_1a8587cee94035 174-181
+src/syscall/fd.c
+  s_eb1964386b2f7c::t_45552be0385941 1031
+tests/test-proctitle-low-stack.sh
+  s_eb1964386b2f7c::t_0907fb3349cca1 2,8-20,32-42,47-58,60,65-80,84-85,89
+tests/driver.sh
+  s_eb1964386b2f7c::t_4ae9a5452fc6d8 240-245,248-252,254
+  s_eb1964386b2f7c::t_a2bd711f85a696 30-37
+tests/test-proctitle-host.c
+  s_eb1964386b2f7c::t_d1db6dbdfb8f4a 6-7,9-25
+  s_eb1964386b2f7c::t_00eec24db0acee 1-5,8,26-62,69-87,92-98,101-115,118-120,133,136-153
+  s_eb1964386b2f7c::t_e2e24a135d14b8 88-91,99-100,116-117
+  s_eb1964386b2f7c::t_8f983548b96390 63-68
+  s_eb1964386b2f7c::t_de350d369b2e96 121-132,134-135
+tests/lib/test-runner.sh
+  s_eb1964386b2f7c::t_2ae0087c995d22 140-143,157-158,206-207,213-217
+  s_eb1964386b2f7c::t_25fa2dd78ca8e2 146-147,166,168-169,171-175
+  s_eb1964386b2f7c::t_51da0a18f277a7 144-145,180-183,203-205
+  s_eb1964386b2f7c::t_a0f09b7cc74402 148-156,163-165,167
+  s_eb1964386b2f7c::t_a8b220d504b09e 48-62
+tests/test-syscall-fidelity.c
+  s_eb1964386b2f7c::t_e079c6be879e57 1-587
+Makefile
+  s_eb1964386b2f7c::t_8713db3fc8f52c 93
+  s_eb1964386b2f7c::t_0ae96bc8e2fc69 1,11
+  s_eb1964386b2f7c::t_f13b00549ab89b 122,132-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "e54c84f198e736ab72d730fca776c27cefed407d",
+  "prompts": {},
+  "sessions": {
+    "s_5b794459c3132a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e35ae-f8c6-7470-9b07-65c6777a5e96",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_eb1964386b2f7c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65fdbaed-0646-4221-b5e9-cbc861f3a96d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

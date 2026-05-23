@@ -1,0 +1,21 @@
+src/core/guest.c
+  s_152460798639c4::t_5dfd79b840d0f3 223-227,240-244,246-248,250-251,255-257,275-291,293-302,304-310,313,315-337,339-340,342-351,356-365,368
+src/runtime/forkipc.c
+  s_152460798639c4::t_c6da35c6b68225 124-127,129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "f8f59a3a54b5605a2ca81d3af6396897351e3890",
+  "prompts": {},
+  "sessions": {
+    "s_152460798639c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63538abc-5344-458b-a30b-4aedc4ff1524",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

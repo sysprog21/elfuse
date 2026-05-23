@@ -1,0 +1,29 @@
+tests/test-matrix.sh
+  s_152460798639c4::t_2f7412a658285a 729-736
+  s_eb1964386b2f7c::t_0ae96bc8e2fc69 9-13
+  s_152460798639c4::t_47c39612e96f91 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "872121d7680e5c35911af5eef2ea81caa1dc6cf1",
+  "prompts": {},
+  "sessions": {
+    "s_152460798639c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63538abc-5344-458b-a30b-4aedc4ff1524",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    },
+    "s_eb1964386b2f7c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65fdbaed-0646-4221-b5e9-cbc861f3a96d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    }
+  }
+}

@@ -1,0 +1,27 @@
+src/syscall/net.c
+  s_152460798639c4::t_33e25164533d04 1018-1022,1024-1025
+src/core/rosetta.c
+  s_152460798639c4::t_140b45fa771224 818-822,824,828-830
+  s_152460798639c4::t_5248adc302f9e3 1007,1020-1022,1024,1027-1028,1040
+  s_152460798639c4::t_a4091b85b70980 28
+tests/test-rosetta-statics.sh
+  s_152460798639c4::t_b3cf6cdb996930 239-240,248,250-253
+tests/test-matrix.sh
+  s_152460798639c4::t_bdd50d1144b5a3 730-732,735-737
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "401f3e31e162db6028955c27aa588d924b8d8f47",
+  "prompts": {},
+  "sessions": {
+    "s_152460798639c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63538abc-5344-458b-a30b-4aedc4ff1524",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

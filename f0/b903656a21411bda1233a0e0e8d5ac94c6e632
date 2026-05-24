@@ -1,0 +1,100 @@
+src/core/guest.c
+  s_7259697bf14bc8::t_e81dd423321795 1441-1446,1450-1456
+src/main.c
+  s_db971505d6da51::t_0233ceb4897984 112,445-446,456
+  s_7dd3fd7eb49a43::t_f53e8a21c620af 418,420,423
+  s_7dd3fd7eb49a43::t_976033ae5222a9 419
+  s_db971505d6da51::t_63d4fdb32ce472 38-39,56-91,361-362,412-417,421-422,428-437,447,452-453,457-458
+src/core/bootstrap.h
+  s_db971505d6da51::t_0233ceb4897984 33,83
+  s_db971505d6da51::t_63d4fdb32ce472 32,34
+  s_db971505d6da51::t_4fcdfd10a9815a 23
+src/syscall/mem.c
+  s_7259697bf14bc8::t_8cfdd7e79f05ce 424-431
+  s_7259697bf14bc8::t_76aa2ebaefa724 528-550
+  s_7259697bf14bc8::t_904478614c9dea 411-417
+  s_7259697bf14bc8::t_900f6e3a4ac8f0 619-647
+tests/test-matrix.sh
+  s_152460798639c4::t_47c39612e96f91 3
+  s_eb1964386b2f7c::t_0ae96bc8e2fc69 9-13
+  s_152460798639c4::t_2f7412a658285a 729-736
+src/core/rosetta.c
+  s_7259697bf14bc8::t_eba280420826c7 897-899
+  s_db971505d6da51::t_c0ae7aa4f8734a 47
+  s_7259697bf14bc8::t_bf0633b2a06781 894-896,905-925
+  s_7259697bf14bc8::t_4ed539219923e5 76-92,100,104,130,137,140,145
+  s_db971505d6da51::t_0233ceb4897984 74,93,105-128,132-135,139,141-142,381,482
+  s_7259697bf14bc8::t_9e359f476705ac 476-480
+  s_7259697bf14bc8::t_cb8f2d026f0064 99,101,129,131,136,138,144,146
+  s_7259697bf14bc8::t_adc6f986954033 686
+  s_7259697bf14bc8::t_94800a4768ef86 688-711,717-724,731-733,736,738,756,765-770
+  s_7259697bf14bc8::t_60bdf78e48e888 712-716,725-730,734-735,737,739-755,757-764
+src/core/bootstrap.c
+  s_db971505d6da51::t_4fcdfd10a9815a 29,31,56-153,197-198,200-230,235-236,243-244,252-253,256-257,495-497,503-504
+  s_db971505d6da51::t_0233ceb4897984 322,539-547,552-557,559-561,564,567-572,575-581,583-587,590,602-608,628,674-745
+  s_db971505d6da51::t_63d4fdb32ce472 321,323,341-342,346-357,363,366-377,382-383,388-412,414-417,419-423,425-428,430-432,443-448,458-466,498,526
+src/core/rosetta.h
+  s_db971505d6da51::t_0233ceb4897984 80-199
+src/syscall/io.c
+  s_7259697bf14bc8::t_5ee69d94729cea 138-162
+  s_7259697bf14bc8::t_d660b3299d7dd9 30,32
+src/runtime/forkipc.c
+  s_db971505d6da51::t_63d4fdb32ce472 223
+src/syscall/exec.c
+  s_db971505d6da51::t_4fcdfd10a9815a 83-139,445-451,453-461,489,491,493-498,502-514,966
+  s_7259697bf14bc8::t_7b5676f789a43e 717-722
+  s_7259697bf14bc8::t_cf6d8cafc1d07a 49-61
+  s_7259697bf14bc8::t_98ae7886208dc4 757
+  s_7259697bf14bc8::t_2643335f6eb329 681-691
+  s_db971505d6da51::t_0233ceb4897984 641,715-716
+  s_7259697bf14bc8::t_c91b54b83ee4ca 693-694,702,704,706-707,709-711
+  s_7259697bf14bc8::t_bc99f17ffe7c53 695-701,703,705,708,714,723-724
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "f0b903656a21411bda1233a0e0e8d5ac94c6e632",
+  "prompts": {},
+  "sessions": {
+    "s_152460798639c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63538abc-5344-458b-a30b-4aedc4ff1524",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    },
+    "s_7259697bf14bc8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd68b130-4a83-4bba-b700-c1b7c44fbb30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    },
+    "s_7dd3fd7eb49a43": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2770-9b5b-70d1-b50c-efb03e025afc",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_db971505d6da51": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e5605-612a-7ac0-b3ae-59ea39d824e7",
+        "model": "gpt-5.4"
+      },
+      "human_author": null
+    },
+    "s_eb1964386b2f7c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65fdbaed-0646-4221-b5e9-cbc861f3a96d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    }
+  }
+}

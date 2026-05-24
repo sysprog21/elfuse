@@ -1,0 +1,20 @@
+tests/test-matrix.sh
+  s_7259697bf14bc8::t_d8aba11e712c44 636-638
+  s_7259697bf14bc8::t_b97986cb406703 639-640
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "227df7da912d30848b42e17b8bcc568d6e8350ac",
+  "prompts": {},
+  "sessions": {
+    "s_7259697bf14bc8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd68b130-4a83-4bba-b700-c1b7c44fbb30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

@@ -1,0 +1,152 @@
+mk/tests.mk
+  s_a159e2a14bf2e0::t_387d5a8491d1b4 457-458,470
+  s_a159e2a14bf2e0::t_5350a41daac256 8-9,156-164,167-168
+tests/fixtures/rosetta/README.md
+  s_14cd86d39cd217::t_6d50ac3942f671 9-17
+  s_14cd86d39cd217::t_bba49f44870577 22
+  s_14cd86d39cd217::t_67e74c8acfc4de 23-30,37-39,42-45
+  s_14cd86d39cd217::t_1ea047dcccd5b6 31-36,40-41
+  s_a159e2a14bf2e0::t_4acd4b5dc65757 1-8,18-21
+mk/config.mk
+  s_14cd86d39cd217::t_63baceab2bf698 22-27,34
+tests/x86_64-glibc-hello.c
+  s_a159e2a14bf2e0::t_a226aa09ed3878 7,11-13
+  s_a159e2a14bf2e0::t_133883b30c3221 1-6,8-10,14-15
+tests/x86_64-glibc-gdtls.c
+  s_14cd86d39cd217::t_cf24ad62616a4f 1-81
+tests/test-matrix.sh
+  s_a159e2a14bf2e0::t_9d965ed2df0aff 858
+  s_14cd86d39cd217::t_aa96b2abdfe056 27-28
+  s_14cd86d39cd217::t_0c1a386a84301c 251
+  s_14cd86d39cd217::t_0005088a917898 893,895,897
+  s_a159e2a14bf2e0::t_9b5729bf5b80d0 29,90,593,771
+  s_14cd86d39cd217::t_661e1195bfa644 868-873,875
+  s_14cd86d39cd217::t_17b61a9bb2d820 907-923,927-928
+  s_14cd86d39cd217::t_89f4b638166a21 856,859
+  s_14cd86d39cd217::t_cb793d8718773c 854,857
+  s_14cd86d39cd217::t_4fb6d661a56fbf 60,160,216,296,317,564-565,874
+  s_14cd86d39cd217::t_de6ee72b1de2d9 862
+  s_14cd86d39cd217::t_7bafe0d0226ca6 878-881
+  s_14cd86d39cd217::t_c70d22b247a794 892,894,896
+  s_14cd86d39cd217::t_181eab64a7e882 957-965,967-969,973-995,999,1004,1009
+  s_a159e2a14bf2e0::t_f6edc9cc7daf7d 88-89,91-94,97-102,267-291,293,300-312,581-582,585-586,588-590,592,750-753,761,764-769,775-779,1022-1028,1034
+  s_a159e2a14bf2e0::t_0ae2e2b12c0cd4 96
+  s_a159e2a14bf2e0::t_6b62a57c4eb3bc 95
+  s_14cd86d39cd217::t_6fb0a0af14d7f5 292,294-295,297-299
+  s_a159e2a14bf2e0::t_f6c1a1b7a48644 583-584,587,591,620-621,762
+  s_a159e2a14bf2e0::t_0e8b8047f05123 594-600,613,619,770,772-773
+  s_14cd86d39cd217::t_ef3364eff89dea 846-853,855,863-867,876-877,882-891,898-906,924-926,929-937
+  s_a159e2a14bf2e0::t_5350a41daac256 601-612,860-861
+  s_14cd86d39cd217::t_bf9de01d01f720 614-618
+  s_a159e2a14bf2e0::t_833a61ecacd8ae 774
+tests/lib/rosetta-test.sh
+  s_14cd86d39cd217::t_f6724bea1991b2 58-72
+  s_14cd86d39cd217::t_10b06ec939ead7 1-57
+tests/test-rosetta-statics.sh
+  s_14cd86d39cd217::t_cb5c3896b5d601 43-48
+  s_a159e2a14bf2e0::t_387254d152a61a 38
+  s_14cd86d39cd217::t_1075dd4487b579 100
+  s_14cd86d39cd217::t_a8708c61e76a9d 239
+tests/test-rosetta-audit.sh
+  s_a159e2a14bf2e0::t_133883b30c3221 41-42
+  s_a159e2a14bf2e0::t_27e5f644f7d372 1-16,19-36,38,43-70
+  s_a159e2a14bf2e0::t_3f814133020615 17-18,39-40
+  s_a159e2a14bf2e0::t_a226aa09ed3878 71
+  s_14cd86d39cd217::t_b90a6a98c10a30 37
+tests/fetch-fixtures.sh
+  s_a159e2a14bf2e0::t_76bbd0983d609a 63,65,87
+  s_14cd86d39cd217::t_3c8a3f63e7805e 56
+  s_14cd86d39cd217::t_6539a333f797c5 97,218,221,249
+.gitignore
+  s_14cd86d39cd217::t_662aa1d5d7bea2 7
+tests/x86_64-rosetta-audit.c
+  s_a159e2a14bf2e0::t_27e5f644f7d372 1-151
+tests/x86_64-glibc-pthread-tls.c
+  s_14cd86d39cd217::t_eba164beb9c8e8 1-95
+tests/test-rosetta-glibc.sh
+  s_a159e2a14bf2e0::t_133883b30c3221 20,44-46,51,54-55,59,95,97
+  s_14cd86d39cd217::t_7024044b8708d1 62-70,72-86,104,110,117,125
+  s_a159e2a14bf2e0::t_aedf81f36917b8 18,47-50,52-53
+  s_a159e2a14bf2e0::t_76bbd0983d609a 127
+  s_14cd86d39cd217::t_43b65dbfc54b10 57-58
+  s_14cd86d39cd217::t_124d7ad83338c3 56
+  s_14cd86d39cd217::t_35c65c1dbffec8 21-22
+  s_14cd86d39cd217::t_ed8e23a7fcc1b4 23-24
+  s_14cd86d39cd217::t_ff88e5a0e0c5b1 43
+  s_14cd86d39cd217::t_41517720b38839 101-103,105-109,111
+  s_14cd86d39cd217::t_9245e4d033dc0b 112-116,118-124,126
+  s_a159e2a14bf2e0::t_27e5f644f7d372 1-17,19,25-42,60-61,71,87-94,96,98-100
+docs/testing.md
+  s_14cd86d39cd217::t_f1b844e27d8efe 134-146,155,157,160-161,163-188,213,215-223,225-249
+  s_14cd86d39cd217::t_2b3ca637032f51 189,191-193,202-212
+  s_14cd86d39cd217::t_56ef09a4195fc0 190,194-201
+  s_14cd86d39cd217::t_56f52dff7b4274 214
+  s_a159e2a14bf2e0::t_7ff66bddfb54f7 110
+  s_a159e2a14bf2e0::t_d420be3de146ad 36,50-51,71-72,84-85,90-91,96,101-103,111-113,119-132
+  s_a159e2a14bf2e0::t_33f89b5ae0696d 159
+  s_a159e2a14bf2e0::t_5350a41daac256 52-53,97-99
+  s_a159e2a14bf2e0::t_b893816c5b875c 156,158,162,224
+  s_14cd86d39cd217::t_63686dbf8e6725 147-154
+tests/x86_64-glibc-dlopen.c
+  s_14cd86d39cd217::t_272986caf7cbdf 22-29
+  s_14cd86d39cd217::t_6e5a2cbc304009 56
+  s_14cd86d39cd217::t_6af5b26525475f 1-21,30-55,57-73
+tests/test-rosetta-alpine.sh
+  s_14cd86d39cd217::t_0fe9d80435013e 42-47
+  s_14cd86d39cd217::t_85d5cacc6e174c 407
+  s_a159e2a14bf2e0::t_c158406fa5ed51 36
+  s_14cd86d39cd217::t_7ac9efe117646e 68
+tests/x86_64-glibc-gdtls-lib.c
+  s_14cd86d39cd217::t_aae8db55068d32 21,24
+  s_14cd86d39cd217::t_66a411d8ab02a9 20,22-23,25-28
+  s_14cd86d39cd217::t_2c42a827ffc2e0 29-30
+  s_14cd86d39cd217::t_63c3ea9d54ec70 1-19,31-40
+tests/bench-rosetta.sh
+  s_14cd86d39cd217::t_274cecc006d18c 32
+tests/x86_64-glibc-tls.c
+  s_14cd86d39cd217::t_b8edd7def0d15c 29-36
+  s_14cd86d39cd217::t_db89aea6737eae 1-28,37-65
+tests/test-rosetta-failure-modes.sh
+  s_14cd86d39cd217::t_cb6edc8cefe996 2-3,8-11,14-25,91
+  s_14cd86d39cd217::t_68b753670365b0 84
+  s_14cd86d39cd217::t_148dac6a4547a3 39-44
+  s_14cd86d39cd217::t_aded66cb7e559b 119
+  s_a159e2a14bf2e0::t_25c208ea0c1b78 59
+tests/test-rosetta-cli.sh
+  s_14cd86d39cd217::t_a796310b0287e2 113
+  s_14cd86d39cd217::t_ced01ad4e8c91f 11-17,20
+  s_14cd86d39cd217::t_fd01589866837c 73,75,79,81,84
+  s_a159e2a14bf2e0::t_4f76cd997fe159 18-19,21-22,69,112
+tests/x86_64-rosetta-tls0.c
+  s_a159e2a14bf2e0::t_27e5f644f7d372 1-12,14-21,24-25,27-28,30-31,34
+  s_a159e2a14bf2e0::t_a226aa09ed3878 13,22-23,26,29,32-33
+tests/test-rosetta-jit.sh
+  s_a159e2a14bf2e0::t_76bbd0983d609a 46,59
+  s_a159e2a14bf2e0::t_a226aa09ed3878 69
+  s_a159e2a14bf2e0::t_27e5f644f7d372 1-41,43-45,47-58,60-68
+  s_14cd86d39cd217::t_594c70f03b5c38 42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "eefa78d36370fce5baa0f516a400f4c19238cbe5",
+  "prompts": {},
+  "sessions": {
+    "s_14cd86d39cd217": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7ebb79e-423a-49bb-88f9-c3c721546c78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_a159e2a14bf2e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e5cb2-c86b-7213-8e6e-fbc80eedaae7",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

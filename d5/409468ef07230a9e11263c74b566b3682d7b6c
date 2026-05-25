@@ -1,0 +1,21 @@
+tests/test-futex-pi.c
+  s_14cd86d39cd217::t_38009f2757213a 209,216-229,236-250,266-273
+  s_14cd86d39cd217::t_989ae7b10be2c3 275
+  ai_agent 203-208,210-215,234-235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "d5409468ef07230a9e11263c74b566b3682d7b6c",
+  "prompts": {},
+  "sessions": {
+    "s_14cd86d39cd217": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7ebb79e-423a-49bb-88f9-c3c721546c78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

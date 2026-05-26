@@ -1,0 +1,102 @@
+src/syscall/sidecar.c
+  s_8b22ca81b64db2::t_be63197e7571e6 695-700,703-704
+src/syscall/mem.c
+  s_8b22ca81b64db2::t_fd1bf0715800ba 831-835
+  s_8b22ca81b64db2::t_fe4fdb4d1dff6f 3548-3555
+  s_8b22ca81b64db2::t_cb592bfb755937 3765
+  s_8b22ca81b64db2::t_d95ae70b1d85df 3711,3724
+src/core/stack.c
+  s_8b22ca81b64db2::t_61d5988a5053dc 200,202-203
+tests/test-file-ops.c
+  s_8a9d6387e1f8a0::t_8e8be2f899f31b 142-160
+src/syscall/fs.c
+  s_8a9d6387e1f8a0::t_d27f2b0df30531 1651-1652
+  s_8b22ca81b64db2::t_8d1107d62c1b45 1700-1705,1708-1711
+  s_8b22ca81b64db2::t_eea5b04c9dcc53 1712-1715
+  s_8a9d6387e1f8a0::t_e6e2bb404e7e48 1653-1658
+  s_8a9d6387e1f8a0::t_3fe99de9b6c534 1641-1650,1659-1663
+src/syscall/inotify.c
+  s_8b22ca81b64db2::t_e9e2e80d7ed6c2 34
+  s_8b22ca81b64db2::t_6bf3f31ca506e4 284-289,293-294
+src/core/rosetta.c
+  s_8b22ca81b64db2::t_071601c3c4cc13 478
+src/syscall/fuse.c
+  s_224cf6569ce32a::t_445b3545f9d880 278-282
+  s_224cf6569ce32a::t_ea1d579ca7b604 2442-2444,2480-2481
+  s_51203e8023ea9a::t_f0b6ea51942d32 2353-2355,2357
+  s_224cf6569ce32a::t_81b5b20ada4878 208-216
+  s_8ede68387f91a2::t_bbaf6791511db1 2628-2631,2633
+  s_8b22ca81b64db2::t_1fe1189cb6d352 2332
+  s_56bc1fb6fa3c58::t_f069a836f6498a 200-203
+  s_8ede68387f91a2::t_b750fa59e50e3e 2482
+  s_224cf6569ce32a::t_8dc370618831df 2632
+  s_8b22ca81b64db2::t_377ff156fe78ef 2320-2331,2333
+src/syscall/fs-stat.c
+  s_8b22ca81b64db2::t_ab33f203253b04 267-268
+  s_8b22ca81b64db2::t_2191094e6c3812 310-311
+  s_8b22ca81b64db2::t_868af5e01b0b1f 380-381
+tests/test-negative.c
+  s_8a9d6387e1f8a0::t_5309baec3b23e7 32-35,437
+  s_8a9d6387e1f8a0::t_3fe99de9b6c534 432-436,438-441
+src/syscall/abi.h
+  s_8a9d6387e1f8a0::t_745cce593ee3df 393-396
+src/syscall/fd.c
+  s_8b22ca81b64db2::t_92d51a1acf532b 686,689-690
+  s_8b22ca81b64db2::t_3cd668b6ddf5da 22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "b6ad3cb0a691de824588d7c0fe0f7dcbd971ef37",
+  "prompts": {},
+  "sessions": {
+    "s_224cf6569ce32a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4b9616c5-1a2a-4648-aaee-a3d61d397062",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_51203e8023ea9a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e64e4-04d4-7b12-84f6-30d29482fc2e",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_56bc1fb6fa3c58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bd275b9f-1f35-44dd-acfd-1c0c5c762055",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_8a9d6387e1f8a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e663c-454e-73c0-b457-96a1e515117f",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_8b22ca81b64db2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59a623e5-c114-4574-9073-c118473b7741",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    },
+    "s_8ede68387f91a2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2b59-8988-7473-80b9-f898a617f0fa",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

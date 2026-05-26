@@ -1,0 +1,70 @@
+tests/test-negative.c
+  s_8a9d6387e1f8a0::t_3fe99de9b6c534 432-436,438-441
+  s_8a9d6387e1f8a0::t_5309baec3b23e7 32-35,437
+src/core/stack.c
+  s_8b22ca81b64db2::t_61d5988a5053dc 200,202-203
+src/syscall/sidecar.c
+  s_8b22ca81b64db2::t_be63197e7571e6 695-700,703-704
+src/syscall/mem.c
+  s_8b22ca81b64db2::t_fd1bf0715800ba 831-835
+  s_8b22ca81b64db2::t_cb592bfb755937 3765
+  s_8b22ca81b64db2::t_fe4fdb4d1dff6f 3548-3555
+  s_8b22ca81b64db2::t_d95ae70b1d85df 3711,3724
+src/syscall/fs-stat.c
+  s_8b22ca81b64db2::t_2191094e6c3812 310-311
+  s_8b22ca81b64db2::t_ab33f203253b04 267-268
+  s_8b22ca81b64db2::t_868af5e01b0b1f 380-381
+src/syscall/inotify.c
+  s_8b22ca81b64db2::t_6bf3f31ca506e4 284-289,293-294
+  s_8b22ca81b64db2::t_e9e2e80d7ed6c2 34
+src/core/rosetta.c
+  s_8b22ca81b64db2::t_071601c3c4cc13 478
+tests/test-file-ops.c
+  s_8a9d6387e1f8a0::t_8e8be2f899f31b 142-160
+src/syscall/fd.c
+  s_8b22ca81b64db2::t_3cd668b6ddf5da 22
+  s_8b22ca81b64db2::t_92d51a1acf532b 686,689-690
+src/syscall/abi.h
+  s_8a9d6387e1f8a0::t_745cce593ee3df 393-396
+src/syscall/fs.c
+  s_8a9d6387e1f8a0::t_e6e2bb404e7e48 1653-1658
+  s_8a9d6387e1f8a0::t_3fe99de9b6c534 1641-1650,1659-1663
+  s_8b22ca81b64db2::t_eea5b04c9dcc53 1712-1715
+  s_8b22ca81b64db2::t_8d1107d62c1b45 1700-1705,1708-1711
+  s_8a9d6387e1f8a0::t_d27f2b0df30531 1651-1652
+src/syscall/fuse.c
+  s_8b22ca81b64db2::t_377ff156fe78ef 2321-2329
+  s_51203e8023ea9a::t_f0b6ea51942d32 2349-2351,2353
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "10adacf9755b8bdb37159754f18f001da7fbeaf1",
+  "prompts": {},
+  "sessions": {
+    "s_51203e8023ea9a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e64e4-04d4-7b12-84f6-30d29482fc2e",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_8a9d6387e1f8a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e663c-454e-73c0-b457-96a1e515117f",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_8b22ca81b64db2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59a623e5-c114-4574-9073-c118473b7741",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

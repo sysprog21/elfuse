@@ -1,0 +1,59 @@
+tests/bench-hot-syscalls.c
+  s_70572ad3f72c76::t_4806d32101d21c 596-602
+tests/test-bench-guardrail.sh
+  s_70572ad3f72c76::t_a43a56bbbdd9de 121-124,130
+  s_70572ad3f72c76::t_39dfaa8e5b7f23 111-112
+  s_70572ad3f72c76::t_f01686988a10c8 50-51,57,59
+  s_70572ad3f72c76::t_ad4a54e8fdce1c 30
+  s_70572ad3f72c76::t_2a8b7d528116e6 31-36,39
+  s_e1293307aa1515::t_576139fffd3b5c 4-5,16,21-26,53-56,58
+  s_68a3aab7845f55::t_4ae1a64dc39239 63,100,132-137
+  s_70572ad3f72c76::t_3ff6f7bc2b054c 28
+  s_70572ad3f72c76::t_2584988f3da1c0 1-3,8-14,17-20,27,29,37-38,40-49,52,60-62,64-99,101-110,113-120,125-129,131,138-147
+  s_70572ad3f72c76::t_5f6d12d7305dda 6-7,15
+Makefile
+  s_70572ad3f72c76::t_6c2f16c161c708 231-236,239-240
+  s_70572ad3f72c76::t_ddaf43bd38771b 230,238,241-242
+  s_70572ad3f72c76::t_fcaac5ab1356fc 224-229,237
+tests/bench-hot-guard.c
+  s_70572ad3f72c76::t_3710139773747a 7-9,11-12,34-35,42-151,156,169,180-222,230
+  s_70572ad3f72c76::t_685e5c87d2c8c0 1-6,13,33,36-39
+  s_70572ad3f72c76::t_078610ad00a9d7 225
+  s_70572ad3f72c76::t_10fe96f27638dc 154,157-168,170
+  s_70572ad3f72c76::t_1bd13a54885957 10,14-32
+mk/tests.mk
+  s_70572ad3f72c76::t_ce696231247e5d 54-60,69-70
+  s_e1293307aa1515::t_576139fffd3b5c 61-68,71-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "63fad5702ac0d3924d9c0ec5df052fdf90617b1e",
+  "prompts": {},
+  "sessions": {
+    "s_68a3aab7845f55": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e734d-4fd8-7560-a07c-2bad48b14d8c",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_70572ad3f72c76": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b74833e-442b-49cf-b3c6-3e968f6085b6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_e1293307aa1515": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e733e-e8db-7e82-a82a-30e70b170e3e",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

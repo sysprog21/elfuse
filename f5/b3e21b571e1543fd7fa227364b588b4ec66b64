@@ -1,0 +1,41 @@
+src/core/vdso.h
+  s_70572ad3f72c76::t_7e5a0b188c52b6 46
+  s_70572ad3f72c76::t_019ee1489188b1 47-54
+src/core/vdso.c
+  s_70572ad3f72c76::t_1745a3627bf88a 237,244
+  s_70572ad3f72c76::t_8926d8d12b0e5d 813-814
+  s_70572ad3f72c76::t_d6b8eddf6be32c 1454-1456,1462-1464
+  s_70572ad3f72c76::t_7266cff1f37a9d 441-442,444-456
+  s_70572ad3f72c76::t_df471fe8ba9373 405
+  s_70572ad3f72c76::t_09cc27e1884bf5 699-703
+  s_70572ad3f72c76::t_e28f37dd9904cb 815-819
+  s_70572ad3f72c76::t_a6dd51186e5e22 715
+  s_70572ad3f72c76::t_15ecf760bd5382 642
+  s_70572ad3f72c76::t_d498d6d834bcf1 600-601
+  s_70572ad3f72c76::t_a602a0143398a3 694-698
+  s_70572ad3f72c76::t_eb563862a642e7 761-764
+  s_70572ad3f72c76::t_f129709661bd26 1466
+  s_70572ad3f72c76::t_3ec119d20e6940 233-236,238-242
+  s_70572ad3f72c76::t_6fcd1a714ad525 443,457-458
+  s_70572ad3f72c76::t_984667b035c53e 635
+  s_70572ad3f72c76::t_170ea9311d692e 692-693,707-709,713-714,716
+  s_70572ad3f72c76::t_f639e75b3fc82f 710-712,717-721
+  s_70572ad3f72c76::t_02fa9a2467e5a7 621,630
+  s_70572ad3f72c76::t_910727c705e479 623-626
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f5b3e21b571e1543fd7fa227364b588b4ec66b64",
+  "prompts": {},
+  "sessions": {
+    "s_70572ad3f72c76": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b74833e-442b-49cf-b3c6-3e968f6085b6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

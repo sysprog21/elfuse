@@ -28,6 +28,8 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <stdlib.h>
 #include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -82,6 +84,11 @@ typedef struct {
     bool is_dir;   /* true if watching a directory */
     dev_t dev;     /* Device ID (for re-add lookup by inode) */
     ino_t ino;     /* Inode number (for re-add lookup by inode) */
+    /* Dir watches only: path + entry-name snapshot, diffed on change to
+     * recover the child name kqueue omits. NULL/0 for file watches. */
+    char *path;
+    char **entries;
+    int n_entries;
 } inotify_watch_t;
 
 typedef struct {
@@ -295,12 +302,136 @@ static void pipe_drain(inotify_instance_t *inst)
         ;
 }
 
+/* Snapshot the entry names of a directory (excluding "." and ".."). On return
+ * *out is a malloc'd array of malloc'd strings with *n_out entries (free with
+ * free_dir_snapshot). On any failure the snapshot is left empty.
+ */
+static void dir_snapshot(const char *path, char ***out, int *n_out)
+{
+    *out = NULL;
+    *n_out = 0;
+
+    DIR *d = opendir(path);
+    if (!d)
+        return;
+
+    char **names = NULL;
+    int n = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (n == cap) {
+            int ncap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, (size_t) ncap * sizeof(char *));
+            if (!tmp)
+                break;
+            names = tmp;
+            cap = ncap;
+        }
+        names[n] = strdup(de->d_name);
+        if (!names[n])
+            break;
+        n++;
+    }
+    closedir(d);
+
+    *out = names;
+    *n_out = n;
+}
+
+static void free_dir_snapshot(char **entries, int n)
+{
+    if (!entries)
+        return;
+    for (int i = 0; i < n; i++)
+        free(entries[i]);
+    free(entries);
+}
+
+static bool snapshot_contains(char *const *entries, int n, const char *name)
+{
+    for (int i = 0; i < n; i++)
+        if (!strcmp(entries[i], name))
+            return true;
+    return false;
+}
+
 /* Collect events from kqueue. */
 
-/* Poll the kqueue for pending vnode events and translate them into inotify
- * events in the instance buffer.
- *
- * Returns the number of events collected.
+/* Translate one EVFILT_VNODE notification into queued inotify events for the
+ * watch on host_fd. Returns the number queued, or -1 on buffer overflow (an
+ * IN_Q_OVERFLOW marker is queued). Caller holds inotify_lock.
+ */
+static int process_vnode_event(inotify_instance_t *inst,
+                               int host_fd,
+                               uint32_t fflags)
+{
+    int widx = watch_find_by_hostfd(inst, host_fd);
+    if (widx < 0)
+        return 0;
+
+    inotify_watch_t *w = &inst->watches[widx];
+    int queued = 0;
+    bool overflow = false;
+
+    if (w->is_dir && (fflags & NOTE_WRITE) && w->path) {
+        char **now = NULL;
+        int now_n = 0;
+        dir_snapshot(w->path, &now, &now_n);
+
+        for (int j = 0; j < now_n && !overflow; j++) {
+            if ((w->mask & IN_CREATE) &&
+                !snapshot_contains(w->entries, w->n_entries, now[j])) {
+                if (queue_event(inst, w->wd, IN_CREATE, 0, now[j]) < 0)
+                    overflow = true;
+                else
+                    queued++;
+            }
+        }
+        for (int j = 0; j < w->n_entries && !overflow; j++) {
+            if ((w->mask & IN_DELETE) &&
+                !snapshot_contains(now, now_n, w->entries[j])) {
+                if (queue_event(inst, w->wd, IN_DELETE, 0, w->entries[j]) < 0)
+                    overflow = true;
+                else
+                    queued++;
+            }
+        }
+
+        /* Advance the snapshot regardless: the directory state has moved on,
+         * and any names dropped under overflow are covered by IN_Q_OVERFLOW.
+         */
+        free_dir_snapshot(w->entries, w->n_entries);
+        w->entries = now;
+        w->n_entries = now_n;
+    }
+
+    if (!overflow) {
+        uint32_t in_mask = notes_to_in_mask(fflags, w->mask, w->is_dir);
+        /* The per-child create/delete is emitted by the diff above; only emit
+         * the bare-mask event for file watches or non-create/delete changes.
+         */
+        if (in_mask != 0 &&
+            !(w->is_dir && (in_mask & (IN_CREATE | IN_DELETE)))) {
+            if (queue_event(inst, w->wd, in_mask, 0, NULL) < 0)
+                overflow = true;
+            else
+                queued++;
+        }
+    }
+
+    if (overflow) {
+        /* IN_Q_OVERFLOW (0x4000) uses wd=-1 per Linux semantics. */
+        queue_event(inst, -1, 0x4000, 0, NULL);
+        return -1;
+    }
+    return queued;
+}
+
+/* Poll the kqueue for pending vnode events and translate them into
+ * inotify events in the instance buffer. Returns the number of
+ * events collected.
  */
 static int collect_events(inotify_instance_t *inst)
 {
@@ -312,35 +443,19 @@ static int collect_events(inotify_instance_t *inst)
         return 0;
 
     int collected = 0;
+    bool overflow = false;
     for (int i = 0; i < nev; i++) {
-        int host_fd = (int) kevs[i].ident;
-        int widx = watch_find_by_hostfd(inst, host_fd);
-        if (widx < 0)
-            continue;
-
-        inotify_watch_t *w = &inst->watches[widx];
-        uint32_t in_mask =
-            notes_to_in_mask((uint32_t) kevs[i].fflags, w->mask, w->is_dir);
-        if (in_mask == 0)
-            continue;
-
-        /* Queue event without a filename for file watches. For directory
-         * watches, inotify emulation also omits the filename since kqueue
-         * EVFILT_VNODE does not report which child changed.
-         */
-        if (queue_event(inst, w->wd, in_mask, 0, NULL) == 0) {
-            collected++;
-        } else {
-            /* Fixed inotify queue is full; queue IN_Q_OVERFLOW and stop.
-             * IN_Q_OVERFLOW (0x4000) uses wd=-1 per Linux semantics.
-             */
-            queue_event(inst, -1, 0x4000, 0, NULL);
+        int r = process_vnode_event(inst, (int) kevs[i].ident,
+                                    (uint32_t) kevs[i].fflags);
+        if (r < 0) {
+            overflow = true;
             break;
         }
+        collected += r;
     }
 
     /* Signal the self-pipe so poll/epoll sees readability */
-    if (collected > 0)
+    if (collected > 0 || overflow)
         pipe_signal(inst);
 
     return collected;
@@ -438,12 +553,27 @@ int64_t sys_inotify_add_watch(guest_t *g,
     /* Strip IN_MASK_ADD control flag before storing */
     uint32_t event_mask = mask & ~(uint32_t) IN_MASK_ADD;
 
+    /* For directory watches, snapshot the path + current entries up-front
+     * (outside the lock) so collect_events can diff on each change to emit
+     * named IN_CREATE/IN_DELETE. Ownership moves to the watch slot on success;
+     * every early-exit path below frees these.
+     */
+    char *wpath = NULL;
+    char **wentries = NULL;
+    int wn = 0;
+    if (is_dir) {
+        wpath = strdup(path);
+        dir_snapshot(path, &wentries, &wn);
+    }
+
     pthread_mutex_lock(&inotify_lock);
 
     int slot = inotify_find(inotify_fd);
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
+        free_dir_snapshot(wentries, wn);
+        free(wpath);
         return -LINUX_EBADF;
     }
 
@@ -467,8 +597,12 @@ int64_t sys_inotify_add_watch(guest_t *g,
         uint32_t snapshot_mask = w->mask; /* Snapshot before unlock */
         pthread_mutex_unlock(&inotify_lock);
 
-        /* Close the duplicate fd; inotify emulation keeps the original */
+        /* Close the duplicate fd; inotify emulation keeps the original.
+         * The existing watch keeps its snapshot; drop this call's copy.
+         */
         close(host_fd);
+        free_dir_snapshot(wentries, wn);
+        free(wpath);
 
         /* Update kevent filter with the new mask (use snapshot -- w->mask may
          * be modified by another thread after unlock)
@@ -487,6 +621,8 @@ int64_t sys_inotify_add_watch(guest_t *g,
     if (widx < 0) {
         pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
+        free_dir_snapshot(wentries, wn);
+        free(wpath);
         return -LINUX_ENOSPC;
     }
 
@@ -502,6 +638,9 @@ int64_t sys_inotify_add_watch(guest_t *g,
     w->is_dir = is_dir;
     w->dev = st.st_dev;
     w->ino = st.st_ino;
+    w->path = wpath;
+    w->entries = wentries;
+    w->n_entries = wn;
 
     /* Capture kq_fd while under lock */
     int kq_fd = inst->kq_fd;
@@ -522,6 +661,11 @@ int64_t sys_inotify_add_watch(guest_t *g,
         pthread_mutex_lock(&inotify_lock);
         w->wd = 0;
         w->host_fd = 0;
+        free_dir_snapshot(w->entries, w->n_entries);
+        w->entries = NULL;
+        w->n_entries = 0;
+        free(w->path);
+        w->path = NULL;
         pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
         errno = saved;
@@ -556,6 +700,11 @@ int64_t sys_inotify_rm_watch(int inotify_fd, int wd)
     w->host_fd = 0;
     w->mask = 0;
     w->is_dir = 0;
+    free_dir_snapshot(w->entries, w->n_entries);
+    w->entries = NULL;
+    w->n_entries = 0;
+    free(w->path);
+    w->path = NULL;
     pthread_mutex_unlock(&inotify_lock);
 
     /* Remove from kqueue and close outside lock */
@@ -619,18 +768,12 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             }
             inst = &inotify_state[slot];
 
-            /* Process the received event */
+            /* Process the received event (same named-directory diff as the
+             * non-blocking collect path).
+             */
             int host_fd = (int) kev.ident;
-            int widx = watch_find_by_hostfd(inst, host_fd);
-            if (widx >= 0) {
-                inotify_watch_t *w = &inst->watches[widx];
-                uint32_t in_mask =
-                    notes_to_in_mask((uint32_t) kev.fflags, w->mask, w->is_dir);
-                if (in_mask != 0) {
-                    queue_event(inst, w->wd, in_mask, 0, NULL);
-                    pipe_signal(inst);
-                }
-            }
+            if (process_vnode_event(inst, host_fd, (uint32_t) kev.fflags) != 0)
+                pipe_signal(inst);
         }
     }
 
@@ -711,6 +854,11 @@ static void inotify_close(int guest_fd)
             watch_fds[nfds++] = inst->watches[i].host_fd;
             inst->watches[i].wd = 0;
         }
+        free_dir_snapshot(inst->watches[i].entries, inst->watches[i].n_entries);
+        inst->watches[i].entries = NULL;
+        inst->watches[i].n_entries = 0;
+        free(inst->watches[i].path);
+        inst->watches[i].path = NULL;
     }
 
     inst->guest_fd = -1;

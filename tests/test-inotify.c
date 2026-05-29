@@ -15,7 +15,10 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
 #include <unistd.h>
@@ -188,6 +191,72 @@ static void test_dir_create(void)
     close(fd);
 }
 
+/* Test 6: a directory watch must deliver a NAMED IN_CREATE for the new child,
+ * not just a nameless event.
+ */
+static void test_dir_create_named(void)
+{
+    TEST("watch dir delivers named IN_CREATE");
+
+    char dir[] = "/tmp/elfuse-inotify-dir-XXXXXX";
+    if (!mkdtemp(dir)) {
+        FAIL("mkdtemp");
+        return;
+    }
+
+    int fd = inotify_init1(IN_NONBLOCK);
+    if (fd < 0) {
+        FAIL("inotify_init1");
+        rmdir(dir);
+        return;
+    }
+
+    int wd = inotify_add_watch(fd, dir, IN_CREATE);
+    if (wd < 0) {
+        FAIL("inotify_add_watch");
+        close(fd);
+        rmdir(dir);
+        return;
+    }
+
+    const char *child = "manifest.yaml";
+    char path[300];
+    snprintf(path, sizeof(path), "%s/%s", dir, child);
+    int tfd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (tfd < 0) {
+        FAIL("create child in watched dir");
+        inotify_rm_watch(fd, wd);
+        close(fd);
+        rmdir(dir);
+        return;
+    }
+    close(tfd);
+
+    /* read() drives the diff; retry until the vnode notification is queued. */
+    bool found = false;
+    for (int attempt = 0; attempt < 50 && !found; attempt++) {
+        char buf[1024];
+        ssize_t n = read(fd, buf, sizeof(buf));
+        for (ssize_t off = 0;
+             off + (ssize_t) sizeof(struct inotify_event) <= n;) {
+            struct inotify_event *ev = (struct inotify_event *) (buf + off);
+            if ((ev->mask & IN_CREATE) && ev->len > 0 &&
+                strcmp(ev->name, child) == 0)
+                found = true;
+            off += (ssize_t) sizeof(struct inotify_event) + ev->len;
+        }
+        if (!found)
+            usleep(20000); /* 20ms */
+    }
+
+    EXPECT_TRUE(found, "named IN_CREATE for new child not delivered");
+
+    unlink(path);
+    inotify_rm_watch(fd, wd);
+    close(fd);
+    rmdir(dir);
+}
+
 /* Main */
 
 int main(void)
@@ -199,6 +268,7 @@ int main(void)
     test_modify_event();
     test_nonblock();
     test_dir_create();
+    test_dir_create_named();
 
     SUMMARY("test-inotify");
     return fails > 0 ? 1 : 0;

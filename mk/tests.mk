@@ -12,7 +12,7 @@
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
-        test-sysroot-nofollow test-sysroot-chdir perf
+        test-sysroot-nofollow test-sysroot-chdir test-go perf
 
 ## Build and run the assembly hello world test
 test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
@@ -51,6 +51,13 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-timeout-disable
 	@printf "\n$(BLUE)━━━ rosetta CLI gating ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-rosetta-cli
+	@printf "\n$(BLUE)━━━ Go static binary vDSO regression ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-go
+
+## Build a Go static linux/arm64 binary and run it under elfuse, guarding the
+## vDSO symbol-versioning regression. Skips when the Go toolchain is absent.
+test-go: $(ELFUSE_BIN)
+	$(call RUN_OPTIONAL_SKIP77,bash tests/test-go.sh $(ELFUSE_BIN),test-go)
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@set -e; \

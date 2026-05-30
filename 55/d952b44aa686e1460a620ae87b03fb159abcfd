@@ -1,0 +1,65 @@
+src/core/shim-globals.c
+  s_6af0d136a483fa::t_6ee293696d00ff 12,14,65-84,139-143,274-276,413-464
+  s_6af0d136a483fa::t_5b66dea1ac8414 277-285,295-307,314,324,326
+  s_6af0d136a483fa::t_107773ac109954 144-145
+  s_6af0d136a483fa::t_dde4bc27e9c0a9 465
+src/runtime/forkipc.c
+  s_6af0d136a483fa::t_6ee293696d00ff 362-368
+src/core/shim.S
+  s_b3e9551b12db25::t_60a54ede28cb05 630
+  s_6af0d136a483fa::t_6ee293696d00ff 128-170,344-349,355,360,365-384,387-400,420,424,426-428,436,447-451,453,467,479,510,512-515,533,542-545,555-565,570-571,586-588,644,648-650,652-688,708-737,744-747,752-754,756-760,762-808
+  s_6af0d136a483fa::t_e3d462b4fbbe95 569,572-584,589,597,605-606,615-616,618-619,622,625,628,632,643
+  s_6af0d136a483fa::t_502a368933406d 738-743,748-751,755
+  s_6af0d136a483fa::t_4b080174988ea1 590-594,596,602-603,633-635,637-638,640
+  s_6af0d136a483fa::t_6c012b949f1f10 489-496
+  s_6af0d136a483fa::t_5214b031dcca7a 598-601,604,607-608,612-614,617,620-621,623-624,626-627,636,641
+  s_6af0d136a483fa::t_59a8f41b3529d0 761
+  s_b3e9551b12db25::t_ec8249f0aa2f41 629
+  s_6af0d136a483fa::t_45fc819c73655b 639,642
+  s_6af0d136a483fa::t_ef0c07dd682a98 454-459,461-463,468-476,480
+src/core/shim-globals.h
+  s_6af0d136a483fa::t_6ee293696d00ff 131-187,217-230,380-396
+  s_6af0d136a483fa::t_cbaefa63c64fa6 231
+src/syscall/exec.c
+  s_6af0d136a483fa::t_6ee293696d00ff 91
+src/syscall/syscall.c
+  s_6af0d136a483fa::t_6ee293696d00ff 372,543
+src/syscall/sys.c
+  s_6af0d136a483fa::t_6ee293696d00ff 26,225
+src/syscall/proc.h
+  s_6af0d136a483fa::t_6ee293696d00ff 129-130,136-141,145-148,150-153
+src/syscall/proc-identity.c
+  s_6af0d136a483fa::t_6ee293696d00ff 12,214-225,248,262,267,285
+tests/test-shim-urandom-wrap.c
+  s_b3e9551b12db25::t_5d0835b82e1347 1-87
+tests/manifest.txt
+  s_b3e9551b12db25::t_5d0835b82e1347 55
+src/core/bootstrap.c
+  s_6af0d136a483fa::t_6ee293696d00ff 712
+src/main.c
+  s_6af0d136a483fa::t_6ee293696d00ff 33,510-517
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "55d952b44aa686e1460a620ae87b03fb159abcfd",
+  "prompts": {},
+  "sessions": {
+    "s_6af0d136a483fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "11017862-5859-46a6-ac24-1f64b727f73e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_b3e9551b12db25": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e78c6-01b9-7103-bced-d042ab88f491",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

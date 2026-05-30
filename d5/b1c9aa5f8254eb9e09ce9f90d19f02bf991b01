@@ -1,0 +1,22 @@
+docs/internals.md
+  s_b1f2816cbfacec::t_fa9035bdb545fe 596
+src/core/elf.c
+  s_b1f2816cbfacec::t_3fa01c26101c5e 330-335,337-341
+  s_b1f2816cbfacec::t_f37ce79b79db5e 342-353
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d5b1c9aa5f8254eb9e09ce9f90d19f02bf991b01",
+  "prompts": {},
+  "sessions": {
+    "s_b1f2816cbfacec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5860b4af-97cb-432e-ab24-5063acf0b748",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

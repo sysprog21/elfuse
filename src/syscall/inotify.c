@@ -302,44 +302,6 @@ static void pipe_drain(inotify_instance_t *inst)
         ;
 }
 
-/* Snapshot the entry names of a directory (excluding "." and ".."). On return
- * *out is a malloc'd array of malloc'd strings with *n_out entries (free with
- * free_dir_snapshot). On any failure the snapshot is left empty.
- */
-static void dir_snapshot(const char *path, char ***out, int *n_out)
-{
-    *out = NULL;
-    *n_out = 0;
-
-    DIR *d = opendir(path);
-    if (!d)
-        return;
-
-    char **names = NULL;
-    int n = 0, cap = 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-            continue;
-        if (n == cap) {
-            int ncap = cap ? cap * 2 : 16;
-            char **tmp = realloc(names, (size_t) ncap * sizeof(char *));
-            if (!tmp)
-                break;
-            names = tmp;
-            cap = ncap;
-        }
-        names[n] = strdup(de->d_name);
-        if (!names[n])
-            break;
-        n++;
-    }
-    closedir(d);
-
-    *out = names;
-    *n_out = n;
-}
-
 static void free_dir_snapshot(char **entries, int n)
 {
     if (!entries)
@@ -347,6 +309,67 @@ static void free_dir_snapshot(char **entries, int n)
     for (int i = 0; i < n; i++)
         free(entries[i]);
     free(entries);
+}
+
+/* List a directory's child names, excluding "." and "..", into the out array
+ * (free with free_dir_snapshot). Returns false on any failure, leaving the
+ * result empty -- which the caller must treat as distinct from a true return
+ * with zero entries, since a failure mistaken for "empty" would diff every
+ * known child as deleted.
+ */
+static bool dir_snapshot(const char *path, char ***out, int *n_out)
+{
+    *out = NULL;
+    *n_out = 0;
+
+    DIR *d = opendir(path);
+    if (!d)
+        return false;
+
+    char **names = NULL;
+    int n = 0, cap = 0;
+    bool ok = true;
+    for (;;) {
+        /* readdir returns NULL both at end-of-stream and on error; reset
+         * errno immediately before each call so a non-zero errno afterwards
+         * unambiguously signals a read error rather than EOF.
+         */
+        errno = 0;
+        struct dirent *de = readdir(d);
+        if (!de) {
+            if (errno != 0)
+                ok = false;
+            break;
+        }
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (n == cap) {
+            int ncap = cap ? cap * 2 : 16;
+            char **tmp = realloc(names, (size_t) ncap * sizeof(char *));
+            if (!tmp) {
+                ok = false;
+                break;
+            }
+            names = tmp;
+            cap = ncap;
+        }
+        names[n] = strdup(de->d_name);
+        if (!names[n]) {
+            ok = false;
+            break;
+        }
+        n++;
+    }
+    closedir(d);
+
+    if (!ok) {
+        free_dir_snapshot(names, n);
+        return false;
+    }
+
+    *out = names;
+    *n_out = n;
+    return true;
 }
 
 static bool snapshot_contains(char *const *entries, int n, const char *name)
@@ -378,33 +401,38 @@ static int process_vnode_event(inotify_instance_t *inst,
     if (w->is_dir && (fflags & NOTE_WRITE) && w->path) {
         char **now = NULL;
         int now_n = 0;
-        dir_snapshot(w->path, &now, &now_n);
-
-        for (int j = 0; j < now_n && !overflow; j++) {
-            if ((w->mask & IN_CREATE) &&
-                !snapshot_contains(w->entries, w->n_entries, now[j])) {
-                if (queue_event(inst, w->wd, IN_CREATE, 0, now[j]) < 0)
-                    overflow = true;
-                else
-                    queued++;
-            }
-        }
-        for (int j = 0; j < w->n_entries && !overflow; j++) {
-            if ((w->mask & IN_DELETE) &&
-                !snapshot_contains(now, now_n, w->entries[j])) {
-                if (queue_event(inst, w->wd, IN_DELETE, 0, w->entries[j]) < 0)
-                    overflow = true;
-                else
-                    queued++;
-            }
-        }
-
-        /* Advance the snapshot regardless: the directory state has moved on,
-         * and any names dropped under overflow are covered by IN_Q_OVERFLOW.
+        /* Only diff against -- and advance to -- a snapshot that succeeded.
+         * On failure keep the previous baseline; the next successful snapshot
+         * reconciles whatever changed in between.
          */
-        free_dir_snapshot(w->entries, w->n_entries);
-        w->entries = now;
-        w->n_entries = now_n;
+        if (dir_snapshot(w->path, &now, &now_n)) {
+            for (int j = 0; j < now_n && !overflow; j++) {
+                if ((w->mask & IN_CREATE) &&
+                    !snapshot_contains(w->entries, w->n_entries, now[j])) {
+                    if (queue_event(inst, w->wd, IN_CREATE, 0, now[j]) < 0)
+                        overflow = true;
+                    else
+                        queued++;
+                }
+            }
+            for (int j = 0; j < w->n_entries && !overflow; j++) {
+                if ((w->mask & IN_DELETE) &&
+                    !snapshot_contains(now, now_n, w->entries[j])) {
+                    if (queue_event(inst, w->wd, IN_DELETE, 0, w->entries[j]) <
+                        0)
+                        overflow = true;
+                    else
+                        queued++;
+                }
+            }
+
+            /* Advance the snapshot: the directory state has moved on, and any
+             * names dropped under overflow are covered by IN_Q_OVERFLOW.
+             */
+            free_dir_snapshot(w->entries, w->n_entries);
+            w->entries = now;
+            w->n_entries = now_n;
+        }
     }
 
     if (!overflow) {
@@ -563,7 +591,10 @@ int64_t sys_inotify_add_watch(guest_t *g,
     int wn = 0;
     if (is_dir) {
         wpath = strdup(path);
-        dir_snapshot(path, &wentries, &wn);
+        /* Best-effort: a failed listing starts the watch with an empty
+         * baseline, which is the only state worth recording at add time.
+         */
+        (void) dir_snapshot(path, &wentries, &wn);
     }
 
     pthread_mutex_lock(&inotify_lock);

@@ -1,0 +1,46 @@
+src/core/shim-globals.c
+  s_7a66dd0543392d::t_693f8a90978ae7 51-55,70-98,153-159,288-299,309-326,333,343,345,432-494,504-505
+  s_7a66dd0543392d::t_cb63b08073529e 495-503
+  s_7a66dd0543392d::t_125f2d402aa23c 506
+src/core/bootstrap.c
+  s_7a66dd0543392d::t_693f8a90978ae7 708
+src/core/shim.S
+  s_7a66dd0543392d::t_d78468d17c3f47 887-892
+  s_7a66dd0543392d::t_0202b54aad53b9 223
+  s_7a66dd0543392d::t_693f8a90978ae7 190-222,228-235,240-242,244-247,440,445-470,473-480,492,496,498-500,508,519-523,525-531,533-535,539-548,551-552,561-568,582,584-587,605,614-617,627-637,641-656,658-680,684-702,704-716,720-724,727-756,770,878-884,893
+  s_52c737d23080f5::t_505a763911e67b 786
+  s_7a66dd0543392d::t_ed8e67b0a980f9 236-238
+  s_7a66dd0543392d::t_7d26fa466704dc 243,248
+  s_7a66dd0543392d::t_011684412cfda3 780-785
+  s_7a66dd0543392d::t_cb53b8246c41f4 759-766,771
+src/runtime/forkipc.c
+  s_7a66dd0543392d::t_693f8a90978ae7 360
+src/syscall/exec.c
+  s_7a66dd0543392d::t_693f8a90978ae7 75
+src/core/shim-globals.h
+  s_7a66dd0543392d::t_693f8a90978ae7 64-80,148-204,234-248,397-424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "a00cc3dbb4c12050b1f8438ee4c11e31c714b60f",
+  "prompts": {},
+  "sessions": {
+    "s_52c737d23080f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0dd80a29-d3b8-4b1d-83db-300374d51d30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_7a66dd0543392d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d1013-61f2-4ea0-9f71-da1372d75ec3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

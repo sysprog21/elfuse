@@ -1,14 +1,14 @@
-src/syscall/mem.c
-  d2ef14d6e8dc5d8d 1021-1043,1055-1062,1064-1075,1077-1078,1089-1092,1097-1112,1118,1124-1134,1137-1141,1150-1156
-  efa13d0913ee97f9 1119,1135-1136
 tests/test-madvise.c
   d2ef14d6e8dc5d8d 1,14,25-40,335-437,439,477-775,798-800
   52a0e277532733f1 7-9
   efa13d0913ee97f9 438,440-476
+src/syscall/mem.c
+  d2ef14d6e8dc5d8d 1021-1043,1055-1062,1064-1075,1077-1078,1089-1092,1097-1112,1118,1124-1134,1137-1141,1150-1156
+  efa13d0913ee97f9 1119,1135-1136
 ---
 {
   "schema_version": "authorship/3.0.0",
-  "git_ai_version": "1.3.4",
+  "git_ai_version": "1.5.3",
   "base_commit_sha": "326fc891b2222114b11b728ca02b1c55715f5961",
   "prompts": {
     "52a0e277532733f1": {
@@ -18,7 +18,6 @@ tests/test-madvise.c
         "model": "gpt-5.4"
       },
       "human_author": "Jim Huang",
-      "messages": [],
       "total_additions": 3,
       "total_deletions": 4,
       "accepted_lines": 3,
@@ -31,7 +30,6 @@ tests/test-madvise.c
         "model": "claude-opus-4-7"
       },
       "human_author": "Jim Huang",
-      "messages": [],
       "total_additions": 443,
       "total_deletions": 55,
       "accepted_lines": 500,
@@ -44,7 +42,6 @@ tests/test-madvise.c
         "model": "gpt-5.4"
       },
       "human_author": "Jim Huang",
-      "messages": [],
       "total_additions": 43,
       "total_deletions": 3,
       "accepted_lines": 40,

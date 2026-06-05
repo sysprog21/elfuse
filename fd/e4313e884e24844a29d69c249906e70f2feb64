@@ -1,0 +1,82 @@
+src/syscall/net-sockopt.c
+  s_9c2f499f07e8ea::t_7dac9cc5351863 127-146
+  s_0513f047d31b5c::t_50778fb1b8b1e2 176,193
+src/syscall/poll.c
+  s_9c2f499f07e8ea::t_287cba2ffe0e78 572-573
+  s_3dde02d32992df::t_6ae14e41e4502c 564-568
+  s_9c2f499f07e8ea::t_52eca381300220 458-462,490-491,494,509-511,523-527,539,543-544
+  s_3dde02d32992df::t_76e263a8ff53ba 198-206,210
+  s_3dde02d32992df::t_3b4c746d1e691e 642,644-645,647-648,650-651,655
+  s_3dde02d32992df::t_58d78be2a7efaf 99
+  s_3dde02d32992df::t_f0c16e290b4111 223-224,228,233
+  s_3dde02d32992df::t_09a18835720647 70,72-73
+  s_3dde02d32992df::t_f3dce3896f481e 383
+  s_3dde02d32992df::t_98199c41b5e423 176,178,180-182
+  s_3dde02d32992df::t_166a32cad93ea4 154,159
+  s_9c2f499f07e8ea::t_7dac9cc5351863 67,95,97,100-103,105-107,254,382,385,397,582-583
+  s_9c2f499f07e8ea::t_6cb1ede9d7ae51 153,156,158,161,384,649,652-653
+  s_3dde02d32992df::t_1dfd2620ff92e0 177
+  s_9c2f499f07e8ea::t_4015e780de357b 65-66,389-396,483-489,492,505-508,512-522,528-536,538,540-542,545-550,613-621
+  s_3dde02d32992df::t_76ef1d12d0dcc7 225-227,229-232,234
+  s_3dde02d32992df::t_db5bc749cf9904 96,104
+  s_3dde02d32992df::t_1b2baaf3a1607d 253
+  s_3dde02d32992df::t_d8c6f50508b61a 438-443,445-449
+  s_3dde02d32992df::t_4c8220b290ee80 537
+src/syscall/abi.h
+  s_9c2f499f07e8ea::t_7dac9cc5351863 685-690
+tests/test-scm-creds.c
+  s_0513f047d31b5c::t_2c45a330019c00 103-119
+  s_0513f047d31b5c::t_fcadca0217df60 77-85
+src/syscall/net.c
+  s_9c2f499f07e8ea::t_4e9e22bdd1f3c6 796-797,799-800,821,824,845,847-850,856,920-923,925
+  s_3dde02d32992df::t_f67c72044d5585 1064,1067-1068
+  s_3dde02d32992df::t_73c7569104811b 985-986,988,993-996,998-999
+  s_9c2f499f07e8ea::t_7dac9cc5351863 1059,1137
+  s_3dde02d32992df::t_7c22144ca46c2d 987,989-992,997
+  s_3dde02d32992df::t_17dc0eafea6857 1062
+  s_3dde02d32992df::t_cfdccc5b597c00 1063
+  s_3dde02d32992df::t_8620eb1efb4d47 1163
+  s_9c2f499f07e8ea::t_10da3158dd2f38 854
+  s_3dde02d32992df::t_0d412dc7cfc5df 944-949,951
+  s_0513f047d31b5c::t_1f39a976b3e42c 801
+tests/test-net.c
+  s_0513f047d31b5c::t_e784f1a7984993 27-40,356-365
+src/syscall/signal.c
+  s_9c2f499f07e8ea::t_7dac9cc5351863 1610
+src/syscall/net-abi.c
+  s_0513f047d31b5c::t_f5fd911920db24 22,24-26
+  s_3dde02d32992df::t_c5d4f7edbada9e 52
+  s_9c2f499f07e8ea::t_7dac9cc5351863 71-84,157-160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "fde4313e884e24844a29d69c249906e70f2feb64",
+  "prompts": {},
+  "sessions": {
+    "s_0513f047d31b5c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e9706-2cd1-7fe1-b388-e1648eac129a",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_3dde02d32992df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "958b0395-8d30-4428-8387-ac9911e36897",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_9c2f499f07e8ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e96bc-67ed-75c3-a741-b930354c05cb",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

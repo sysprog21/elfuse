@@ -1,0 +1,60 @@
+tests/test-rosetta-alpine.sh
+  s_ca751723adaa19::t_d982aafe2f0efe 198-199
+tests/test-matrix.sh
+  s_ca751723adaa19::t_0988baf7931879 990-991
+  s_ca751723adaa19::t_ef3f02604ac7d2 175-178
+  s_b92ea12c430248::t_f4ef9587d0fa60 171,887
+  s_ca751723adaa19::t_c2c31aac483583 870-886,888-899,905-909,911,921-923
+  s_ca751723adaa19::t_b1628a98b7aef6 900-904,910,912-920
+  s_ca751723adaa19::t_edf3c85a35614d 157
+docs/testing.md
+  s_ca751723adaa19::t_ad05dbacddebc4 16-25
+tests/fetch-fixtures.sh
+  s_ca751723adaa19::t_faa8e4ab9fab73 428-430,433,435-436
+  s_ca751723adaa19::t_73d36d155a1f17 446-448,451-454,462-463,468
+  s_ca751723adaa19::t_c0f75fbe7b3360 233-234,237,243-244,246
+  s_ca751723adaa19::t_b72dbc1d06f6c8 331-332,335
+  s_ca751723adaa19::t_d94dee2f534c7c 56-99,102-110,115-118
+  s_ca751723adaa19::t_6f11112bc77094 35-37
+  s_b92ea12c430248::t_f4ef9587d0fa60 111-114,216-217,235-236,431-432,449-450
+  s_ca751723adaa19::t_37113c06715fad 213-215,218
+  s_ca751723adaa19::t_5e058b7b35a593 378-379,384
+tests/driver.sh
+  s_ca751723adaa19::t_c6418973803f73 350-353
+  s_ca751723adaa19::t_1e729386f01610 306-309,311
+tests/lib/bash-compat.sh
+  s_b92ea12c430248::t_f4ef9587d0fa60 50-53
+  s_ca751723adaa19::t_ae4df2eec4d38e 1-49,54-115
+tests/test-perf.sh
+  s_ca751723adaa19::t_99aa71cf066803 13-16,27-29
+tests/lib/test-runner.sh
+  s_ca751723adaa19::t_358494b37279cb 51-57
+  s_ca751723adaa19::t_18a271550a179e 151,158
+  s_ca751723adaa19::t_2672702d1ad1ff 10-12
+  s_ca751723adaa19::t_f74f080b1e91bd 146-149
+  s_ca751723adaa19::t_50f30b8c47ce67 152,201,259,293
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "7f74e92c589dc01f827539e97504fe2dd0021da5",
+  "prompts": {},
+  "sessions": {
+    "s_b92ea12c430248": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e95ec-3511-7442-928e-7356387b671f",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_ca751723adaa19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff0856ba-b23a-4f44-836a-09c480802266",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

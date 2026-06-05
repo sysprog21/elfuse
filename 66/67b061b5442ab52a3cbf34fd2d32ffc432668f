@@ -1,0 +1,39 @@
+src/syscall/path.c
+  s_db396469ab91ab::t_5e0e8e775900d0 669
+  s_db396469ab91ab::t_da2de5334ae66c 1219-1231
+  s_9ef0f86ab247cc::t_27a3d8e43db5d2 648-649,651,653,655-666
+  s_9ef0f86ab247cc::t_7fa81a01225855 652
+tests/test-syscall-fidelity.c
+  s_db396469ab91ab::t_aed5e177c56baf 791-818
+  s_9ef0f86ab247cc::t_adbb37b6a7079d 819-894,1048
+  s_db396469ab91ab::t_a97d8584820f13 1047
+src/syscall/syscall.c
+  s_db396469ab91ab::t_061d5c6184642c 1438-1449
+  s_db396469ab91ab::t_c99beb9c2ea859 1450-1452
+  s_db396469ab91ab::t_d02d460bba95ba 1482-1487,1489-1509
+  s_db396469ab91ab::t_c2f07e3eb8120d 1432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "6667b061b5442ab52a3cbf34fd2d32ffc432668f",
+  "prompts": {},
+  "sessions": {
+    "s_9ef0f86ab247cc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e959a-5b1d-70e1-9178-936462d59d70",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_db396469ab91ab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6e01928-68f9-4f5f-ae74-b6dfb9312b16",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

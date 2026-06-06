@@ -1,0 +1,34 @@
+src/syscall/abi.h
+  s_ad7d4e691cae2e::t_36c6db03553def 381,389
+src/syscall/fuse.c
+  s_ad7d4e691cae2e::t_1efbeb270c6b2e 2610-2617
+src/syscall/fd.c
+  s_ad7d4e691cae2e::t_8d4048f2864df3 217-220,222
+src/syscall/translate.c
+  s_ad7d4e691cae2e::t_3c0ee6fc6cc1c9 236-237
+  s_ad7d4e691cae2e::t_a833e3bb0f47d9 222
+src/syscall/fs.c
+  s_ad7d4e691cae2e::t_735b5e41b3a591 752-770
+  s_ad7d4e691cae2e::t_6f5d52b598fcb3 504-508,512
+  s_ad7d4e691cae2e::t_ee7b51e32a2d52 709-718
+tests/test-timerfd.c
+  s_ad7d4e691cae2e::t_57444cea14f297 188-197,201-202,207-212,216-241,245-251
+  s_ad7d4e691cae2e::t_9ee02ff996337c 19
+  s_ad7d4e691cae2e::t_47512c5b8751b0 198-200,203-206,213-215,242-244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "ef5a10c487c901fd4eb96dc69d41dbc42d8bdea4",
+  "prompts": {},
+  "sessions": {
+    "s_ad7d4e691cae2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e5f664a5-a33c-4efe-a59c-b1ed227781be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

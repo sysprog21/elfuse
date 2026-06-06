@@ -1,0 +1,24 @@
+src/syscall/fd.c
+  s_ad7d4e691cae2e::t_9339ce22f8c8a4 411-419,433
+  s_ad7d4e691cae2e::t_fcfe46f267f4fa 92-97
+  s_ad7d4e691cae2e::t_5683688bedaf16 218-219
+  s_ad7d4e691cae2e::t_6f4daa7ee27f28 176-177,186-191
+tests/test-timerfd.c
+  s_ad7d4e691cae2e::t_53825cc2677464 151-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "fa421b64a1e32841ee6c1b86f5d280d34f013103",
+  "prompts": {},
+  "sessions": {
+    "s_ad7d4e691cae2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e5f664a5-a33c-4efe-a59c-b1ed227781be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

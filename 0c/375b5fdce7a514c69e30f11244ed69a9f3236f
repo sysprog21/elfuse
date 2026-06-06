@@ -1,0 +1,37 @@
+src/syscall/internal.h
+  s_ad7d4e691cae2e::t_25551da636e826 112-120
+src/syscall/fd.c
+  s_ad7d4e691cae2e::t_841574aab5b90c 221-224
+  s_ad7d4e691cae2e::t_bbfffc1652648e 663-664,1087-1088
+src/syscall/fuse.c
+  s_ad7d4e691cae2e::t_558fd482858d78 1333-1336
+  s_ad7d4e691cae2e::t_9d54b1a2e7580f 2616-2617,2621-2625,2627,2633
+  s_ad7d4e691cae2e::t_27e6f71b728a02 1904-1907
+src/syscall/fs.c
+  s_ad7d4e691cae2e::t_31b241b32b0b56 737,747-750
+  s_ad7d4e691cae2e::t_01cf9a1f76fb12 671-680,693,707,709-719,724,728
+  s_ad7d4e691cae2e::t_42ec211d863b63 799-808,812
+  s_ad7d4e691cae2e::t_9765f95e9b996f 762-766,768-773,783
+src/syscall/fdtable.c
+  s_ad7d4e691cae2e::t_889bb95ee854b2 407-415
+tests/test-timerfd.c
+  s_ad7d4e691cae2e::t_cb6a6656611acf 228-254
+src/syscall/inotify.c
+  s_ad7d4e691cae2e::t_bbfffc1652648e 405
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "0c375b5fdce7a514c69e30f11244ed69a9f3236f",
+  "prompts": {},
+  "sessions": {
+    "s_ad7d4e691cae2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e5f664a5-a33c-4efe-a59c-b1ed227781be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

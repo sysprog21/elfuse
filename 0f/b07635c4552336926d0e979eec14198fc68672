@@ -1,0 +1,20 @@
+src/syscall/fs.c
+  s_ad7d4e691cae2e::t_7aa5aa2b455fe7 741-745
+  s_ad7d4e691cae2e::t_127e62eba5fa8f 746-749,751-754
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "0fb07635c4552336926d0e979eec14198fc68672",
+  "prompts": {},
+  "sessions": {
+    "s_ad7d4e691cae2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e5f664a5-a33c-4efe-a59c-b1ed227781be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

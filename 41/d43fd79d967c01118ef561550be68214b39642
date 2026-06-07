@@ -1,0 +1,36 @@
+src/runtime/fork-state.c
+  s_a8a00b2585cec3::t_71d7f3ce1a1975 742-743
+  s_a8a00b2585cec3::t_7af2feb47d3731 485,527-528,530-532,717-722
+src/runtime/fork-state.h
+  s_a8a00b2585cec3::t_fbface9c639c4f 21-24,28,105
+src/core/guest.c
+  s_e500317ba0465e::t_0995b5cee44d2e 1991-1997,2003
+src/core/guest.h
+  s_a8a00b2585cec3::t_48b9480f7b8302 500-502
+src/runtime/forkipc.c
+  s_a8a00b2585cec3::t_45d337b387ba9a 1581,1603-1605
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "41d43fd79d967c01118ef561550be68214b39642",
+  "prompts": {},
+  "sessions": {
+    "s_a8a00b2585cec3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ea2c6-91a0-7ff3-be20-ea7e70e2b2f1",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_e500317ba0465e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5c4da570-293e-49b6-b496-659cd507ccc1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

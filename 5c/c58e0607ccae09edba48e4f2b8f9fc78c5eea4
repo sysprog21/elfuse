@@ -1,0 +1,22 @@
+src/runtime/procemu.c
+  s_ee88159eac6ee7::t_35cb8afe6aa652 1793-1795,1798-1810,1816,1818-2089,2095-2098,2140,2164-2170
+  s_ee88159eac6ee7::t_a0145354487212 1796-1797,1811-1815,1817
+tests/test-pty.c
+  s_ee88159eac6ee7::t_9022553642f866 21-167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "5cc58e0607ccae09edba48e4f2b8f9fc78c5eea4",
+  "prompts": {},
+  "sessions": {
+    "s_ee88159eac6ee7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ea403-40ab-7e10-a623-b6998b71a418",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

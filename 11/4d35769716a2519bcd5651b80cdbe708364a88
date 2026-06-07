@@ -1,0 +1,29 @@
+src/core/guest.h
+  s_a8a00b2585cec3::t_48b9480f7b8302 500-502
+src/core/guest.c
+  s_e500317ba0465e::t_0995b5cee44d2e 1992-1997,2003
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "114d35769716a2519bcd5651b80cdbe708364a88",
+  "prompts": {},
+  "sessions": {
+    "s_a8a00b2585cec3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ea2c6-91a0-7ff3-be20-ea7e70e2b2f1",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_e500317ba0465e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5c4da570-293e-49b6-b496-659cd507ccc1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

@@ -1,0 +1,59 @@
+docs/usage.md
+  s_6fe2fc20cc26c0::t_b1ec62d33a5fc5 88-106,123-136
+  s_6fe2fc20cc26c0::t_2b30ca3276edbe 52-87
+  s_6fe2fc20cc26c0::t_f8ebd5a981d688 21-23
+  s_6fe2fc20cc26c0::t_d080b683309c96 107-122
+  s_6fe2fc20cc26c0::t_2f4ed579f8d90a 160-165
+  s_6fe2fc20cc26c0::t_ff295f0fb89038 208-211
+README.md
+  s_6fe2fc20cc26c0::t_2f1f49c4e18c2a 137-152,154-159
+  s_6fe2fc20cc26c0::t_b6e06443daf57b 131-132
+  s_6fe2fc20cc26c0::t_cf6df1438645b8 76-77,85-90,97-99
+  s_6fe2fc20cc26c0::t_9e812617b0f897 3-20,23-29,32,36-46
+  s_6fe2fc20cc26c0::t_21150c5110a4af 31,35
+  s_6fe2fc20cc26c0::t_cbd0d427575ced 106-115
+docs/testing.md
+  s_6fe2fc20cc26c0::t_838a695bebb1db 56-69,79-80
+  s_6fe2fc20cc26c0::t_c9bd4943069093 267
+docs/internals.md
+  s_6fe2fc20cc26c0::t_1f6735230a6313 76,78-79,91-94,97,99-103,107,109-110,114
+  s_6fe2fc20cc26c0::t_eb474838478ab8 244,247-249,251,262-274
+  s_6fe2fc20cc26c0::t_a21dacd6faad73 250,252-261
+  s_6fe2fc20cc26c0::t_7771c5b352b44c 241-243,277-279,285,294-296
+  s_6fe2fc20cc26c0::t_e7b37efc313cb0 281-284,286-293,298-302
+  s_6fe2fc20cc26c0::t_435f687b4a7be2 429-443
+  s_6fe2fc20cc26c0::t_e8caa7b615332b 175-182
+  s_6fe2fc20cc26c0::t_94b710ad8dd572 506,508-512
+  s_6fe2fc20cc26c0::t_f81f8b64edbc4c 316
+  s_6fe2fc20cc26c0::t_a01950f7a1e0ae 546
+  s_6fe2fc20cc26c0::t_8891c146e3827f 20,23-25,57
+  s_6fe2fc20cc26c0::t_5a2ec01b8edf7e 153-160,163-165
+  s_6fe2fc20cc26c0::t_eae6bc0ec1e4cd 500-502,505
+  s_6fe2fc20cc26c0::t_0a5d1d1a8ea2e3 688-716
+  s_6fe2fc20cc26c0::t_364f41949d170e 315
+  s_6fe2fc20cc26c0::t_11dc6e3cf96e1e 730
+  s_6fe2fc20cc26c0::t_fce54241ef1ad4 765-802,816-824
+  s_6fe2fc20cc26c0::t_326f92c488936c 803-815
+  s_6fe2fc20cc26c0::t_d0b68366ae7196 445-451
+  s_6fe2fc20cc26c0::t_fb232801bac1f2 846-849,851-852,854-859,862-868
+  s_6fe2fc20cc26c0::t_8bf8949fbcb62b 21-22,26-56
+  s_6fe2fc20cc26c0::t_96032b7f714af3 111
+  s_6fe2fc20cc26c0::t_0d6a2c7a172871 412-419
+  s_6fe2fc20cc26c0::t_51a04d7ecd4714 548-550,552-554,556-559,563-571,573-576
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "caae9bfba5503a08b763b7280374c7bb50eccbf5",
+  "prompts": {},
+  "sessions": {
+    "s_6fe2fc20cc26c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf0a62f7-7199-4e0f-963b-91980d01f331",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+README.md
+  s_14cd86d39cd217::t_b660c088fceedc 74,112
+docs/internals.md
+  s_14cd86d39cd217::t_b660c088fceedc 85,119,121,359,426,434,499,514-516,518,604-606,611,621-624
+docs/testing.md
+  s_14cd86d39cd217::t_b660c088fceedc 143,148,160,173,178,184,191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "bef492e04d4ea5de824ab233d60466ff6f69b51c",
+  "prompts": {},
+  "sessions": {
+    "s_14cd86d39cd217": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7ebb79e-423a-49bb-88f9-c3c721546c78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

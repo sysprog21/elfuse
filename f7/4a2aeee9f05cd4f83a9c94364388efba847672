@@ -1,0 +1,75 @@
+tests/test-static-bins.sh
+  s_14cd86d39cd217::t_6539a333f797c5 2
+  s_14cd86d39cd217::t_4fb6d661a56fbf 38
+tests/qemu-runner.sh
+  s_14cd86d39cd217::t_4fb6d661a56fbf 229
+  s_14cd86d39cd217::t_6539a333f797c5 2,165
+tests/test-negative.c
+  s_14cd86d39cd217::t_45ba11bb6afa30 398
+src/debug/gdbstub.c
+  s_14cd86d39cd217::t_45ba11bb6afa30 760
+tests/test-gdbstub.sh
+  s_14cd86d39cd217::t_6539a333f797c5 282,345,459
+src/syscall/poll.c
+  s_14cd86d39cd217::t_989ae7b10be2c3 782
+tests/test-busybox.sh
+  s_14cd86d39cd217::t_6539a333f797c5 2
+tests/lib/test-runner.sh
+  s_14cd86d39cd217::t_4fb6d661a56fbf 13,15-16,37,140
+tests/test-coreutils.sh
+  s_14cd86d39cd217::t_6539a333f797c5 2
+src/syscall/io.c
+  s_14cd86d39cd217::t_d7ec89604deace 97-99
+tests/test-epoll-edge.c
+  s_14cd86d39cd217::t_45ba11bb6afa30 494
+mk/shim.mk
+  s_14cd86d39cd217::t_6539a333f797c5 31
+src/core/rosetta.c
+  s_14cd86d39cd217::t_d0f29dd2acb342 9
+  s_14cd86d39cd217::t_82d726eeab555c 804
+  s_14cd86d39cd217::t_05b46cbba3717a 888
+tests/test-perf.sh
+  s_14cd86d39cd217::t_28257953558066 56
+  s_14cd86d39cd217::t_4fb6d661a56fbf 133
+src/core/rosetta.h
+  s_14cd86d39cd217::t_fd34a5d879c75c 172
+src/runtime/thread.h
+  s_14cd86d39cd217::t_45ba11bb6afa30 108-109
+src/syscall/sys.c
+  s_14cd86d39cd217::t_45ba11bb6afa30 149
+tests/test-dynamic-coreutils.sh
+  s_14cd86d39cd217::t_6539a333f797c5 2
+tests/test-rwx.c
+  s_14cd86d39cd217::t_45ba11bb6afa30 194-196
+src/syscall/syscall.c
+  s_14cd86d39cd217::t_989ae7b10be2c3 139
+tests/test-cross-fork-mapshared.c
+  s_14cd86d39cd217::t_6539a333f797c5 135,256,342
+tests/test-fuse-alpine.sh
+  s_14cd86d39cd217::t_6539a333f797c5 2
+src/utils.h
+  s_14cd86d39cd217::t_989ae7b10be2c3 154,203
+src/syscall/proc.c
+  s_14cd86d39cd217::t_ca09b83777a63a 1010
+src/core/shim.S
+  s_14cd86d39cd217::t_8a5875813c0232 608
+  s_14cd86d39cd217::t_45ba11bb6afa30 251
+mk/common.mk
+  s_14cd86d39cd217::t_6539a333f797c5 1,21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "f74a2aeee9f05cd4f83a9c94364388efba847672",
+  "prompts": {},
+  "sessions": {
+    "s_14cd86d39cd217": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7ebb79e-423a-49bb-88f9-c3c721546c78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

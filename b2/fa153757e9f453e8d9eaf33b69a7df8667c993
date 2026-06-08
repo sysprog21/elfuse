@@ -1,0 +1,43 @@
+src/runtime/procemu.c
+  s_eabc0a947fe597::t_259d1329a5b891 2266-2281,2283,3312-3327
+src/syscall/fs.c
+  s_eabc0a947fe597::t_259d1329a5b891 108-113,115-124,130-131,133-134,202-203,231-239,241-247,256-258,311-312,342,381-383,409,431-432
+src/syscall/fs-stat.c
+  s_297e7ffa76e50f::t_116daf998e51e9 246-248
+  s_eabc0a947fe597::t_259d1329a5b891 216,221-222,228-245,251-253,294-305
+  s_b213dc01dc5c47::t_8a6170300823dc 306
+tests/test-pty.c
+  s_eabc0a947fe597::t_259d1329a5b891 33,53-61,65-89,106-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "b2fa153757e9f453e8d9eaf33b69a7df8667c993",
+  "prompts": {},
+  "sessions": {
+    "s_297e7ffa76e50f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ea669-179e-7480-b2e0-11f699ed62ea",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_b213dc01dc5c47": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ea648-8a2e-7170-be99-1cc677dc860b",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_eabc0a947fe597": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c08d711-1ab3-4e80-ac5c-631ffbda5a30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

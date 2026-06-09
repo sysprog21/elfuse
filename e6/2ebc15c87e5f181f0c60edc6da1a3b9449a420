@@ -1,0 +1,23 @@
+src/syscall/mem.c
+  s_12d6e7e3e944a7::t_d8c9bd81dc5d15 1481-1490,1500-1506
+src/runtime/futex.c
+  s_12d6e7e3e944a7::t_70de8387b39f35 107-110
+  s_12d6e7e3e944a7::t_e8ccd57a69561e 460-462,464
+  s_12d6e7e3e944a7::t_41e51c75f30792 572-576,580
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "e62ebc15c87e5f181f0c60edc6da1a3b9449a420",
+  "prompts": {},
+  "sessions": {
+    "s_12d6e7e3e944a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0b69dbfd-77cf-4d4d-92d3-48989e1f9a2b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

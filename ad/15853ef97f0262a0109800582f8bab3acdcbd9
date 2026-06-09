@@ -1,10 +1,3 @@
-src/syscall/signal.c
-  s_6ff51145050b9e::t_15a5df9a2b6418 410-421,443,458-459,461-463
-  s_56bc1fb6fa3c58::t_72e9b7b8d19c25 422-432,434,440,444-447,460
-  s_56bc1fb6fa3c58::t_0fd8ba617a6bc1 433,435-439,441-442
-  s_56bc1fb6fa3c58::t_a6d2a3355c3d11 448-457
-src/syscall/signal.h
-  s_6ff51145050b9e::t_15a5df9a2b6418 59,245
 src/runtime/forkipc.c
   s_6ff51145050b9e::t_15a5df9a2b6418 349-354,358,469,552-558,564,573-575
   s_6ff51145050b9e::t_109f0c927a9a37 409-413,462-463,493-494,512-513,533-534,591,600-604,682-683,705-707
@@ -26,6 +19,13 @@ src/syscall/fuse.c
   s_593c7f04235cad::t_544a167ffdbdd1 1464-1467,1473,1538,1638,1764,1778,1789,1803,1817
   s_593c7f04235cad::t_d24f7e9cbdd0cb 1501-1503
   s_593c7f04235cad::t_e1aca1f4eadbdc 1643-1645,1666-1667
+src/syscall/signal.c
+  s_6ff51145050b9e::t_15a5df9a2b6418 410-421,443,458-459,461-463
+  s_56bc1fb6fa3c58::t_72e9b7b8d19c25 422-432,434,440,444-447,460
+  s_56bc1fb6fa3c58::t_0fd8ba617a6bc1 433,435-439,441-442
+  s_56bc1fb6fa3c58::t_a6d2a3355c3d11 448-457
+src/syscall/signal.h
+  s_6ff51145050b9e::t_15a5df9a2b6418 59,245
 tests/test-fuse-basic.c
   s_6ff51145050b9e::t_6e9e19d607a51f 5,34,43-44,82-99,147-152,155-165,173-179,340-344,359-397,452-458,604-627,769-776
   s_6ff51145050b9e::t_52145801e08df3 166-172
@@ -34,7 +34,7 @@ tests/test-fuse-basic.c
 ---
 {
   "schema_version": "authorship/3.0.0",
-  "git_ai_version": "1.5.0",
+  "git_ai_version": "1.5.3",
   "base_commit_sha": "ad15853ef97f0262a0109800582f8bab3acdcbd9",
   "prompts": {},
   "sessions": {

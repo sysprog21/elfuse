@@ -1,0 +1,25 @@
+src/syscall/translate.c
+  s_12d6e7e3e944a7::t_24bd2d1c520937 97-111
+tests/test-xattr.c
+  s_12d6e7e3e944a7::t_246e0193b4b362 1-177
+src/syscall/abi.h
+  s_12d6e7e3e944a7::t_fc810474210021 336
+tests/manifest.txt
+  s_12d6e7e3e944a7::t_d3f2b2b1cb33dc 111-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "0fabc25b91247f472c3c5c0991799719a33c191c",
+  "prompts": {},
+  "sessions": {
+    "s_12d6e7e3e944a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0b69dbfd-77cf-4d4d-92d3-48989e1f9a2b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

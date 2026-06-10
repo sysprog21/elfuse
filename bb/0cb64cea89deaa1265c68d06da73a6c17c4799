@@ -1,0 +1,64 @@
+src/syscall/syscall.c
+  s_b1f2816cbfacec::t_758b1fb445ac42 1395-1396,1399
+  s_b1f2816cbfacec::t_a3b70af93b1850 1430,1433-1438
+  s_1eadfca715c374::t_a97cea2fb604b4 1431-1432
+src/syscall/path.h
+  s_1eadfca715c374::t_1d22c4fd6d2dbf 97-99
+  s_b1f2816cbfacec::t_de61fe529a6e41 81-95
+  s_b1f2816cbfacec::t_08b91e76610288 73-76,96
+  s_b1f2816cbfacec::t_496043f195dd5c 77-80
+tests/test-syscall-fidelity.c
+  s_1eadfca715c374::t_7999f00c2cb4d5 9,566-608,610-621,892
+  s_b1f2816cbfacec::t_7006ff214873b4 719-746
+  s_1eadfca715c374::t_3a0fd94a3875cb 470-471,535-536,609,632
+  s_b1f2816cbfacec::t_b014540e27085d 886-888
+  s_b1f2816cbfacec::t_592bdf5fcc3ae2 168,171-172
+  s_b1f2816cbfacec::t_cfb583da1a5637 897
+  s_b1f2816cbfacec::t_18681423ae44e3 683-693,697-708,710-718
+  s_b1f2816cbfacec::t_7aa3edf71543c2 895-896
+  s_1eadfca715c374::t_75ce95c1204664 889-891
+  s_1eadfca715c374::t_5232d904c6fd8e 505-534,537-565
+  s_1eadfca715c374::t_834a8b5d86f830 642-682,893-894
+  s_1eadfca715c374::t_02f8330a969557 694-696,709
+  s_b1f2816cbfacec::t_2ba24322a22c4b 460-469,472-504,622-631,633-641
+src/syscall/path.c
+  s_b1f2816cbfacec::t_5f02e89043f7dd 777-786,797-802,807-808,813-820,847,849-853,855,861-862,866,901-902,979-980,1011-1012,1014
+  s_1eadfca715c374::t_06ba166b228295 846,854,856-860,867-882,884,891-892,898-900,945-950,953,962,967-968
+  s_1eadfca715c374::t_f2f5aae1e14548 787-788,809-812
+  s_b1f2816cbfacec::t_3527750ff3571c 789-796
+  s_b1f2816cbfacec::t_0965bfafa94127 908,910,914-919,922-943,951-952,954-961,963-966,977-978,981-997,999-1010,1013
+  s_1eadfca715c374::t_3a0fd94a3875cb 821-823,944
+  s_1eadfca715c374::t_1e9e2bedaa2f31 824-845,885-890,893-897
+  s_b1f2816cbfacec::t_d5473c238667dc 903-907,909,911-913,920-921
+  s_b1f2816cbfacec::t_c35a757a476214 848,863-865,883
+  s_b1f2816cbfacec::t_8c5d716d7b9ffd 969-976,998
+  s_1eadfca715c374::t_f08f680e9267e1 803-806
+src/syscall/fuse.c
+  s_b1f2816cbfacec::t_b77d32579a857d 1491-1504
+src/syscall/fuse.h
+  s_b1f2816cbfacec::t_be28c86cc646e7 23-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "bb0cb64cea89deaa1265c68d06da73a6c17c4799",
+  "prompts": {},
+  "sessions": {
+    "s_1eadfca715c374": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e7ab3-4396-7ab2-a59d-9fb53de0bb58",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_b1f2816cbfacec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5860b4af-97cb-432e-ab24-5063acf0b748",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

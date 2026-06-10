@@ -288,6 +288,136 @@ static int64_t reject_unsupported_fuse_path_op(const path_translation_t *tx)
     return tx && tx->fuse_path ? -LINUX_ENOSYS : INT64_MIN;
 }
 
+static int path_parent_copy(const char *path, char *out, size_t outsz)
+{
+    size_t len = str_copy_trunc(out, path, outsz);
+    if (len >= outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    char *slash = strrchr(out, '/');
+    if (!slash) {
+        str_copy_trunc(out, ".", outsz);
+    } else if (slash == out) {
+        out[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return 0;
+}
+
+static int append_path_part(char *out,
+                            size_t outsz,
+                            size_t *used,
+                            const char *part,
+                            size_t part_len)
+{
+    if (*used + part_len >= outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out + *used, part, part_len);
+    *used += part_len;
+    out[*used] = '\0';
+    return 0;
+}
+
+static int relative_path_between(const char *from_dir,
+                                 const char *to_path,
+                                 char *out,
+                                 size_t outsz)
+{
+    size_t common = 0;
+    for (size_t i = 0; from_dir[i] && to_path[i] && from_dir[i] == to_path[i];
+         i++) {
+        if (from_dir[i] == '/')
+            common = i;
+    }
+
+    if (common == 0) {
+        errno = EXDEV;
+        return -1;
+    }
+
+    const char *from_tail = from_dir + common;
+    while (*from_tail == '/')
+        from_tail++;
+    const char *to_tail = to_path + common;
+    while (*to_tail == '/')
+        to_tail++;
+
+    size_t used = 0;
+    out[0] = '\0';
+    for (const char *p = from_tail; *p;) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        const char *next = strchr(p, '/');
+        if (append_path_part(out, outsz, &used, "../", 3) < 0)
+            return -1;
+        p = next ? next + 1 : p + strlen(p);
+    }
+
+    if (*to_tail) {
+        if (append_path_part(out, outsz, &used, to_tail, strlen(to_tail)) < 0)
+            return -1;
+    } else if (used == 0) {
+        if (append_path_part(out, outsz, &used, ".", 1) < 0)
+            return -1;
+    } else if (used >= 1 && out[used - 1] == '/') {
+        out[used - 1] = '\0';
+    }
+    return 0;
+}
+
+static const char *host_relative_symlink_target(const char *guest_target,
+                                                host_fd_ref_t *dir_ref,
+                                                const path_translation_t *tx,
+                                                char *buf,
+                                                size_t bufsz)
+{
+    char sysroot[LINUX_PATH_MAX];
+    if (!guest_target || guest_target[0] != '/' ||
+        !proc_sysroot_snapshot(sysroot, sizeof(sysroot)))
+        return guest_target;
+
+    char target_host[LINUX_PATH_MAX];
+    int n = snprintf(target_host, sizeof(target_host), "%s%s", sysroot,
+                     guest_target);
+    if (n < 0 || (size_t) n >= sizeof(target_host)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+
+    char link_host[LINUX_PATH_MAX];
+    if (tx->host_path[0] == '/') {
+        if (str_copy_trunc(link_host, tx->host_path, sizeof(link_host)) >=
+            sizeof(link_host)) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+    } else {
+        char dir_host[LINUX_PATH_MAX];
+        if (fcntl(dir_ref->fd, F_GETPATH, dir_host) < 0)
+            return NULL;
+        n = snprintf(link_host, sizeof(link_host), "%s/%s", dir_host,
+                     tx->host_path);
+        if (n < 0 || (size_t) n >= sizeof(link_host)) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+    }
+
+    char link_parent[LINUX_PATH_MAX];
+    if (path_parent_copy(link_host, link_parent, sizeof(link_parent)) < 0)
+        return NULL;
+    if (relative_path_between(link_parent, target_host, buf, bufsz) < 0)
+        return NULL;
+    return buf;
+}
+
 /* open/close. */
 
 int64_t sys_openat_path(guest_t *g,
@@ -1250,6 +1380,10 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
     if (pipe(host_fds) < 0)
         return linux_errno();
 
+#ifdef F_SETNOSIGPIPE
+    (void) fcntl(host_fds[1], F_SETNOSIGPIPE, 1);
+#endif
+
     int guest_fds[2];
     guest_fds[0] = fd_alloc(FD_PIPE, host_fds[0], NULL);
     if (guest_fds[0] < 0) {
@@ -1623,8 +1757,16 @@ int64_t sys_symlinkat(guest_t *g,
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    /* Resolve linkpath (the new symlink location) through sysroot */
-    if (symlinkat(target, dir_ref.fd, tx.host_path) < 0) {
+    char relative_target[LINUX_PATH_MAX];
+    const char *host_target = host_relative_symlink_target(
+        target, &dir_ref, &tx, relative_target, sizeof(relative_target));
+    if (!host_target) {
+        host_fd_ref_close(&dir_ref);
+        return linux_errno();
+    }
+
+    /* Resolve linkpath (the new symlink location) through sysroot. */
+    if (symlinkat(host_target, dir_ref.fd, tx.host_path) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }

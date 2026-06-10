@@ -556,6 +556,7 @@ SC_FORWARD(sc_setfsuid, (int64_t) proc_get_euid())
 SC_FORWARD(sc_setfsgid, (int64_t) proc_get_egid())
 SC_FORWARD(sc_setpgid, proc_sys_setpgid(g, (int64_t) x0, (int64_t) x1))
 SC_STUB(sc_fadvise64,           0)
+SC_STUB(sc_sync_file_range,     0)
 SC_STUB(sc_sched_yield,         (sched_yield(), 0))
 SC_STUB(sc_mlock,               0)
 SC_STUB(sc_munlock,             0)
@@ -1952,8 +1953,6 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 result = ret;
                 goto fast_done;
             }
-            if (nr == SYS_write && errno == EPIPE)
-                signal_queue(LINUX_SIGPIPE);
             result = linux_errno();
             goto fast_done;
         }
@@ -2057,12 +2056,23 @@ fast_done:
         if (verbose) {
             log_debug("  -> %lld (0x%llx)", (long long) result,
                       (unsigned long long) (uint64_t) result);
-            /* Log file paths for openat/readlinkat */
+            /* Log path-bearing syscalls. */
             if ((int) x8 == SYS_openat || (int) x8 == SYS_readlinkat ||
-                (int) x8 == SYS_faccessat) {
+                (int) x8 == SYS_faccessat || (int) x8 == SYS_newfstatat ||
+                (int) x8 == SYS_unlinkat || (int) x8 == SYS_mkdirat ||
+                (int) x8 == SYS_fchmodat || (int) x8 == SYS_fchownat) {
                 char pathbuf[256];
                 if (guest_read_str(g, x1, pathbuf, sizeof(pathbuf)) >= 0)
                     log_debug("  path=\"%s\"", pathbuf);
+            } else if ((int) x8 == SYS_renameat || (int) x8 == SYS_renameat2 ||
+                       (int) x8 == SYS_linkat || (int) x8 == SYS_symlinkat) {
+                char path_a[256];
+                char path_b[256];
+                uint64_t a_gva = ((int) x8 == SYS_symlinkat) ? x0 : x1;
+                uint64_t b_gva = ((int) x8 == SYS_symlinkat) ? x2 : x3;
+                if (guest_read_str(g, a_gva, path_a, sizeof(path_a)) >= 0 &&
+                    guest_read_str(g, b_gva, path_b, sizeof(path_b)) >= 0)
+                    log_debug("  path=\"%s\" -> \"%s\"", path_a, path_b);
             }
         }
         /* Write result back to X0 */

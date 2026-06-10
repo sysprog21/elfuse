@@ -71,7 +71,7 @@ int fork_ipc_read_all(int fd, void *buf, size_t len)
  * message comfortably below that limit and stream large fd sets in multiple
  * chunks.
  */
-#define FORK_IPC_FD_CHUNK 120
+#define FORK_IPC_FD_CHUNK 32
 
 int fork_ipc_send_fds(int sock, const int *fds, int count)
 {

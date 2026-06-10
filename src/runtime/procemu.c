@@ -1676,7 +1676,13 @@ static int pty_keepalive_register_locked(int master_host_fd,
     if (pty_keepalive_table[slot].slave_host_fd >= 0 &&
         pty_keepalive_table[slot].slave_host_fd != slave_host_fd)
         close(pty_keepalive_table[slot].slave_host_fd);
-    pty_keepalive_table[slot].slave_host_fd = slave_host_fd;
+    if (stale_open_once) {
+        pty_keepalive_table[slot].slave_host_fd = slave_host_fd;
+    } else {
+        if (slave_host_fd >= 0)
+            close(slave_host_fd);
+        pty_keepalive_table[slot].slave_host_fd = PTY_KEEPALIVE_FREE;
+    }
     pty_keepalive_table[slot].linux_pts_num = linux_pts_num;
     pty_keepalive_table[slot].stale_open_once = stale_open_once;
     if (slave_path)
@@ -2051,21 +2057,27 @@ void proc_pty_dup_keepalive_locked(int src_master_host_fd,
     int slot = pty_keepalive_find_master_locked(src_master_host_fd);
     if (slot < 0)
         return;
-    int dst_slave = dup(pty_keepalive_table[slot].slave_host_fd);
-    if (dst_slave < 0)
-        return;
+    int dst_slave = -1;
+    if (pty_keepalive_table[slot].slave_host_fd >= 0) {
+        dst_slave = dup(pty_keepalive_table[slot].slave_host_fd);
+        if (dst_slave < 0)
+            return;
+    }
     uint32_t src_pts_num = pty_keepalive_table[slot].linux_pts_num;
     char src_slave_path[PTY_SLAVE_PATH_MAX];
     memcpy(src_slave_path, pty_keepalive_table[slot].slave_path,
            PTY_SLAVE_PATH_MAX);
 
-    /* dup(2) clears FD_CLOEXEC; the keepalive must not survive exec into a
-     * guest child that has no map back to it.
-     */
-    int fdflags = fcntl(dst_slave, F_GETFD);
-    if (fdflags < 0 || fcntl(dst_slave, F_SETFD, fdflags | FD_CLOEXEC) < 0) {
-        close(dst_slave);
-        return;
+    if (dst_slave >= 0) {
+        /* dup(2) clears FD_CLOEXEC; the keepalive must not survive exec into
+         * a guest child that has no map back to it.
+         */
+        int fdflags = fcntl(dst_slave, F_GETFD);
+        if (fdflags < 0 ||
+            fcntl(dst_slave, F_SETFD, fdflags | FD_CLOEXEC) < 0) {
+            close(dst_slave);
+            return;
+        }
     }
     int rc =
         pty_keepalive_register_locked(dst_master_host_fd, dst_slave,
@@ -2076,7 +2088,8 @@ void proc_pty_dup_keepalive_locked(int src_master_host_fd,
          * fd that should not already be in the table unless a prior close
          * skipped proc_pty_close_keepalive.
          */
-        close(dst_slave);
+        if (dst_slave >= 0)
+            close(dst_slave);
     }
 }
 
@@ -2156,11 +2169,18 @@ int proc_pty_snapshot_keepalive(proc_pty_ipc_entry_t *out_entries,
         if (pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE)
             continue;
 
-        /* dup under the lock so the slave fd cannot be closed and the host fd
-         * number recycled before SCM_RIGHTS reads it. The caller closes the dup
-         * after the send completes.
+        /* Live entries keep only the slave path so the master can observe HUP
+         * when the real child-side slave closes. Open a temporary slave fd only
+         * for SCM_RIGHTS handoff to the fork child; stale one-shot entries may
+         * already carry a retained slave fd and can still be duped.
          */
-        int duped = dup(pty_keepalive_table[i].slave_host_fd);
+        int duped = -1;
+        if (pty_keepalive_table[i].slave_host_fd >= 0) {
+            duped = dup(pty_keepalive_table[i].slave_host_fd);
+        } else if (pty_keepalive_table[i].slave_path[0] != '\0') {
+            duped = open(pty_keepalive_table[i].slave_path,
+                         O_RDWR | O_NOCTTY | O_CLOEXEC);
+        }
         if (duped < 0)
             continue;
 
@@ -2554,10 +2574,11 @@ int proc_intercept_open(const guest_t *g,
             "VmRSS:\t%llu kB\n"
             "Threads:\t%d\n",
             name, (long long) proc_get_pid(), (long long) proc_get_pid(),
-            (long long) proc_get_ppid(), GUEST_UID, GUEST_UID, GUEST_UID,
-            GUEST_UID, GUEST_GID, GUEST_GID, GUEST_GID, GUEST_GID,
-            (unsigned long long) vm_size_kb, (unsigned long long) vm_size_kb,
-            (unsigned long long) vm_rss_kb, threads);
+            (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
+            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
+            proc_get_sgid(), proc_get_egid(), (unsigned long long) vm_size_kb,
+            (unsigned long long) vm_size_kb, (unsigned long long) vm_rss_kb,
+            threads);
     }
 
     /* /proc/self/limits -> resource limits from prlimit64 cache */
@@ -2660,8 +2681,9 @@ int proc_intercept_open(const guest_t *g,
                 "Gid:\t%d\t%d\t%d\t%d\n"
                 "Threads:\t%d\n",
                 proc_comm_name(), (long long) proc_get_pid(), tid,
-                (long long) proc_get_ppid(), GUEST_UID, GUEST_UID, GUEST_UID,
-                GUEST_UID, GUEST_GID, GUEST_GID, GUEST_GID, GUEST_GID,
+                (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
+                proc_get_suid(), proc_get_euid(), proc_get_gid(),
+                proc_get_egid(), proc_get_sgid(), proc_get_egid(),
                 thread_active_count());
         }
 

@@ -328,9 +328,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * binfmt_script.
      */
     elf_info_t elf_info;
-    if (elf_load(path_host, &elf_info) < 0) {
-        /* Not a valid ELF. Check if it's a script with a shebang line. Read the
-         * first 256 bytes and look for "#!" at the start.
+    if (elf_load_quiet(path_host, &elf_info) < 0) {
+        /* Not a valid ELF. Check if it's a script with a shebang line.
+         * Read the first 256 bytes and look for "#!" at the start.
          */
         int script_fd = open(path_host, O_RDONLY);
         if (script_fd < 0) {

@@ -100,6 +100,7 @@ SYS_fremovexattr sc_fremovexattr 1
 SYS_sync sc_sync 1
 SYS_fsync sc_fsync 1
 SYS_fdatasync sc_fdatasync 1
+SYS_sync_file_range sc_sync_file_range 0
 SYS_msync sc_msync 0
 SYS_membarrier sc_membarrier 0
 

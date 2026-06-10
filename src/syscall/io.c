@@ -833,10 +833,6 @@ static int64_t io_write_result(ssize_t ret)
     if (ret >= 0)
         return ret;
 
-    int saved_errno = errno;
-    if (saved_errno == EPIPE)
-        signal_queue(LINUX_SIGPIPE);
-    errno = saved_errno;
     return linux_errno();
 }
 

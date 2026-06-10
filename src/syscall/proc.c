@@ -313,6 +313,7 @@ void proc_mark_child_exited(pid_t host_pid, int status)
         pthread_cond_broadcast(&pid_cond);
         pthread_mutex_unlock(&pid_lock);
         proc_pidfd_notify_exit(gpid);
+        signal_queue(LINUX_SIGCHLD);
         return;
     }
     pthread_mutex_unlock(&pid_lock);

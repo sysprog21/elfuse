@@ -105,6 +105,7 @@ typedef struct {
  * Returns 0 on success, -1 on failure. Does NOT copy to guest yet.
  */
 int elf_load(const char *path, elf_info_t *info);
+int elf_load_quiet(const char *path, elf_info_t *info);
 
 /* Copy ELF segments into guest memory. Call after elf_load() and guest_init().
  * Also copies program headers into guest memory for AT_PHDR. load_base is added

@@ -1661,6 +1661,19 @@ int guest_get_used_regions(const guest_t *g,
         n++;
     }
 
+    /* Interpreter high block. The dynamic linker stores process-global state
+     * such as __stack_chk_guard in its high mapping just above interp_base.
+     * Fork children that take the region-copy path must inherit those bytes;
+     * otherwise libc's post-fork canary check observes zeroed guard storage
+     * and aborts before the child can exec.
+     */
+    if (n < max && g->interp_base > 0 &&
+        g->interp_base <= g->guest_size - BLOCK_2MIB) {
+        out[n].offset = g->interp_base;
+        out[n].size = BLOCK_2MIB;
+        n++;
+    }
+
     /* ELF + brk region: from elf_load_min (set by ELF loader) to brk_current.
      * The lower bound is the actual ELF load address, not ELF_DEFAULT_BASE:
      * ET_EXECs linked below 0x400000 (e.g. at 0x200000) have segments below the

@@ -75,6 +75,7 @@
 #define SYS_sync 81
 #define SYS_fsync 82
 #define SYS_fdatasync 83
+#define SYS_sync_file_range 84
 #define SYS_utimensat 88
 #define SYS_exit 93
 #define SYS_exit_group 94

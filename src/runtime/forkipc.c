@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/event.h>
 #include <dirent.h> /* fdopendir, for DIR* reconstruction in child */
 #include <sys/wait.h>
 #include <sys/clonefile.h> /* fclonefileat for CoW shm snapshots */
@@ -48,9 +49,142 @@
 #include "debug/log.h"
 #include "debug/syscall-hist.h"
 
+typedef struct fork_child_monitor_arg {
+    pid_t host_pid;
+} fork_child_monitor_arg_t;
+
+static void *fork_child_monitor_main(void *arg)
+{
+    fork_child_monitor_arg_t *m = (fork_child_monitor_arg_t *) arg;
+    pid_t host_pid = m->host_pid;
+    free(m);
+
+    int kq = kqueue();
+    if (kq < 0) {
+        log_warn("clone: child monitor kqueue failed for pid=%d: %s",
+                 (int) host_pid, strerror(errno));
+        return NULL;
+    }
+
+    struct kevent kev;
+    EV_SET(&kev, (uintptr_t) host_pid, EVFILT_PROC, EV_ADD | EV_ONESHOT,
+           NOTE_EXIT, 0, NULL);
+    if (kevent(kq, &kev, 1, NULL, 0, NULL) < 0) {
+        if (errno != ESRCH)
+            log_warn("clone: child monitor kevent add pid=%d failed: %s",
+                     (int) host_pid, strerror(errno));
+        close(kq);
+        return NULL;
+    }
+
+    do {
+        errno = 0;
+    } while (kevent(kq, NULL, 0, &kev, 1, NULL) < 0 && errno == EINTR);
+    close(kq);
+    signal_queue(LINUX_SIGCHLD);
+    return NULL;
+}
+
+static void fork_child_monitor_start(pid_t host_pid)
+{
+    fork_child_monitor_arg_t *arg = calloc(1, sizeof(*arg));
+    if (!arg) {
+        log_warn("clone: failed to allocate child monitor for pid=%d",
+                 (int) host_pid);
+        return;
+    }
+    arg->host_pid = host_pid;
+
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int err = pthread_create(&thread, &attr, fork_child_monitor_main, arg);
+    pthread_attr_destroy(&attr);
+    if (err != 0) {
+        log_warn("clone: failed to start child monitor for pid=%d: %s",
+                 (int) host_pid, strerror(err));
+        free(arg);
+    }
+}
+
+/* Pointer-authentication sysregs were added to recent macOS SDKs. Define the
+ * architectural encodings as a fallback so older SDK headers can still build
+ * the runtime.
+ */
+#ifndef HV_SYS_REG_APIAKEYLO_EL1
+#define HV_SYS_REG_APIAKEYLO_EL1 ((hv_sys_reg_t) 0xc108)
+#define HV_SYS_REG_APIAKEYHI_EL1 ((hv_sys_reg_t) 0xc109)
+#define HV_SYS_REG_APIBKEYLO_EL1 ((hv_sys_reg_t) 0xc10a)
+#define HV_SYS_REG_APIBKEYHI_EL1 ((hv_sys_reg_t) 0xc10b)
+#define HV_SYS_REG_APDAKEYLO_EL1 ((hv_sys_reg_t) 0xc110)
+#define HV_SYS_REG_APDAKEYHI_EL1 ((hv_sys_reg_t) 0xc111)
+#define HV_SYS_REG_APDBKEYLO_EL1 ((hv_sys_reg_t) 0xc112)
+#define HV_SYS_REG_APDBKEYHI_EL1 ((hv_sys_reg_t) 0xc113)
+#define HV_SYS_REG_APGAKEYLO_EL1 ((hv_sys_reg_t) 0xc118)
+#define HV_SYS_REG_APGAKEYHI_EL1 ((hv_sys_reg_t) 0xc119)
+#endif
+#ifndef HV_SYS_REG_TPIDRRO_EL0
+#define HV_SYS_REG_TPIDRRO_EL0 ((hv_sys_reg_t) 0xde83)
+#endif
+#ifndef HV_SYS_REG_TPIDR2_EL0
+#define HV_SYS_REG_TPIDR2_EL0 ((hv_sys_reg_t) 0xde85)
+#endif
+
+static void capture_pauth_keys(hv_vcpu_t vcpu, ipc_pauth_keys_t *keys)
+{
+    keys->apiakeylo_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APIAKEYLO_EL1);
+    keys->apiakeyhi_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APIAKEYHI_EL1);
+    keys->apibkeylo_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APIBKEYLO_EL1);
+    keys->apibkeyhi_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APIBKEYHI_EL1);
+    keys->apdakeylo_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APDAKEYLO_EL1);
+    keys->apdakeyhi_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APDAKEYHI_EL1);
+    keys->apdbkeylo_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APDBKEYLO_EL1);
+    keys->apdbkeyhi_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APDBKEYHI_EL1);
+    keys->apgakeylo_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APGAKEYLO_EL1);
+    keys->apgakeyhi_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_APGAKEYHI_EL1);
+}
+
+static hv_return_t restore_pauth_keys(hv_vcpu_t vcpu,
+                                      const ipc_pauth_keys_t *keys)
+{
+    hv_return_t r;
+
+#define SET_PAUTH_KEY(reg, val)                  \
+    do {                                         \
+        r = hv_vcpu_set_sys_reg(vcpu, reg, val); \
+        if (r != HV_SUCCESS)                     \
+            return r;                            \
+    } while (0)
+
+    SET_PAUTH_KEY(HV_SYS_REG_APIAKEYLO_EL1, keys->apiakeylo_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APIAKEYHI_EL1, keys->apiakeyhi_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APIBKEYLO_EL1, keys->apibkeylo_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APIBKEYHI_EL1, keys->apibkeyhi_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APDAKEYLO_EL1, keys->apdakeylo_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APDAKEYHI_EL1, keys->apdakeyhi_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APDBKEYLO_EL1, keys->apdbkeylo_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APDBKEYHI_EL1, keys->apdbkeyhi_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APGAKEYLO_EL1, keys->apgakeylo_el1);
+    SET_PAUTH_KEY(HV_SYS_REG_APGAKEYHI_EL1, keys->apgakeyhi_el1);
+#undef SET_PAUTH_KEY
+
+    return HV_SUCCESS;
+}
+
 /* fork_child_main. */
 
 static int fork_child_vfork_notify_fd = -1;
+
+/* Linux clone flags */
+#define LINUX_CLONE_VM 0x00000100
+#define LINUX_CLONE_VFORK 0x00004000
+#define LINUX_CLONE_THREAD 0x00010000
+#define LINUX_CLONE_SETTLS 0x00080000
+#define LINUX_CLONE_PARENT_SETTID 0x00100000
+#define LINUX_CLONE_CHILD_CLEARTID 0x00200000
+#define LINUX_CLONE_CHILD_SETTID 0x01000000
+/* LINUX_SIGCHLD defined in syscall_signal.h (included above) */
 
 void fork_notify_vfork_exec(void)
 {
@@ -275,6 +409,16 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
 
+    if ((hdr.clone_flags & LINUX_CLONE_CHILD_SETTID) && hdr.child_tid_gva) {
+        int32_t tid32 = (int32_t) hdr.child_pid;
+        if (guest_write_small(&g, hdr.child_tid_gva, &tid32, sizeof(tid32)) <
+            0) {
+            log_error("fork-child: failed to write CLONE_CHILD_SETTID");
+            guest_destroy(&g);
+            return 1;
+        }
+    }
+
     /* POSIX: "Signals pending to the parent shall not be pending to the child."
      * Clear pending bitmask and RT queue before applying state.
      * signal_set_state() is deferred until after thread_register_main() so that
@@ -313,9 +457,14 @@ int fork_child_main(int ipc_fd,
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, regs.ttbr0_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, regs.ttbr1_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, regs.cpacr_el1));
+    uint64_t child_sp_el1 = g.ipa_base + g.shim_data_base + BLOCK_2MIB;
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, regs.sp_el0));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, regs.sp_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, child_sp_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs.tpidr_el0));
+    HV_CHECK(
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDRRO_EL0, regs.tpidrro_el0));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR2_EL0, regs.tpidr2_el0));
+    HV_CHECK(restore_pauth_keys(vcpu, &regs.pauth_keys));
 
     /* TPIDR_EL1 is set by the host (never inherited from the parent's register
      * snapshot) because it must point at the child's own shim_globals base in
@@ -355,13 +504,15 @@ int fork_child_main(int ipc_fd,
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, regs.elr_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, regs.spsr_el1));
     HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, regs.elr_el1));
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, regs.spsr_el1));
 
     /* Register the fork child's main thread in the thread table. Without this,
      * current_thread is NULL and any syscall handler that accesses per-thread
      * state (signal masks, ptrace, CLONE_THREAD) will dereference NULL.
      */
-    thread_register_main(vcpu, vexit, hdr.child_pid, regs.sp_el1);
+    thread_register_main(vcpu, vexit, hdr.child_pid, child_sp_el1);
+    if ((hdr.clone_flags & LINUX_CLONE_CHILD_CLEARTID) && hdr.child_tid_gva)
+        current_thread->clear_child_tid = hdr.child_tid_gva;
 
     /* Re-publish identity into the child's shim-globals cache: the CoW / region
      * copy inherits the parent's pid/uid values, and the shim's identity fast
@@ -420,16 +571,6 @@ int fork_child_main(int ipc_fd,
 
 /* sys_clone. */
 
-/* Linux clone flags */
-#define LINUX_CLONE_VM 0x00000100
-#define LINUX_CLONE_VFORK 0x00004000
-#define LINUX_CLONE_THREAD 0x00010000
-#define LINUX_CLONE_SETTLS 0x00080000
-#define LINUX_CLONE_PARENT_SETTID 0x00100000
-#define LINUX_CLONE_CHILD_CLEARTID 0x00200000
-#define LINUX_CLONE_CHILD_SETTID 0x01000000
-/* LINUX_SIGCHLD defined in syscall_signal.h (included above) */
-
 /* Namespace flags. elfuse implements no namespace isolation. Both sys_clone and
  * sys_clone3 reject them.
  */
@@ -467,7 +608,8 @@ typedef struct {
     uint64_t child_stack, flags, tls;
     /* Parent system regs to copy into the new vCPU */
     uint64_t elr, spsr, vbar, ttbr0, sctlr, tcr, mair, cpacr;
-    uint64_t tpidr;
+    uint64_t tpidr, tpidrro, tpidr2;
+    ipc_pauth_keys_t pauth_keys;
     uint64_t gprs[31];
     uint64_t sp_el1;
     vcpu_simd_state_t simd_state;
@@ -559,6 +701,12 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
     parent_mair = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
     parent_cpacr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_CPACR_EL1);
     parent_tpidr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR_EL0);
+    uint64_t parent_tpidrro =
+        vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDRRO_EL0);
+    uint64_t parent_tpidr2 =
+        vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR2_EL0);
+    ipc_pauth_keys_t parent_pauth_keys;
+    capture_pauth_keys(parent_vcpu, &parent_pauth_keys);
 
     uint64_t parent_gprs[31];
     vcpu_snapshot_gprs(parent_vcpu, parent_gprs);
@@ -587,6 +735,9 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
     tca->mair = parent_mair;
     tca->cpacr = parent_cpacr;
     tca->tpidr = parent_tpidr;
+    tca->tpidrro = parent_tpidrro;
+    tca->tpidr2 = parent_tpidr2;
+    tca->pauth_keys = parent_pauth_keys;
     memcpy(tca->gprs, parent_gprs, sizeof(parent_gprs));
     tca->sp_el1 = child_sp_el1;
     vcpu_snapshot_simd(parent_vcpu, &tca->simd_state);
@@ -762,6 +913,9 @@ static void *thread_create_and_run(void *arg)
     } else {
         WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tpidr));
     }
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDRRO_EL0, tca->tpidrro));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR2_EL0, tca->tpidr2));
+    WORKER_HV(restore_pauth_keys(vcpu, &tca->pauth_keys));
 
     /* ELR_EL1 = clone return point (same as parent) */
     WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, tca->elr));
@@ -943,6 +1097,12 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
     uint64_t parent_mair = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
     uint64_t parent_cpacr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_CPACR_EL1);
     uint64_t parent_tpidr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR_EL0);
+    uint64_t parent_tpidrro =
+        vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDRRO_EL0);
+    uint64_t parent_tpidr2 =
+        vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR2_EL0);
+    ipc_pauth_keys_t parent_pauth_keys;
+    capture_pauth_keys(parent_vcpu, &parent_pauth_keys);
 
     uint64_t parent_gprs[31];
     vcpu_snapshot_gprs(parent_vcpu, parent_gprs);
@@ -970,6 +1130,9 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
     tca->mair = parent_mair;
     tca->cpacr = parent_cpacr;
     tca->tpidr = parent_tpidr;
+    tca->tpidrro = parent_tpidrro;
+    tca->tpidr2 = parent_tpidr2;
+    tca->pauth_keys = parent_pauth_keys;
     memcpy(tca->gprs, parent_gprs, sizeof(parent_gprs));
     tca->sp_el1 = child_sp_el1;
     vcpu_snapshot_simd(parent_vcpu, &tca->simd_state);
@@ -1070,6 +1233,9 @@ static void *vm_clone_thread_run(void *arg)
     } else {
         HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tpidr));
     }
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDRRO_EL0, tca->tpidrro));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR2_EL0, tca->tpidr2));
+    HV_CHECK(restore_pauth_keys(vcpu, &tca->pauth_keys));
 
     /* ELR_EL1 = clone return point */
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, tca->elr));
@@ -1528,6 +1694,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .rosetta_entry = g->rosetta_entry,
         .kbuf_gpa = g->kbuf_gpa,
         .ttbr1 = g->ttbr1,
+        .clone_flags = flags,
+        .child_tid_gva = ctid_gva,
     };
     if (fork_ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
         log_error("clone: failed to send header");
@@ -1561,7 +1729,10 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     regs.mair_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_MAIR_EL1);
     regs.cpacr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_CPACR_EL1);
     regs.tpidr_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDR_EL0);
+    regs.tpidrro_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDRRO_EL0);
+    regs.tpidr2_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDR2_EL0);
     regs.sp_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
+    capture_pauth_keys(vcpu, &regs.pauth_keys);
     vcpu_snapshot_gprs(vcpu, regs.x);
 
     vcpu_snapshot_simd(vcpu, &regs.simd_state);
@@ -1660,6 +1831,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             if (waited == child_host_pid)
                 proc_mark_child_exited(child_host_pid, status);
         }
+    } else {
+        fork_child_monitor_start(child_host_pid);
     }
 
     log_debug("clone: child pid=%lld (host=%d)", (long long) child_guest_pid,

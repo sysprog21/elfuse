@@ -7,6 +7,9 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #include "syscall/abi.h"
 #include "core/shim-globals.h"
@@ -24,16 +27,33 @@ static _Atomic int64_t guest_sid = 1, guest_pgid = 1;
 static _Atomic int64_t guest_fg_pgrp = 1;
 static _Atomic int32_t guest_has_ctty = 1;
 
+static uint32_t proc_identity_env_u32(const char *name, uint32_t fallback)
+{
+    const char *value = getenv(name);
+    if (!value || !*value)
+        return fallback;
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > UINT32_MAX)
+        return fallback;
+    return (uint32_t) parsed;
+}
+
 void proc_identity_init(void)
 {
+    uint32_t initial_uid = proc_identity_env_u32("ELFUSE_GUEST_UID", GUEST_UID);
+    uint32_t initial_gid = proc_identity_env_u32("ELFUSE_GUEST_GID", GUEST_GID);
+
     guest_pid = 1;
     parent_pid = 0;
-    emu_uid = GUEST_UID;
-    emu_euid = GUEST_UID;
-    emu_suid = GUEST_UID;
-    emu_gid = GUEST_GID;
-    emu_egid = GUEST_GID;
-    emu_sgid = GUEST_GID;
+    emu_uid = initial_uid;
+    emu_euid = initial_uid;
+    emu_suid = initial_uid;
+    emu_gid = initial_gid;
+    emu_egid = initial_gid;
+    emu_sgid = initial_gid;
     emu_nice = 0;
     guest_sid = 1;
     guest_pgid = 1;
@@ -93,36 +113,47 @@ static bool gid_is_permitted(uint32_t val)
 
 int64_t proc_sys_setuid(uint32_t uid)
 {
-    if (!uid_is_permitted(uid))
+    bool privileged = (emu_euid == 0);
+    if (!privileged && !uid_is_permitted(uid))
         return -LINUX_EPERM;
+    if (privileged) {
+        emu_uid = uid;
+        emu_suid = uid;
+    }
     emu_euid = uid;
     return 0;
 }
 
 int64_t proc_sys_setgid(uint32_t gid)
 {
-    if (!gid_is_permitted(gid))
+    bool privileged = (emu_euid == 0);
+    if (!privileged && !gid_is_permitted(gid))
         return -LINUX_EPERM;
+    if (privileged) {
+        emu_gid = gid;
+        emu_sgid = gid;
+    }
     emu_egid = gid;
     return 0;
 }
 
-#define DEFINE_SETRE(suffix, real, eff, saved, perm_fn)    \
-    int64_t proc_sys_setre##suffix(uint32_t r, uint32_t e) \
-    {                                                      \
-        uint32_t old_real = real;                          \
-        if (r != (uint32_t) -1 && r != real && r != eff)   \
-            return -LINUX_EPERM;                           \
-        if (e != (uint32_t) -1 && !perm_fn(e))             \
-            return -LINUX_EPERM;                           \
-        if (r != (uint32_t) -1)                            \
-            real = r;                                      \
-        if (e != (uint32_t) -1) {                          \
-            eff = e;                                       \
-            if (r != (uint32_t) -1 || e != old_real)       \
-                saved = e;                                 \
-        }                                                  \
-        return 0;                                          \
+#define DEFINE_SETRE(suffix, real, eff, saved, perm_fn)                 \
+    int64_t proc_sys_setre##suffix(uint32_t r, uint32_t e)              \
+    {                                                                   \
+        uint32_t old_real = real;                                       \
+        bool privileged = (emu_euid == 0);                              \
+        if (!privileged && r != (uint32_t) -1 && r != real && r != eff) \
+            return -LINUX_EPERM;                                        \
+        if (!privileged && e != (uint32_t) -1 && !perm_fn(e))           \
+            return -LINUX_EPERM;                                        \
+        if (r != (uint32_t) -1)                                         \
+            real = r;                                                   \
+        if (e != (uint32_t) -1) {                                       \
+            eff = e;                                                    \
+            if (r != (uint32_t) -1 || e != old_real)                    \
+                saved = e;                                              \
+        }                                                               \
+        return 0;                                                       \
     }
 
 DEFINE_SETRE(uid, emu_uid, emu_euid, emu_suid, uid_is_permitted)
@@ -133,11 +164,12 @@ DEFINE_SETRE(gid, emu_gid, emu_egid, emu_sgid, gid_is_permitted)
 #define DEFINE_SETRES(suffix, real, eff, saved, perm_fn)                \
     int64_t proc_sys_setres##suffix(uint32_t r, uint32_t e, uint32_t s) \
     {                                                                   \
-        if (r != (uint32_t) -1 && !perm_fn(r))                          \
+        bool privileged = (emu_euid == 0);                              \
+        if (!privileged && r != (uint32_t) -1 && !perm_fn(r))           \
             return -LINUX_EPERM;                                        \
-        if (e != (uint32_t) -1 && !perm_fn(e))                          \
+        if (!privileged && e != (uint32_t) -1 && !perm_fn(e))           \
             return -LINUX_EPERM;                                        \
-        if (s != (uint32_t) -1 && !perm_fn(s))                          \
+        if (!privileged && s != (uint32_t) -1 && !perm_fn(s))           \
             return -LINUX_EPERM;                                        \
         if (r != (uint32_t) -1)                                         \
             real = r;                                                   \

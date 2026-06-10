@@ -31,9 +31,6 @@
 
 /* System info syscall handlers. */
 
-static pthread_once_t groups_once = PTHREAD_ONCE_INIT;
-static uint32_t cached_linux_groups[64];
-static int cached_ngroups = -1;
 static const linux_utsname_t cached_uname = {
     .sysname = "Linux",
     .nodename = "elfuse",
@@ -80,18 +77,6 @@ _Static_assert(offsetof(struct rusage, ru_maxrss) ==
  * per-thread TID gate.
  */
 static bool sched_pid_alive(int pid);
-
-static void groups_init_cached_linux_groups(void)
-{
-    gid_t groups[64];
-    int ngroups = getgroups(64, groups);
-    if (ngroups < 0)
-        return;
-
-    for (int i = 0; i < ngroups; i++)
-        cached_linux_groups[i] = (uint32_t) groups[i];
-    cached_ngroups = ngroups;
-}
 
 static void sysinfo_init_cached_host_state(void)
 {
@@ -156,19 +141,6 @@ static void sysinfo_refresh_cached_locked(time_t now_sec)
     }
 
     cached_sysinfo_sec = now_sec;
-}
-
-static int get_cached_linux_groups(void)
-{
-    if (thread_is_single_active()) {
-        if (cached_ngroups >= 0)
-            return cached_ngroups;
-        groups_init_cached_linux_groups();
-        return cached_ngroups;
-    }
-
-    pthread_once(&groups_once, groups_init_cached_linux_groups);
-    return cached_ngroups;
 }
 
 int64_t sys_uname(guest_t *g, uint64_t buf_gva)
@@ -487,17 +459,15 @@ int64_t sys_sched_rr_get_interval(guest_t *g, int pid, uint64_t ts_gva)
 
 int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva)
 {
-    int ngroups = get_cached_linux_groups();
-    if (ngroups < 0)
-        return linux_errno();
+    const int ngroups = 1;
 
     if (size == 0)
         return ngroups;
     if (size < ngroups)
         return -LINUX_EINVAL;
 
-    size_t bytes = (size_t) ngroups * sizeof(cached_linux_groups[0]);
-    if (guest_write_small(g, list_gva, cached_linux_groups, bytes) < 0)
+    uint32_t group = proc_get_gid();
+    if (guest_write_small(g, list_gva, &group, sizeof(group)) < 0)
         return -LINUX_EFAULT;
 
     return ngroups;

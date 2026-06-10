@@ -266,7 +266,8 @@ static void split_regions_at_boundary(guest_t *g, uint64_t boundary)
 static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
-                                    uint64_t max_addr)
+                                    uint64_t max_addr,
+                                    uint64_t align)
 {
     /* Round the search start up to the next host-page boundary so an unaligned
      * addr hint cannot return a result that lands inside a host page already
@@ -275,8 +276,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
      * aligning to the guest 4 KiB page is not enough. Advance past each walked
      * region to the same boundary for the same reason.
      */
-    size_t hps = host_page_size_cached();
-    uint64_t gap_start = ALIGN_UP(min_addr, hps);
+    uint64_t gap_start = ALIGN_UP(min_addr, align);
 
     /* Skip the prefix of regions entirely below gap_start in O(log n). After a
      * successful allocation the gap hint advances near or past the existing
@@ -308,7 +308,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
             return gap_start;
 
         /* Region overlaps; advance past it and round to the next host page */
-        gap_start = ALIGN_UP(g->regions[i].end, hps);
+        gap_start = ALIGN_UP(g->regions[i].end, align);
     }
 
     /* Check trailing space after all regions */
@@ -326,33 +326,27 @@ static uint64_t find_free_gap_inner(const guest_t *g,
 static uint64_t find_free_gap(guest_t *g,
                               uint64_t length,
                               uint64_t min_addr,
-                              uint64_t max_addr)
+                              uint64_t max_addr,
+                              uint64_t align)
 {
     /* RX and RW mappings advance independently, so keep separate hints. */
     uint64_t *hint =
         (min_addr < MMAP_BASE) ? &g->mmap_rx_gap_hint : &g->mmap_rw_gap_hint;
 
-    /* Advance the hint to the next host-page boundary so the following
-     * sequential allocation lands on an address that the kernel accepts for
-     * mmap MAP_FIXED (Apple Silicon enforces 16 KiB host pages). The tradeoff
-     * is up to host_page-1 bytes of address-space waste per small allocation;
-     * physical pages are still demand-paged, so RAM cost is unchanged.
-     */
-    size_t hps = host_page_size_cached();
-
     /* Try cached hint first (only if within the valid range) */
     if (*hint >= min_addr && *hint < max_addr) {
-        uint64_t result = find_free_gap_inner(g, length, *hint, max_addr);
+        uint64_t result =
+            find_free_gap_inner(g, length, *hint, max_addr, align);
         if (result != UINT64_MAX) {
-            *hint = ALIGN_UP(result + length, hps);
+            *hint = ALIGN_UP(result + length, align);
             return result;
         }
     }
 
     /* Full scan from base */
-    uint64_t result = find_free_gap_inner(g, length, min_addr, max_addr);
+    uint64_t result = find_free_gap_inner(g, length, min_addr, max_addr, align);
     if (result != UINT64_MAX)
-        *hint = ALIGN_UP(result + length, hps);
+        *hint = ALIGN_UP(result + length, align);
     return result;
 }
 
@@ -1869,14 +1863,6 @@ int64_t sys_mmap(guest_t *g,
             return -LINUX_ENODEV;
     }
 
-    /* Round length up to page size (overflow-safe) */
-    if (length > UINT64_MAX - 4095)
-        return -LINUX_ENOMEM;
-    length = PAGE_ALIGN_UP(length);
-    if (length == 0)
-        return -LINUX_ENOMEM;
-
-    /* Linux kernel rejects MAP_FIXED with non-page-aligned address */
     bool is_fixed =
         (flags & LINUX_MAP_FIXED) || (flags & LINUX_MAP_FIXED_NOREPLACE);
     if (is_fixed && (addr & 4095))
@@ -1886,6 +1872,19 @@ int64_t sys_mmap(guest_t *g,
      * overlaps any existing mapping.
      */
     bool is_noreplace = (flags & LINUX_MAP_FIXED_NOREPLACE) != 0;
+
+    size_t hps = host_page_size_cached();
+    uint64_t align = hps;
+    if (!is_fixed && !is_anon && fd >= 0 && (flags & LINUX_MAP_SHARED)) {
+        align = BLOCK_2MIB;
+    }
+
+    /* Round length up to align size (overflow-safe) */
+    if (length > UINT64_MAX - (align - 1))
+        return -LINUX_ENOMEM;
+    length = ALIGN_UP(length, align);
+    if (length == 0)
+        return -LINUX_ENOMEM;
 
     uint64_t result_off; /* Result as offset (0-based) */
     if (is_fixed) {
@@ -2191,7 +2190,8 @@ int64_t sys_mmap(guest_t *g,
              * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
              * permission.
              */
-            result_off = find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit);
+            result_off =
+                find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit, align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RX address space exhausted "
@@ -2232,12 +2232,13 @@ int64_t sys_mmap(guest_t *g,
                      */
                     uint64_t hint_max =
                         (hint_off < MMAP_BASE) ? MMAP_BASE : g->mmap_limit;
-                    result_off =
-                        find_free_gap_inner(g, length, hint_off, hint_max);
+                    result_off = find_free_gap_inner(g, length, hint_off,
+                                                     hint_max, align);
                 }
             }
             if (result_off == UINT64_MAX)
-                result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit);
+                result_off =
+                    find_free_gap(g, length, MMAP_BASE, g->mmap_limit, align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RW address space exhausted "
@@ -2366,6 +2367,12 @@ int64_t sys_mmap(guest_t *g,
          * host pages). The "extra" trailing bytes inside the host page are
          * never reachable by the guest because the gap-finder advances the hint
          * to the next host-page boundary after each allocation.
+        /* mmap rounds length up to the host page size internally; only
+         * addr and offset alignment matter for MAP_FIXED on macOS Apple
+         * Silicon (16 KiB host pages). The "extra" trailing bytes inside
+         * the host page are never reachable by the guest because the
+         * gap-finder advances the hint to the next host-page boundary
+         * after each allocation.
          */
         /* overlay_fd_writable rejects read-only backing fds inside
          * hvf_apply_file_overlay; mirror the check here so a read-only mmap
@@ -2480,7 +2487,6 @@ int64_t sys_mmap(guest_t *g,
      * keeps coherent with the file's page cache.
      */
     if (!is_anon && fd >= 0 && !is_prot_none && (flags & LINUX_MAP_SHARED)) {
-        size_t hps = host_page_size_cached();
         if ((result_off % hps == 0) && ((uint64_t) offset % hps == 0)) {
             for (int i = 0; i < g->nregions; i++) {
                 if (g->regions[i].start == result_off &&
@@ -2932,9 +2938,11 @@ int64_t sys_mremap(guest_t *g,
 
         uint64_t new_off;
         if (needs_exec && !(prot & LINUX_PROT_WRITE))
-            new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit);
+            new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit,
+                                    host_page_size_cached());
         else
-            new_off = find_free_gap(g, new_size, MMAP_BASE, g->mmap_limit);
+            new_off = find_free_gap(g, new_size, MMAP_BASE, g->mmap_limit,
+                                    host_page_size_cached());
 
         if (new_off == UINT64_MAX) {
             if (track_backing_fd >= 0)

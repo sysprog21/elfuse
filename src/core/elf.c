@@ -8,6 +8,7 @@
  * segments, and copies them into guest memory.
  */
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,19 +20,21 @@
 #include "debug/log.h"
 #include "utils.h"
 
-int elf_load(const char *path, elf_info_t *info)
+static int elf_load_impl(const char *path, elf_info_t *info, bool quiet)
 {
     memset(info, 0, sizeof(*info));
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        perror(path);
+        if (!quiet)
+            perror(path);
         return -1;
     }
 
     elf64_ehdr_t ehdr;
     if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
-        log_error("%s: failed to read ELF header", path);
+        if (!quiet)
+            log_error("%s: failed to read ELF header", path);
         fclose(f);
         return -1;
     }
@@ -39,21 +42,24 @@ int elf_load(const char *path, elf_info_t *info)
     /* Reject non-ELF inputs before interpreting the rest of the header. */
     if (ehdr.e_ident[0] != ELFMAG0 || ehdr.e_ident[1] != ELFMAG1 ||
         ehdr.e_ident[2] != ELFMAG2 || ehdr.e_ident[3] != ELFMAG3) {
-        log_error("%s: not an ELF file", path);
+        if (!quiet)
+            log_error("%s: not an ELF file", path);
         fclose(f);
         return -1;
     }
 
     /* elfuse only implements the 64-bit Linux ABI. */
     if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        log_error("%s: not a 64-bit ELF", path);
+        if (!quiet)
+            log_error("%s: not a 64-bit ELF", path);
         fclose(f);
         return -1;
     }
 
     /* aarch64-linux user binaries are little-endian in the supported mode. */
     if (ehdr.e_ident[EI_DATA] != ELFDATA2LSB) {
-        log_error("%s: not little-endian", path);
+        if (!quiet)
+            log_error("%s: not little-endian", path);
         fclose(f);
         return -1;
     }
@@ -62,8 +68,9 @@ int elf_load(const char *path, elf_info_t *info)
      * diagnostic instead of a generic parse failure.
      */
     if (ehdr.e_machine != EM_AARCH64 && ehdr.e_machine != EM_X86_64) {
-        log_error("%s: unsupported architecture (e_machine=%u)", path,
-                  ehdr.e_machine);
+        if (!quiet)
+            log_error("%s: unsupported architecture (e_machine=%u)", path,
+                      ehdr.e_machine);
         fclose(f);
         return -1;
     }
@@ -72,7 +79,8 @@ int elf_load(const char *path, elf_info_t *info)
      * the load base that keeps them away from elfuse's reserved regions.
      */
     if (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) {
-        log_error("%s: not an executable (e_type=%u)", path, ehdr.e_type);
+        if (!quiet)
+            log_error("%s: not an executable (e_type=%u)", path, ehdr.e_type);
         fclose(f);
         return -1;
     }
@@ -202,6 +210,16 @@ int elf_load(const char *path, elf_info_t *info)
     free(ph_buf);
     fclose(f);
     return 0;
+}
+
+int elf_load(const char *path, elf_info_t *info)
+{
+    return elf_load_impl(path, info, false);
+}
+
+int elf_load_quiet(const char *path, elf_info_t *info)
+{
+    return elf_load_impl(path, info, true);
 }
 
 int elf_map_segments(const elf_info_t *info,

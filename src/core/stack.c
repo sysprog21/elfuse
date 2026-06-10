@@ -16,7 +16,7 @@
 #include <sys/random.h>
 
 #include "core/stack.h"
-#include "syscall/abi.h" /* GUEST_UID, GUEST_GID */
+#include "syscall/proc.h"
 
 /* Linux aarch64 HWCAP bits (from asm/hwcap.h). Only the bits the VZ-sanitized
  * ID registers actually advertise are listed here; HWCAP bits left out (e.g.,
@@ -284,12 +284,12 @@ uint64_t build_linux_stack(guest_t *g,
     AUX(AT_PHENT, elf_info->phentsize);
     AUX(AT_PHNUM, elf_info->phnum);
     AUX(AT_ENTRY, elf_info->entry + elf_load_base);
-    AUX(AT_UID, GUEST_UID);
-    AUX(AT_EUID, GUEST_UID);
-    AUX(AT_GID, GUEST_GID);
-    AUX(AT_EGID, GUEST_GID);
-    /* Bionic's __libc_init_AT_SECURE aborts when AT_SECURE is absent. elfuse
-     * never elevates privileges, so AT_SECURE is always 0.
+    AUX(AT_UID, proc_get_uid());
+    AUX(AT_EUID, proc_get_euid());
+    AUX(AT_GID, proc_get_gid());
+    AUX(AT_EGID, proc_get_egid());
+    /* Bionic's __libc_init_AT_SECURE aborts when AT_SECURE is absent.
+     * elfuse never elevates privileges, so AT_SECURE is always 0.
      */
     AUX(AT_SECURE, 0);
     AUX(AT_HWCAP2, query_hwcap2());

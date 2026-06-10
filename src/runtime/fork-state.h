@@ -18,14 +18,30 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER 0x454C464BU   /* "ELFK" */
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
-/* Bumped to 11 when regions_tracker_stale was added to process state so forked
- * children preserve mprotect fast-path correctness.
+/* Bumped to 13 when pointer-authentication key registers and the remaining
+ * EL0 TLS registers were added so forked children and clone-created vCPUs
+ * resume with the same userspace CPU context as the parent. New Ubuntu arm64
+ * userspace can use PAC in libc and TLS-adjacent state during fork return.
+ *
+ * Bumped to 12 when clone_flags/child_tid_gva were added so fork-process
+ * children can apply CLONE_CHILD_SETTID/CLEARTID inside their own snapshot.
+ *
+ * Bumped to 11 when regions_tracker_stale was added to process state so
+ * forked children preserve mprotect fast-path correctness.
  *
  * Bumped to 10 when the rosetta placement / kbuf / ttbr1 tuple was added so a
  * rosetta-aware child rejects an older parent's header instead of trying to
  * interpret unknown trailing fields.
  */
-#define IPC_VERSION 11
+#define IPC_VERSION 13
+
+typedef struct {
+    uint64_t apiakeylo_el1, apiakeyhi_el1;
+    uint64_t apibkeylo_el1, apibkeyhi_el1;
+    uint64_t apdakeylo_el1, apdakeyhi_el1;
+    uint64_t apdbkeylo_el1, apdbkeyhi_el1;
+    uint64_t apgakeylo_el1, apgakeyhi_el1;
+} ipc_pauth_keys_t;
 
 typedef struct {
     uint32_t magic;
@@ -60,6 +76,8 @@ typedef struct {
     uint64_t rosetta_entry;
     uint64_t kbuf_gpa;
     uint64_t ttbr1;
+    uint64_t clone_flags;
+    uint64_t child_tid_gva;
 } ipc_header_t;
 
 typedef struct {
@@ -74,8 +92,10 @@ typedef struct {
      * access faults.
      */
     uint64_t ttbr1_el1;
-    uint64_t sctlr_el1, tcr_el1, mair_el1, cpacr_el1, tpidr_el0, sp_el1;
+    uint64_t sctlr_el1, tcr_el1, mair_el1, cpacr_el1;
+    uint64_t tpidr_el0, tpidrro_el0, tpidr2_el0, sp_el1;
     uint64_t x[31];
+    ipc_pauth_keys_t pauth_keys;
     vcpu_simd_state_t simd_state;
 } ipc_registers_t;
 

@@ -553,7 +553,16 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         errno = ENAMETOOLONG;
         return NULL;
     }
-    return path;
+    char parent[LINUX_PATH_MAX];
+    str_copy_trunc(parent, buf, sizeof(parent));
+    char *slash = strrchr(parent, '/');
+    if (!slash || slash == parent)
+        return buf;
+    *slash = '\0';
+
+    if (sysroot_validate_dir_prefix(parent) < 0)
+        return NULL;
+    return buf;
 }
 
 const char *proc_resolve_sysroot_path(const char *path, char *buf, size_t bufsz)
@@ -614,14 +623,6 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      */
     if (errno != ENOENT && errno != ENOTDIR)
         return NULL;
-
-    /* Parent doesn't exist in sysroot. Only /tmp, /var/tmp, and ccache get
-     * forcefully redirected to the sysroot to avoid host case-collisions;
-     * everything else falls back to the host literal.
-     */
-    if (strncmp(path, "/tmp/", 5) && strncmp(path, "/var/tmp/", 9) &&
-        !strstr(path, "/.ccache/"))
-        return path;
 
     if (!create_parents) {
         if (sysroot_validate_dir_prefix(parent) < 0)

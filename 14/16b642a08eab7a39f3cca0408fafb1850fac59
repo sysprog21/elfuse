@@ -1,0 +1,30 @@
+src/syscall/syscall.c
+  s_2ed139b55ab059::t_5d61fe8c1a1f04 545-552
+src/syscall/dispatch.tbl
+  s_2ed139b55ab059::t_6225c24d06381d 160-161
+src/syscall/abi.h
+  s_2ed139b55ab059::t_35912d2fabc859 120-121
+  s_2ed139b55ab059::t_4de33a056001ee 230-231
+tests/test-tier-a.c
+  s_2ed139b55ab059::t_2356d3dd426bb3 171,174
+tests/test-credentials.c
+  s_2ed139b55ab059::t_0eb4655b3fa104 21-22
+  s_2ed139b55ab059::t_653b752f74d0a1 145-156
+  s_2ed139b55ab059::t_014f1b98fb02e5 124-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "1416b642a08eab7a39f3cca0408fafb1850fac59",
+  "prompts": {},
+  "sessions": {
+    "s_2ed139b55ab059": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c11d0c1-cc2c-4e99-aba7-64515a112bcf",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

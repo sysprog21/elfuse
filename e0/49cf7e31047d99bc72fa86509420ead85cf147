@@ -1,0 +1,31 @@
+tests/test-chown-overlay.c
+  s_d652dd8096823c::t_0511db456647ce 34,44-49,51,53-54,56-61,63-67
+  s_d652dd8096823c::t_4026183645d80e 220-223
+tests/test-fork-ipc-protocol-host.c
+  s_d652dd8096823c::t_4d89d2fd086861 39-46
+src/syscall/fs.c
+  s_d652dd8096823c::t_8af8108aff1e7a 1969-1978
+src/syscall/chown-overlay.h
+  s_d652dd8096823c::t_1c52eca2e01183 43-46,49-53
+  s_d652dd8096823c::t_e973db74e964c1 25,27-32
+src/syscall/chown-overlay.c
+  s_d652dd8096823c::t_cffd3f31f2b93a 94-99,101,109-111,114-115,136,138
+  s_d652dd8096823c::t_52109cb10f9976 21
+  s_d652dd8096823c::t_02e6de4d61f6c1 190-198,211-212,227-230,232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "e049cf7e31047d99bc72fa86509420ead85cf147",
+  "prompts": {},
+  "sessions": {
+    "s_d652dd8096823c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "49737e03-1dcc-45c8-ac13-1fd459dc61b7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

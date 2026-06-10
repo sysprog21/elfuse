@@ -1,0 +1,26 @@
+tests/test-chown-overlay.c
+  s_aea9f6733c2ba3::t_e99de9b6f9bb66 33-274
+src/syscall/fs.c
+  s_aea9f6733c2ba3::t_23d35c76716947 84-92
+  s_aea9f6733c2ba3::t_6eb416e41f1c35 577-579
+  s_aea9f6733c2ba3::t_cb6de083f89153 1556-1557,1694-1703,1709-1710,1718-1719
+  s_aea9f6733c2ba3::t_a933c81960199f 497-502,505-512,531-560,565-568
+  s_aea9f6733c2ba3::t_489716f9bee05b 496,503-504,513-530,574-576,580-582,585-587
+  s_aea9f6733c2ba3::t_e485f47d30d318 561-564,583-584
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "8f519953a09870a28e61045f4bc91242d6d8004a",
+  "prompts": {},
+  "sessions": {
+    "s_aea9f6733c2ba3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb067-c04f-7cd0-abe0-c0e590d13793",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

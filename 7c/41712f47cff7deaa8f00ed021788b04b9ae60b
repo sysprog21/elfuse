@@ -1,0 +1,88 @@
+mk/config.mk
+  s_0dfe1b843b7f7d::t_d3750861f67ce7 23-24
+tests/test-chown-overlay.c
+  s_738ad848a60ea9::t_37da0ef87833fe 95-114,208
+  s_d652dd8096823c::t_92aba016b343ec 1-5,10-94,115-207,209-217
+  s_d652dd8096823c::t_e214cc3ec0ab4e 6-9
+tests/test-fork-ipc-protocol-host.c
+  s_0dfe1b843b7f7d::t_aee6bba1d20187 1-45
+src/runtime/fork-state.h
+  s_0dfe1b843b7f7d::t_27dff34e19ac7e 18-19,21-23
+  s_0dfe1b843b7f7d::t_d6ccb408104130 29,44,51
+src/runtime/forkipc.c
+  s_d652dd8096823c::t_9a1d466d283739 40,273-274,1627-1628
+  s_0dfe1b843b7f7d::t_2d66730d616bea 93-94
+  s_0dfe1b843b7f7d::t_b4139c5739d257 226,1502,1527
+  s_d652dd8096823c::t_993b9136f25e2c 275-278
+  s_d652dd8096823c::t_7a81aaaf034be1 1629-1631
+src/syscall/fs-stat.c
+  s_d652dd8096823c::t_9a1d466d283739 17,124-126,129,138-140,143
+tests/manifest.txt
+  s_d652dd8096823c::t_1d758727393d29 206-208
+src/syscall/fs.c
+  s_0d272ecb4b6850::t_747f010d72e35f 1454-1459
+  s_738ad848a60ea9::t_37da0ef87833fe 1946
+  s_0d272ecb4b6850::t_9d8d3e2a6bfa03 1612
+  s_d652dd8096823c::t_94d125c584c445 1947-1948,1956-1960,1967
+  s_0d272ecb4b6850::t_542cfba1eaf75a 1466-1467,1620-1621,1629-1630
+  s_0d272ecb4b6850::t_351587bba249a6 466-500,518,532
+  s_d652dd8096823c::t_9a1d466d283739 32,1949-1955,1961-1965,1968-1972,2002-2011,2025-2035
+  s_0d272ecb4b6850::t_8fff532f4ec165 1605-1611,1613-1614
+  s_0d272ecb4b6850::t_b906c993dfe27d 79-88
+src/syscall/chown-overlay.c
+  s_738ad848a60ea9::t_20663d1b831cfb 148
+  s_738ad848a60ea9::t_b6d562a2b62888 66-79,139-141,155
+  s_d652dd8096823c::t_4469ca5005ed9c 17-22,26-32,42,96,98,108,115,120,142,147,153,157,165,174,191-196,199,203,207-211,219,222,226,234-235,237-252,254,261-262,265-269,275-276
+  s_738ad848a60ea9::t_1f001dd956e9ad 112-113
+  s_d652dd8096823c::t_1d1f4814469e2e 1-16,23-25,33-41,43-65,80-95,97,99-107,109-111,118-119,121-138,143-146,149-152,154,156,158-164,166-173,175-190,197-198,200-202,204-206,212-218,220-221,223-225,227-233,236,253,255-260,263-264,270-274,277-278
+  s_738ad848a60ea9::t_2db52f6e0728b3 114,116-117
+src/syscall/chown-overlay.h
+  s_738ad848a60ea9::t_37da0ef87833fe 25-26,35
+  s_d652dd8096823c::t_7b3386eee65ed7 1-22,27-34,36-49
+mk/tests.mk
+  s_0dfe1b843b7f7d::t_bec864b12a4625 13-14,553-556
+  s_0dfe1b843b7f7d::t_71e9b4260a7c90 40-41,45-46
+Makefile
+  s_0dfe1b843b7f7d::t_3e5c0cb44527b7 146-152
+  s_d652dd8096823c::t_9a1d466d283739 43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7c41712f47cff7deaa8f00ed021788b04b9ae60b",
+  "prompts": {},
+  "sessions": {
+    "s_0d272ecb4b6850": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb01d-834e-7931-a801-df433d031631",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_0dfe1b843b7f7d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb02e-a30d-7463-a0c3-0dc58720d3a9",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_738ad848a60ea9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb010-f8cd-7b00-8d35-77e701d2a7bc",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_d652dd8096823c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "49737e03-1dcc-45c8-ac13-1fd459dc61b7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

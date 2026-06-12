@@ -1,0 +1,48 @@
+src/runtime/forkipc.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 40,93-94,271-276,1622-1623
+  s_89c19584ecfe1e::t_c8eea70c58ea9b 224,1522
+  s_89c19584ecfe1e::t_a86a139ae6dd16 1497
+tests/test-chown-overlay.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-282
+src/syscall/fs-stat.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 17,124-126,129,138-140,143
+src/runtime/fork-state.h
+  s_89c19584ecfe1e::t_7f4d5ddd3f7c28 29
+  s_89c19584ecfe1e::t_fab83eba00fe33 51
+mk/config.mk
+  s_89c19584ecfe1e::t_87b762b9a5f51b 23-24
+Makefile
+  s_89c19584ecfe1e::t_87b762b9a5f51b 43,145-150
+tests/manifest.txt
+  s_89c19584ecfe1e::t_87b762b9a5f51b 206-208
+mk/tests.mk
+  s_89c19584ecfe1e::t_87b762b9a5f51b 13-14,40-41,45-46,553-556
+src/syscall/chown-overlay.h
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-54
+tests/test-fork-ipc-protocol-host.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-10,12-34,47-53
+  s_89c19584ecfe1e::t_e8bd593dba0ba4 11,35-36
+  s_89c19584ecfe1e::t_65a4a0df228097 37-46
+src/syscall/fs.c
+  s_89c19584ecfe1e::t_e327b9436a9efb 2094-2097,2101,2103-2106,2109-2119
+  s_89c19584ecfe1e::t_87b762b9a5f51b 31,78-96,474-588,606,620,1542-1547,1554-1556,1693-1702,1708-1709,1717-1718,2034-2051,2053-2064,2098-2100,2102,2107-2108,2133-2143
+src/syscall/chown-overlay.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-26,30-172,177-189,194-226,229-283
+  s_89c19584ecfe1e::t_23061a661dd7af 27-29,173-176,190-193,227-228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "befeff9d6f3387cff7c9c9a6cd63fec6feacaffe",
+  "prompts": {},
+  "sessions": {
+    "s_89c19584ecfe1e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ebb15-5c6a-7bd2-ad8a-7250e17f7b10",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}

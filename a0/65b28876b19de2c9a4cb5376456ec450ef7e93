@@ -1,7 +1,86 @@
+src/syscall/syscall.c
+  s_6af0d136a483fa::t_6ee293696d00ff 372,543
+src/core/shim-globals.h
+  s_6af0d136a483fa::t_6ee293696d00ff 131-187,217-230,380-396
+  s_6af0d136a483fa::t_cbaefa63c64fa6 231
+src/core/shim.S
+  s_6af0d136a483fa::t_6ee293696d00ff 178-179,186,190-200,205,208,212-214,216-222,225,227-228,402-407,418,423-435,437-438,441-445,447-450,474,476-478,486,497-501,503,517,529,560,562-565,583,592-595,605-615,620-621,636-638,694,698-700,702,705-711,717,719-738,744,774-777,779-796,803-806,811-813,815-819,821-864
+  s_6af0d136a483fa::t_af471b89841b2f 180-181,187-189,201-204,206-207,209-211,215,223-224,226
+  s_6af0d136a483fa::t_3e41816624357b 413
+  s_6af0d136a483fa::t_1fd68e21a706ed 436,446
+  s_6af0d136a483fa::t_de83429bb730ee 451-458
+  s_6af0d136a483fa::t_6e00d0f26829c6 470
+  s_6af0d136a483fa::t_ef0c07dd682a98 504-509,511-513,518-526,530
+  s_6af0d136a483fa::t_6c012b949f1f10 539-546
+  s_6af0d136a483fa::t_e3d462b4fbbe95 619,622-634,639,647,655-656,665-666,668-669,672,675,678,682,693
+  s_6af0d136a483fa::t_4b080174988ea1 640-646,652-653,683-685,687-688,690
+  s_6af0d136a483fa::t_5214b031dcca7a 648-651,654,657-658,662-664,667,670-671,673-674,676-677,686,691
+  s_b3e9551b12db25::t_ec8249f0aa2f41 679
+  s_b3e9551b12db25::t_60a54ede28cb05 680
+  s_6af0d136a483fa::t_45fc819c73655b 689,692
+  s_ccace74ee5e032::t_1666573fd51f0d 701,745
+  s_6af0d136a483fa::t_19c1a05919be23 712-716,718
+  s_6af0d136a483fa::t_89e25433dc5002 739-743
+  s_6af0d136a483fa::t_a2f13a51bf8d17 764-773
+  s_6af0d136a483fa::t_d2a7b48ae50c44 778
+  s_6af0d136a483fa::t_502a368933406d 797-802,807-810,814
+  s_6af0d136a483fa::t_59a8f41b3529d0 820
+src/main.c
+  s_6af0d136a483fa::t_6ee293696d00ff 33,510-517
+src/syscall/proc-identity.c
+  s_6af0d136a483fa::t_6ee293696d00ff 12,214-225,248,262,267,285
+src/runtime/forkipc.c
+  s_6af0d136a483fa::t_6ee293696d00ff 363-369
+src/syscall/proc.h
+  s_6af0d136a483fa::t_6ee293696d00ff 129-130,136-141,145-148,150-153
+src/syscall/sys.c
+  s_6af0d136a483fa::t_6ee293696d00ff 26,225
+src/core/bootstrap.c
+  s_6af0d136a483fa::t_6ee293696d00ff 712
+tests/test-shim-urandom-wrap.c
+  s_b3e9551b12db25::t_5d0835b82e1347 1-87
+tests/manifest.txt
+  s_b3e9551b12db25::t_5d0835b82e1347 55
+src/syscall/exec.c
+  s_6af0d136a483fa::t_6ee293696d00ff 91
+src/core/shim-globals.c
+  s_6af0d136a483fa::t_6ee293696d00ff 12,14,65-73,83-93,148-152,283-285,427-440,446-483
+  s_6af0d136a483fa::t_77369b8c6501c7 74-82
+  s_6af0d136a483fa::t_107773ac109954 153-154
+  s_6af0d136a483fa::t_5b66dea1ac8414 286-294,312-315,317-321,328,338,340
+  s_6af0d136a483fa::t_d080942ff6c895 304-311,316
+  s_6af0d136a483fa::t_cb2557020e0974 441-445
+  s_6af0d136a483fa::t_dde4bc27e9c0a9 484
 ---
 {
   "schema_version": "authorship/3.0.0",
-  "git_ai_version": "1.5.3",
+  "git_ai_version": "1.5.6",
   "base_commit_sha": "a065b28876b19de2c9a4cb5376456ec450ef7e93",
-  "prompts": {}
+  "prompts": {},
+  "sessions": {
+    "s_6af0d136a483fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "11017862-5859-46a6-ac24-1f64b727f73e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null
+    },
+    "s_b3e9551b12db25": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e78c6-01b9-7103-bced-d042ab88f491",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_ccace74ee5e032": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e6de0-1f15-74a3-b6c5-0541ab2125c4",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
 }

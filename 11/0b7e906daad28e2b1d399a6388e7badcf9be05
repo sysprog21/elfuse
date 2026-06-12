@@ -1,0 +1,21 @@
+src/syscall/poll.c
+  s_23417afc113597::t_c3f77c2f11698d 497-500,582-583,1070-1071
+  s_23417afc113597::t_2439c8508e008d 1011
+  s_23417afc113597::t_8e4537b1f11187 208,226-228,248-249
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "110b7e906daad28e2b1d399a6388e7badcf9be05",
+  "prompts": {},
+  "sessions": {
+    "s_23417afc113597": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb09b-1a57-7150-93bf-d8137ec8434a",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

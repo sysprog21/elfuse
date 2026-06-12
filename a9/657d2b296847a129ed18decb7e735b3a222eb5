@@ -1,0 +1,39 @@
+mk/tests.mk
+  s_89c19584ecfe1e::t_87b762b9a5f51b 13-14,40-41,45-46,553-556
+tests/manifest.txt
+  s_89c19584ecfe1e::t_87b762b9a5f51b 206-208
+mk/config.mk
+  s_89c19584ecfe1e::t_87b762b9a5f51b 23-24
+src/syscall/fs.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 31,78-96,474-588,606,620,1542-1547,1554-1556,1693-1702,1708-1709,1717-1718,2034-2053,2055-2066,2096-2105,2119-2129
+tests/test-fork-ipc-protocol-host.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-53
+Makefile
+  s_89c19584ecfe1e::t_87b762b9a5f51b 43,145-150
+src/syscall/chown-overlay.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-283
+src/runtime/forkipc.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 40,93-94,224,271-276,1497,1522,1622-1623
+src/syscall/chown-overlay.h
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-54
+tests/test-chown-overlay.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 1-282
+src/syscall/fs-stat.c
+  s_89c19584ecfe1e::t_87b762b9a5f51b 17,124-126,129,138-140,143
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "a9657d2b296847a129ed18decb7e735b3a222eb5",
+  "prompts": {},
+  "sessions": {
+    "s_89c19584ecfe1e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ebb15-5c6a-7bd2-ad8a-7250e17f7b10",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

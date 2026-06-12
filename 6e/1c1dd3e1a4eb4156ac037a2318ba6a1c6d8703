@@ -1,0 +1,60 @@
+src/core/shim-globals.h
+  s_52b334adaeeb09::t_fbc5fe7e76ea00 110-111
+  s_52b334adaeeb09::t_69e36a75d51f89 331
+src/syscall/net.c
+  s_52b334adaeeb09::t_2d8f34769205db 1049-1051
+src/syscall/time.c
+  s_52b334adaeeb09::t_90d0388b9ee61c 442
+tests/test-mprotect-mt.c
+  s_52b334adaeeb09::t_8de1c26484bdb8 568-569
+src/core/guest.h
+  s_52b334adaeeb09::t_b7993b426a93e8 311
+tests/test-multi-vcpu.c
+  s_52b334adaeeb09::t_86eaab6929b97b 426
+  s_52b334adaeeb09::t_c4a3a4ee8fe2a6 526-527
+src/debug/crashreport.c
+  s_52b334adaeeb09::t_15504442555961 133,136-141
+  s_52b334adaeeb09::t_424728de85bc65 243-245
+  s_52b334adaeeb09::t_2c77d94a27d46f 241-242
+  s_52b334adaeeb09::t_6141114aa8b3d6 134-135
+src/runtime/procemu.c
+  s_52b334adaeeb09::t_e8d1ac1a519a0f 1767-1768
+src/core/vdso.c
+  s_52b334adaeeb09::t_fcb132d1ad0cf4 641
+src/syscall/exec.c
+  s_52b334adaeeb09::t_fd55a09bb92bbf 916-917
+src/core/shim-globals.c
+  s_52b334adaeeb09::t_62689b39d8e6ae 360,362-363
+tests/test-rwx.c
+  s_52b334adaeeb09::t_1c7d1be9bd07d4 232-234
+src/syscall/abi.h
+  s_52b334adaeeb09::t_581e9d72188df4 559
+tests/test-epoll-aba.c
+  s_52b334adaeeb09::t_a7eb4b62a1c52f 8
+src/syscall/sys.c
+  s_52b334adaeeb09::t_f8eee9dcfdbe94 357-360
+src/syscall/fuse.c
+  s_52b334adaeeb09::t_6bbf70a25d7e1b 800-801
+src/core/guest.c
+  s_52b334adaeeb09::t_ea0176ffc5e270 223
+  s_52b334adaeeb09::t_64b017192f3284 2697-2698
+  s_52b334adaeeb09::t_022e48ccb87e4e 584
+src/runtime/forkipc.c
+  s_52b334adaeeb09::t_cf3c14e2e5587d 384
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6e1c1dd3e1a4eb4156ac037a2318ba6a1c6d8703",
+  "prompts": {},
+  "sessions": {
+    "s_52b334adaeeb09": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d96ebe94-12c4-4222-b222-e3b75a596ebc",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

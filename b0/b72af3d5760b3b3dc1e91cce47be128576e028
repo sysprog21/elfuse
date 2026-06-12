@@ -1,0 +1,21 @@
+src/syscall/mem.c
+  s_23417afc113597::t_bc48da66461cf3 1419-1482,1484-1488,1498-1499,1501,1504-1516,1523-1525,1527,1531-1541,1544,1551-1563,1574-1578,1598-1601,1603-1618,1620,1623-1624,1626,1630-1635
+tests/test-msync.c
+  s_23417afc113597::t_a8458aa99a7d6d 23-26,197-200,264-267,312-313,340-342,453-544,555
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "b0b72af3d5760b3b3dc1e91cce47be128576e028",
+  "prompts": {},
+  "sessions": {
+    "s_23417afc113597": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb09b-1a57-7150-93bf-d8137ec8434a",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

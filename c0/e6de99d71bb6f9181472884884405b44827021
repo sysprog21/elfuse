@@ -1,0 +1,31 @@
+tests/test-fork-ipc-protocol-host.c
+  s_c8857bc5a7d4d3::t_3b6a7ebd478de9 35-42
+src/runtime/fork-state.h
+  s_c8857bc5a7d4d3::t_3bb1870a70e061 29
+src/syscall/fs.c
+  s_e1e796f7141d29::t_cf2d597de7d487 1249-1259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "c0e6de99d71bb6f9181472884884405b44827021",
+  "prompts": {},
+  "sessions": {
+    "s_c8857bc5a7d4d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc0157b2-d15c-43ee-9ab2-d353b7a42391",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_e1e796f7141d29": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d21c335-278d-4bdf-9a4a-49f3eca80d41",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}

@@ -384,9 +384,17 @@ static bool snapshot_contains(char *const *entries, int n, const char *name)
 
 /* Translate one EVFILT_VNODE notification into queued inotify events for the
  * watch on host_fd. Returns the number queued, or -1 on buffer overflow (an
- * IN_Q_OVERFLOW marker is queued). Caller holds inotify_lock.
+ * IN_Q_OVERFLOW marker is queued).
+ *
+ * Caller holds inotify_lock; it is held again on return. For a directory write
+ * the lock is released around the opendir/readdir snapshot so filesystem I/O
+ * does not stall inotify operations on other instances. guest_fd identifies
+ * this instance: because the table can change while unlocked, the instance and
+ * the watch are re-validated (by host_fd and dev/ino) before the snapshot is
+ * applied, and a teardown or host_fd reuse during the window discards it.
  */
 static int process_vnode_event(inotify_instance_t *inst,
+                               int guest_fd,
                                int host_fd,
                                uint32_t fflags)
 {
@@ -398,41 +406,77 @@ static int process_vnode_event(inotify_instance_t *inst,
     int queued = 0;
     bool overflow = false;
 
+    char **now = NULL;
+    int now_n = 0;
+    bool snap_ok = false;
+
     if (w->is_dir && (fflags & NOTE_WRITE) && w->path) {
-        char **now = NULL;
-        int now_n = 0;
+        /* Copy the path + identity, then release the lock for the opendir/
+         * readdir snapshot so filesystem I/O does not block other instances.
+         */
+        char *path = strdup(w->path);
+        if (path) {
+            dev_t dev = w->dev;
+            ino_t ino = w->ino;
+            int slot = (int) (inst - inotify_state);
+
+            pthread_mutex_unlock(&inotify_lock);
+            snap_ok = dir_snapshot(path, &now, &now_n);
+            free(path);
+            pthread_mutex_lock(&inotify_lock);
+
+            /* Re-validate across the unlocked window: the instance may have
+             * been closed, or the watch removed and its host_fd reused for a
+             * different file. Any of these discards the stale snapshot.
+             */
+            widx = watch_find_by_hostfd(inst, host_fd);
+            if (inotify_state[slot].guest_fd != guest_fd || widx < 0) {
+                free_dir_snapshot(now, now_n);
+                return 0;
+            }
+            w = &inst->watches[widx];
+            if (!w->is_dir || w->dev != dev || w->ino != ino) {
+                free_dir_snapshot(now, now_n);
+                return 0;
+            }
+        }
+    }
+
+    if (snap_ok) {
         /* Only diff against -- and advance to -- a snapshot that succeeded.
          * On failure keep the previous baseline; the next successful snapshot
          * reconciles whatever changed in between.
          */
-        if (dir_snapshot(w->path, &now, &now_n)) {
-            for (int j = 0; j < now_n && !overflow; j++) {
-                if ((w->mask & IN_CREATE) &&
-                    !snapshot_contains(w->entries, w->n_entries, now[j])) {
-                    if (queue_event(inst, w->wd, IN_CREATE, 0, now[j]) < 0)
-                        overflow = true;
-                    else
-                        queued++;
-                }
+        for (int j = 0; j < now_n && !overflow; j++) {
+            if ((w->mask & IN_CREATE) &&
+                !snapshot_contains(w->entries, w->n_entries, now[j])) {
+                if (queue_event(inst, w->wd, IN_CREATE, 0, now[j]) < 0)
+                    overflow = true;
+                else
+                    queued++;
             }
-            for (int j = 0; j < w->n_entries && !overflow; j++) {
-                if ((w->mask & IN_DELETE) &&
-                    !snapshot_contains(now, now_n, w->entries[j])) {
-                    if (queue_event(inst, w->wd, IN_DELETE, 0, w->entries[j]) <
-                        0)
-                        overflow = true;
-                    else
-                        queued++;
-                }
-            }
-
-            /* Advance the snapshot: the directory state has moved on, and any
-             * names dropped under overflow are covered by IN_Q_OVERFLOW.
-             */
-            free_dir_snapshot(w->entries, w->n_entries);
-            w->entries = now;
-            w->n_entries = now_n;
         }
+        for (int j = 0; j < w->n_entries && !overflow; j++) {
+            if ((w->mask & IN_DELETE) &&
+                !snapshot_contains(now, now_n, w->entries[j])) {
+                if (queue_event(inst, w->wd, IN_DELETE, 0, w->entries[j]) < 0)
+                    overflow = true;
+                else
+                    queued++;
+            }
+        }
+
+        /* Advance the snapshot: the directory state has moved on, and any
+         * names dropped under overflow are covered by IN_Q_OVERFLOW.
+         */
+        free_dir_snapshot(w->entries, w->n_entries);
+        w->entries = now;
+        w->n_entries = now_n;
+    } else {
+        /* File watch or failed snapshot: nothing to apply. free_dir_snapshot
+         * tolerates the NULL result dir_snapshot leaves on failure.
+         */
+        free_dir_snapshot(now, now_n);
     }
 
     if (!overflow) {
@@ -470,20 +514,28 @@ static int collect_events(inotify_instance_t *inst)
     if (nev <= 0)
         return 0;
 
+    /* process_vnode_event may release inotify_lock around directory I/O;
+     * capture the instance identity to detect teardown across that window.
+     */
+    int slot = (int) (inst - inotify_state);
+    int guest_fd = inst->guest_fd;
+
     int collected = 0;
     bool overflow = false;
     for (int i = 0; i < nev; i++) {
-        int r = process_vnode_event(inst, (int) kevs[i].ident,
+        int r = process_vnode_event(inst, guest_fd, (int) kevs[i].ident,
                                     (uint32_t) kevs[i].fflags);
         if (r < 0) {
             overflow = true;
             break;
         }
         collected += r;
+        if (inotify_state[slot].guest_fd != guest_fd)
+            return collected; /* instance closed during snapshot I/O */
     }
 
     /* Signal the self-pipe so poll/epoll sees readability */
-    if (collected > 0 || overflow)
+    if ((collected > 0 || overflow) && inotify_state[slot].guest_fd == guest_fd)
         pipe_signal(inst);
 
     return collected;
@@ -762,6 +814,14 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     if (inst->event_used == 0) {
         int n = collect_events(inst);
 
+        /* collect_events may release the lock for directory I/O; bail if the
+         * instance was closed in that window.
+         */
+        if (inotify_state[slot].guest_fd != guest_fd) {
+            pthread_mutex_unlock(&inotify_lock);
+            return -LINUX_EBADF;
+        }
+
         if (n == 0) {
             if (inst->nonblock) {
                 pthread_mutex_unlock(&inotify_lock);
@@ -803,7 +863,16 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
              * non-blocking collect path).
              */
             int host_fd = (int) kev.ident;
-            if (process_vnode_event(inst, host_fd, (uint32_t) kev.fflags) != 0)
+            int r = process_vnode_event(inst, guest_fd, host_fd,
+                                        (uint32_t) kev.fflags);
+            /* process_vnode_event may release the lock for the snapshot; bail
+             * if the instance was closed in that window.
+             */
+            if (inotify_state[slot].guest_fd != guest_fd) {
+                pthread_mutex_unlock(&inotify_lock);
+                return -LINUX_EBADF;
+            }
+            if (r != 0)
                 pipe_signal(inst);
         }
     }

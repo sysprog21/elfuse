@@ -1236,6 +1236,99 @@ static int64_t sc_fsync_common(guest_t *g,
 #define sc_fsync sc_fsync_common
 #define sc_fdatasync sc_fsync_common
 
+static int64_t sc_sync_file_range(guest_t *g,
+                                  uint64_t x0,
+                                  uint64_t x1,
+                                  uint64_t x2,
+                                  uint64_t x3,
+                                  uint64_t x4,
+                                  uint64_t x5,
+                                  bool verbose)
+{
+    (void) g;
+    (void) x4;
+    (void) x5;
+    (void) verbose;
+
+    int fd = (int) x0;
+    int64_t offset = (int64_t) x1;
+    int64_t nbytes = (int64_t) x2;
+    unsigned int flags = (unsigned int) x3;
+
+    if (offset < 0 || nbytes < 0 || INT64_MAX - offset < nbytes)
+        return -LINUX_EINVAL;
+
+    host_fd_ref_t host_ref;
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
+    if (err < 0)
+        return err;
+
+    struct stat st;
+    if (fstat(host_ref.fd, &st) == 0 && !S_ISREG(st.st_mode) &&
+        !S_ISBLK(st.st_mode) && !S_ISDIR(st.st_mode)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_ESPIPE;
+    }
+
+    /* Validate flags: only bits 1, 2, 4 are valid */
+    if (flags & ~7u) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EINVAL;
+    }
+
+    /*
+     * If the flags only ask to initiate asynchronous write-out without waiting
+     * (i.e. SYNC_FILE_RANGE_WRITE (2)), we return 0 immediately to avoid
+     * blocking. The host OS's background page-out daemon will handle flushing
+     * dirty buffers. WAIT_BEFORE (1) and WAIT_AFTER (4) require blocking until
+     * writes complete.
+     *
+     * Note on macOS/Darwin: macOS does not provide a system call equivalent to
+     * Linux's sync_file_range(2) that can synchronize file data without writing
+     * back metadata. Therefore, we use fsync() to accomplish the
+     * synchronization, which will also write back metadata, unlike native Linux
+     * sync_file_range(2).
+     */
+    int64_t ret = 0;
+    if (flags & (1u | 4u)) {
+        ret = (fsync(host_ref.fd) < 0) ? linux_errno() : 0;
+    }
+
+    host_fd_ref_close(&host_ref);
+    return ret;
+}
+
+static int64_t sc_syncfs(guest_t *g,
+                         uint64_t x0,
+                         uint64_t x1,
+                         uint64_t x2,
+                         uint64_t x3,
+                         uint64_t x4,
+                         uint64_t x5,
+                         bool verbose)
+{
+    (void) g;
+    (void) x1;
+    (void) x2;
+    (void) x3;
+    (void) x4;
+    (void) x5;
+    (void) verbose;
+
+    int fd = (int) x0;
+    host_fd_ref_t host_ref;
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
+    if (err < 0)
+        return err;
+    host_fd_ref_close(&host_ref);
+
+    /* macOS does not have syncfs. We fall back to sync() which synchronizes
+     * all mounted filesystems, satisfying the filesystem-level consistency
+     * guarantee of syncfs. */
+    sync();
+    return 0;
+}
+
 /* getresuid/getresgid: write emulated real/effective/saved IDs to guest ptrs */
 static int64_t sc_getresid_write(guest_t *g,
                                  uint64_t x0,

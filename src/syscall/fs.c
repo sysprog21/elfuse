@@ -1651,8 +1651,9 @@ int64_t sys_renameat2(guest_t *g,
     if (sidecar_rc != SIDECAR_NOT_HANDLED)
         return sidecar_rc;
 
-    if (path_translate_at(olddirfd, oldpath, PATH_TR_NONE, &old_tx) < 0 ||
-        path_translate_at(newdirfd, newpath, PATH_TR_CREATE, &new_tx) < 0)
+    if (path_translate_at(olddirfd, oldpath, PATH_TR_NOFOLLOW, &old_tx) < 0 ||
+        path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
+                          &new_tx) < 0)
         return linux_errno();
     if (old_tx.fuse_path || new_tx.fuse_path)
         return -LINUX_ENOSYS;
@@ -1839,8 +1840,11 @@ int64_t sys_linkat(guest_t *g,
     if (sidecar_rc != SIDECAR_NOT_HANDLED)
         return sidecar_rc;
 
-    if (path_translate_at(olddirfd, oldpath, PATH_TR_NONE, &old_tx) < 0 ||
-        path_translate_at(newdirfd, newpath, PATH_TR_CREATE, &new_tx) < 0)
+    unsigned int old_flags =
+        (flags & LINUX_AT_SYMLINK_FOLLOW) ? PATH_TR_NONE : PATH_TR_NOFOLLOW;
+    if (path_translate_at(olddirfd, oldpath, old_flags, &old_tx) < 0 ||
+        path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
+                          &new_tx) < 0)
         return linux_errno();
     if (old_tx.fuse_path || new_tx.fuse_path)
         return -LINUX_ENOSYS;

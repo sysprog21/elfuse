@@ -75,6 +75,7 @@
 #define SYS_sync 81
 #define SYS_fsync 82
 #define SYS_fdatasync 83
+#define SYS_sync_file_range 84
 #define SYS_utimensat 88
 #define SYS_exit 93
 #define SYS_exit_group 94
@@ -165,6 +166,7 @@
 #define SYS_madvise 233
 #define SYS_wait4 260
 #define SYS_prlimit64 261
+#define SYS_syncfs 267
 #define SYS_renameat2 276
 #define SYS_getrandom 278
 #define SYS_execveat 281

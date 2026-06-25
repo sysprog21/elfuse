@@ -66,6 +66,14 @@
 #define SYS_set_tid_address 96
 #endif
 
+#ifndef SYS_sync_file_range
+#define SYS_sync_file_range 84
+#endif
+
+#ifndef SYS_syncfs
+#define SYS_syncfs 267
+#endif
+
 int passes = 0, fails = 0;
 extern char **environ;
 
@@ -884,6 +892,143 @@ static void test_urandom_open_flags(void)
     PASS();
 }
 
+static void test_sync_file_range(void)
+{
+    TEST("sync_file_range");
+    char path[] = "/tmp/elfuse-sync-file-range-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        FAIL("mkstemp");
+        return;
+    }
+    unlink(path);
+
+    /* Write some data first */
+    const char *msg = "hello sync_file_range";
+    if (write(fd, msg, strlen(msg)) != (ssize_t) strlen(msg)) {
+        FAIL("write");
+        close(fd);
+        return;
+    }
+
+    /* 1. Test basic success case with valid flags (SYNC_FILE_RANGE_WRITE, etc.)
+     */
+    /* Note: SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+     * SYNC_FILE_RANGE_WAIT_AFTER is 7 */
+    if (syscall(SYS_sync_file_range, fd, (off64_t) 0, (off64_t) 0, 7) != 0) {
+        FAIL("sync_file_range basic");
+        close(fd);
+        return;
+    }
+
+    /* 2. Test invalid flags (only bits 1, 2, 4 are valid) */
+    errno = 0;
+    if (syscall(SYS_sync_file_range, fd, (off64_t) 0, (off64_t) 0, 8) != -1 ||
+        errno != EINVAL) {
+        FAIL("sync_file_range invalid flags");
+        close(fd);
+        return;
+    }
+
+    /* 3. Test invalid offset (offset < 0) */
+    errno = 0;
+    if (syscall(SYS_sync_file_range, fd, (off64_t) -1, (off64_t) 0, 7) != -1 ||
+        errno != EINVAL) {
+        FAIL("sync_file_range negative offset");
+        close(fd);
+        return;
+    }
+
+    /* 4. Test invalid nbytes (nbytes < 0) */
+    errno = 0;
+    if (syscall(SYS_sync_file_range, fd, (off64_t) 0, (off64_t) -1, 7) != -1 ||
+        errno != EINVAL) {
+        FAIL("sync_file_range negative nbytes");
+        close(fd);
+        return;
+    }
+
+    /* 5. Test offset + nbytes overflow */
+    errno = 0;
+    off64_t huge_offset = 0x7fffffffffffffffLL;
+    off64_t huge_nbytes = 1;
+    if (syscall(SYS_sync_file_range, fd, huge_offset, huge_nbytes, 7) != -1 ||
+        errno != EINVAL) {
+        FAIL("sync_file_range offset+nbytes overflow");
+        close(fd);
+        return;
+    }
+
+    /* 6. SYNC_FILE_RANGE_WRITE only (async hint) returns 0 without blocking.
+     * Covers the deliberate-divergence branch. */
+    if (syscall(SYS_sync_file_range, fd, (off64_t) 0, (off64_t) 0, 2) != 0) {
+        FAIL("sync_file_range write-only");
+        close(fd);
+        return;
+    }
+
+    /* 7. Bad fd → EBADF. */
+    errno = 0;
+    if (syscall(SYS_sync_file_range, -1, (off64_t) 0, (off64_t) 0, 7) != -1 ||
+        errno != EBADF) {
+        FAIL("sync_file_range bad fd");
+        close(fd);
+        return;
+    }
+
+    /* 8. Unsupported file type (pipe) → ESPIPE. */
+    int pipefds[2];
+    if (pipe(pipefds) == 0) {
+        errno = 0;
+        if (syscall(SYS_sync_file_range, pipefds[0], (off64_t) 0, (off64_t) 0,
+                    7) != -1 ||
+            errno != ESPIPE) {
+            FAIL("sync_file_range pipe ESPIPE");
+            close(pipefds[0]);
+            close(pipefds[1]);
+            close(fd);
+            return;
+        }
+        close(pipefds[0]);
+        close(pipefds[1]);
+    } else {
+        FAIL("pipe creation failed");
+    }
+
+    close(fd);
+    PASS();
+}
+
+static void test_syncfs(void)
+{
+    TEST("syncfs");
+    char path[] = "/tmp/elfuse-syncfs-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        FAIL("mkstemp");
+        return;
+    }
+    unlink(path);
+
+    /* 1. Test basic success case */
+    if (syscall(SYS_syncfs, fd) != 0) {
+        FAIL("syncfs basic");
+        close(fd);
+        return;
+    }
+
+    /* 2. Test invalid fd case (should return EBADF) */
+    errno = 0;
+    if (syscall(SYS_syncfs, -1) != -1 || errno != EBADF) {
+        FAIL("syncfs invalid fd");
+        close(fd);
+        return;
+    }
+
+    close(fd);
+    PASS();
+}
+
 int main(int argc, char **argv)
 {
     printf("test-syscall-smoke: direct syscall smoke coverage\n\n");
@@ -905,6 +1050,8 @@ int main(int argc, char **argv)
     test_sysv_semaphore_ops();
     test_urandom_byte_reads();
     test_urandom_open_flags();
+    test_sync_file_range();
+    test_syncfs();
 
     SUMMARY("test-syscall-smoke");
     return fails > 0 ? 1 : 0;

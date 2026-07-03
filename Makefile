@@ -26,6 +26,7 @@ SRCS := \
     core/shim-globals.c \
     core/bootstrap.c \
     core/rosetta.c \
+    core/launch.c \
     core/sysroot.c \
     runtime/thread.c \
     runtime/futex.c \
@@ -68,15 +69,63 @@ SRCS := \
     debug/gdbstub-reg.c \
     debug/gdbstub-rsp.c \
     debug/log.c \
-    debug/syscall-hist.c
+    debug/syscall-hist.c \
+    oci/ref.c \
+    oci/util.c \
+    oci/cli.c \
+    oci/digest.c \
+    oci/digest-set.c \
+    oci/blob-store.c \
+    oci/media-type.c \
+    oci/manifest.c \
+    oci/store.c \
+    oci/pull.c \
+    oci/inspect.c \
+    oci/dedup-metrics.c \
+    oci/status.c \
+    oci/tar.c \
+    oci/layer-meta.c \
+    oci/layer-apply.c \
+    oci/origin-meta.c \
+    oci/volume.c \
+    oci/volume-list.c \
+    oci/clone-rootfs.c \
+    oci/unpack.c \
+    oci/rebuild-cache.c \
+    oci/runspec.c \
+    oci/user-lookup.c \
+    oci/path-resolve.c \
+    oci/runtime-files.c \
+    oci/run.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
+# cJSON (JSON parser for OCI manifests / config / policy) is consumed as a
+# system shared library via pkg-config, mirroring libarchive / libcurl.
+# Install with `brew install cjson` (macOS) or `apt-get install libcjson-dev`
+# (Linux). It is used across the OCI subsystem, so the include path goes into
+# the global CFLAGS rather than a per-translation-unit override.
+CJSON_CFLAGS := $(shell pkg-config --cflags libcjson)
+CJSON_LIBS := $(shell pkg-config --libs libcjson)
+CFLAGS += $(CJSON_CFLAGS)
+
+# libarchive backs the OCI tar reader (src/oci/tar.c): tar format work
+# (ustar / GNU / PAX) plus gzip and zstd layer decoding in one stop. The
+# macOS SDK ships only the link stub (libarchive.tbd, no headers), so the
+# brew keg provides both; the keg is keg-only, hence the explicit
+# PKG_CONFIG_PATH fallback. Install with `brew install libarchive`
+# (macOS) or `apt-get install libarchive-dev` (Linux).
+LIBARCHIVE_PC := PKG_CONFIG_PATH="$$PKG_CONFIG_PATH:/opt/homebrew/opt/libarchive/lib/pkgconfig:/usr/local/opt/libarchive/lib/pkgconfig" pkg-config
+LIBARCHIVE_CFLAGS := $(shell $(LIBARCHIVE_PC) --cflags libarchive)
+LIBARCHIVE_LIBS := $(shell $(LIBARCHIVE_PC) --libs libarchive)
+
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
-HVF_LDFLAGS := -framework Hypervisor -arch arm64
+# $(LIBARCHIVE_LIBS): tar + gzip/zstd decode for OCI layer unpack.
+# $(CJSON_LIBS): JSON parsing for OCI manifests/config/policy (system cJSON).
+HVF_LDFLAGS := -framework Hypervisor -arch arm64 $(LIBARCHIVE_LIBS) $(CJSON_LIBS)
 
 # Generated headers under build/ that must exist before compiling sources that
 # include them.
@@ -122,6 +171,8 @@ elfuse: $(ELFUSE_BIN)
 
 $(ELFUSE_BIN): $(OBJS) | $(BUILD_DIR)
 	$(call link-and-sign,$@,$(OBJS))
+	@echo "  LN      $(BUILD_DIR)/elfuse-container"
+	$(Q)ln -sf elfuse $(BUILD_DIR)/elfuse-container
 
 # Native test binaries (macOS, Hypervisor.framework)
 
@@ -173,6 +224,165 @@ $(BUILD_DIR)/test-shebang-host: $(BUILD_DIR)/test-shebang-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the OCI reference parser unit test (native macOS binary).
+## Pure C, no HVF, no codesign required.
+$(BUILD_DIR)/test-oci-ref: $(BUILD_DIR)/test-oci-ref.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI digest unit test (native macOS binary). Pure C, no HVF.
+$(BUILD_DIR)/test-oci-digest: $(BUILD_DIR)/test-oci-digest.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI blob store unit test (native macOS binary). Pure C, no HVF.
+$(BUILD_DIR)/test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI manifest / index / config parser unit test (native, no HVF).
+$(BUILD_DIR)/test-oci-manifest: $(BUILD_DIR)/test-oci-manifest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI local store unit test (native macOS, no HVF). Pure C; links
+## against the store wrapper plus its blob-store, digest, and cJSON deps.
+## cJSON is required because store.c now reads / writes index.json.
+$(BUILD_DIR)/test-oci-store: $(BUILD_DIR)/test-oci-store.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI inspect renderer unit test (native macOS, no HVF). Pure
+## offline: no fetcher, no mock server, no libcurl. Pre-populates the store
+## via oci_blob_store_put_bytes + oci_store_put_ref.
+$(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/inspect.o $(BUILD_DIR)/oci/dedup-metrics.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI cross-image dedup metrics unit test (native macOS, no HVF).
+## Drives oci_dedup_metrics_compute against scratch stores hand-populated
+## via oci_blob_store_put_bytes + oci_store_put_ref. Same dependency set
+## as test-oci-inspect, plus oci/dedup-metrics.o.
+$(BUILD_DIR)/test-oci-dedup-metrics: $(BUILD_DIR)/test-oci-dedup-metrics.o $(BUILD_DIR)/oci/dedup-metrics.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI rebuild-cache unit test (native macOS, no HVF). Drives
+## oci_rebuild_cache against scratch stores hand-populated via oci_origin_write
+## into a fixture <volume>/images/sha256-<hex>/ tree, then asserts that
+## <store>/layers/stacks/sha256/<chain>/ entries are created (commit) or left
+## absent (dry-run). Same dependency set as test-oci-store plus oci/rebuild-
+## cache.o.
+$(BUILD_DIR)/test-oci-rebuild-cache: $(BUILD_DIR)/test-oci-rebuild-cache.o $(BUILD_DIR)/oci/rebuild-cache.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI store-wide status unit test (native macOS, no HVF). Drives
+## oci_status_compute against scratch stores hand-populated via
+## stage_image / oci_origin_write fixture helpers and asserts the aggregated
+## struct fields (pin entries, unpacked entries, reachable + populated
+## ratios, store totals). Same dependency set as test-oci-store plus
+## oci/status.o.
+$(BUILD_DIR)/test-oci-status: $(BUILD_DIR)/test-oci-status.o $(BUILD_DIR)/oci/status.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI runspec unit test (native macOS, no HVF). Merges
+## image-config runtime block + CLI overrides; the rootfs-driven
+## symbolic-User cases write /etc/passwd and /etc/group fixtures under
+## /tmp, so the link island pulls in oci/user-lookup.o.
+$(BUILD_DIR)/test-oci-runspec: $(BUILD_DIR)/test-oci-runspec.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/user-lookup.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI User-field resolver unit test (native macOS, no HVF).
+## Pure C; the test builds scratch /tmp rootfses with synthetic
+## /etc/passwd / /etc/group and drives oci_user_lookup across the seven
+## OCI image-spec User shapes plus the policy edges.
+$(BUILD_DIR)/test-oci-user: $(BUILD_DIR)/test-oci-user.o $(BUILD_DIR)/oci/user-lookup.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI path-resolve unit test (native macOS, no HVF). Touches
+## the host filesystem to build a small fake sysroot tree and drives
+## oci_path_resolve through realpath / stat / symlink-follow scenarios.
+## Pure C; no libcurl, no zstd, no HVF.
+$(BUILD_DIR)/test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/core/elf.o $(BUILD_DIR)/debug/log.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI run orchestrator unit test (native macOS, no HVF). Links
+## the same OCI graph the unpack test pulls in, plus oci/run.o,
+## oci/runspec.o, and oci/path-resolve.o. Does NOT link core/launch.o:
+## the test ships an in-file elfuse_launch stub that aborts when called,
+## and every case installs a launch hook via oci_run_set_launch_for_testing
+## before invoking oci_run, so the real VM bring-up never runs from a test.
+$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/user-lookup.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/runtime-files.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/elf.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(LIBARCHIVE_LIBS) $(CJSON_LIBS)
+
+## Build the OCI runtime-files injection unit test (native macOS, no HVF).
+## Pure C; the test drives oci_runtime_files_inject against scratch
+## /tmp/elfuse-rf-* run directories and verifies the synthesised
+## /etc/{resolv.conf,hosts,hostname} content.
+$(BUILD_DIR)/test-oci-runtime-files: $(BUILD_DIR)/test-oci-runtime-files.o $(BUILD_DIR)/oci/runtime-files.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI fixture builder (used by the OCI compat tests). Standalone tool
+## that synthesises a complete OCI store from uncompressed-tar layers
+## plus image-config flags. Used by tests/test-oci-compat.sh and
+## available standalone for one-off "shape an image from local files"
+## experiments.
+$(BUILD_DIR)/oci-fixture-builder: $(BUILD_DIR)/lib/oci-fixture-builder.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## tar.c is the only translation unit in elfuse that includes libarchive
+## headers; scope the keg-only include path to it.
+$(BUILD_DIR)/oci/tar.o: CFLAGS += $(LIBARCHIVE_CFLAGS)
+
+## Build the OCI sidecar metadata unit test (native macOS, no HVF). Pure
+## C; links against cJSON for the JSON round-trip plus the layer-meta
+## translation unit.
+$(BUILD_DIR)/test-oci-meta: $(BUILD_DIR)/test-oci-meta.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI origin sidecar unit test (native macOS, no HVF). Drives
+## oci_origin_write against a tmpdir and verifies the resulting
+## .elfuse-origin.json by parsing it back through cJSON.
+$(BUILD_DIR)/test-oci-origin: $(BUILD_DIR)/test-oci-origin.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(CJSON_LIBS)
+
+## Build the OCI layer applier unit test (native macOS, no HVF). Builds
+## tar payloads in memory, drives them through oci_layer_apply into a
+## tmp tree, and verifies filesystem state via lstat/readlink.
+$(BUILD_DIR)/test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(LIBARCHIVE_LIBS) $(CJSON_LIBS)
+
+## Build the OCI volume bootstrap unit test (native macOS, no HVF).
+## Default-volume test is gated behind OCI_VOLUME_TEST=1 because it
+## costs ~150 ms of hdiutil orchestration on first run. Links
+## src/core/sysroot.o for the hdiutil wrappers PR #33 introduced.
+$(BUILD_DIR)/test-oci-volume: $(BUILD_DIR)/test-oci-volume.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI clone-rootfs unit test (native macOS, no HVF). The
+## test skips itself if clonefile returns ENOTSUP (non-APFS scratch).
+$(BUILD_DIR)/test-oci-clone: $(BUILD_DIR)/test-oci-clone.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI unpack orchestrator integration smoke (native macOS,
+## no HVF). Pulls in the full OCI stack so the dependency edges
+## between modules are exercised at link time.
+$(BUILD_DIR)/test-oci-unpack: $(BUILD_DIR)/test-oci-unpack.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(BUILD_DIR)/oci/util.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(LIBARCHIVE_LIBS) $(CJSON_LIBS)
 
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.

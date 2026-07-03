@@ -21,7 +21,16 @@ endif
 # Exclude native macOS test files from cross-compilation
 NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-tlbi-encoder-host.c \
-                tests/test-fork-ipc-protocol-host.c
+                tests/test-fork-ipc-protocol-host.c \
+                tests/test-oci-ref.c \
+                tests/test-oci-digest.c tests/test-oci-blob-store.c \
+                tests/test-oci-manifest.c \
+                tests/test-oci-store.c \
+                tests/test-oci-inspect.c tests/test-oci-meta.c \
+                tests/test-oci-layer-apply.c tests/test-oci-volume.c \
+                tests/test-oci-clone.c tests/test-oci-unpack.c \
+                tests/test-oci-runspec.c tests/test-oci-path-resolve.c \
+                tests/test-oci-run.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c
 SPECIAL_TEST_BINS := $(BUILD_DIR)/test-lowbase-mem-200000 $(BUILD_DIR)/test-lowbase-mem-300000
 

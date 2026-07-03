@@ -13,6 +13,16 @@
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
         test-sysroot-host-fallback \
         test-sysroot-create-paths test-fork-ipc-protocol-host test-identity-override-host \
+        test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
+        test-oci-store \
+        test-oci-inspect test-oci-dedup-metrics test-oci-rebuild-cache \
+        test-oci-status \
+        test-oci-meta \
+        test-oci-origin \
+        test-oci-layer-apply test-oci-volume test-oci-clone \
+        test-oci-unpack test-oci-runspec test-oci-user test-oci-path-resolve \
+        test-oci-runtime-files \
+        test-oci-run test-oci-compat oci-fixture-builder \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir perf
@@ -71,6 +81,48 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-rosetta-cli
 	@printf "\n$(BLUE)━━━ hot-syscall guardrail ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-bench-guardrail
+	@printf "\n$(BLUE)━━━ OCI reference parser unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-ref
+	@printf "\n$(BLUE)━━━ OCI digest unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-digest
+	@printf "\n$(BLUE)━━━ OCI blob store unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-blob-store
+	@printf "\n$(BLUE)━━━ OCI manifest parser unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-manifest
+	@printf "\n$(BLUE)━━━ OCI store unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-store
+	@printf "\n$(BLUE)━━━ OCI inspect renderer unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-inspect
+	@printf "\n$(BLUE)━━━ OCI cross-image dedup metrics unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-dedup-metrics
+	@printf "\n$(BLUE)━━━ OCI rebuild-cache unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-rebuild-cache
+	@printf "\n$(BLUE)━━━ OCI store-wide status unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-status
+	@printf "\n$(BLUE)━━━ OCI sidecar metadata unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-meta
+	@printf "\n$(BLUE)━━━ OCI origin sidecar unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-origin
+	@printf "\n$(BLUE)━━━ OCI layer applier unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-layer-apply
+	@printf "\n$(BLUE)━━━ OCI volume bootstrap unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-volume
+	@printf "\n$(BLUE)━━━ OCI clone-rootfs unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-clone
+	@printf "\n$(BLUE)━━━ OCI unpack orchestrator smoke ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-unpack
+	@printf "\n$(BLUE)━━━ OCI runspec resolver unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-runspec
+	@printf "\n$(BLUE)━━━ OCI User-field resolver unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-user
+	@printf "\n$(BLUE)━━━ OCI path-resolve unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-path-resolve
+	@printf "\n$(BLUE)━━━ OCI runtime-files injection unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-runtime-files
+	@printf "\n$(BLUE)━━━ OCI run orchestrator unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-run
+	@printf "\n$(BLUE)━━━ OCI compat shell smoke ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-compat
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
@@ -91,6 +143,134 @@ test-bench-guardrail: $(BENCH_GUARDRAIL_DEPS)
 	    BENCH_GUARDRAIL_REQUIRE_STATIC="$(BENCH_GUARDRAIL_REQUIRE_STATIC)" \
 	    LINUX_TOOLCHAIN="$(LINUX_TOOLCHAIN)" \
 	    bash tests/test-bench-guardrail.sh
+
+## Run the OCI image reference parser unit tests (native, no HVF)
+test-oci-ref: $(BUILD_DIR)/test-oci-ref
+	@$(BUILD_DIR)/test-oci-ref
+
+## Run the OCI digest unit tests (native, no HVF)
+test-oci-digest: $(BUILD_DIR)/test-oci-digest
+	@$(BUILD_DIR)/test-oci-digest
+
+## Run the OCI blob store unit tests (native, no HVF)
+test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store
+	@$(BUILD_DIR)/test-oci-blob-store
+
+## Run the OCI manifest / index / config parser unit tests (native, no HVF)
+test-oci-manifest: $(BUILD_DIR)/test-oci-manifest
+	@$(BUILD_DIR)/test-oci-manifest
+
+## Run the OCI local store unit tests (native, no HVF)
+test-oci-store: $(BUILD_DIR)/test-oci-store
+	@$(BUILD_DIR)/test-oci-store
+
+## Run the OCI inspect renderer unit tests (native, no HVF, no network)
+test-oci-inspect: $(BUILD_DIR)/test-oci-inspect
+	@$(BUILD_DIR)/test-oci-inspect
+
+## Run the OCI cross-image dedup metrics unit tests (native, no HVF, no network).
+## validates oci_dedup_metrics_compute against pin-only
+## and pin + unpacked-tree scratch stores.
+test-oci-dedup-metrics: $(BUILD_DIR)/test-oci-dedup-metrics
+	@$(BUILD_DIR)/test-oci-dedup-metrics
+
+## Run the OCI rebuild-cache unit tests (native, no HVF, no network).
+## validates oci_rebuild_cache against scratch
+## stores hand-populated via oci_origin_write into a fixture
+## <volume>/images/sha256-<hex>/ tree.
+test-oci-rebuild-cache: $(BUILD_DIR)/test-oci-rebuild-cache
+	@$(BUILD_DIR)/test-oci-rebuild-cache
+
+## Run the OCI store-wide status unit tests (native, no HVF, no network).
+## validates oci_status_compute against scratch stores
+## hand-populated via stage_image + oci_origin_write fixture helpers.
+test-oci-status: $(BUILD_DIR)/test-oci-status
+	@$(BUILD_DIR)/test-oci-status
+
+## Run the OCI sidecar metadata unit tests (native, no HVF, no network)
+test-oci-meta: $(BUILD_DIR)/test-oci-meta
+	@$(BUILD_DIR)/test-oci-meta
+
+## Run the OCI origin sidecar unit tests (native, no HVF, no network).
+## Covers oci_origin_write + cJSON parse-back round-trips. The oci run
+## orchestrator sees the file in unpacked image directories; the
+## garbage collector's root-set walker consumes it to attribute layer
+## blobs back to live sysroots.
+test-oci-origin: $(BUILD_DIR)/test-oci-origin
+	@$(BUILD_DIR)/test-oci-origin
+
+## Run the OCI layer applier unit tests (native, no HVF, no network)
+test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply
+	@$(BUILD_DIR)/test-oci-layer-apply
+
+## Run the OCI volume bootstrap unit tests (native, no HVF). The
+## default-sparsebundle case is gated behind OCI_VOLUME_TEST=1 because
+## hdiutil orchestration is slow.
+test-oci-volume: $(BUILD_DIR)/test-oci-volume
+	@$(BUILD_DIR)/test-oci-volume
+
+## Run the OCI clone-rootfs unit tests (native, no HVF). Skips itself
+## if the test scratch directory does not support clonefile.
+test-oci-clone: $(BUILD_DIR)/test-oci-clone
+	@$(BUILD_DIR)/test-oci-clone
+
+## Run the OCI unpack orchestrator smoke (native, no HVF). The full
+## end-to-end fixture is gated behind OCI_VOLUME_TEST=1.
+test-oci-unpack: $(BUILD_DIR)/test-oci-unpack
+	@$(BUILD_DIR)/test-oci-unpack
+
+## Run the OCI runspec resolver unit tests (native, no HVF, no network).
+## Feeds hand-built oci_image_runtime_t literals plus synthetic CLI flags
+## through oci_runspec_build and asserts argv / envp / uid / cwd outputs
+## against the override matrix and Env policy. Symbolic User cases
+## write scratch /tmp rootfses for /etc/passwd lookup.
+test-oci-runspec: $(BUILD_DIR)/test-oci-runspec
+	@$(BUILD_DIR)/test-oci-runspec
+
+## Run the OCI User-field resolver unit tests (native, no HVF, no network).
+## validates oci_user_lookup against scratch rootfses
+## carrying synthetic /etc/passwd / /etc/group; covers the seven OCI
+## image-spec User shapes plus the policy edges (digit-name collision,
+## missing passwd, name-not-found, invalid characters).
+test-oci-user: $(BUILD_DIR)/test-oci-user
+	@$(BUILD_DIR)/test-oci-user
+
+## Run the OCI guest PATH resolver unit tests (native, no HVF, no network).
+## Builds a fake sysroot tree under /tmp and drives oci_path_resolve
+## against it: PATH search, symlink-follow, escape-symlink skip,
+## EACCES on noexec, ENOENT diagnostics with searched-dirs list.
+test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve
+	@$(BUILD_DIR)/test-oci-path-resolve
+
+## Run the OCI runtime-files injection unit tests (native, no HVF, no network).
+## validates oci_runtime_files_inject against scratch
+## run directories, covering fresh-/etc creation, symlink overwrite,
+## regular-file overwrite, and the synthesised /etc/{resolv.conf,
+## hosts, hostname} content.
+test-oci-runtime-files: $(BUILD_DIR)/test-oci-runtime-files
+	@$(BUILD_DIR)/test-oci-runtime-files
+
+## Run the OCI run orchestrator unit tests (native, no HVF, no network).
+## Covers oci_cli_run argument parsing plus oci_run early-failure
+## paths against a case-insensitive volume; the launch backend is
+## stubbed via oci_run_set_launch_for_testing so the test never spins
+## up a real HVF VM. End-to-end launch coverage lives in the compat
+## shell suite.
+test-oci-run: $(BUILD_DIR)/test-oci-run
+	@$(BUILD_DIR)/test-oci-run
+
+## Build the OCI fixture builder tool. Standalone executable used by
+## tests/test-oci-compat.sh and available for hand-rolled fixtures.
+oci-fixture-builder: $(BUILD_DIR)/oci-fixture-builder
+
+## Run the OCI run compatibility shell smoke (native, no HVF). Default
+## mode covers CLI surface + fixture-builder integration; OCI_COMPAT_TEST=1
+## gates the heavy end-to-end harness (hdiutil sparsebundle + actual
+## elfuse oci run launches); OCI_FETCH_ONLINE=1 gates the docker.io
+## pull + run sibling. Requires test-hello (assembly aarch64 ELF) +
+## elfuse + oci-fixture-builder pre-built.
+test-oci-compat: $(ELFUSE_BIN) $(BUILD_DIR)/oci-fixture-builder $(TEST_HELLO_DEP)
+	@bash tests/test-oci-compat.sh
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@set -e; \

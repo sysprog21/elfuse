@@ -140,13 +140,17 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
         return true;
     }
 
-    if (strncmp(path, "/proc", 5) != 0)
-        return false;
-
+    const char *virt = NULL;
     char virt_buf[64];
-    const char *virt = proc_virtual_dir_path(path, virt_buf, sizeof(virt_buf));
-    if (!virt)
-        virt = proc_stateful_file_path(path);
+
+    if (strncmp(path, "/proc", 5) == 0) {
+        virt = proc_virtual_dir_path(path, virt_buf, sizeof(virt_buf));
+        if (!virt)
+            virt = proc_stateful_file_path(path);
+    } else if (strncmp(path, "/dev", 4) == 0) {
+        virt = proc_dev_special_path(path);
+    }
+
     if (!virt)
         return false;
 

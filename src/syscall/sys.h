@@ -14,10 +14,17 @@
 
 #include <stdint.h>
 #include "core/guest.h"
+#include "syscall/abi.h"
 
 /* System info syscall handlers. */
 
 int64_t sys_uname(guest_t *g, uint64_t buf_gva);
+
+/* Returns a pointer to the cached uname struct. Stable for process
+ * lifetime; safe to read concurrently. /proc/sys/kernel/{ostype,
+ * osrelease,hostname,domainname} read this so uname(2) and procfs agree.
+ */
+const linux_utsname_t *sys_uname_cached(void);
 int64_t sys_getrandom(guest_t *g,
                       uint64_t buf_gva,
                       uint64_t buflen,

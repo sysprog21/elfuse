@@ -180,6 +180,11 @@ int64_t sys_uname(guest_t *g, uint64_t buf_gva)
     return 0;
 }
 
+const linux_utsname_t *sys_uname_cached(void)
+{
+    return &cached_uname;
+}
+
 /* Linux getrandom(2) flags. arc4random_buf is always non-blocking and always
  * seeded, so GRND_NONBLOCK / GRND_RANDOM / GRND_INSECURE all collapse to the
  * same behavior here. Unknown flag bits must still return EINVAL per kernel

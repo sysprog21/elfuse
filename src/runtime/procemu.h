@@ -171,3 +171,12 @@ void proc_pty_restore_keepalive(int master_host_fd,
                                 int slave_host_fd,
                                 uint32_t linux_pts_num,
                                 const char *slave_path);
+
+/* Returns the canonical proc_path tag for runtime-emulated /dev paths
+ * whose write semantics require FD-level dispatch (currently /dev/full,
+ * which must answer ENOSPC for any non-zero write), or NULL when the
+ * path needs no special tagging. Callers store the tag in
+ * fd_entry_t.proc_path so proc_intercept_write can recognise the FD on
+ * later writes.
+ */
+const char *proc_dev_special_path(const char *path);

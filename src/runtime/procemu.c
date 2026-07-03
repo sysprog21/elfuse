@@ -2674,6 +2674,25 @@ int proc_intercept_open(const guest_t *g,
             host_accmode = O_RDWR;
     } else if (!strcmp(path, "/dev/tty"))
         host_dev = "/dev/tty";
+    else if (!strcmp(path, "/dev/full")) {
+        /* Linux /dev/full read returns a NUL stream like /dev/zero, while
+         * any non-zero write must fail with ENOSPC. Back the FD with host
+         * /dev/zero so read and lseek work without extra plumbing; the
+         * proc_path tag set by resolve_virtual_path() routes writes through
+         * proc_intercept_write below for the ENOSPC short-circuit.
+         */
+        host_dev = "/dev/zero";
+        if (host_accmode == O_WRONLY)
+            host_accmode = O_RDWR;
+    } else if (!strcmp(path, "/dev/console")) {
+        /* macOS /dev/console is reserved for the kernel and non-root
+         * processes cannot open it. Container runtimes synthesise the
+         * guest /dev/console from the controlling tty; mirror that by
+         * redirecting to host /dev/tty so guest writes reach the
+         * controlling terminal when one exists.
+         */
+        host_dev = "/dev/tty";
+    }
 
     if (host_dev) {
         /* Restrict to access mode plus descriptor flags. Creation/truncation
@@ -3125,6 +3144,65 @@ int proc_intercept_open(const guest_t *g,
         int r = proc_open_mounts_node(path);
         if (r != PROC_NOT_INTERCEPTED)
             return r;
+    }
+
+    /* /proc/self/cgroup -> empty cgroup v2 layout. elfuse runs outside any
+     * cgroup hierarchy, so emit the canonical "no cgroup" form ("0::/").
+     * Container detectors (systemd-detect-virt, runc internal, podman) read
+     * this and interpret "0::/" as "host environment, not containerized".
+     * Returning a fake v1 hierarchy here would mislead those probes into
+     * thinking elfuse is itself a container manager.
+     */
+    if (!strcmp(path, "/proc/self/cgroup"))
+        return proc_emit_literal("0::/\n");
+
+    /* /proc/sys/kernel/{ostype,osrelease,hostname} mirror the fields of the
+     * cached uname struct so uname(2) and procfs agree. Some init scripts
+     * and language runtimes (Go runtime/sys/unix, Java's sun.misc.VM) read
+     * both and abort on mismatch.
+     */
+    if (!strcmp(path, "/proc/sys/kernel/ostype"))
+        return proc_emit_literal("Linux\n");
+    if (!strcmp(path, "/proc/sys/kernel/osrelease"))
+        return proc_emit_fmt("%s\n", sys_uname_cached()->release);
+    if (!strcmp(path, "/proc/sys/kernel/hostname"))
+        return proc_emit_fmt("%s\n", sys_uname_cached()->nodename);
+
+    /* /proc/self/comm -> the comm-name string + LF. ps, htop, and pstree
+     * read this when /proc/<pid>/stat parsing is inconvenient. Matches the
+     * second field of /proc/self/stat (basename of the loaded ELF).
+     */
+    if (!strcmp(path, "/proc/self/comm"))
+        return proc_emit_fmt("%s\n", proc_comm_name());
+
+    /* /proc/self/statm -> seven page-count fields:
+     *   size resident shared text lib data dt
+     * top, ps -o vsz/rss, and htop read this in place of the parser-hostile
+     * /proc/self/stat. Compute from g->regions[] using the same source as
+     * the vsize/rss columns of /proc/self/stat. shared/lib/dt stay zero
+     * (Linux docs note "dt" is unused since 2.6; shared and lib have weak
+     * meaning without a real page cache).
+     */
+    if (!strcmp(path, "/proc/self/statm")) {
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0)
+            page_size = 4096;
+        uint64_t total = 0, resident = 0, text = 0, data = 0;
+        for (int i = 0; i < g->nregions; i++) {
+            uint64_t pages = (g->regions[i].end - g->regions[i].start) /
+                             (uint64_t) page_size;
+            total += pages;
+            if (g->regions[i].prot != LINUX_PROT_NONE)
+                resident += pages;
+            if (g->regions[i].prot & LINUX_PROT_EXEC)
+                text += pages;
+            else if (g->regions[i].prot & LINUX_PROT_WRITE)
+                data += pages;
+        }
+        return proc_emit_fmt(
+            "%llu %llu 0 %llu 0 %llu 0\n", (unsigned long long) total,
+            (unsigned long long) resident, (unsigned long long) text,
+            (unsigned long long) data);
     }
 
     /* OOM nodes share one stored adjustment.
@@ -3598,6 +3676,12 @@ int proc_intercept_stat(const char *path, struct stat *st)
         "/proc/filesystems",
         "/proc/sys/vm/mmap_min_addr",
         "/proc/sys/kernel/randomize_va_space",
+        "/proc/sys/kernel/ostype",
+        "/proc/sys/kernel/osrelease",
+        "/proc/sys/kernel/hostname",
+        "/proc/self/cgroup",
+        "/proc/self/comm",
+        "/proc/self/statm",
         "/proc/net/tcp",
         "/proc/net/tcp6",
         "/proc/net/udp",
@@ -3836,6 +3920,20 @@ int proc_intercept_readv(int guest_fd,
     return 1;
 }
 
+const char *proc_dev_special_path(const char *path)
+{
+    /* /dev/full is the only runtime-emulated /dev node that needs a
+     * post-open proc_path tag right now: read/lseek borrow host
+     * /dev/zero behaviour, but every non-zero write must fail with
+     * ENOSPC, and proc_intercept_write keys that off the tag below.
+     * Other /dev nodes (null, zero, random, urandom, tty, console) use
+     * the host device directly and need no FD-level dispatch.
+     */
+    if (path && !strcmp(path, "/dev/full"))
+        return "/dev/full";
+    return NULL;
+}
+
 int proc_intercept_write(int guest_fd,
                          int host_fd,
                          const void *buf,
@@ -3847,6 +3945,20 @@ int proc_intercept_write(int guest_fd,
     fd_entry_t snap;
     if (!fd_snapshot(guest_fd, &snap))
         return 0;
+
+    /* /dev/full: any non-zero write must fail with ENOSPC. The POSIX
+     * zero-length write rule (return 0 with no side effect) still
+     * applies and short-circuits before the device error.
+     */
+    if (!strcmp(snap.proc_path, "/dev/full")) {
+        if (count == 0) {
+            *written_out = 0;
+            return 1;
+        }
+        errno = ENOSPC;
+        return -1;
+    }
+
     int kind = proc_oom_path_kind(snap.proc_path);
     if (kind == OOM_PATH_SCORE) {
         /* Linux: oom_score has no write handler. proc_reg_write returns -EIO

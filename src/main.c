@@ -34,6 +34,8 @@
 #include "core/shim-globals.h"
 #include "core/sysroot.h"
 
+#include "oci/cli.h"
+
 #include "runtime/forkipc.h"
 #include "runtime/proctitle.h"
 
@@ -223,6 +225,32 @@ int main(int argc, char **argv)
         argv = rewritten;
         argc = 5;
     }
+
+    /* BusyBox-style multicall dispatch: invoked through a symlink named
+     * elfuse-container (ln -s elfuse elfuse-container), the whole command
+     * line is the container CLI — `elfuse-container run alpine:3` is
+     * `elfuse oci run alpine:3`. One binary, two spellings; oci_cli_main
+     * brands usage text with the alias it sees in argv[0]. Only the
+     * basename participates in the lookup, so an invocation name cannot
+     * smuggle a directory component into applet selection, and an
+     * unrecognized name falls through to the default elfuse behavior
+     * (closed applet table, matching BusyBox). An execve with an empty
+     * argv leaves argv[0] NULL; treat that as the default entry.
+     */
+    const char *invoked_as = "elfuse";
+    if (argc > 0 && argv[0]) {
+        const char *argv0_slash = strrchr(argv[0], '/');
+        invoked_as = argv0_slash ? argv0_slash + 1 : argv[0];
+    }
+    if (!strcmp(invoked_as, "elfuse-container"))
+        return oci_cli_main(argc, argv);
+
+    /* `elfuse oci ...` is a self-contained CLI subcommand: image distribution
+     * never touches Hypervisor.framework, so dispatch before any guest setup
+     * to avoid host-DC-ZVA / entitlement checks the user never asked for.
+     */
+    if (argc > 1 && !strcmp(argv[1], "oci"))
+        return oci_cli_main(argc - 1, argv + 1);
 
     /* --help and --version do not require an ELF path. */
     if (argc > 1) {

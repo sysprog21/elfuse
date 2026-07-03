@@ -51,6 +51,14 @@ boot-time overhead those tools impose.
 - macOS 13 or newer
 - Xcode Command Line Tools, `clang`, `codesign`, and GNU `make`
 - GNU `objcopy` from Homebrew `binutils`, or `llvm-objcopy`
+- `libarchive` and `cJSON` libraries with headers for OCI image support,
+  resolved via `pkg-config`: `brew install libarchive cjson` (macOS) or
+  `apt-get install libarchive-dev libcjson-dev` (Linux). The `oci`
+  subcommand reads tar layers (with gzip/zstd decoding) through
+  libarchive and parses JSON manifests. `elfuse oci pull` additionally
+  shells out to `skopeo` at runtime (`brew install skopeo`) for registry
+  transfers; the rest of the build
+  links the system `libcurl` and `zlib` that ship with macOS.
 - Hypervisor entitlement: `com.apple.security.hypervisor`
 
 For guest test binaries, the project also expects an AArch64 Linux cross

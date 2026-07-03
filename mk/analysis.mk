@@ -14,10 +14,14 @@ SHELL_SCRIPTS := $(shell git ls-files --cached --others --exclude-standard \
 PYTHON_FORMAT_FILES := $(shell git ls-files --cached --others --exclude-standard \
                               -- '*.py')
 
-## Run clang-tidy on all source files
+## Run clang-tidy on all source files. LIBARCHIVE_CFLAGS comes from the
+## parent Makefile (pkg-config libarchive, keg-only) so src/oci/tar.c,
+## which is the only translation unit that #includes <archive.h>, can
+## resolve the header during analysis.
 lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 	@echo "  TIDY    src/"
-	$(Q)$(CLANG_TIDY) $(SRCS) -- $(CFLAGS) -Isrc -I$(BUILD_DIR)
+	$(Q)$(CLANG_TIDY) $(SRCS) -- $(CFLAGS) -Isrc -I$(BUILD_DIR) \
+	    $(LIBARCHIVE_CFLAGS)
 
 ## Run clang static analyzer (scan-build)
 analyze:

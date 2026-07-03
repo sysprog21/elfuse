@@ -11,13 +11,20 @@
  *   3. /proc/self/cmdline is non-empty
  *   4. /proc/self/maps contains [heap] and [stack]
  *   5. /proc/self/status contains correct PID
+ *   6. /proc/self/cgroup is cgroup v2 "0::/" (not containerized)
+ *   7. /proc/self/comm is non-empty, single LF-terminated line
+ *   8. /proc/self/statm has seven page-count fields with size >= resident
+ *   9. /proc/sys/kernel/ostype is "Linux"
+ *  10. /proc/sys/kernel/osrelease agrees with uname(2)
+ *  11. /proc/sys/kernel/hostname agrees with uname(2)
  *
- * Syscalls: openat(56), read(63), close(57), getpid(172)
+ * Syscalls: openat(56), read(63), close(57), getpid(172), uname(160)
  */
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/utsname.h>
 
 #include "test-harness.h"
 #include "test-util.h"
@@ -133,6 +140,135 @@ int main(void)
                 EXPECT_TRUE(found, "PID mismatch in status");
             } else {
                 FAIL("empty status");
+            }
+        }
+    }
+
+    TEST("procfs: /proc/self/cgroup is cgroup v2 \"0::/\"");
+    {
+        n = raw_read_file_nul("/proc/self/cgroup", buf, sizeof(buf));
+        if (n < 0)
+            FAIL("open failed");
+        else
+            EXPECT_TRUE(strstr(buf, "0::/") != NULL,
+                        "cgroup v2 root marker missing");
+    }
+
+    TEST("procfs: /proc/self/cgroup ends with newline");
+    {
+        n = raw_read_file_nul("/proc/self/cgroup", buf, sizeof(buf));
+        if (n <= 0)
+            FAIL("open failed");
+        else
+            EXPECT_TRUE(buf[n - 1] == '\n', "cgroup last byte not LF");
+    }
+
+    TEST("procfs: /proc/self/comm is single LF-terminated line");
+    {
+        n = raw_read_file_nul("/proc/self/comm", buf, sizeof(buf));
+        if (n <= 0) {
+            FAIL("open failed");
+        } else {
+            bool ok = (n >= 2) && (buf[n - 1] == '\n');
+            /* Only one newline allowed (Linux semantic). */
+            int lfs = 0;
+            for (ssize_t i = 0; i < n; i++)
+                if (buf[i] == '\n')
+                    lfs++;
+            EXPECT_TRUE(ok && lfs == 1, "comm shape wrong");
+        }
+    }
+
+    TEST("procfs: /proc/self/statm has seven fields");
+    {
+        n = raw_read_file_nul("/proc/self/statm", buf, sizeof(buf));
+        if (n <= 0) {
+            FAIL("open failed");
+        } else {
+            int fields = 0;
+            bool in_token = false;
+            for (ssize_t i = 0; i < n; i++) {
+                char c = buf[i];
+                if (c == '\n')
+                    break;
+                if (c == ' ') {
+                    in_token = false;
+                } else if (!in_token) {
+                    in_token = true;
+                    fields++;
+                }
+            }
+            EXPECT_TRUE(fields == 7, "statm field count wrong");
+        }
+    }
+
+    TEST("procfs: /proc/self/statm size >= resident");
+    {
+        n = raw_read_file_nul("/proc/self/statm", buf, sizeof(buf));
+        if (n <= 0) {
+            FAIL("open failed");
+        } else {
+            unsigned long long total = 0, resident = 0;
+            /* Skip whitespace, parse digits for the first two fields. */
+            ssize_t i = 0;
+            while (i < n && (buf[i] == ' ' || buf[i] == '\t'))
+                i++;
+            while (i < n && buf[i] >= '0' && buf[i] <= '9')
+                total = total * 10 + (unsigned long long) (buf[i++] - '0');
+            while (i < n && (buf[i] == ' ' || buf[i] == '\t'))
+                i++;
+            while (i < n && buf[i] >= '0' && buf[i] <= '9')
+                resident =
+                    resident * 10 + (unsigned long long) (buf[i++] - '0');
+            EXPECT_TRUE(total >= resident, "statm total smaller than resident");
+        }
+    }
+
+    TEST("procfs: /proc/sys/kernel/ostype is \"Linux\"");
+    {
+        n = raw_read_file_nul("/proc/sys/kernel/ostype", buf, sizeof(buf));
+        if (n <= 0)
+            FAIL("open failed");
+        else
+            EXPECT_TRUE(n == 6 && !memcmp(buf, "Linux\n", 6),
+                        "ostype content mismatch");
+    }
+
+    TEST("procfs: /proc/sys/kernel/osrelease agrees with uname");
+    {
+        struct utsname u;
+        if (uname(&u) < 0) {
+            FAIL("uname syscall failed");
+        } else {
+            n = raw_read_file_nul("/proc/sys/kernel/osrelease", buf,
+                                  sizeof(buf));
+            if (n <= 0) {
+                FAIL("open failed");
+            } else {
+                /* Trim trailing LF before strcmp. */
+                if (buf[n - 1] == '\n')
+                    buf[n - 1] = '\0';
+                EXPECT_TRUE(!strcmp(buf, u.release),
+                            "osrelease disagrees with uname.release");
+            }
+        }
+    }
+
+    TEST("procfs: /proc/sys/kernel/hostname agrees with uname");
+    {
+        struct utsname u;
+        if (uname(&u) < 0) {
+            FAIL("uname syscall failed");
+        } else {
+            n = raw_read_file_nul("/proc/sys/kernel/hostname", buf,
+                                  sizeof(buf));
+            if (n <= 0) {
+                FAIL("open failed");
+            } else {
+                if (buf[n - 1] == '\n')
+                    buf[n - 1] = '\0';
+                EXPECT_TRUE(!strcmp(buf, u.nodename),
+                            "hostname disagrees with uname.nodename");
             }
         }
     }

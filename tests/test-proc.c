@@ -7,10 +7,10 @@
  *
  * Tests: /proc/self/cmdline, /proc/meminfo, /proc/stat, /proc/version,
  *        /proc/filesystems, /proc/mounts, readlink(/proc/self/exe),
- *        /dev/null, /dev/zero, /dev/urandom
+ *        /dev/null, /dev/zero, /dev/urandom, /dev/full, /dev/console
  *
- * Syscalls exercised: openat(56), read(63), write(64), readlinkat(78),
- *                     close(57)
+ * Syscalls exercised: openat(56), read(63), write(64), writev(66),
+ *                     lseek(62), readlinkat(78), close(57)
  */
 
 #include <stdlib.h>
@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 
 #include "test-harness.h"
 #include "test-util.h"
@@ -494,6 +495,117 @@ int main(void)
             close(fd);
         } else
             FAIL("open failed");
+    }
+
+    /* /dev/full: write fails with ENOSPC, read returns NUL stream. */
+    TEST("/dev/full write returns ENOSPC");
+    {
+        int fd = open("/dev/full", O_RDWR);
+        if (fd < 0) {
+            FAIL("open failed");
+        } else {
+            char data[] = "test";
+            ssize_t w = write(fd, data, 4);
+            int saved_errno = errno;
+            if (w == 0)
+                FAIL("zero-byte short write instead of error");
+            else if (w > 0)
+                FAIL("write unexpectedly succeeded");
+            else
+                EXPECT_TRUE(saved_errno == ENOSPC, "wrong errno on write");
+
+            /* POSIX zero-length write must short-circuit cleanly. */
+            ssize_t zw = write(fd, data, 0);
+            EXPECT_TRUE(zw == 0, "zero-length write did not return 0");
+            close(fd);
+        }
+    }
+
+    TEST("/dev/full read returns zeros");
+    {
+        int fd = open("/dev/full", O_RDONLY);
+        if (fd < 0) {
+            FAIL("open failed");
+        } else {
+            unsigned char buf[64];
+            memset(buf, 0xFF, sizeof(buf));
+            ssize_t r = read(fd, buf, sizeof(buf));
+            if (r != 64) {
+                FAIL("read wrong size");
+            } else {
+                int all_zero = 1;
+                for (size_t i = 0; i < sizeof(buf); i++) {
+                    if (buf[i] != 0) {
+                        all_zero = 0;
+                        break;
+                    }
+                }
+                EXPECT_TRUE(all_zero, "not all zeros");
+            }
+            close(fd);
+        }
+    }
+
+    TEST("/dev/full lseek");
+    {
+        int fd = open("/dev/full", O_RDWR);
+        if (fd < 0) {
+            FAIL("open failed");
+        } else {
+            off_t pos = lseek(fd, 4096, SEEK_SET);
+            EXPECT_TRUE(pos == 4096, "lseek returned wrong offset");
+            close(fd);
+        }
+    }
+
+    TEST("/dev/full writev returns ENOSPC");
+    {
+        int fd = open("/dev/full", O_WRONLY);
+        if (fd < 0) {
+            FAIL("open failed");
+        } else {
+            char a[] = "abcd";
+            char b[] = "wxyz";
+            struct iovec iov[2] = {
+                {a, 4},
+                {b, 4},
+            };
+            ssize_t w = writev(fd, iov, 2);
+            int saved_errno = errno;
+            if (w > 0)
+                FAIL("writev unexpectedly succeeded");
+            else
+                EXPECT_TRUE(saved_errno == ENOSPC, "wrong errno on writev");
+            close(fd);
+        }
+    }
+
+    /* /dev/console: container-style alias for the controlling tty. With no
+     * controlling terminal (CI invocation via pipe), the host /dev/tty
+     * open returns ENXIO on Linux but ENOTTY on macOS; ENOENT / EACCES /
+     * EPERM are also tolerated so a real regression still surfaces.
+     */
+    TEST("/dev/console open");
+    {
+        int fd = open("/dev/console", O_RDWR);
+        if (isatty(STDIN_FILENO)) {
+            if (fd < 0) {
+                FAIL("/dev/console open under tty failed");
+            } else {
+                ssize_t w = write(fd, "", 0);
+                EXPECT_TRUE(w == 0, "zero-byte write on /dev/console");
+                close(fd);
+            }
+        } else {
+            int saved_errno = errno;
+            int ok =
+                (fd >= 0) || (saved_errno == ENXIO || saved_errno == ENOTTY ||
+                              saved_errno == EACCES || saved_errno == ENOENT ||
+                              saved_errno == EPERM);
+            EXPECT_TRUE(ok, "unexpected errno from non-tty open");
+            if (fd >= 0)
+                close(fd);
+        }
     }
 
     TEST("writable /dev/zero and /dev/random");

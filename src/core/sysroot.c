@@ -6,6 +6,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <spawn.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -209,10 +210,35 @@ static int spawn_capture_stdout(char *const argv[],
     return 0;
 }
 
-static int spawn_simple(char *const argv[])
+static int spawn_simple_common(char *const argv[], bool silence_stdout)
 {
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_t *actions_ptr = NULL;
+    if (silence_stdout) {
+        /* hdiutil prints messages like '"diskN" ejected.' to stdout,
+         * even on success. Callers that promise a clean stdout contract
+         * (oci unpack / oci clone) must not inherit that noise, so
+         * redirect the child's fd 1 to /dev/null. stderr is left alone
+         * so genuine error messages still surface for diagnostics.
+         */
+        if (posix_spawn_file_actions_init(&actions) != 0) {
+            errno = ENOMEM;
+            return -1;
+        }
+        if (posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+                                             "/dev/null", O_WRONLY, 0) != 0) {
+            posix_spawn_file_actions_destroy(&actions);
+            errno = EIO;
+            return -1;
+        }
+        actions_ptr = &actions;
+    }
+
     pid_t pid = -1;
-    int spawn_ret = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+    int spawn_ret =
+        posix_spawnp(&pid, argv[0], actions_ptr, NULL, argv, environ);
+    if (actions_ptr)
+        posix_spawn_file_actions_destroy(actions_ptr);
     if (spawn_ret != 0) {
         errno = spawn_ret;
         return -1;
@@ -229,6 +255,11 @@ static int spawn_simple(char *const argv[])
         return -1;
     }
     return 0;
+}
+
+static int spawn_simple_silent(char *const argv[])
+{
+    return spawn_simple_common(argv, true);
 }
 
 static int parse_attach_mountpoint(const char *plist,
@@ -406,11 +437,11 @@ static int sysroot_detach_mountpoint_force(const char *mount_path, bool force)
     if (force) {
         char *const argv[] = {"hdiutil", "detach", "-force",
                               (char *) mount_path, NULL};
-        return spawn_simple(argv);
+        return spawn_simple_silent(argv);
     }
 
     char *const argv[] = {"hdiutil", "detach", (char *) mount_path, NULL};
-    return spawn_simple(argv);
+    return spawn_simple_silent(argv);
 }
 
 static bool sysroot_mountpoint_is_active(const char *mount_path)
@@ -492,7 +523,7 @@ int sysroot_create_mount(const char *mount_path, sysroot_mount_t *mount)
                                      "elfuse_sysroot",
                                      mount->image_path,
                                      NULL};
-        if (spawn_simple(create_argv) < 0) {
+        if (spawn_simple_silent(create_argv) < 0) {
             log_error("sysroot: hdiutil create failed for %s: %s",
                       mount->image_path, strerror(errno));
             return -1;

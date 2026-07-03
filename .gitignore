@@ -1,6 +1,10 @@
 build/
 archive/
-externals/
+# externals/ holds downloaded fixtures (kernel, rootfs, packages) that are
+# fetched on demand; tracking them in git would balloon the repo. Nothing
+# under externals/ is vendored now -- cJSON and zstd are both consumed as
+# system libraries via pkg-config.
+externals/*
 lib/modules/
 *.o
 *.bin

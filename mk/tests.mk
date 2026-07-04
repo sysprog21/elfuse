@@ -15,7 +15,7 @@
         test-sysroot-create-paths test-fork-ipc-protocol-host test-identity-override-host \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
-        test-sysroot-nofollow test-sysroot-chdir perf
+        test-sysroot-nofollow test-sysroot-chdir test-fd-limit-stock perf
 
 ## Build and run the assembly hello world test
 test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
@@ -43,6 +43,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 		$(BUILD_DIR)/test-fork-ipc-protocol-host \
 		$(BUILD_DIR)/test-identity-override-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
+	@printf "\n$(BLUE)━━━ stock fd-limit (256) regression ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-fd-limit-stock
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
 	@printf "\n$(BLUE)━━━ fork IPC protocol identity unit test ━━━$(RESET)\n"
@@ -73,6 +75,15 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-rosetta-cli
 	@printf "\n$(BLUE)━━━ hot-syscall guardrail ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-bench-guardrail
+
+## Rerun the fd-heavy stress test with the soft RLIMIT_NOFILE forced to the
+## stock macOS default (256): fdtable_init must raise the host limit itself.
+FD_LIMIT_STOCK_DEPS := $(ELFUSE_BIN)
+ifndef GUEST_TEST_BINARIES
+  FD_LIMIT_STOCK_DEPS += $(BUILD_DIR)/test-stress
+endif
+test-fd-limit-stock: $(FD_LIMIT_STOCK_DEPS)
+	@bash -c 'ulimit -S -n 256 && exec "$(ELFUSE_BIN)" "$(TEST_DIR)/test-stress"'
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.

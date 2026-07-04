@@ -10,10 +10,12 @@
  * access through fd_lock.
  */
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <errno.h>
 #include <dirent.h>
@@ -145,11 +147,35 @@ static int fd_bitmap_find_free(int minfd)
 
 /* fdtable_init. */
 
+/* Raise the host RLIMIT_NOFILE soft limit to min(OPEN_MAX, rlim_max), the
+ * largest value macOS accepts. The stock soft limit is 256, far below the
+ * FD_TABLE_SIZE fds this table advertises to guests, and every guest fd needs
+ * at least one backing host fd.
+ *
+ * Returns without changing anything if getrlimit fails or the limit already
+ * meets the target (an inherited higher limit is never lowered); setrlimit
+ * failure is ignored.
+ */
+static void fd_raise_host_nofile(void)
+{
+    struct rlimit rl;
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return;
+    rlim_t want = (rl.rlim_max < OPEN_MAX) ? rl.rlim_max : OPEN_MAX;
+    if (rl.rlim_cur >= want)
+        return;
+    rl.rlim_cur = want;
+    (void) setrlimit(RLIMIT_NOFILE, &rl);
+}
+
 /* Initialize the FD table and bitmap, pre-open stdin/stdout/stderr. Extracted
  * from syscall_init(); call before any guest code runs.
  */
 void fdtable_init(void)
 {
+    fd_raise_host_nofile();
+
     memset(fd_table, 0, sizeof(fd_table));
 
     /* Mark all FDs as free in bitmap */

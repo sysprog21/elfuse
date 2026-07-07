@@ -68,6 +68,7 @@ SRCS := \
     debug/gdbstub-reg.c \
     debug/gdbstub-rsp.c \
     debug/log.c \
+    debug/runtime-stats.c \
     debug/syscall-hist.c
 
 SRCS := $(addprefix src/,$(SRCS))

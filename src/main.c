@@ -43,6 +43,7 @@
 
 #include "debug/gdbstub.h"
 #include "debug/log.h"
+#include "debug/runtime-stats.h"
 #include "debug/syscall-hist.h"
 
 static int parse_int_arg(const char *s, int min, int max, int *out)
@@ -188,6 +189,7 @@ static int host_dc_zva_assert(void)
 int main(int argc, char **argv)
 {
     log_init();
+    runtime_stats_init(argc, argv);
     /* Resolve ELFUSE_STARTUP_TRACE before any guest syscall can fire so the
      * histogram captures the very first dynamic-linker openat.
      */
@@ -670,19 +672,11 @@ int main(int argc, char **argv)
     /* Tear down debugger state before freeing guest/vCPU resources. */
     gdb_stub_shutdown();
 
-    /* Diagnostic counter dump runs before guest_destroy so the shim_data
-     * mapping is still valid. ELFUSE_SHIM_STATS is the gate; an unset variable
-     * produces no output.
-     */
-    if (shim_globals_stats_enabled())
-        shim_globals_counters_dump(&g);
-
-    /* Dump the startup histogram before guest_destroy so any cleanup-path
-     * syscalls (closing host fds, unmapping the slab) do not appear in the
-     * captured set. The dump is a no-op when ELFUSE_STARTUP_TRACE=syscalls was
-     * not requested.
-     */
-    syscall_hist_dump();
+    /* Diagnostic dumps run before guest_destroy so shim_data is still valid. */
+    if (runtime_stats_enabled())
+        runtime_stats_dump(&g, "exit", true);
+    else
+        syscall_hist_dump();
     cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
                            have_host_cwd ? host_cwd : NULL, guest_argv,
                            guest_argc, elf_path, sysroot_path);

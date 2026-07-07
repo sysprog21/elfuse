@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include <stdio.h>
+
 #include <Hypervisor/Hypervisor.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -378,6 +380,15 @@ int64_t sys_waitid(guest_t *g,
 void proc_request_exit_group(int code);
 void proc_clear_exit_group(void);
 int proc_exit_group_requested(void);
+
+/* Dump the vCPU exit-reason accounting (total returns, VTIMER masks, spurious
+ * cancels, null-exit share) to stderr. Intended for the process-exit path when
+ * runtime-stats are enabled (ELFUSE_SHIM_STATS or ELFUSE_RUNTIME_STATS, via
+ * shim_globals_stats_enabled()); counters stay zero when the gate is unset.
+ */
+void proc_dump_vcpu_exit_stats(void);
+void proc_dump_vcpu_exit_stats_json(FILE *out);
+void proc_reset_vcpu_exit_stats(void);
 
 /* vCPU run loop. */
 

@@ -48,6 +48,7 @@
 #include "syscall/signal.h"
 
 #include "debug/log.h"
+#include "debug/runtime-stats.h"
 #include "debug/syscall-hist.h"
 
 /* Linux clone flags. Shared by the fork-child TID-sync emulation below and
@@ -65,6 +66,13 @@
 /* fork_child_main. */
 
 static int fork_child_vfork_notify_fd = -1;
+
+static void fork_child_destroy_guest(guest_t *g, const char *reason)
+{
+    if (runtime_stats_enabled())
+        runtime_stats_dump(g, reason, true);
+    guest_destroy(g);
+}
 
 void fork_notify_vfork_exec(void)
 {
@@ -91,11 +99,13 @@ int fork_child_main(int ipc_fd,
         log_set_level(LOG_DEBUG);
 
     /* The startup syscall histogram captures dynamic-linker bring-up of the
-     * top-level guest only; the child resumes from the parent's snapshot, so
-     * its first syscalls would be steady-state traffic that confuses the dump.
-     * Disable before any guest syscall is dispatched.
+     * top-level guest only; the child resumes from the parent's snapshot. Keep
+     * child syscall recording only for ELFUSE_RUNTIME_STATS, whose contract is
+     * whole-workload cost attribution.
      */
-    syscall_hist_disable();
+    const char *rt_stats = getenv("ELFUSE_RUNTIME_STATS");
+    if (!rt_stats || !rt_stats[0] || strcmp(rt_stats, "0") == 0)
+        syscall_hist_disable();
 
     /* Reset static process/thread/futex state before receiving the parent
      * snapshot so the incoming metadata survives child restore.
@@ -205,7 +215,7 @@ int fork_child_main(int ipc_fd,
         ((hdr.pt_pool_next - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
         log_error("fork-child: invalid pt_pool_next 0x%llx",
                   (unsigned long long) hdr.pt_pool_next);
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         close(ipc_fd);
         return 1;
     }
@@ -214,7 +224,7 @@ int fork_child_main(int ipc_fd,
         ((ttbr0_off - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
         log_error("fork-child: invalid ttbr0 0x%llx",
                   (unsigned long long) hdr.ttbr0);
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         close(ipc_fd);
         return 1;
     }
@@ -250,19 +260,19 @@ int fork_child_main(int ipc_fd,
     ipc_registers_t regs;
     if (fork_ipc_read_all(ipc_fd, &regs, sizeof(regs)) < 0) {
         log_error("fork-child: failed to read registers");
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         return 1;
     }
 
     if (fork_ipc_recv_memory_regions(ipc_fd, &g) < 0) {
         log_error("fork-child: failed to receive memory regions");
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         return 1;
     }
 
     if (fork_ipc_recv_fd_table(ipc_fd, &g) < 0) {
         log_error("fork-child: failed to receive fd table");
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         return 1;
     }
 
@@ -271,20 +281,20 @@ int fork_child_main(int ipc_fd,
      */
     if (fork_ipc_recv_pty_keepalives(ipc_fd) < 0) {
         log_error("fork-child: failed to receive pty keepalives");
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         return 1;
     }
 
     signal_state_t sig;
     if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
         log_error("fork-child: failed to receive process state");
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         return 1;
     }
 
     if (chown_overlay_recv(ipc_fd) < 0) {
         log_error("fork-child: failed to receive chown overlay");
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         return 1;
     }
 
@@ -339,7 +349,7 @@ int fork_child_main(int ipc_fd,
      * the single-threaded child at this point).
      */
     if (shim_globals_install_per_vcpu(vcpu, &g, hdr.child_pid) < 0) {
-        guest_destroy(&g);
+        fork_child_destroy_guest(&g, "fork-child-error");
         return 1;
     }
 
@@ -407,6 +417,7 @@ int fork_child_main(int ipc_fd,
      */
     shim_globals_init(&g);
     shim_globals_publish_stats_gate(&g);
+    runtime_stats_reset_baseline();
     shim_globals_set_trace_enabled(&g, verbose);
     shim_globals_publish_pid(&g, hdr.child_pid, hdr.parent_pid);
     shim_globals_publish_creds(&g, hdr.uid, hdr.euid, hdr.gid, hdr.egid);
@@ -451,7 +462,7 @@ int fork_child_main(int ipc_fd,
     /* The child resumes from the captured fork frame and returns 0 to EL0. */
     int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
 
-    guest_destroy(&g);
+    fork_child_destroy_guest(&g, "fork-child-exit");
     return exit_code;
 }
 

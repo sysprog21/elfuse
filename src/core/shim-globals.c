@@ -465,13 +465,36 @@ void shim_globals_counters_dump(const guest_t *g)
     }
 }
 
+void shim_globals_counters_dump_json(FILE *out, const guest_t *g)
+{
+    fputc('{', out);
+    bool first = true;
+    for (unsigned i = 0; i < SHIM_COUNTERS_N; i++) {
+        const char *name = counter_names[i];
+        uint64_t v = shim_globals_counter_get(g, i);
+        if (!name && v == 0)
+            continue;
+        char namebuf[32];
+        if (!name) {
+            snprintf(namebuf, sizeof(namebuf), "reserved%u", i);
+            name = namebuf;
+        }
+        fprintf(out, "%s\"%s\":%llu", first ? "" : ",", name,
+                (unsigned long long) v);
+        first = false;
+    }
+    fputc('}', out);
+}
+
 static pthread_once_t stats_once = PTHREAD_ONCE_INIT;
 static bool stats_enabled_cache;
 
 static void stats_resolve(void)
 {
     const char *v = getenv("ELFUSE_SHIM_STATS");
-    stats_enabled_cache = v && v[0] && strcmp(v, "0") != 0;
+    const char *rv = getenv("ELFUSE_RUNTIME_STATS");
+    stats_enabled_cache = (v && v[0] && strcmp(v, "0") != 0) ||
+                          (rv && rv[0] && strcmp(rv, "0") != 0);
 }
 
 bool shim_globals_stats_enabled(void)

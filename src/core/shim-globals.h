@@ -39,6 +39,8 @@
 
 #pragma once
 
+#include <stdio.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -391,6 +393,7 @@ void shim_globals_refill_urandom_ring(guest_t *g);
  */
 uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot);
 void shim_globals_counters_dump(const guest_t *g);
+void shim_globals_counters_dump_json(FILE *out, const guest_t *g);
 
 /* ELFUSE_SHIM_STATS env-var gate (idempotent / cached). When enabled the exit
  * path dumps the counter table to stderr so a single bench run attributes every

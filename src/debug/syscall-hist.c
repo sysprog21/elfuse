@@ -1,5 +1,5 @@
 /*
- * Dynamic-linker startup syscall histogram
+ * Dynamic-linker startup / steady-state syscall histogram
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -40,6 +40,7 @@ enum {
     HIST_FROZEN = 2,
 };
 static _Atomic int hist_mode = HIST_OFF;
+static bool hist_steady;
 
 /* Resolved once via pthread_once. The resolver is idempotent so multiple
  * dispatch contexts converge on the same answer without locking.
@@ -59,14 +60,13 @@ static const char *_Atomic hist_freeze_reason = NULL;
  */
 static _Atomic uint64_t hist_first_ns = 0;
 
-/* Count of recorders currently inside the update window. Bumped at entry to
- * syscall_hist_record before the mode probe and decremented after the slot
- * updates retire. syscall_hist_dump waits for this to drain to zero after
- * flipping mode to OFF, so a sibling vCPU that already passed the mode probe
- * cannot land its atomic_fetch_add on count / total_ns / max_ns after the dump
- * has read those slots. Without this barrier the dump and a mid-flight recorder
- * race and the dump's totals can silently lose updates or read torn
- * intermediate values.
+/* Count of recorders currently inside the update window. syscall_hist_enter()
+ * first does a cheap disabled-mode probe, then bumps this guard and rechecks
+ * mode. syscall_hist_dump waits for the guard to drain after flipping mode to
+ * OFF, so a sibling vCPU that already passed the guarded probe cannot land its
+ * atomic_fetch_add on count / total_ns / max_ns after the dump has read those
+ * slots. Without this barrier the dump and a mid-flight recorder race and the
+ * dump's totals can silently lose updates or read torn intermediate values.
  */
 static _Atomic int hist_active_recorders = 0;
 
@@ -98,9 +98,10 @@ static const char *const hist_names[HIST_TABLE_SIZE] = {
 };
 
 /* Parse ELFUSE_STARTUP_TRACE. Accepts comma-separated tokens. "syscalls" or
- * "all" turns the histogram on. The legacy "1" value (steps trace) and the
- * "steps" token leave the histogram off so existing scripts keep working. Token
- * matching is whole-word against a fixed allow-list to avoid matching
+ * "all" turns the startup histogram on. "syscalls-steady" records until guest
+ * exit instead of freezing at execve. The legacy "1" value (steps trace) and
+ * the "steps" token leave the histogram off so existing scripts keep working.
+ * Token matching is whole-word against a fixed allow-list to avoid matching
  * "syscalls_disabled" or similar.
  */
 static bool env_contains_token(const char *env, const char *tok)
@@ -124,8 +125,15 @@ static bool env_contains_token(const char *env, const char *tok)
 static void hist_init_resolve(void)
 {
     const char *env = getenv("ELFUSE_STARTUP_TRACE");
-    if (env_contains_token(env, "syscalls") || env_contains_token(env, "all"))
+    const char *rt = getenv("ELFUSE_RUNTIME_STATS");
+    if ((rt && rt[0] && strcmp(rt, "0") != 0) ||
+        env_contains_token(env, "syscalls-steady")) {
+        hist_steady = true;
         atomic_store_explicit(&hist_mode, HIST_RECORD, memory_order_release);
+    } else if (env_contains_token(env, "syscalls") ||
+               env_contains_token(env, "all")) {
+        atomic_store_explicit(&hist_mode, HIST_RECORD, memory_order_release);
+    }
 }
 
 void syscall_hist_init(void)
@@ -142,37 +150,54 @@ bool syscall_hist_enabled(void)
 
 uint64_t syscall_hist_now_ns(void)
 {
-    if (!syscall_hist_enabled())
-        return 0;
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
         return 0;
     return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
 }
 
-void syscall_hist_record(int nr, uint64_t ns)
+uint64_t syscall_hist_enter(void)
 {
-    /* Enter the recording window before the mode probe. The matching decrement
-     * runs on every exit path. syscall_hist_dump waits for the counter to drain
-     * to zero after flipping mode to OFF; that wait is what guarantees the
-     * dump's reads see no further updates.
+    syscall_hist_init();
+    if (atomic_load_explicit(&hist_mode, memory_order_acquire) != HIST_RECORD)
+        return 0;
+
+    /* Increment the recorder guard after the cheap disabled probe, then recheck
+     * the mode. The first probe keeps normal runs off the global RMW hot path;
+     * the second preserves the dump race protection if a dump flips RECORD to
+     * OFF between the first probe and the guard increment.
      */
     atomic_fetch_add_explicit(&hist_active_recorders, 1, memory_order_acquire);
-    if (atomic_load_explicit(&hist_mode, memory_order_acquire) != HIST_RECORD)
-        goto leave;
-    if (nr < 0 || nr >= HIST_TABLE_SIZE)
+    if (atomic_load_explicit(&hist_mode, memory_order_acquire) != HIST_RECORD) {
+        atomic_fetch_sub_explicit(&hist_active_recorders, 1,
+                                  memory_order_release);
+        return 0;
+    }
+    uint64_t ns = syscall_hist_now_ns();
+    if (!ns) {
+        atomic_fetch_sub_explicit(&hist_active_recorders, 1,
+                                  memory_order_release);
+        return 0;
+    }
+    return ns;
+}
+
+void syscall_hist_record(int nr, uint64_t start_ns, uint64_t end_ns)
+{
+    /* Guard was entered by syscall_hist_enter(); always release on exit. end_ns
+     * == 0 or end_ns < start_ns means the end clock failed: skip the slot
+     * update but still release the guard so the dump can proceed.
+     */
+    if (!end_ns || end_ns < start_ns || nr < 0 || nr >= HIST_TABLE_SIZE)
         goto leave;
 
-    /* Cheap-load probe before the clock_gettime: hist_first_ns is set exactly
-     * once at the first record, so subsequent records skip the syscall
-     * entirely. Without this gate, every record paid for a CLOCK_MONOTONIC read
-     * whose result was thrown away by the failing CAS.
-     */
+    uint64_t ns = end_ns - start_ns;
+
     if (atomic_load_explicit(&hist_first_ns, memory_order_relaxed) == 0) {
         uint64_t expected = 0;
-        atomic_compare_exchange_strong_explicit(
-            &hist_first_ns, &expected, syscall_hist_now_ns(),
-            memory_order_relaxed, memory_order_relaxed);
+        atomic_compare_exchange_strong_explicit(&hist_first_ns, &expected,
+                                                start_ns, memory_order_relaxed,
+                                                memory_order_relaxed);
     }
 
     hist_slot_t *slot = &hist_table[nr];
@@ -180,8 +205,7 @@ void syscall_hist_record(int nr, uint64_t ns)
     atomic_fetch_add_explicit(&slot->total_ns, ns, memory_order_relaxed);
 
     /* CAS-loop max keeps the slot lock-free under contention from sibling vCPUs
-     * racing on the same syscall number. Reads use relaxed order because the
-     * dump only consumes them after the active-recorder count drains.
+     * racing on the same syscall number.
      */
     uint64_t prev = atomic_load_explicit(&slot->max_ns, memory_order_relaxed);
     while (ns > prev) {
@@ -196,6 +220,9 @@ leave:
 
 void syscall_hist_freeze(const char *reason)
 {
+    if (hist_steady)
+        return;
+
     /* Publish the reason BEFORE the state transition so a concurrent dump that
      * wins the FROZEN -> OFF exchange cannot observe HIST_FROZEN with a NULL
      * reason and print the wrong dump header. The store on hist_freeze_reason
@@ -223,6 +250,28 @@ void syscall_hist_disable(void)
     atomic_store_explicit(&hist_mode, HIST_OFF, memory_order_release);
 }
 
+void syscall_hist_reset(void)
+{
+    atomic_store_explicit(&hist_mode, HIST_OFF, memory_order_release);
+    while (atomic_load_explicit(&hist_active_recorders, memory_order_acquire) >
+           0) {
+    }
+    for (int i = 0; i < HIST_TABLE_SIZE; i++) {
+        atomic_store_explicit(&hist_table[i].count, 0, memory_order_relaxed);
+        atomic_store_explicit(&hist_table[i].total_ns, 0, memory_order_relaxed);
+        atomic_store_explicit(&hist_table[i].max_ns, 0, memory_order_relaxed);
+    }
+    atomic_store_explicit(&hist_first_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&hist_freeze_reason, NULL, memory_order_release);
+    if (hist_steady)
+        atomic_store_explicit(&hist_mode, HIST_RECORD, memory_order_release);
+}
+
+static uint64_t sat_add_u64(uint64_t a, uint64_t b)
+{
+    return (a > UINT64_MAX - b) ? UINT64_MAX : a + b;
+}
+
 /* Sort key for the dump. Keys carry the slot index so the qsort comparator can
  * resolve names without consulting hist_table again.
  */
@@ -246,6 +295,112 @@ static int hist_row_cmp(const void *a, const void *b)
     if (ra->count > rb->count)
         return -1;
     return ra->nr - rb->nr;
+}
+
+static int hist_snapshot_rows(hist_row_t rows[HIST_TABLE_SIZE],
+                              uint64_t *total_count,
+                              uint64_t *total_ns)
+{
+    int nrows = 0;
+    *total_count = 0;
+    *total_ns = 0;
+    for (int i = 0; i < HIST_TABLE_SIZE; i++) {
+        uint64_t cnt =
+            atomic_load_explicit(&hist_table[i].count, memory_order_relaxed);
+        if (cnt == 0)
+            continue;
+        rows[nrows].nr = i;
+        rows[nrows].count = cnt;
+        rows[nrows].total_ns =
+            atomic_load_explicit(&hist_table[i].total_ns, memory_order_relaxed);
+        rows[nrows].max_ns =
+            atomic_load_explicit(&hist_table[i].max_ns, memory_order_relaxed);
+        *total_count = sat_add_u64(*total_count, cnt);
+        *total_ns = sat_add_u64(*total_ns, rows[nrows].total_ns);
+        nrows++;
+    }
+    qsort(rows, (size_t) nrows, sizeof(rows[0]), hist_row_cmp);
+    return nrows;
+}
+
+void syscall_hist_dump_json(FILE *out, bool consume)
+{
+    int mode = atomic_load_explicit(&hist_mode, memory_order_acquire);
+    if (mode == HIST_OFF) {
+        fputs("{\"total_count\":0,\"total_ns\":0,\"rows\":[]}", out);
+        return;
+    }
+
+    if (consume) {
+        if (mode == HIST_RECORD) {
+            int expected = HIST_RECORD;
+            atomic_compare_exchange_strong_explicit(
+                &hist_mode, &expected, HIST_FROZEN, memory_order_release,
+                memory_order_acquire);
+        }
+        int prev = atomic_exchange_explicit(&hist_mode, HIST_OFF,
+                                            memory_order_acq_rel);
+        if (prev == HIST_OFF) {
+            fputs("{\"total_count\":0,\"total_ns\":0,\"rows\":[]}", out);
+            return;
+        }
+        while (atomic_load_explicit(&hist_active_recorders,
+                                    memory_order_acquire) > 0) {
+        }
+    }
+
+    hist_row_t rows[HIST_TABLE_SIZE];
+    uint64_t total_count = 0;
+    uint64_t total_ns = 0;
+    int nrows = hist_snapshot_rows(rows, &total_count, &total_ns);
+
+    fprintf(out, "{\"total_count\":%llu,\"total_ns\":%llu,\"rows\":[",
+            (unsigned long long) total_count, (unsigned long long) total_ns);
+    for (int i = 0; i < nrows; i++) {
+        const char *name = hist_names[rows[i].nr];
+        fprintf(out,
+                "%s{\"nr\":%d,\"name\":\"%s\",\"count\":%llu,"
+                "\"total_ns\":%llu,\"max_ns\":%llu}",
+                i ? "," : "", rows[i].nr, name ? name : "",
+                (unsigned long long) rows[i].count,
+                (unsigned long long) rows[i].total_ns,
+                (unsigned long long) rows[i].max_ns);
+    }
+    fputs("]}", out);
+}
+
+static uint64_t hist_total_for(int nr)
+{
+    if (nr < 0 || nr >= HIST_TABLE_SIZE)
+        return 0;
+    return atomic_load_explicit(&hist_table[nr].total_ns, memory_order_relaxed);
+}
+
+void syscall_hist_dump_cost_buckets_json(FILE *out)
+{
+    uint64_t clone_ns =
+        sat_add_u64(hist_total_for(SYS_clone), hist_total_for(SYS_clone3));
+    uint64_t wait_ns =
+        sat_add_u64(hist_total_for(SYS_wait4), hist_total_for(SYS_waitid));
+    uint64_t open_ns =
+        sat_add_u64(hist_total_for(SYS_openat), hist_total_for(SYS_openat2));
+    uint64_t futex_ns =
+        sat_add_u64(hist_total_for(SYS_futex), hist_total_for(SYS_futex_waitv));
+    uint64_t mem_ns = sat_add_u64(
+        sat_add_u64(hist_total_for(SYS_mmap), hist_total_for(SYS_mprotect)),
+        hist_total_for(SYS_madvise));
+
+    fprintf(out,
+            "\"phase\":{\"process_lifecycle_ns\":%llu,"
+            "\"clone_ns\":%llu,\"wait_ns\":%llu,"
+            "\"host_vfs_ns\":%llu,\"futex_ns\":%llu,\"mem_ns\":%llu},"
+            "\"fd\":{},\"path\":{\"openat_ns\":%llu},"
+            "\"futex\":{\"total_ns\":%llu},\"mem\":{\"total_ns\":%llu}",
+            (unsigned long long) sat_add_u64(clone_ns, wait_ns),
+            (unsigned long long) clone_ns, (unsigned long long) wait_ns,
+            (unsigned long long) open_ns, (unsigned long long) futex_ns,
+            (unsigned long long) mem_ns, (unsigned long long) open_ns,
+            (unsigned long long) futex_ns, (unsigned long long) mem_ns);
 }
 
 void syscall_hist_dump(void)
@@ -284,30 +439,12 @@ void syscall_hist_dump(void)
          */
     }
 
-    hist_row_t rows[HIST_TABLE_SIZE];
-    int nrows = 0;
     uint64_t total_count = 0;
     uint64_t total_ns = 0;
-    for (int i = 0; i < HIST_TABLE_SIZE; i++) {
-        uint64_t cnt =
-            atomic_load_explicit(&hist_table[i].count, memory_order_relaxed);
-        if (cnt == 0)
-            continue;
-        rows[nrows].nr = i;
-        rows[nrows].count = cnt;
-        rows[nrows].total_ns =
-            atomic_load_explicit(&hist_table[i].total_ns, memory_order_relaxed);
-        rows[nrows].max_ns =
-            atomic_load_explicit(&hist_table[i].max_ns, memory_order_relaxed);
-        total_count += cnt;
-        total_ns += rows[nrows].total_ns;
-        nrows++;
-    }
-
+    hist_row_t rows[HIST_TABLE_SIZE];
+    int nrows = hist_snapshot_rows(rows, &total_count, &total_ns);
     if (nrows == 0)
         return;
-
-    qsort(rows, (size_t) nrows, sizeof(rows[0]), hist_row_cmp);
 
     const char *reason =
         atomic_load_explicit(&hist_freeze_reason, memory_order_acquire);

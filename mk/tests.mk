@@ -1,6 +1,7 @@
 # Test targets
 
 .PHONY: test-hello test-all check check-syscall-coverage test-gdbstub test-coreutils test-busybox \
+        test-runtime-stats \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -73,6 +74,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-rosetta-cli
 	@printf "\n$(BLUE)━━━ hot-syscall guardrail ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-bench-guardrail
+	@printf "\n$(BLUE)━━━ runtime-stats output validation ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-runtime-stats
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
@@ -429,6 +432,14 @@ test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 		exit 1; \
 	fi
 	@bash tests/test-busybox.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
+
+## Validate ELFUSE_RUNTIME_STATS output shapes (json/jsonl/summary + signal)
+test-runtime-stats: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
+	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \
+		printf "$(RED)✗ Busybox not found.$(RESET) Set BUSYBOX_BIN=/path/to/busybox.\n"; \
+		exit 1; \
+	fi
+	@bash tests/test-runtime-stats.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
 
 ## Run the low-stack argv rewrite regression on busybox startup
 test-proctitle-low-stack: $(ELFUSE_BIN) $(BUSYBOX_DEPS)

@@ -246,6 +246,15 @@ static inline long raw_futex_wait(int *addr, int val)
                         FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (long) val, 0, 0, 0);
 }
 
+static inline long raw_futex_wait_cleartid(int *addr, int val)
+{
+    /* Linux's CLONE_CHILD_CLEARTID exit wake is a plain futex wake. Match it
+     * with plain FUTEX_WAIT rather than FUTEX_WAIT_PRIVATE.
+     */
+    return raw_syscall6(__NR_futex, (long) addr, FUTEX_WAIT, (long) val, 0, 0,
+                        0);
+}
+
 static inline long raw_futex_wake(int *addr, int count)
 {
     return raw_syscall6(__NR_futex, (long) addr,

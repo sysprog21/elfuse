@@ -243,22 +243,27 @@ unstage_sysroot_fixtures()
 
 # Generic test helpers.
 
-# Tests that either hang under qemu-system-aarch64 on Apple Silicon (raw clone /
-# massive thread+mmap stress) or currently diverge from the Alpine linux-virt
-# reference kernel on the deprecated oom_adj procfs compatibility path exercised
-# by test-io-opt. test-sysfs-cpu asserts the elfuse stub contract
+# Tests that either hang under qemu-system-aarch64 on Apple Silicon or currently
+# diverge from the Alpine linux-virt reference kernel on the deprecated
+# oom_adj procfs compatibility path exercised by test-io-opt. test-sysfs-cpu
+# asserts the elfuse stub contract
 # (cache/topology subtree empty, possible == online, cpuN count == online count)
 # which a real kernel does not honor. All listed tests still run in
 # elfuse-aarch64 mode and in 'make check'; the qemu reference run skips them.
-QEMU_SKIP="test-thread test-stress test-osync-requeue test-io-opt test-sysfs-cpu"
+QEMU_SKIP="
+test-osync-requeue
+test-io-opt
+test-sysfs-cpu
+"
 
 is_qemu_skipped()
 {
     local label="$1"
-    case " $QEMU_SKIP " in
-        *" $label "*) return 0 ;;
-        *) return 1 ;;
-    esac
+    local skipped
+    for skipped in $QEMU_SKIP; do
+        [ "$skipped" = "$label" ] && return 0
+    done
+    return 1
 }
 
 # Honor QEMU_SKIP across all test_* wrappers.
@@ -987,7 +992,7 @@ run_suite()
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
     "elfuse-aarch64|169|0"
-    "qemu-aarch64|163|0"
+    "qemu-aarch64|165|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

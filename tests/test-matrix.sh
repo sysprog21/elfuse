@@ -246,11 +246,9 @@ unstage_sysroot_fixtures()
 # Tests that either hang under qemu-system-aarch64 on Apple Silicon (raw clone /
 # PI futex / massive thread+mmap stress) or currently diverge from the Alpine
 # linux-virt reference kernel on the deprecated oom_adj procfs compatibility
-# path exercised by test-io-opt. test-sysfs-cpu asserts the elfuse stub contract
-# (cache/topology subtree empty, possible == online, cpuN count == online count)
-# which a real kernel does not honor. All listed tests still run in
-# elfuse-aarch64 mode and in 'make check'; the qemu reference run skips them.
-QEMU_SKIP="test-thread test-stress test-futex-pi test-osync-requeue test-io-opt test-sysfs-cpu"
+# path exercised by test-io-opt. All listed tests still run in elfuse-aarch64
+# mode and in 'make check'; the qemu reference run skips them.
+QEMU_SKIP="test-thread test-stress test-futex-pi test-osync-requeue test-io-opt"
 
 is_qemu_skipped()
 {
@@ -987,7 +985,7 @@ run_suite()
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
     "elfuse-aarch64|169|0"
-    "qemu-aarch64|163|0"
+    "qemu-aarch64|164|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

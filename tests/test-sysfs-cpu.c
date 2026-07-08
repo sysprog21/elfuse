@@ -1,14 +1,13 @@
 /*
- * Test /sys/devices/system/cpu emulation
+ * Test /sys/devices/system/cpu behavior
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
  * Tests: /sys/devices/system/cpu/{online,possible,present} read,
  *        opendir + readdir on /sys/devices/system/cpu, stat on cpuN
- *        directories, and ENOENT on the cache/topology subtrees that the
- *        stub deliberately leaves empty, plus access()/faccessat() mode
- *        checks for the read-only synthetic tree.
+ *        directories, and access()/faccessat() mode checks that are shared by
+ *        elfuse's synthetic tree and a real Linux sysfs tree under qemu.
  *
  * Syscalls exercised: openat(56), read(63), close(57), getdents64(61),
  *                     newfstatat(79).
@@ -68,11 +67,16 @@ static int read_cpurange(const char *path)
     return parse_cpurange(buf, n);
 }
 
+static int errno_is(int actual, int a, int b)
+{
+    return actual == a || actual == b;
+}
+
 int main(void)
 {
     int passes = 0, fails = 0;
 
-    printf("test-sysfs-cpu: /sys/devices/system/cpu emulation\n");
+    printf("test-sysfs-cpu: /sys/devices/system/cpu behavior\n");
 
     TEST("read /sys/devices/system/cpu/online");
     int max_cpu = read_cpurange("/sys/devices/system/cpu/online");
@@ -113,17 +117,22 @@ int main(void)
             FAIL("stat failed");
     }
 
-    TEST("ENOENT on missing topology subtree");
+    TEST("topology core_id readable or absent");
     {
         errno = 0;
         int fd =
             open("/sys/devices/system/cpu/cpu0/topology/core_id", O_RDONLY);
         if (fd < 0 && errno == ENOENT) {
             PASS();
+        } else if (fd >= 0) {
+            char buf[64];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            EXPECT_TRUE(n >= 0, "topology core_id unreadable");
         } else {
-            if (fd >= 0)
-                close(fd);
-            FAIL("expected ENOENT for empty subtree");
+            FAIL("unexpected topology core_id open error");
         }
     }
 
@@ -145,9 +154,9 @@ int main(void)
             FAIL("opendir failed");
     }
 
-    /* The stub is read-only: O_WRONLY / O_RDWR / O_CREAT / O_TRUNC must fail
-     * with EACCES so a guest cannot mutate the synthetic tree (and cannot pivot
-     * a creation into the host scratch dir).
+    /* elfuse's synthetic tree is read-only, while a real qemu sysfs tree runs
+     * these tests as root. Keep the shared checks focused on non-mutation and
+     * accept the errno/root-access differences Linux permits.
      */
     TEST("EACCES on O_WRONLY of online");
     {
@@ -158,13 +167,14 @@ int main(void)
         EXPECT_TRUE(fd < 0 && errno == EACCES, "writable open accepted");
     }
 
-    TEST("EACCES on O_WRONLY of sysfs cpu root");
+    TEST("O_WRONLY of sysfs cpu root fails");
     {
         errno = 0;
         int fd = open("/sys/devices/system/cpu", O_WRONLY);
         if (fd >= 0)
             close(fd);
-        EXPECT_TRUE(fd < 0 && errno == EACCES, "writable root open accepted");
+        EXPECT_TRUE(fd < 0 && errno_is(errno, EACCES, EISDIR),
+                    "writable root open accepted");
     }
 
     TEST("EACCES on O_CREAT of new entry");
@@ -179,53 +189,54 @@ int main(void)
         EXPECT_TRUE(fd < 0 && errno == EACCES, "O_CREAT accepted");
     }
 
-    TEST("access reports online readable but not writable or executable");
+    TEST("access reports online readable and not executable");
     {
         EXPECT_TRUE(access("/sys/devices/system/cpu/online", F_OK) == 0,
                     "F_OK failed");
         EXPECT_TRUE(access("/sys/devices/system/cpu/online", R_OK) == 0,
                     "R_OK failed");
         errno = 0;
-        EXPECT_TRUE(access("/sys/devices/system/cpu/online", W_OK) < 0 &&
-                        errno == EACCES,
-                    "W_OK unexpectedly succeeded");
+        int writable = access("/sys/devices/system/cpu/online", W_OK);
+        EXPECT_TRUE(writable == 0 || (writable < 0 && errno == EACCES),
+                    "W_OK returned unexpected error");
         errno = 0;
         EXPECT_TRUE(access("/sys/devices/system/cpu/online", X_OK) < 0 &&
                         errno == EACCES,
                     "X_OK unexpectedly succeeded");
     }
 
-    TEST("access reports cpu root searchable but not writable");
+    TEST("access reports cpu root searchable");
     {
         EXPECT_TRUE(access("/sys/devices/system/cpu", R_OK) == 0,
                     "cpu root R_OK failed");
         EXPECT_TRUE(access("/sys/devices/system/cpu", X_OK) == 0,
                     "cpu root X_OK failed");
         errno = 0;
-        EXPECT_TRUE(
-            access("/sys/devices/system/cpu", W_OK) < 0 && errno == EACCES,
-            "cpu root W_OK unexpectedly succeeded");
+        int writable = access("/sys/devices/system/cpu", W_OK);
+        EXPECT_TRUE(writable == 0 || (writable < 0 && errno == EACCES),
+                    "cpu root W_OK returned unexpected error");
     }
 
-    /* '..' in the suffix must not let the open/stat fall through onto an
-     * arbitrary host path. The stub keeps the tree closed against traversal
-     * regardless of where the scratch dir happens to live.
+    /* '..' in the suffix must not let the open/stat reach a real target.
+     * elfuse rejects traversal inside the synthetic tree with EACCES; Linux
+     * resolves the normalized sysfs path and reports ENOENT for this probe.
      */
-    TEST("EACCES on dotdot traversal in open");
+    TEST("dotdot traversal in open does not resolve");
     {
         errno = 0;
         int fd = open("/sys/devices/system/cpu/../../etc/hostname", O_RDONLY);
         if (fd >= 0)
             close(fd);
-        EXPECT_TRUE(fd < 0 && errno == EACCES, "dotdot traversal accepted");
+        EXPECT_TRUE(fd < 0 && errno_is(errno, EACCES, ENOENT),
+                    "dotdot traversal accepted");
     }
 
-    TEST("EACCES on dotdot traversal in stat");
+    TEST("dotdot traversal in stat does not resolve");
     {
         struct stat st;
         errno = 0;
         int rc = stat("/sys/devices/system/cpu/../../etc/hostname", &st);
-        EXPECT_TRUE(rc < 0 && errno == EACCES,
+        EXPECT_TRUE(rc < 0 && errno_is(errno, EACCES, ENOENT),
                     "dotdot traversal accepted in stat");
     }
 

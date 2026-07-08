@@ -17,15 +17,6 @@
 
 #include "test-harness.h"
 
-static void reset_oom_score_adj(void)
-{
-    int fd = open("/proc/self/oom_score_adj", O_RDWR);
-    if (fd >= 0) {
-        write(fd, "0\n", 2);
-        close(fd);
-    }
-}
-
 int main(void)
 {
     int passes = 0, fails = 0;
@@ -87,52 +78,6 @@ int main(void)
                 close(out_fd);
             FAIL("open failed");
         }
-    }
-
-    TEST("sendfile rereads synthetic oom proc source");
-    {
-        const char *proc_dst = "/tmp/elfuse-test-proc-sendfile.txt";
-        unlink(proc_dst);
-        reset_oom_score_adj();
-
-        int in_fd = open("/proc/self/oom_adj", O_RDONLY);
-        int score_fd = open("/proc/self/oom_score_adj", O_RDWR);
-        int out_fd = open(proc_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-        if (in_fd >= 0 && score_fd >= 0 && out_fd >= 0) {
-            char buf[32] = {0};
-            off_t offset = 0;
-            ssize_t wrote = write(score_fd, "1000\n", 5);
-            ssize_t copied =
-                wrote == 5 ? sendfile(out_fd, in_fd, &offset, 32) : -1;
-            close(out_fd);
-            close(score_fd);
-            close(in_fd);
-
-            int verify_fd = open(proc_dst, O_RDONLY);
-            if (copied >= 0 && verify_fd >= 0) {
-                ssize_t n = read(verify_fd, buf, sizeof(buf) - 1);
-                close(verify_fd);
-                if (copied == 3 && offset == 3 && n == 3 &&
-                    memcmp(buf, "15\n", 3) == 0)
-                    PASS();
-                else
-                    FAIL("unexpected sendfile proc content");
-            } else {
-                if (verify_fd >= 0)
-                    close(verify_fd);
-                FAIL("proc sendfile setup failed");
-            }
-        } else {
-            if (in_fd >= 0)
-                close(in_fd);
-            if (score_fd >= 0)
-                close(score_fd);
-            if (out_fd >= 0)
-                close(out_fd);
-            PASS();
-        }
-        reset_oom_score_adj();
-        unlink(proc_dst);
     }
 
     /* Test fsync */
@@ -236,54 +181,6 @@ int main(void)
             FAIL("open failed");
         }
         unlink(cfr_dst);
-    }
-
-    TEST("copy_file_range rereads synthetic oom proc source");
-    {
-        const char *proc_dst = "/tmp/elfuse-test-proc-cfr.txt";
-        unlink(proc_dst);
-        reset_oom_score_adj();
-
-        int in_fd = open("/proc/self/oom_adj", O_RDONLY);
-        int score_fd = open("/proc/self/oom_score_adj", O_RDWR);
-        int out_fd = open(proc_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-        if (in_fd >= 0 && score_fd >= 0 && out_fd >= 0) {
-            char buf[32] = {0};
-            off_t off_in = 0, off_out = 0;
-            ssize_t wrote = write(score_fd, "1000\n", 5);
-            ssize_t copied =
-                wrote == 5
-                    ? copy_file_range(in_fd, &off_in, out_fd, &off_out, 32, 0)
-                    : -1;
-            close(out_fd);
-            close(score_fd);
-            close(in_fd);
-
-            int verify_fd = open(proc_dst, O_RDONLY);
-            if (copied >= 0 && verify_fd >= 0) {
-                ssize_t n = read(verify_fd, buf, sizeof(buf) - 1);
-                close(verify_fd);
-                if (copied == 3 && off_in == 3 && off_out == 3 && n == 3 &&
-                    memcmp(buf, "15\n", 3) == 0)
-                    PASS();
-                else
-                    FAIL("unexpected copy_file_range proc content");
-            } else {
-                if (verify_fd >= 0)
-                    close(verify_fd);
-                FAIL("proc copy_file_range setup failed");
-            }
-        } else {
-            if (in_fd >= 0)
-                close(in_fd);
-            if (score_fd >= 0)
-                close(score_fd);
-            if (out_fd >= 0)
-                close(out_fd);
-            PASS();
-        }
-        reset_oom_score_adj();
-        unlink(proc_dst);
     }
 
     /* Cleanup */

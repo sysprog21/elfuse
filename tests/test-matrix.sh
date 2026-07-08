@@ -244,13 +244,19 @@ unstage_sysroot_fixtures()
 # Generic test helpers.
 
 # Tests that either hang under qemu-system-aarch64 on Apple Silicon (raw clone /
-# PI futex / massive thread+mmap stress) or currently diverge from the Alpine
-# linux-virt reference kernel on the deprecated oom_adj procfs compatibility
-# path exercised by test-io-opt. test-sysfs-cpu asserts the elfuse stub contract
-# (cache/topology subtree empty, possible == online, cpuN count == online count)
-# which a real kernel does not honor. All listed tests still run in
-# elfuse-aarch64 mode and in 'make check'; the qemu reference run skips them.
-QEMU_SKIP="test-thread test-stress test-futex-pi test-osync-requeue test-io-opt test-sysfs-cpu"
+# PI futex / massive thread+mmap stress) or assert an elfuse-specific stub
+# contract a real kernel does not honor: test-sysfs-cpu checks cache/topology
+# subtree empty, possible == online, cpuN count == online count. All listed
+# tests still run in elfuse-aarch64 mode and in 'make check'; the qemu
+# reference run skips them.
+#
+# The two oom_adj/oom_score_adj sendfile-and-copy_file_range-interception
+# subtests that used to make test-io-opt diverge here were split out into
+# tests/test-oom-proc.c (make check only, not part of this matrix at all) --
+# see that file's header comment. test-io-opt itself is now pure portable
+# sendfile/fsync/fallocate/copy_file_range coverage and runs against qemu
+# like any other test.
+QEMU_SKIP="test-thread test-stress test-futex-pi test-osync-requeue test-sysfs-cpu"
 
 is_qemu_skipped()
 {

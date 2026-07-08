@@ -49,6 +49,7 @@ test-file-ops
 test-flock
 test-sysinfo
 test-io-opt
+test-oom-proc
 test-syscall-smoke
 test-vdso
 test-shim-identity

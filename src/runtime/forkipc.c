@@ -59,6 +59,7 @@
 #include "utils.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 
 #include "runtime/forkipc.h"
 #include "runtime/fork-state.h"
@@ -539,6 +540,11 @@ int fork_child_main(int ipc_fd,
      */
     shim_globals_rebuild_urandom_bitmap();
 
+    if (!verbose)
+        mmap_fastpath_prepare_vcpu(&g, current_thread);
+    else
+        mmap_fastpath_disable(&g);
+
     /* Now that current_thread is set, apply signal state. This must happen
      * after thread_register_main() so the per-thread blocked mask and altstack
      * are properly restored to the thread entry.
@@ -610,7 +616,7 @@ typedef struct {
     vcpu_simd_state_t simd_state;
 } thread_create_args_t;
 
-static void resolve_clone_stack_range(const guest_t *g,
+static void resolve_clone_stack_range(guest_t *g,
                                       uint64_t child_stack,
                                       uint64_t *start_out,
                                       uint64_t *end_out)
@@ -626,13 +632,10 @@ static void resolve_clone_stack_range(const guest_t *g,
     if (sp_off == 0 || sp_off > g->guest_size)
         return;
 
-    /* The region array is mutated under mmap_lock by any concurrent mmap or
-     * munmap, and clone does not otherwise take it. Reading it unlocked is a
-     * data race on g->regions and g->nregions, reported by ThreadSanitizer as
-     * soon as a sibling allocates while another thread clones. Neither caller
-     * holds a lock here, and mmap_lock is order 1, so taking it is safe.
+    /* The region array is mutated under mmap_lock. The acquire also drains EL1
+     * mmap publications before clone resolves a newly allocated stack.
      */
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire(g);
     const guest_region_t *r = guest_region_find(g, sp_off - 1);
     if (r) {
         if (start_out)
@@ -640,7 +643,7 @@ static void resolve_clone_stack_range(const guest_t *g,
         if (end_out)
             *end_out = r->end;
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 }
 
 /* Forward declaration: worker entry runs after sys_clone_thread */
@@ -1107,10 +1110,12 @@ startup_ok:
      * how pthread_join works in musl: the joining thread does FUTEX_WAIT on
      * this address until it becomes 0.
      *
-     * Drain any deferred munmap of this thread's stack before waking the
-     * joiner: the parent may reuse the freed VA as soon as it returns from
-     * pthread_join, and reuse must not race with the deferred unmap.
+     * Drain any deferred munmap before publishing clear_child_tid. A joiner
+     * may observe the zero without ever sleeping in FUTEX_WAIT, then reuse the
+     * freed VA immediately; ordering only the wake after cleanup leaves a
+     * window where MAP_FIXED_NOREPLACE still sees the old stack VMA.
      */
+    mem_cleanup_deferred_stack_unmaps(g, t);
     bool wake_ctid = false;
     if (t->clear_child_tid != 0) {
         uint32_t zero = 0;
@@ -1125,7 +1130,6 @@ startup_ok:
                 (unsigned long long) t->clear_child_tid);
         }
     }
-    mem_cleanup_deferred_stack_unmaps(g, t);
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
@@ -1388,16 +1392,16 @@ static void *vm_clone_thread_run(void *arg)
     /* Set per-thread TLS pointer and enter worker run loop */
     current_thread = t;
     thread_fork_barrier_check();
-
     log_debug("vm_clone tid=%lld starting on vCPU", (long long) thread_tid(t));
 
     int wait_status = 0;
     int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0, &wait_status);
 
-    /* CLONE_CHILD_CLEARTID cleanup. Same ordering as thread_entry: drain
-     * deferred stack munmaps before waking the joiner so the parent does not
-     * reuse the VA before it is released.
+    /* CLONE_CHILD_CLEARTID cleanup. Same ordering as thread_entry: the zero
+     * itself, not just the futex wake, releases a joiner, so publish it only
+     * after the deferred stack mapping is gone.
      */
+    mem_cleanup_deferred_stack_unmaps(g, t);
     bool wake_ctid = false;
     if (t->clear_child_tid != 0) {
         uint32_t zero = 0;
@@ -1412,7 +1416,6 @@ static void *vm_clone_thread_run(void *arg)
                 (unsigned long long) t->clear_child_tid);
         }
     }
-    mem_cleanup_deferred_stack_unmaps(g, t);
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
@@ -1740,6 +1743,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
     guest_region_t *regions_snapshot = NULL;
+    uint64_t *dirty_blocks_snapshot = NULL;
     guest_region_t preannounced_snapshot[GUEST_MAX_PREANNOUNCED];
     int snapshot_shm_fd = -1;
     bool siblings_quiesced = false;
@@ -1970,6 +1974,10 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         }
         memcpy(regions_snapshot, g->regions, snap_sz);
     }
+    dirty_blocks_snapshot = malloc(sizeof(g->dirty_blocks));
+    if (!dirty_blocks_snapshot)
+        goto fail_snapshot;
+    memcpy(dirty_blocks_snapshot, g->dirty_blocks, sizeof(g->dirty_blocks));
     int npreannounced_snapshot = g->npreannounced;
     if (npreannounced_snapshot > 0) {
         memcpy(preannounced_snapshot, g->preannounced,
@@ -1994,8 +2002,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     uint32_t num_preannounced = (uint32_t) npreannounced_snapshot;
     if (fork_ipc_send_process_state(
             ipc_sock, regions_snapshot, num_guest_regions,
-            regions_tracker_stale_snapshot, preannounced_snapshot,
-            num_preannounced) < 0) {
+            regions_tracker_stale_snapshot, dirty_blocks_snapshot,
+            preannounced_snapshot, num_preannounced) < 0) {
         log_error("clone: failed to send process state");
         goto fail_snapshot;
     }
@@ -2076,6 +2084,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
               child_host_pid);
 
     free(regions_snapshot);
+    free(dirty_blocks_snapshot);
     if (snapshot_shm_fd >= 0)
         close(snapshot_shm_fd);
     return child_guest_pid;
@@ -2083,6 +2092,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 fail_snapshot:
     proc_cancel_child(child_guest_pid);
     free(regions_snapshot);
+    free(dirty_blocks_snapshot);
     if (snapshot_shm_fd >= 0)
         close(snapshot_shm_fd);
 

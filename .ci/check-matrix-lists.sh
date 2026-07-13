@@ -68,6 +68,7 @@ test-shim-urandom-smp
 test-shim-urandom-toctou
 test-shim-urandom-wrap
 test-shim-cred-race
+test-mmap-fastpath
 test-mremap-infra
 test-mremap-fork-tracking
 test-dev-shm-paths

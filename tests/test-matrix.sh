@@ -643,22 +643,22 @@ test_pipe()
 #
 # This is the full aarch64 unit-test surface: every tests/manifest.txt ("make
 # check") binary except the handful that assert elfuse-internal implementation
-# details with no meaningful counterpart on a real kernel (the EL1 shim
-# fast-path suite -- test-shim-* and test-shim-cred-race, which probe elfuse's
-# own shim_data block and identity cache -- test-mremap-infra, which guards
-# elfuse's guest-IPA infra reserve, and test-oom-proc, documented in its own
-# header). test-mremap-tail-emfile is listed here as an elfuse-lane regression
-# and marked QEMU_SKIP because its host-reserve assertion has no Linux analogue.
-# There is no "core" vs "extended" split here; everything below runs in both
-# elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood divergences
-# from the qemu reference kernel are called out via QEMU_SKIP with a comment
-# rather than silently dropped from this list. The unit lane runs binaries this
-# repo builds, not fixtures it downloads, so an empty build/ is a setup mistake
-# rather than a run to report on. Without this every test fails on a missing
-# file and the summary reads like a hundred-odd regressions; "make clean"
-# followed by "make elfuse" is enough to produce it, because elfuse alone does
-# not build the test binaries. Name the cause once and stop, the way driver.sh
-# does with ALLOW_MISSING_BINARIES.
+# details with no meaningful counterpart on a real kernel. Test-shim-* and
+# test-shim-cred-race probe elfuse's own shim_data block and identity cache;
+# test-mmap-fastpath probes elfuse's arena and TLBI protocol; test-mremap-infra
+# guards elfuse's guest-IPA infra reserve; test-oom-proc documents its reason in
+# its own header. test-mremap-tail-emfile is listed here as an elfuse-lane
+# regression and marked QEMU_SKIP because its host-reserve assertion has no
+# Linux analogue. There is no "core" vs "extended" split here; everything below
+# runs in both elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood
+# divergences from the qemu reference kernel are called out via QEMU_SKIP with a
+# comment rather than silently dropped from this list. The unit lane runs
+# binaries this repo builds, not fixtures it downloads, so an empty build/ is a
+# setup mistake rather than a run to report on. Without this every test fails on
+# a missing file and the summary reads like a hundred-odd regressions; "make
+# clean" followed by "make elfuse" is enough to produce it, because elfuse alone
+# does not build the test binaries. Name the cause once and stop, the way
+# driver.sh does with ALLOW_MISSING_BINARIES.
 require_unit_binaries()
 {
     local bindir="$1"
@@ -843,6 +843,7 @@ run_unit_tests()
     test_rc "$runner" "test-mmap-hint" 0 "$bindir/test-mmap-hint"
 
     test_rc "$runner" "test-mmap-sigbus-efault" 0 "$bindir/test-mmap-sigbus-efault"
+    test_rc "$runner" "test-mmap-lazy" 0 "$bindir/test-mmap-lazy"
 
     printf "\nLow-base ET_EXEC memory regression\n"
     test_rc "$runner" "test-lowbase-mem-200000" 0 "$bindir/test-lowbase-mem-200000"

@@ -449,7 +449,21 @@ svc_handler:
     b.eq getsid_fast
     cmp x10, #278                      /* SYS_getrandom? */
     b.eq getrandom_fast
+    cmp x10, #222                      /* SYS_mmap? */
+    b.eq mmap_anon_fast
     b handle_svc_0
+
+/* The mmap fast path is a freestanding C consumer.  The saved frame remains
+ * authoritative: false leaves it untouched for HVC #5; true places the
+ * completed result in saved X0.  The normal restore tail reloads every other
+ * guest register, so the C ABI's caller-clobbered set is private to EL1.
+ */
+mmap_anon_fast:
+    mov x0, sp
+    bl _el1_mmap_fastpath
+    cbz w0, handle_svc_0
+    ldr x0, [sp, #0]
+    b svc_restore_eret
 
 identity_class_fast:
     mrs x12, tpidr_el1               /* shim-globals base */
@@ -1206,6 +1220,7 @@ handle_el0_fault:
 
 .Lel0_fault_tlbi_full:
     /* Broadcast TLB + conditional I-cache flush. X11=0 skips IC IALLU. */
+    dsb ishst
     tlbi vmalle1is
     dsb ish
     cbz x11, .Lel0_fault_full_no_ic
@@ -1227,6 +1242,7 @@ handle_el0_fault:
     mov x13, x11
     ubfx x11, x9, #12, #44
     mov x12, x10
+    dsb ishst
 4:  tlbi vae1is, x11
     add x11, x11, #1
     subs x12, x12, #1
@@ -1241,7 +1257,9 @@ handle_el0_fault:
 
 .Lel0_fault_tlbi_rvae:
     /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE). X9 carries the pre-encoded
-     * operand (baddr | NUM<<39 | TG=01<<46); X11 the I-cache hint. */
+     * operand (baddr | NUM<<39 | SCALE<<44 | TG=01<<46); X11 the I-cache
+     * hint. */
+    dsb ishst
     tlbi rvae1is, x9
     dsb ish
     cbz x11, .Lel0_fault_rvae_no_ic
@@ -1285,6 +1303,7 @@ tlbi_restore_eret:
      * into the TTL [47:44] or ASID [63:48] operand fields.
      */
     ubfx x0, x0, #12, #44
+    dsb ishst
     tlbi vae1is, x0
     dsb ish
     ic iallu
@@ -1358,6 +1377,7 @@ handle_svc_0:
      *        1 = broadcast TLBI VMALLE1IS
      *        2 = execve replaced register state (drop frame + flush)
      *        3 = selective TLBI VAE1IS over X10 pages starting at X9
+     *        4 = single-shot TLBI RVAE1IS with encoded operand in X9
      *   5. Resume vCPU (execution continues below)
      */
     hvc #5
@@ -1386,6 +1406,7 @@ tlbi_full:
      * the shim must IC IALLU; zero means a data-only PT change and the I-cache
      * invalidation is skipped.
      */
+    dsb ishst
     tlbi vmalle1is
     dsb ish
     cbz x11, .Ltlbi_full_skip_ic
@@ -1422,6 +1443,7 @@ tlbi_selective:
      */
     ubfx x11, x9, #12, #44    /* x11 = VA[55:12] (current page operand) */
     mov x12, x10              /* x12 = remaining page counter */
+    dsb ishst
 3:  tlbi vae1is, x11
     add x11, x11, #1          /* next page (operand is in 4 KiB units) */
     subs x12, x12, #1
@@ -1435,13 +1457,13 @@ tlbi_selective:
     b svc_restore_eret
 
 tlbi_range_large:
-    /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has encoded
-     * the full operand in X9: baddr (VA >> 12), TTL=0, NUM in bits [43:39],
-     * SCALE=0, ASID=0. One instruction covers up to 64 pages, avoiding the
-     * broadcast TLBI VMALLE1IS that the prior selective cap forced for
-     * 17..64-page ranges. X11 carries the I-cache hint as in tlbi_full /
+    /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has
+     * encoded the full operand in X9: baddr (VA >> 12), TTL=0, NUM in bits
+     * [43:39], SCALE in bits [45:44], ASID=0. One instruction covers up to
+     * TLBI_RVAE_MAX_PAGES. X11 carries the I-cache hint as in tlbi_full /
      * tlbi_selective.
      */
+    dsb ishst
     tlbi rvae1is, x9
     dsb ish
     cbz x11, .Ltlbi_rvae_skip_ic

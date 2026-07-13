@@ -165,7 +165,7 @@
  * not in urandom bitmap, len zero, len over inline cap, ring fill below
  * request, ring wrap, EL0 buffer probe failure). Slots 8..11 record fast-path
  * hits so bail rates can be computed against a hit denominator. Slots 12..15
- * are reserved.
+ * attribute lazy-fault materializations and the TLBI wire mode they emit.
  *
  * The shim hardcodes the byte offset of each slot; the static_asserts in
  * shim-globals.c keep the C-side macros and the assembly in sync.
@@ -185,6 +185,10 @@
 #define SHIM_COUNTER_URANDOM_HIT 9
 #define SHIM_COUNTER_GETRANDOM_HIT 10
 #define SHIM_COUNTER_PGSID_HIT 11
+#define SHIM_COUNTER_FAULT_MATERIALIZE 12
+#define SHIM_COUNTER_FAULT_TLBI_VAE 13
+#define SHIM_COUNTER_FAULT_TLBI_RVAE 14
+#define SHIM_COUNTER_FAULT_TLBI_BCAST 15
 
 /* Extended identity slots: pgid and sid.
  *
@@ -390,6 +394,7 @@ void shim_globals_refill_urandom_ring(guest_t *g);
  * when ELFUSE_SHIM_STATS is set.
  */
 uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot);
+void shim_globals_counter_inc(guest_t *g, unsigned slot);
 void shim_globals_counters_dump(const guest_t *g);
 
 /* ELFUSE_SHIM_STATS env-var gate (idempotent / cached). When enabled the exit

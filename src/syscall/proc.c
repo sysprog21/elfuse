@@ -3624,9 +3624,12 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
     int new_perms = (type == 0) ? MEM_PERM_RX : MEM_PERM_RW;
 
     /* Hold mmap_lock for page table modifications AND region lookups to prevent
-     * races with concurrent mmap/mprotect/munmap from other vCPU threads.
+     * races with concurrent mmap/mprotect/munmap from other vCPU threads. The
+     * full acquire, not the raw lock: the split and permission rewrite below
+     * need the PT gate closed against EL1 munmap like every other descriptor
+     * writer, and the region lookup needs the publication drain.
      */
-    mmap_lock_acquire();
+    mmap_lock_acquire(g);
 
     /* Check if this is a genuine permission violation (not a W^X toggle). If
      * the guest region lacks the required permission, deliver SIGSEGV instead
@@ -3909,8 +3912,8 @@ static bool vcpu_handle_el0_fault(guest_t *g,
     uint32_t fsc_type = (fsc >> 2) & 0xF;
     if (fsc_type == 0x01) {
         uint64_t fault_off = far_addr - g->ipa_base;
-        mmap_lock_acquire();
-        int mat = guest_materialize_lazy(g, fault_off);
+        mmap_lock_acquire(g);
+        int mat = guest_materialize_lazy_fault(g, fault_off);
         mmap_lock_release();
         if (mat == 0) {
             /* Page materialized; the helpers inside guest_materialize_lazy
@@ -3922,6 +3925,21 @@ static bool vcpu_handle_el0_fault(guest_t *g,
              * (negative) entries would re-fault on the retry, looping until the
              * entry self-evicts.
              */
+            shim_globals_counter_inc(g, SHIM_COUNTER_FAULT_MATERIALIZE);
+            switch ((tlbi_kind_t) cpu_tlbi_req.kind) {
+            case TLBI_RANGE:
+                shim_globals_counter_inc(g, SHIM_COUNTER_FAULT_TLBI_VAE);
+                break;
+            case TLBI_RANGE_LARGE:
+                shim_globals_counter_inc(g, SHIM_COUNTER_FAULT_TLBI_RVAE);
+                break;
+            case TLBI_BROADCAST:
+                shim_globals_counter_inc(g, SHIM_COUNTER_FAULT_TLBI_BCAST);
+                break;
+            case TLBI_NONE:
+            default:
+                break;
+            }
             tlbi_request_emit_to_vcpu(vcpu);
             return true;
         }
@@ -3968,8 +3986,8 @@ static bool vcpu_handle_el0_fault(guest_t *g,
     uint64_t live_avail = 0;
     void *live_pt = NULL;
     if (stale_plausible) {
-        mmap_lock_acquire();
-        live_pt = guest_ptr_avail(g, far_addr, &live_avail, want_perm);
+        mmap_lock_acquire(g);
+        live_pt = guest_ptr_avail_nofault(g, far_addr, &live_avail, want_perm);
         mmap_lock_release();
     }
     if (live_pt) {

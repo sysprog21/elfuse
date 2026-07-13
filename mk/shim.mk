@@ -1,10 +1,28 @@
-# EL1 kernel shim assembly pipeline
+# EL1 kernel shim pipeline
 #
-# shim.S -> shim.o -> shim.bin -> shim_blob.h (C byte array)
+# shim.S + freestanding shim-mmap.c -> shim.o -> shim.bin -> shim_blob.h
 
-$(BUILD_DIR)/shim.o: src/core/shim.S | $(BUILD_DIR)
+SHIM_CFLAGS := -O2 -Wall -Wextra -Wpedantic -Wshadow \
+	-Wstrict-prototypes -Wmissing-prototypes -Wformat=2 \
+	-Wimplicit-fallthrough -Wundef -Wnull-dereference \
+	-Wno-unused-parameter -ffreestanding -fno-builtin \
+	-fno-stack-protector -fno-unwind-tables \
+	-fno-asynchronous-unwind-tables -mno-outline-atomics
+SHIM_LD ?= ld
+
+$(BUILD_DIR)/shim-asm.o: src/core/shim.S | $(BUILD_DIR)
 	@echo "  AS      $<"
 	$(Q)$(SHIM_AS) $(SHIM_ASFLAGS) -o $@ $<
+
+$(BUILD_DIR)/shim-mmap.o: src/core/shim-mmap.c src/core/shim-mmap.h \
+		src/core/mmap-fastpath.h src/core/shim-globals.h | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(SHIM_CFLAGS) -MMD -MP -MF $(BUILD_DIR)/shim-mmap.d \
+		-Isrc -c -o $@ $<
+
+$(BUILD_DIR)/shim.o: $(BUILD_DIR)/shim-asm.o $(BUILD_DIR)/shim-mmap.o
+	@echo "  LD      $@"
+	$(Q)$(SHIM_LD) -static -arch arm64 -e _start -o $@ $^
 
 $(BUILD_DIR)/shim.bin: $(BUILD_DIR)/shim.o
 	@echo "  OBJCOPY $@"

@@ -855,23 +855,6 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
                                       uint64_t envp_gva,
                                       const char *host_path)
 {
-    /* Release mmap_lock, which this thread's sc_execve wrapper holds, before
-     * touching the slot at all.
-     *
-     * Waiting for the slot under it deadlocks the second of two concurrent
-     * requesters against the leader: the leader takes the first request,
-     * releases exec_handoff_lock, and blocks acquiring mmap_lock to run it,
-     * while this thread holds mmap_lock waiting for a slot only that leader can
-     * free. Neither side is torn down, so no stop check breaks the cycle.
-     *
-     * Safe to drop this early because the handoff is the first thing sys_execve
-     * does for a non-leader, so nothing has yet read what mmap_lock protects,
-     * and the guest addresses published below are dereferenced by the leader
-     * under its own mmap_lock rather than here. Re-taken on every return path
-     * so the wrapper's unlock stays balanced.
-     */
-    mmap_lock_release();
-
     pthread_mutex_lock(&exec_handoff_lock);
 
     /* Wait for the slot. A concurrent handoff either fails (freeing the slot)
@@ -879,7 +862,6 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
      */
     if (!exec_handoff_wait_for(HANDOFF_EMPTY)) {
         pthread_mutex_unlock(&exec_handoff_lock);
-        mmap_lock_acquire();
         return -LINUX_EINTR;
     }
 
@@ -898,7 +880,6 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
         exec_handoff_set_state(HANDOFF_EMPTY);
         pthread_cond_broadcast(&exec_handoff_cond);
         pthread_mutex_unlock(&exec_handoff_lock);
-        mmap_lock_acquire();
         return -LINUX_ENAMETOOLONG;
     }
     exec_handoff.blocked_mask =
@@ -927,7 +908,6 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
     }
     pthread_mutex_unlock(&exec_handoff_lock);
 
-    mmap_lock_acquire();
     return result;
 }
 
@@ -988,14 +968,8 @@ int64_t exec_run_handoff(hv_vcpu_t vcpu, guest_t *g, bool verbose)
     saved_mask = signal_save_blocked();
     signal_set_blocked(adopt_mask);
 
-    /* sys_execve is written to run with mmap_lock held, which on the direct
-     * path its sc_execve wrapper takes. This path comes from the run loop, so
-     * take it here instead.
-     */
-    mmap_lock_acquire();
     int64_t rc =
         sys_execve(vcpu, g, path_gva, argv_gva, envp_gva, verbose, host_path);
-    mmap_lock_release();
 
     pthread_mutex_lock(&exec_handoff_lock);
     if (rc == SYSCALL_EXEC_HAPPENED) {
@@ -2238,21 +2212,14 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * already have destroyed. It also has to precede the CLOEXEC sweep and
      * guest_reset: a sibling parked in read() on a fd about to close, or still
      * executing the old image's code, winds down against the memory and fd
-     * table its guest still expects. Both callers hold mmap_lock (order 1)
-     * across the whole syscall, and the teardown must not run under it: a
-     * sibling blocked acquiring mmap_lock inside sc_brk, sc_mmap, sc_munmap,
-     * sc_mprotect, or its own deferred stack unmap is reachable by none of the
-     * teardown wakes, so it can never reach a stop check and the join below
-     * would always time out. Measured before this release: four siblings
-     * looping on mmap/munmap took the fatal path every time.
-     *
-     * Dropping it here is safe because nothing in the teardown touches guest
-     * memory or the region table, and re-acquiring cannot contend: by the time
-     * it returns 0 no other guest thread is left to hold it.
+     * table its guest still expects.
      */
-    mmap_lock_release();
+    /* Teardown must run without mmap_lock: a sibling blocked in an mmap-family
+     * syscall or its deferred stack unmap cannot reach a stop check while the
+     * lock is held. sys_execve acquires the lock below, immediately before the
+     * point of no return, after every sibling has stopped.
+     */
     int survivors = thread_exec_de_thread();
-    mmap_lock_acquire();
 
     exec_require_no_survivors(survivors);
 
@@ -2270,6 +2237,22 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         exec_cleanup_inputs(&c);
         return err;
     }
+
+    /* Input copying above may fault in argv/env strings from lazy anonymous
+     * mappings, so it must run without mmap_lock held. Serialize only after
+     * all recoverable validation is complete and immediately before replacing
+     * the guest address space. From this point every failure is fatal and both
+     * successful return paths release the lock explicitly.
+     */
+    mmap_lock_acquire(g);
+
+    /* guest_reset zeroes shim data, the PT gate count with it. A host thread
+     * with no vCPU (the GDB stub's guest_write) can hold a gate reference
+     * across a dirty-block memset with mmap_lock dropped; resetting under it
+     * would let that thread install a descriptor into the new image. Wait its
+     * claim out first, as the fork snapshot does.
+     */
+    guest_materialize_wait_all_locked(g);
 
     /* Point of no return. guest_reset() zeroes all guest memory. The old
      * process image is gone. All validation that can fail gracefully MUST
@@ -2315,6 +2298,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         if (interp.resolved_temp)
             unlink(interp.resolved);
         exec_cleanup_inputs(&c);
+        mmap_lock_release();
         return SYSCALL_EXEC_HAPPENED;
     }
 
@@ -2359,5 +2343,6 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         unlink(interp.resolved);
     exec_cleanup_inputs(&c);
 
+    mmap_lock_release();
     return SYSCALL_EXEC_HAPPENED;
 }

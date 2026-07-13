@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <libkern/OSCacheControl.h>
 
 #include "debug/log.h"
@@ -314,6 +315,50 @@ static int read_string_array(guest_t *g,
     return count;
 }
 
+static int check_exec_permission(const struct stat *st)
+{
+    uint32_t uid = proc_get_euid();
+    uint32_t gid = proc_get_egid();
+
+    /* Root can execute if any execute bit is set */
+    if (uid == 0) {
+        if (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+            return 0;
+        return -LINUX_EACCES;
+    }
+
+    if (uid == (uint32_t) st->st_uid) {
+        if (st->st_mode & S_IXUSR)
+            return 0;
+        return -LINUX_EACCES;
+    }
+
+    bool in_group = (gid == (uint32_t) st->st_gid);
+    if (!in_group) {
+        gid_t groups[64];
+        int ngroups = getgroups(64, groups);
+        if (ngroups > 0) {
+            for (int i = 0; i < ngroups; i++) {
+                if (groups[i] == (gid_t) st->st_gid) {
+                    in_group = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (in_group) {
+        if (st->st_mode & S_IXGRP)
+            return 0;
+        return -LINUX_EACCES;
+    }
+
+    if (st->st_mode & S_IXOTH)
+        return 0;
+
+    return -LINUX_EACCES;
+}
+
 int64_t sys_execve(hv_vcpu_t vcpu,
                    guest_t *g,
                    uint64_t path_gva,
@@ -353,6 +398,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     size_t argv_buf_size = 0;
     size_t envp_buf_size = 0;
     size_t running_bytes = 0;
+    int exec_fd = -1;
+    int interp_fd = -1;
+
 
     char *temp_str = malloc(131072);
     if (!temp_str) {
@@ -421,11 +469,37 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     elf_info_t elf_info;
     int shebang_depth = 0;
 
+    /* Open the directly-executed file first and bind it to an fd to avoid
+     * TOCTOU. */
+    exec_fd = open(path_host, O_RDONLY | O_CLOEXEC);
+    if (exec_fd < 0) {
+        err = linux_errno();
+        goto fail;
+    }
+
+    /* Snapshot the directly-executed file's metadata before shebang
+     * resolution overwrites path_host with the interpreter path.  The
+     * setuid/setgid check below needs the *original* file's mode bits.
+     */
+    bool exec_is_script = false;
+    struct stat exec_st;
+    bool have_exec_st = (fstat(exec_fd, &exec_st) == 0);
+    if (!have_exec_st) {
+        err = linux_errno();
+        goto fail;
+    }
+
+    err = check_exec_permission(&exec_st);
+    if (err < 0) {
+        goto fail;
+    }
+
     while (true) {
         char interp_start[256];
         char interp_arg[256];
-        int rc = elf_read_shebang(path_host, interp_start, sizeof(interp_start),
-                                  interp_arg, sizeof(interp_arg));
+        int rc =
+            elf_read_shebang_fd(exec_fd, interp_start, sizeof(interp_start),
+                                interp_arg, sizeof(interp_arg));
         if (rc < 0) {
             errno = -rc;
             err = linux_errno();
@@ -433,6 +507,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         }
         if (rc == 0)
             break;
+
+        /* The file at the current path is a shebang script. */
+        exec_is_script = true;
 
         /* The current path is a script. Bound the resolution chain only once a
          * further shebang is confirmed, so a max-depth chain ending in a real
@@ -544,11 +621,46 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                            sizeof(path_host_buf));
             path_host = path_host_buf;
         }
+
+        /* Close old fd and open the new interpreter */
+        close(exec_fd);
+        exec_fd = open(path_host, O_RDONLY | O_CLOEXEC);
+        if (exec_fd < 0) {
+            err = linux_errno();
+            goto fail;
+        }
+        struct stat interp_st;
+        if (fstat(exec_fd, &interp_st) < 0) {
+            err = linux_errno();
+            goto fail;
+        }
+        err = check_exec_permission(&interp_st);
+        if (err < 0) {
+            goto fail;
+        }
     }
 
-    if (elf_load(path_host, &elf_info) < 0) {
+    if (elf_load_fd(exec_fd, path_host, &elf_info) < 0) {
         err = -LINUX_ENOEXEC;
         goto fail;
+    }
+
+    /* Compute setuid/setgid from the directly-executed file, matching Linux
+     * kernel behaviour (fs/exec.c bprm_fill_uid).  Scripts are
+     * deliberately excluded: the kernel ignores setuid/setgid on shebang
+     * scripts to prevent privilege escalation via interpreter manipulation.
+     * S_ISGID is only effective when the group-execute bit is also set,
+     * matching the kernel's mandatory-locking vs setgid distinction.
+     */
+    uint32_t new_euid = proc_get_euid();
+    uint32_t new_egid = proc_get_egid();
+    if (have_exec_st && !exec_is_script && S_ISREG(exec_st.st_mode)) {
+        if (exec_st.st_mode & S_ISUID) {
+            new_euid = (uint32_t) exec_st.st_uid;
+        }
+        if ((exec_st.st_mode & S_ISGID) && (exec_st.st_mode & S_IXGRP)) {
+            new_egid = (uint32_t) exec_st.st_gid;
+        }
     }
 
     /* Pre-PNR validation. All checks that can fail gracefully MUST happen
@@ -642,7 +754,26 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
         log_debug("execve: pre-validating interpreter: %s", interp_resolved);
 
-        if (elf_load(interp_resolved, &interp_info) < 0) {
+        interp_fd = open(interp_resolved, O_RDONLY | O_CLOEXEC);
+        if (interp_fd < 0) {
+            log_error("execve: failed to open interpreter: %s",
+                      interp_resolved);
+            err = linux_errno();
+            goto fail;
+        }
+
+        struct stat interp_st;
+        if (fstat(interp_fd, &interp_st) < 0) {
+            err = linux_errno();
+            goto fail;
+        }
+
+        err = check_exec_permission(&interp_st);
+        if (err < 0) {
+            goto fail;
+        }
+
+        if (elf_load_fd(interp_fd, interp_resolved, &interp_info) < 0) {
             log_error("execve: failed to load interpreter: %s",
                       interp_resolved);
             err = -LINUX_ENOEXEC;
@@ -660,8 +791,18 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* Past pre-PNR validation. Fall through to point of no return. The fail
      * label below handles all pre-PNR error paths.
      */
+    /* Commit credentials right before the Point of No Return.
+     * Saved UID/GID are refreshed from the final effective IDs.
+     */
+    proc_set_ids(proc_get_uid(), new_euid, new_euid, proc_get_gid(), new_egid,
+                 new_egid);
+
     if (0) {
     fail:
+        if (exec_fd >= 0)
+            close(exec_fd);
+        if (interp_fd >= 0)
+            close(interp_fd);
         free(temp_str);
         exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                             path_host_temp, interp_host_buf, interp_host_temp);
@@ -881,6 +1022,12 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         log_debug("execve: rosetta target %s, entry=0x%llx sp=0x%llx", path,
                   (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
         free(temp_str);
+        if (exec_fd >= 0) {
+            close(exec_fd);
+        }
+        if (interp_fd >= 0) {
+            close(interp_fd);
+        }
         exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                             path_host_temp, interp_host_buf, interp_host_temp);
         return SYSCALL_EXEC_HAPPENED;
@@ -889,8 +1036,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* Load the executable image that was validated before guest_reset(). */
     uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
     uint64_t infra_hi = g->interp_base;
-    if (elf_map_segments(&elf_info, path_host, g->host_base, g->guest_size,
-                         elf_load_base, infra_lo, infra_hi) < 0) {
+    if (elf_map_segments_fd(&elf_info, exec_fd, path_host, g->host_base,
+                            g->guest_size, elf_load_base, infra_lo,
+                            infra_hi) < 0) {
         log_fatal(
             "execve failed after point of no return: "
             "failed to map ELF segments for %s",
@@ -910,9 +1058,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
     if (elf_info.interp_path[0] != '\0') {
         interp_base = g->interp_base;
-        if (elf_map_segments(&interp_info, interp_resolved, g->host_base,
-                             g->guest_size, interp_base, infra_lo,
-                             infra_hi) < 0) {
+        if (elf_map_segments_fd(&interp_info, interp_fd, interp_resolved,
+                                g->host_base, g->guest_size, interp_base,
+                                infra_lo, infra_hi) < 0) {
             log_fatal(
                 "execve failed after point of no return: "
                 "failed to map interpreter segments");
@@ -1184,6 +1332,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
               (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
 
     free(temp_str);
+    if (exec_fd >= 0)
+        close(exec_fd);
+    if (interp_fd >= 0)
+        close(interp_fd);
     exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                         path_host_temp, interp_host_buf, interp_host_temp);
 

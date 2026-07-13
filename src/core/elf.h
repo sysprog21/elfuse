@@ -106,6 +106,7 @@ typedef struct {
  * Returns 0 on success, -1 on failure. Does NOT copy to guest yet.
  */
 int elf_load(const char *path, elf_info_t *info);
+int elf_load_fd(int fd, const char *display_path, elf_info_t *info);
 
 /* Copy ELF segments into guest memory. Call after elf_load() and guest_init().
  * Also copies program headers into guest memory for AT_PHDR. load_base is added
@@ -125,6 +126,14 @@ int elf_map_segments(const elf_info_t *info,
                      uint64_t load_base,
                      uint64_t infra_lo,
                      uint64_t infra_hi);
+int elf_map_segments_fd(const elf_info_t *info,
+                        int fd,
+                        const char *display_path,
+                        void *guest_base,
+                        uint64_t guest_size,
+                        uint64_t load_base,
+                        uint64_t infra_lo,
+                        uint64_t infra_hi);
 
 /* Resolve a PT_INTERP path against a sysroot directory. Tries three strategies:
  *   1. sysroot + interp_path  (standard /lib/ld-musl-*.so.1)
@@ -143,10 +152,10 @@ void elf_resolve_interp(const char *sysroot,
  */
 #define ELF_SHEBANG_MAX_DEPTH 5
 
-/* Read, probe, and parse a shebang script header from host_path. Writes
- * interpreter path to interp_out and the single optional argument (if present)
- * to arg_out. arg_out will be set to an empty string if there is no optional
- * argument.
+/* Parse the first line of a file to check for a binfmt_script shebang
+ * interpreter. Reads the first line into a local buffer and extracts the
+ * interpreter path and a single optional argument. Trailing whitespace is
+ * stripped.
  *
  * Supports LF (\n), CRLF (\r\n), and CR (\r) line endings. If the shebang line
  * is not terminated within the 511-byte buffer limit, returns -ENOEXEC.
@@ -162,6 +171,11 @@ int elf_read_shebang(const char *host_path,
                      size_t interp_sz,
                      char *arg_out,
                      size_t arg_sz);
+int elf_read_shebang_fd(int fd,
+                        char *interp_out,
+                        size_t interp_sz,
+                        char *arg_out,
+                        size_t arg_sz);
 
 /* Translate ELF program-header flags (PF_R=4, PF_W=2, PF_X=1) into the
  * R=1/W=2/X=4 bitset shared by both MEM_PERM_R/W/X (page-table permissions) and

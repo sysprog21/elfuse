@@ -21,42 +21,32 @@
 #include "debug/log.h"
 #include "utils.h"
 
-int elf_load(const char *path, elf_info_t *info)
+int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
 {
     memset(info, 0, sizeof(*info));
 
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        perror(path);
-        return -1;
-    }
-
     elf64_ehdr_t ehdr;
-    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
-        log_error("%s: failed to read ELF header", path);
-        fclose(f);
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) {
+        log_error("%s: failed to read ELF header", display_path);
         return -1;
     }
 
     /* Reject non-ELF inputs before interpreting the rest of the header. */
     if (ehdr.e_ident[0] != ELFMAG0 || ehdr.e_ident[1] != ELFMAG1 ||
         ehdr.e_ident[2] != ELFMAG2 || ehdr.e_ident[3] != ELFMAG3) {
-        log_error("%s: not an ELF file", path);
-        fclose(f);
+        log_error("%s: not an ELF file", display_path);
         return -1;
     }
 
     /* elfuse only implements the 64-bit Linux ABI. */
     if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        log_error("%s: not a 64-bit ELF", path);
-        fclose(f);
+        log_error("%s: not a 64-bit ELF", display_path);
         return -1;
     }
 
     /* aarch64-linux user binaries are little-endian in the supported mode. */
     if (ehdr.e_ident[EI_DATA] != ELFDATA2LSB) {
-        log_error("%s: not little-endian", path);
-        fclose(f);
+        log_error("%s: not little-endian", display_path);
         return -1;
     }
 
@@ -64,9 +54,8 @@ int elf_load(const char *path, elf_info_t *info)
      * diagnostic instead of a generic parse failure.
      */
     if (ehdr.e_machine != EM_AARCH64 && ehdr.e_machine != EM_X86_64) {
-        log_error("%s: unsupported architecture (e_machine=%u)", path,
+        log_error("%s: unsupported architecture (e_machine=%u)", display_path,
                   ehdr.e_machine);
-        fclose(f);
         return -1;
     }
 
@@ -74,8 +63,8 @@ int elf_load(const char *path, elf_info_t *info)
      * the load base that keeps them away from elfuse's reserved regions.
      */
     if (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) {
-        log_error("%s: not an executable (e_type=%u)", path, ehdr.e_type);
-        fclose(f);
+        log_error("%s: not an executable (e_type=%u)", display_path,
+                  ehdr.e_type);
         return -1;
     }
 
@@ -89,23 +78,20 @@ int elf_load(const char *path, elf_info_t *info)
 
     /* Program headers drive both memory mappings and auxv AT_PHDR. */
     if (ehdr.e_phnum == 0) {
-        log_error("%s: no program headers", path);
-        fclose(f);
+        log_error("%s: no program headers", display_path);
         return -1;
     }
     if (ehdr.e_phentsize < sizeof(elf64_phdr_t)) {
-        log_error("%s: e_phentsize too small (%u < %zu)", path,
+        log_error("%s: e_phentsize too small (%u < %zu)", display_path,
                   ehdr.e_phentsize, sizeof(elf64_phdr_t));
-        fclose(f);
         return -1;
     }
     /* Linux kernel caps program headers at 64KiB. Reject pathological inputs
      * before allocating to avoid attacker-controlled large allocations.
      */
     if ((size_t) ehdr.e_phnum * ehdr.e_phentsize > 65536) {
-        log_error("%s: program header table too large (%u * %u)", path,
+        log_error("%s: program header table too large (%u * %u)", display_path,
                   ehdr.e_phnum, ehdr.e_phentsize);
-        fclose(f);
         return -1;
     }
 
@@ -113,15 +99,12 @@ int elf_load(const char *path, elf_info_t *info)
     uint8_t *ph_buf = malloc(ph_total);
     if (!ph_buf) {
         perror("malloc");
-        fclose(f);
         return -1;
     }
 
-    if (fseek(f, (long) ehdr.e_phoff, SEEK_SET) != 0 ||
-        fread(ph_buf, ph_total, 1, f) != 1) {
-        log_error("%s: failed to read program headers", path);
+    if (pread(fd, ph_buf, ph_total, ehdr.e_phoff) != (ssize_t) ph_total) {
+        log_error("%s: failed to read program headers", display_path);
         free(ph_buf);
-        fclose(f);
         return -1;
     }
 
@@ -137,34 +120,29 @@ int elf_load(const char *path, elf_info_t *info)
         if (ph->p_type == PT_INTERP) {
             size_t interp_len = ph->p_filesz;
             if (interp_len >= sizeof(info->interp_path)) {
-                log_error("%s: PT_INTERP path too long (%zu >= %zu)", path,
-                          interp_len, sizeof(info->interp_path));
+                log_error("%s: PT_INTERP path too long (%zu >= %zu)",
+                          display_path, interp_len, sizeof(info->interp_path));
                 free(ph_buf);
-                fclose(f);
                 return -1;
             }
             if (interp_len > 0) {
-                long saved_pos = ftell(f);
-                if (fseek(f, (long) ph->p_offset, SEEK_SET) == 0) {
-                    size_t n = fread(info->interp_path, 1, interp_len, f);
-                    /* interp_len includes the NUL from the ELF file. On short
-                     * read, clear the path (unusable). On full read,
-                     * force-terminate as insurance.
-                     */
-                    if (n < interp_len)
-                        info->interp_path[0] = '\0';
-                    else
-                        info->interp_path[interp_len - 1] = '\0';
-                }
-                fseek(f, saved_pos, SEEK_SET);
+                ssize_t n =
+                    pread(fd, info->interp_path, interp_len, ph->p_offset);
+                /* interp_len includes the NUL from the ELF file. On short
+                 * read, clear the path (unusable). On full read,
+                 * force-terminate as insurance.
+                 */
+                if (n < (ssize_t) interp_len)
+                    info->interp_path[0] = '\0';
+                else
+                    info->interp_path[interp_len - 1] = '\0';
             }
         }
 
         if (ph->p_type == PT_LOAD) {
             if (seg_count >= ELF_MAX_SEGMENTS) {
-                log_error("%s: too many PT_LOAD segments", path);
+                log_error("%s: too many PT_LOAD segments", display_path);
                 free(ph_buf);
-                fclose(f);
                 return -1;
             }
 
@@ -189,9 +167,8 @@ int elf_load(const char *path, elf_info_t *info)
     info->num_segments = seg_count;
 
     if (seg_count == 0) {
-        log_error("%s: no PT_LOAD segments", path);
+        log_error("%s: no PT_LOAD segments", display_path);
         free(ph_buf);
-        fclose(f);
         return -1;
     }
 
@@ -202,17 +179,29 @@ int elf_load(const char *path, elf_info_t *info)
     info->phdr_gpa = info->load_min + ehdr.e_phoff;
 
     free(ph_buf);
-    fclose(f);
     return 0;
 }
 
-int elf_map_segments(const elf_info_t *info,
-                     const char *path,
-                     void *guest_base,
-                     uint64_t guest_size,
-                     uint64_t load_base,
-                     uint64_t infra_lo,
-                     uint64_t infra_hi)
+int elf_load(const char *path, elf_info_t *info)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror(path);
+        return -1;
+    }
+    int rc = elf_load_fd(fd, path, info);
+    close(fd);
+    return rc;
+}
+
+int elf_map_segments_fd(const elf_info_t *info,
+                        int fd,
+                        const char *display_path,
+                        void *guest_base,
+                        uint64_t guest_size,
+                        uint64_t load_base,
+                        uint64_t infra_lo,
+                        uint64_t infra_hi)
 {
     /* Half-open intersection test for [a, a+alen) and [b, b+blen). When
      * infra_lo == infra_hi the caller opted out (early bring-up before guest_t
@@ -220,16 +209,10 @@ int elf_map_segments(const elf_info_t *info,
      * guest_size bound check.
      */
     bool infra_active = infra_lo < infra_hi;
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        perror(path);
-        return -1;
-    }
 
     /* Re-read ELF header to get phoff */
     elf64_ehdr_t ehdr;
-    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
-        fclose(f);
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) {
         return -1;
     }
 
@@ -239,19 +222,15 @@ int elf_map_segments(const elf_info_t *info,
      */
     size_t ph_total = (size_t) ehdr.e_phnum * ehdr.e_phentsize;
     if (ph_total == 0 || ph_total > 65536) {
-        fclose(f);
         return -1;
     }
     uint8_t *ph_buf = malloc(ph_total);
     if (!ph_buf) {
-        fclose(f);
         return -1;
     }
 
-    if (fseek(f, (long) ehdr.e_phoff, SEEK_SET) != 0 ||
-        fread(ph_buf, ph_total, 1, f) != 1) {
+    if (pread(fd, ph_buf, ph_total, ehdr.e_phoff) != (ssize_t) ph_total) {
         free(ph_buf);
-        fclose(f);
         return -1;
     }
 
@@ -268,10 +247,9 @@ int elf_map_segments(const elf_info_t *info,
         log_error(
             "%s: program headers at 0x%llx exceed guest memory "
             "(size 0x%llx)",
-            path, (unsigned long long) (phdr_dest + ph_total),
+            display_path, (unsigned long long) (phdr_dest + ph_total),
             (unsigned long long) guest_size);
         free(ph_buf);
-        fclose(f);
         return -1;
     }
     if (infra_active && phdr_dest < infra_hi &&
@@ -279,10 +257,9 @@ int elf_map_segments(const elf_info_t *info,
         log_error(
             "%s: program headers at 0x%llx overlap infra reserve "
             "[0x%llx, 0x%llx)",
-            path, (unsigned long long) phdr_dest, (unsigned long long) infra_lo,
-            (unsigned long long) infra_hi);
+            display_path, (unsigned long long) phdr_dest,
+            (unsigned long long) infra_lo, (unsigned long long) infra_hi);
         free(ph_buf);
-        fclose(f);
         return -1;
     }
     memcpy((uint8_t *) guest_base + phdr_dest, ph_buf, ph_total);
@@ -312,20 +289,19 @@ int elf_map_segments(const elf_info_t *info,
             log_error(
                 "%s: segment at 0x%llx has filesz > memsz "
                 "(0x%llx > 0x%llx)",
-                path, (unsigned long long) gpa, (unsigned long long) filesz,
-                (unsigned long long) memsz);
+                display_path, (unsigned long long) gpa,
+                (unsigned long long) filesz, (unsigned long long) memsz);
             free(ph_buf);
-            fclose(f);
             return -1;
         }
 
         /* Keep the mapped segment inside the configured IPA-sized guest slab.
          */
         if (memsz > guest_size || gpa > guest_size - memsz) {
-            log_error("%s: segment at 0x%llx+0x%llx exceeds guest memory", path,
-                      (unsigned long long) gpa, (unsigned long long) memsz);
+            log_error("%s: segment at 0x%llx+0x%llx exceeds guest memory",
+                      display_path, (unsigned long long) gpa,
+                      (unsigned long long) memsz);
             free(ph_buf);
-            fclose(f);
             return -1;
         }
 
@@ -359,11 +335,10 @@ int elf_map_segments(const elf_info_t *info,
             log_error(
                 "%s: segment at 0x%llx+0x%llx (zero-extent 0x%llx) overlaps "
                 "infra reserve [0x%llx, 0x%llx)",
-                path, (unsigned long long) gpa, (unsigned long long) memsz,
-                (unsigned long long) zero_len, (unsigned long long) infra_lo,
-                (unsigned long long) infra_hi);
+                display_path, (unsigned long long) gpa,
+                (unsigned long long) memsz, (unsigned long long) zero_len,
+                (unsigned long long) infra_lo, (unsigned long long) infra_hi);
             free(ph_buf);
-            fclose(f);
             return -1;
         }
 
@@ -378,22 +353,14 @@ int elf_map_segments(const elf_info_t *info,
             memset((uint8_t *) guest_base + gpa + filesz, 0, zero_len - filesz);
 
         if (filesz > 0) {
-            if (fseek(f, (long) ph->p_offset, SEEK_SET) != 0) {
-                log_error("%s: seek failed for segment at 0x%llx", path,
-                          (unsigned long long) gpa);
-                free(ph_buf);
-                fclose(f);
-                return -1;
-            }
-            size_t nread = fread((uint8_t *) guest_base + gpa, 1, filesz, f);
-            if (nread != filesz) {
+            if (pread(fd, (uint8_t *) guest_base + gpa, filesz, ph->p_offset) !=
+                (ssize_t) filesz) {
                 log_error(
                     "%s: short read for segment at 0x%llx "
-                    "(got %zu, expected %llu)",
-                    path, (unsigned long long) gpa, nread,
+                    "(expected %llu)",
+                    display_path, (unsigned long long) gpa,
                     (unsigned long long) filesz);
                 free(ph_buf);
-                fclose(f);
                 return -1;
             }
         }
@@ -402,8 +369,26 @@ int elf_map_segments(const elf_info_t *info,
     }
 
     free(ph_buf);
-    fclose(f);
     return 0;
+}
+
+int elf_map_segments(const elf_info_t *info,
+                     const char *path,
+                     void *guest_base,
+                     uint64_t guest_size,
+                     uint64_t load_base,
+                     uint64_t infra_lo,
+                     uint64_t infra_hi)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror(path);
+        return -1;
+    }
+    int rc = elf_map_segments_fd(info, fd, path, guest_base, guest_size,
+                                 load_base, infra_lo, infra_hi);
+    close(fd);
+    return rc;
 }
 
 void elf_resolve_interp(const char *sysroot,
@@ -430,19 +415,14 @@ void elf_resolve_interp(const char *sysroot,
     str_copy_trunc(out, interp_path, out_sz);
 }
 
-int elf_read_shebang(const char *host_path,
-                     char *interp_out,
-                     size_t interp_sz,
-                     char *arg_out,
-                     size_t arg_sz)
+int elf_read_shebang_fd(int fd,
+                        char *interp_out,
+                        size_t interp_sz,
+                        char *arg_out,
+                        size_t arg_sz)
 {
-    int fd = open(host_path, O_RDONLY);
-    if (fd < 0)
-        return -errno;
-
     char buf[512];
-    ssize_t nread = read(fd, buf, sizeof(buf) - 1);
-    close_keep_errno(fd);
+    ssize_t nread = pread(fd, buf, sizeof(buf) - 1, 0);
 
     if (nread < 0) {
         return -errno;
@@ -513,4 +493,18 @@ int elf_read_shebang(const char *host_path,
     }
 
     return 1; /* Successfully parsed shebang */
+}
+
+int elf_read_shebang(const char *host_path,
+                     char *interp_out,
+                     size_t interp_sz,
+                     char *arg_out,
+                     size_t arg_sz)
+{
+    int fd = open(host_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -errno;
+    int rc = elf_read_shebang_fd(fd, interp_out, interp_sz, arg_out, arg_sz);
+    close_keep_errno(fd);
+    return rc;
 }

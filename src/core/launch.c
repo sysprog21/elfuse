@@ -26,6 +26,7 @@
 
 #include "core/bootstrap.h"
 #include "core/guest.h"
+#include "core/mmap-fastpath.h"
 #include "core/shim-globals.h"
 #include "core/sysroot.h"
 
@@ -191,6 +192,14 @@ int elfuse_launch(const launch_args_t *args)
     if (guest_bootstrap_create_vcpu(&g, &boot, args->verbose, &vcpu, &vexit) <
         0)
         goto fail;
+
+    /* Tracing/debuggers require every mmap to reach host dispatch so syscall
+     * observation and region state advance in lockstep. This also prevents a
+     * trace-gated shim from leaving invisible arena reservations that perturb
+     * the host slow path's address-hint behavior.
+     */
+    if (args->verbose || args->gdb_port > 0)
+        mmap_fastpath_disable(&g);
 
     /* GDB setup must happen before the first run so entry-stop and hardware
      * breakpoints can affect the initial vCPU.

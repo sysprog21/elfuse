@@ -253,7 +253,12 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
         return gva; /* propagate mmap error */
     }
 
-    /* Copy host shm content into guest memory */
+    /* Copy host shm content into guest memory. sys_shmat runs under
+     * mmap_lock (SC_LOCKED), so the resolve-time lazy fault-in inside
+     * guest_write would self-deadlock on it; materialize the fresh anonymous
+     * mapping through the locked variant first.
+     */
+    guest_lazy_faultin_locked(g, (uint64_t) gva, seg_size);
     if (guest_write(g, (uint64_t) gva, host_addr, seg_size) < 0) {
         shmdt(host_addr);
         return -LINUX_EFAULT;
@@ -312,7 +317,11 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
 
     /* Write back guest modifications to host shm (unless read-only) */
     if (!entry.rdonly) {
-        /* Read guest memory back to host shm buffer */
+        /* Read guest memory back to host shm buffer. Same SC_LOCKED
+         * self-deadlock hazard as the shmat copy-in: pages the guest never
+         * touched may still be unmaterialized.
+         */
+        guest_lazy_faultin_locked(g, entry.guest_gva, entry.size);
         guest_read(g, entry.guest_gva, entry.host_addr, entry.size);
     }
 

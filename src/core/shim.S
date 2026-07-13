@@ -251,6 +251,28 @@
 .Lctr_skip_\@:
 .endm
 
+/* Per-vCPU mmap counters live after the 16 x 24-byte publication ring in the
+ * mmap control block. Each vCPU is the sole writer of its own slots. Keep the
+ * shared stats gate so normal fast paths do not touch diagnostic cache lines.
+ */
+.equ SHIM_MMAP_COUNTERS_OFF, 0x1C0
+.equ MC_SHAPE_MISS,          0
+.equ MC_CAPACITY_MISS,       1
+.equ MC_RING_FULL,           2
+.equ MC_GENERATION_STALE,    3
+.equ MC_ATTENTION,           4
+.equ MC_HIT,                 5
+
+.macro MMAP_COUNTER_INC slot
+    mrs x29, tpidr_el1
+    ldrb w30, [x29, #SHIM_STATS_EN_OFF]
+    cbz w30, .Lmmap_ctr_skip_\@
+    ldr x29, [x12, #(SHIM_MMAP_COUNTERS_OFF + 8 * \slot)]
+    add x29, x29, #1
+    str x29, [x12, #(SHIM_MMAP_COUNTERS_OFF + 8 * \slot)]
+.Lmmap_ctr_skip_\@:
+.endm
+
 /* BAD_VEC: vector-table entry that reports an unexpected exception.
  * Each table slot is 128 bytes; the leading .align 7 places this entry at the
  * next 128-byte boundary.
@@ -440,6 +462,118 @@ svc_handler:
     b.eq getsid_fast
     cmp x10, #278                      /* SYS_getrandom? */
     b.eq getrandom_fast
+    cmp x10, #222                      /* SYS_mmap? */
+    b.eq mmap_anon_fast
+    b handle_svc_0
+
+/* mmap_anon_fast: consume a host-prepared, per-vCPU VA arena for the exact
+ * anonymous RW shape used by allocators:
+ *
+ *   mmap(NULL, len, PROT_READ|PROT_WRITE,
+ *        MAP_PRIVATE|MAP_ANONYMOUS[|MAP_NORESERVE], fd, off)
+ *
+ * The control is selected without another system register.  SP_EL1 stack tops
+ * are shim_data_end - slot*4KiB; controls are shim_data+0x20000 + slot*2KiB,
+ * so (shim_data_end - ALIGN_UP(sp,4KiB))/2 is the control-array displacement.
+ * Each vCPU is the sole producer of its ring and cursor.  The host acquire-
+ * drains all rings whenever it takes mmap_lock.
+ */
+mmap_anon_fast:
+    mrs x12, tpidr_el1                 /* shared shim-data base */
+    ldar w13, [x12]                    /* tracing/signal attention gate */
+
+    add x14, sp, #0xfff
+    and x14, x14, #~0xfff              /* this vCPU's stack top */
+    add x15, x12, #0x200, lsl #12      /* shim_data + 2MiB */
+    sub x15, x15, x14                  /* slot * 4KiB */
+    lsr x15, x15, #1                   /* slot * 2KiB */
+    add x12, x12, x15
+    add x12, x12, #0x20, lsl #12       /* control base + 0x20000 */
+
+    cbnz w13, mmap_attention_bail
+
+    ldr x14, [sp, #0]                  /* addr */
+    cbnz x14, mmap_shape_bail
+    ldr x16, [sp, #16]                 /* prot */
+    cmp x16, #3                        /* PROT_READ|PROT_WRITE */
+    b.ne mmap_shape_bail
+    ldr x17, [sp, #24]                 /* flags */
+    bic x18, x17, #0x4000              /* tolerate MAP_NORESERVE */
+    cmp x18, #0x22                     /* MAP_PRIVATE|MAP_ANONYMOUS */
+    b.ne mmap_shape_bail
+
+    ldr x15, [sp, #8]                  /* len */
+    cbz x15, mmap_shape_bail
+    adds x15, x15, #0xfff
+    b.cs mmap_shape_bail                /* PAGE_ALIGN_UP overflow */
+    and x15, x15, #~0xfff
+
+    ldar w13, [x12]                    /* descriptor generation */
+    ldr w14, [x12, #4]                 /* consumer generation */
+    cmp w13, w14
+    b.ne mmap_generation_bail
+    ldr w13, [x12, #8]                 /* SHIM_MMAP_CTRL_ENABLED */
+    tbz w13, #0, mmap_capacity_bail
+
+    ldr x19, [x12, #40]                /* private bump cursor */
+    mov x20, #0x200000
+    cmp x15, x20
+    b.lo 1f
+    sub x21, x20, #1
+    adds x19, x19, x21
+    b.cs mmap_capacity_bail
+    bic x19, x19, x21                  /* >=2MiB: 2MiB-align */
+1:  ldr x20, [x12, #32]                /* arena limit */
+    adds x21, x19, x15                 /* new cursor */
+    b.cs mmap_capacity_bail
+    cmp x21, x20
+    b.hi mmap_capacity_bail
+
+    add x23, x12, #12                  /* &head */
+    ldar w22, [x23]
+    ldr w23, [x12, #16]                /* producer-owned tail */
+    sub w24, w23, w22
+    cmp w24, #16                       /* SHIM_MMAP_RING_SIZE */
+    b.hs mmap_ring_full_bail
+
+    and w24, w23, #15
+    add x24, x24, x24, lsl #1          /* index * 3 */
+    add x25, x12, #64                   /* ring base */
+    add x25, x25, x24, lsl #3          /* index * 24 */
+    str x19, [x25, #0]
+    str x15, [x25, #8]
+    str x16, [x25, #16]
+    str x21, [x12, #40]                /* publish cursor before entry */
+    add w23, w23, #1
+    add x25, x12, #16
+    stlr w23, [x25]                    /* release-publish ring entry */
+    mov x0, x19
+    MMAP_COUNTER_INC MC_HIT
+    b svc_restore_eret
+
+mmap_shape_bail:
+    MMAP_COUNTER_INC MC_SHAPE_MISS
+    b handle_svc_0
+
+mmap_capacity_bail:
+    MMAP_COUNTER_INC MC_CAPACITY_MISS
+    b handle_svc_0
+
+mmap_ring_full_bail:
+    MMAP_COUNTER_INC MC_RING_FULL
+    b handle_svc_0
+
+mmap_attention_bail:
+    MMAP_COUNTER_INC MC_ATTENTION
+    b attn_bail
+
+mmap_generation_bail:
+    /* A revocation deliberately leaves the consumer generation stale.  Ack
+     * only after the acquire load above, then make this syscall take HVC; the
+     * host will either leave the control disabled or publish a fresh arena.
+     */
+    MMAP_COUNTER_INC MC_GENERATION_STALE
+    str w13, [x12, #4]
     b handle_svc_0
 
 identity_class_fast:
@@ -1203,6 +1337,7 @@ handle_el0_fault:
 
 .Lel0_fault_tlbi_full:
     /* Broadcast TLB + conditional I-cache flush. X11=0 skips IC IALLU. */
+    dsb ishst
     tlbi vmalle1is
     dsb ish
     cbz x11, .Lel0_fault_full_no_ic
@@ -1223,6 +1358,7 @@ handle_el0_fault:
     mov x13, x11
     ubfx x11, x9, #12, #44
     mov x12, x10
+    dsb ishst
 4:  tlbi vae1is, x11
     add x11, x11, #1
     subs x12, x12, #1
@@ -1237,7 +1373,9 @@ handle_el0_fault:
 
 .Lel0_fault_tlbi_rvae:
     /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE). X9 carries the pre-encoded
-     * operand (baddr | NUM<<39 | TG=01<<46); X11 the I-cache hint. */
+     * operand (baddr | NUM<<39 | SCALE<<44 | TG=01<<46); X11 the I-cache
+     * hint. */
+    dsb ishst
     tlbi rvae1is, x9
     dsb ish
     cbz x11, .Lel0_fault_rvae_no_ic
@@ -1281,6 +1419,7 @@ tlbi_restore_eret:
      * leak VA bits into the TTL [47:44] or ASID [63:48] operand fields.
      */
     ubfx x0, x0, #12, #44
+    dsb ishst
     tlbi vae1is, x0
     dsb ish
     ic iallu
@@ -1356,6 +1495,7 @@ handle_svc_0:
      *        1 = broadcast TLBI VMALLE1IS
      *        2 = execve replaced register state (drop frame + flush)
      *        3 = selective TLBI VAE1IS over X10 pages starting at X9
+     *        4 = single-shot TLBI RVAE1IS with encoded operand in X9
      *   5. Resume vCPU (execution continues below)
      */
     hvc #5
@@ -1384,6 +1524,7 @@ tlbi_full:
      * include exec), so the shim must IC IALLU; zero means a data-only
      * PT change and the I-cache invalidation is skipped.
      */
+    dsb ishst
     tlbi vmalle1is
     dsb ish
     cbz x11, .Ltlbi_full_skip_ic
@@ -1419,6 +1560,7 @@ tlbi_selective:
      * leak VA bits into the TTL [47:44] or ASID [63:48] operand fields. */
     ubfx x11, x9, #12, #44    /* x11 = VA[55:12] (current page operand) */
     mov x12, x10              /* x12 = remaining page counter */
+    dsb ishst
 3:  tlbi vae1is, x11
     add x11, x11, #1          /* next page (operand is in 4 KiB units) */
     subs x12, x12, #1
@@ -1434,11 +1576,11 @@ tlbi_selective:
 tlbi_range_large:
     /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has
      * encoded the full operand in X9: baddr (VA >> 12), TTL=0, NUM in bits
-     * [43:39], SCALE=0, ASID=0. One instruction covers up to 64 pages,
-     * avoiding the broadcast TLBI VMALLE1IS that the prior selective cap
-     * forced for 17..64-page ranges. X11 carries the I-cache hint as in
-     * tlbi_full / tlbi_selective.
+     * [43:39], SCALE in bits [45:44], ASID=0. One instruction covers up to
+     * TLBI_RVAE_MAX_PAGES. X11 carries the I-cache hint as in tlbi_full /
+     * tlbi_selective.
      */
+    dsb ishst
     tlbi rvae1is, x9
     dsb ish
     cbz x11, .Ltlbi_rvae_skip_ic

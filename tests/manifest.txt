@@ -105,6 +105,10 @@ test-fork-synthetic-fd
 test-guard-page
 test-mmap-hint
 
+[section] Lazy anonymous mmap tests
+test-mmap-lazy
+test-mmap-fastpath
+
 [section] mremap tests
 test-mremap
 test-mremap-infra

@@ -50,6 +50,13 @@ typedef int host_fd_t;
 extern pthread_mutex_t mmap_lock; /* Lock order: 1, mmap/brk + page tables */
 extern pthread_mutex_t fd_lock;   /* Lock order: 3, FD table */
 
+/* The only supported mmap_lock entry/exit API.  Acquire drains the per-vCPU
+ * EL1 mmap rings before any caller can inspect semantic region state.
+ */
+void mmap_lock_acquire(guest_t *g);
+void mmap_lock_release(void);
+void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond);
+
 /* FD table (defined in syscall/fdtable.c). */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];
 

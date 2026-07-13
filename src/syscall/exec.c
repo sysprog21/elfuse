@@ -668,6 +668,14 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         return err;
     }
 
+    /* Input copying above may fault in argv/env strings from lazy anonymous
+     * mappings, so it must run without mmap_lock held. Serialize only after
+     * all recoverable validation is complete and immediately before replacing
+     * the guest address space. From this point every failure is fatal and both
+     * successful return paths release the lock explicitly.
+     */
+    mmap_lock_acquire(g);
+
     /* Point of no return. guest_reset() zeroes all guest memory. The old
      * process image is gone. All validation that can fail gracefully MUST
      * happen above this line. Failures below are unrecoverable; elfuse exits
@@ -883,6 +891,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         free(temp_str);
         exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                             path_host_temp, interp_host_buf, interp_host_temp);
+        mmap_lock_release();
         return SYSCALL_EXEC_HAPPENED;
     }
 
@@ -1187,6 +1196,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                         path_host_temp, interp_host_buf, interp_host_temp);
 
+    mmap_lock_release();
     return SYSCALL_EXEC_HAPPENED;
 
 too_many_regions:

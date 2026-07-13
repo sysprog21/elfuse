@@ -21,8 +21,10 @@
 #include <pthread.h>
 
 #include "debug/log.h"
+#include "debug/syscall-hist.h"
 #include "utils.h"
 
+#include "core/mmap-fastpath.h"
 #include "runtime/thread.h"
 #include "syscall/abi.h"
 #include "syscall/fuse.h"
@@ -34,6 +36,392 @@
  * allocations or corrupt page table structures.
  */
 pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
+
+static pthread_once_t mmap_fastpath_env_once = PTHREAD_ONCE_INIT;
+static bool mmap_fastpath_env_enabled;
+static _Atomic bool mmap_fastpath_forced_off;
+
+static uint64_t find_free_gap_inner(const guest_t *g,
+                                    uint64_t length,
+                                    uint64_t min_addr,
+                                    uint64_t max_addr,
+                                    uint64_t align);
+
+static void mmap_fastpath_read_env(void)
+{
+    const char *v = getenv("ELFUSE_MMAP_FASTPATH");
+    mmap_fastpath_env_enabled =
+        !v || (strcmp(v, "0") != 0 && strcmp(v, "false") != 0);
+}
+
+static bool mmap_fastpath_available(const guest_t *g)
+{
+    pthread_once(&mmap_fastpath_env_once, mmap_fastpath_read_env);
+    return mmap_fastpath_env_enabled && !g->is_rosetta &&
+           !atomic_load_explicit(&mmap_fastpath_forced_off,
+                                 memory_order_acquire) &&
+           !syscall_hist_enabled();
+}
+
+static shim_mmap_control_t *mmap_fastpath_control(const guest_t *g, int slot)
+{
+    if (!g || !g->host_base || slot < 0 || slot >= MAX_THREADS)
+        return NULL;
+    return (shim_mmap_control_t *) ((uint8_t *) g->host_base +
+                                    g->shim_data_base + SHIM_MMAP_CONTROL_BASE +
+                                    (uint64_t) slot * SHIM_MMAP_CONTROL_STRIDE);
+}
+
+static void mmap_fastpath_disable_control(shim_mmap_control_t *c)
+{
+    uint32_t generation =
+        atomic_load_explicit(&c->generation, memory_order_relaxed) + 1;
+    if (generation == 0)
+        generation = 1;
+    atomic_store_explicit(&c->flags, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->arena_base, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->arena_limit, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->cursor, 0, memory_order_relaxed);
+    c->next_arena_size = MMAP_FAST_ARENA_MIN;
+    c->max_len_seen = 0;
+    atomic_store_explicit(&c->generation, generation, memory_order_release);
+}
+
+void mmap_fastpath_drain_locked(guest_t *g)
+{
+    if (!g || !g->host_base)
+        return;
+
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        uint32_t head = atomic_load_explicit(&c->head, memory_order_relaxed);
+        uint32_t tail = atomic_load_explicit(&c->tail, memory_order_acquire);
+        if ((uint32_t) (tail - head) > SHIM_MMAP_RING_SIZE) {
+            log_fatal(
+                "mmap fast path: corrupt ring in vCPU slot %d "
+                "(head=%u tail=%u)",
+                slot, head, tail);
+        }
+
+        uint64_t arena_base =
+            atomic_load_explicit(&c->arena_base, memory_order_relaxed);
+        uint64_t arena_limit =
+            atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+        while (head != tail) {
+            const shim_mmap_entry_t *e =
+                &c->ring[head & (SHIM_MMAP_RING_SIZE - 1)];
+            uint64_t addr = e->addr;
+            uint64_t len = e->len;
+            if ((addr & (GUEST_PAGE_SIZE - 1)) || !len ||
+                (len & (GUEST_PAGE_SIZE - 1)) || addr < arena_base ||
+                addr > arena_limit || len > arena_limit - addr ||
+                e->prot != (LINUX_PROT_READ | LINUX_PROT_WRITE)) {
+                log_fatal(
+                    "mmap fast path: invalid entry in vCPU slot %d "
+                    "(addr=0x%llx len=0x%llx arena=0x%llx..0x%llx)",
+                    slot, (unsigned long long) addr, (unsigned long long) len,
+                    (unsigned long long) arena_base,
+                    (unsigned long long) arena_limit);
+            }
+            if (guest_region_add_ex(g, addr, addr + len,
+                                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS |
+                                        LINUX_MAP_NORESERVE,
+                                    0, NULL, -1) < 0) {
+                /* EL1 already returned this address to the guest.  Continuing
+                 * without semantic metadata would turn first touch into a
+                 * false SIGSEGV, so fail closed on the violated provisioning
+                 * invariant instead of silently corrupting process state.
+                 */
+                log_fatal(
+                    "mmap fast path: region metadata exhausted while "
+                    "draining vCPU slot %d",
+                    slot);
+            }
+            if (len > c->max_len_seen)
+                c->max_len_seen = len;
+            head++;
+        }
+        atomic_store_explicit(&c->head, head, memory_order_release);
+    }
+}
+
+void mmap_lock_acquire(guest_t *g)
+{
+    pthread_mutex_lock(&mmap_lock);
+    mmap_fastpath_drain_locked(g);
+}
+
+void mmap_lock_release(void)
+{
+    pthread_mutex_unlock(&mmap_lock);
+}
+
+void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond)
+{
+    pthread_cond_wait(cond, &mmap_lock);
+    /* pthread_cond_wait reacquires mmap_lock directly, so preserve the
+     * drain-before-region-read invariant of mmap_lock_acquire().
+     */
+    mmap_fastpath_drain_locked(g);
+}
+
+static bool mmap_fastpath_request_fits(uint64_t cursor,
+                                       uint64_t limit,
+                                       uint64_t len)
+{
+    if (!len)
+        return cursor < limit;
+    uint64_t start = cursor;
+    if (len >= BLOCK_2MIB) {
+        if (start > UINT64_MAX - (BLOCK_2MIB - 1))
+            return false;
+        start = ALIGN_UP(start, BLOCK_2MIB);
+    }
+    return start <= limit && len <= limit - start;
+}
+
+static uint64_t mmap_fastpath_pow2_clamped(uint64_t value)
+{
+    if (value <= MMAP_FAST_ARENA_MIN)
+        return MMAP_FAST_ARENA_MIN;
+    if (value >= MMAP_FAST_ARENA_MAX)
+        return MMAP_FAST_ARENA_MAX;
+    value--;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    value |= value >> 32;
+    return value + 1;
+}
+
+static uint64_t mmap_fastpath_arena_size(uint64_t max_len_seen,
+                                         uint64_t request_len)
+{
+    uint64_t adaptive = MMAP_FAST_ARENA_MIN;
+    if (max_len_seen) {
+        uint64_t target =
+            max_len_seen > MMAP_FAST_ARENA_MAX / MMAP_FAST_HISTORY_MULTIPLIER
+                ? MMAP_FAST_ARENA_MAX
+                : max_len_seen * MMAP_FAST_HISTORY_MULTIPLIER;
+        adaptive = mmap_fastpath_pow2_clamped(target);
+    }
+
+    uint64_t covering = MMAP_FAST_ARENA_MIN;
+    if (request_len) {
+        uint64_t target = request_len > MMAP_FAST_ARENA_MAX / 2
+                              ? MMAP_FAST_ARENA_MAX
+                              : request_len * 2;
+        covering = mmap_fastpath_pow2_clamped(target);
+    }
+    return adaptive > covering ? adaptive : covering;
+}
+
+static void mmap_fastpath_refill_thread_locked(guest_t *g,
+                                               thread_entry_t *t,
+                                               uint64_t request_len)
+{
+    if (!t || t->sp_el1_slot < 0)
+        return;
+    shim_mmap_control_t *c = mmap_fastpath_control(g, t->sp_el1_slot);
+    if (!c)
+        return;
+    if (!mmap_fastpath_available(g)) {
+        mmap_fastpath_disable_control(c);
+        return;
+    }
+
+    /* Giant requests are deliberately slow-path-only. Do not abandon a useful
+     * small-request arena or poison its adaptive history.
+     */
+    if (request_len > MMAP_FAST_ARENA_MAX)
+        return;
+
+    if (request_len > c->max_len_seen)
+        c->max_len_seen = request_len;
+
+    uint64_t cursor = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    uint64_t limit =
+        atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+    uint32_t flags = atomic_load_explicit(&c->flags, memory_order_relaxed);
+    if ((flags & SHIM_MMAP_CTRL_ENABLED) &&
+        mmap_fastpath_request_fits(cursor, limit, request_len))
+        return;
+
+    /* The owner is parked in HVC. Make the stranded tail immediately
+     * recyclable before the gap scan; mappings already served from the prefix
+     * were drained into regions[] on mmap_lock acquisition.
+     */
+    if (flags & SHIM_MMAP_CTRL_ENABLED)
+        atomic_store_explicit(&c->cursor, limit, memory_order_relaxed);
+
+    uint64_t arena_size =
+        mmap_fastpath_arena_size(c->max_len_seen, request_len);
+
+    /* Prefer a real hole below the current high-water mark. Active sibling
+     * arena tails are excluded by mmap_fastpath_skip_reserved inside the gap
+     * allocator. Only grow mmap_next when no recyclable hole fits.
+     */
+    uint64_t high = g->mmap_next;
+    if (high > g->mmap_limit)
+        high = g->mmap_limit;
+    uint64_t base = UINT64_MAX;
+    bool recycled = false;
+    if (high > MMAP_BASE) {
+        base = find_free_gap_inner(g, arena_size, MMAP_BASE, high, BLOCK_2MIB);
+        recycled = base != UINT64_MAX;
+    }
+
+    if (!recycled) {
+        if (g->mmap_next > UINT64_MAX - (BLOCK_2MIB - 1)) {
+            mmap_fastpath_disable_control(c);
+            return;
+        }
+        base = ALIGN_UP(g->mmap_next, BLOCK_2MIB);
+        if (base > g->mmap_limit || arena_size > g->mmap_limit - base) {
+            mmap_fastpath_disable_control(c);
+            return;
+        }
+    }
+    uint64_t new_limit = base + arena_size;
+
+    /* Carve VA only.  Clearing stale descriptors once here makes every later
+     * bump allocation PTE-free without putting page-table work in EL1.
+     */
+    if (guest_invalidate_ptes(g, base, new_limit) < 0) {
+        mmap_fastpath_disable_control(c);
+        return;
+    }
+    if (!recycled) {
+        g->mmap_next = new_limit;
+        if (g->mmap_rw_gap_hint < new_limit)
+            g->mmap_rw_gap_hint = new_limit;
+    }
+
+    uint32_t generation =
+        atomic_load_explicit(&c->generation, memory_order_relaxed) + 1;
+    if (generation == 0)
+        generation = 1;
+    atomic_store_explicit(&c->arena_base, base, memory_order_relaxed);
+    atomic_store_explicit(&c->arena_limit, new_limit, memory_order_relaxed);
+    atomic_store_explicit(&c->cursor, base, memory_order_relaxed);
+    c->next_arena_size = arena_size;
+    c->max_len_seen = 0;
+    c->refill_count++;
+    if (recycled)
+        c->recycle_count++;
+    if (arena_size > c->peak_arena_size)
+        c->peak_arena_size = arena_size;
+    atomic_store_explicit(&c->flags, SHIM_MMAP_CTRL_ENABLED,
+                          memory_order_relaxed);
+    /* This vCPU is stopped in HVC (or has never run), so host may acknowledge
+     * the freshly published descriptor on its behalf.  Revocation deliberately
+     * does not do this, making an in-flight stale generation bail once.
+     */
+    atomic_store_explicit(&c->consumer_generation, generation,
+                          memory_order_relaxed);
+    atomic_store_explicit(&c->generation, generation, memory_order_release);
+}
+
+void mmap_fastpath_refill_current_locked(guest_t *g, uint64_t request_len)
+{
+    mmap_fastpath_refill_thread_locked(g, current_thread, request_len);
+}
+
+void mmap_fastpath_release_current_hint_locked(guest_t *g,
+                                               uint64_t addr,
+                                               uint64_t length)
+{
+    if (!current_thread || current_thread->sp_el1_slot < 0 || !length ||
+        addr > UINT64_MAX - length)
+        return;
+    shim_mmap_control_t *c =
+        mmap_fastpath_control(g, current_thread->sp_el1_slot);
+    if (!c || !(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+                SHIM_MMAP_CTRL_ENABLED))
+        return;
+    uint64_t cursor = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    uint64_t limit =
+        atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+    if (cursor >= limit || addr >= limit || addr + length <= cursor)
+        return;
+
+    /* The owner is stopped in the HVC that reached sys_mmap, so it cannot race
+     * this descriptor update. Revoke its whole unconsumed tail: the explicit
+     * hint must remain semantically free, and the post-syscall refill will
+     * provision a new non-overlapping arena.
+     */
+    mmap_fastpath_disable_control(c);
+}
+
+void mmap_fastpath_prepare_vcpu(guest_t *g, thread_entry_t *t)
+{
+    mmap_lock_acquire(g);
+    mmap_fastpath_refill_thread_locked(g, t, 0);
+    mmap_lock_release();
+}
+
+void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water)
+{
+    mmap_fastpath_drain_locked(g);
+    for (int slot = 0; slot < MAX_THREADS; slot++)
+        mmap_fastpath_disable_control(mmap_fastpath_control(g, slot));
+
+    if (!shrink_high_water)
+        return;
+    uint64_t high = MMAP_BASE;
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= MMAP_BASE && r->start < g->mmap_limit && r->end > high)
+            high = r->end;
+    }
+    g->mmap_next = high;
+    if (g->mmap_rw_gap_hint > high)
+        g->mmap_rw_gap_hint = high;
+}
+
+void mmap_fastpath_disable(guest_t *g)
+{
+    atomic_store_explicit(&mmap_fastpath_forced_off, true,
+                          memory_order_release);
+    mmap_lock_acquire(g);
+    mmap_fastpath_revoke_all_locked(g, true);
+    mmap_lock_release();
+}
+
+void mmap_fastpath_skip_reserved(const guest_t *g,
+                                 uint64_t *start,
+                                 uint64_t length,
+                                 uint64_t align,
+                                 uint64_t max_addr)
+{
+    if (!g || !start || !length)
+        return;
+    bool advanced;
+    do {
+        advanced = false;
+        if (*start > max_addr || length > max_addr - *start)
+            return;
+        uint64_t end = *start + length;
+        for (int slot = 0; slot < MAX_THREADS; slot++) {
+            shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+            if (!(atomic_load_explicit(&c->flags, memory_order_acquire) &
+                  SHIM_MMAP_CTRL_ENABLED))
+                continue;
+            uint64_t cursor =
+                atomic_load_explicit(&c->cursor, memory_order_acquire);
+            uint64_t limit =
+                atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+            if (cursor < limit && *start < limit && end > cursor) {
+                *start = ALIGN_UP(limit, align);
+                advanced = true;
+                break;
+            }
+        }
+    } while (advanced);
+}
 
 /* Host kernel page size (16 KiB on Apple Silicon, typically 4 KiB on Intel
  * macOS). MAP_FIXED requires addr/length/offset multiples of this, so an
@@ -103,6 +491,11 @@ static int restore_snapshot_page_tables(guest_t *g,
 static int restore_region_snapshots(guest_t *g,
                                     region_snapshot_t *snaps,
                                     int n);
+static int read_file_range_to_guest(guest_t *g,
+                                    uint64_t gpa,
+                                    int fd,
+                                    uint64_t file_off,
+                                    uint64_t len);
 
 static int region_count_after_removes(const guest_t *g,
                                       const remove_range_t *ranges,
@@ -298,6 +691,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
      * allocation patterns.
      */
     uint64_t gap_start = ALIGN_UP(min_addr, align);
+    mmap_fastpath_skip_reserved(g, &gap_start, length, align, max_addr);
 
     /* Skip the prefix of regions entirely below gap_start in O(log n). After a
      * successful allocation the gap hint advances near or past the existing
@@ -306,6 +700,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
      */
     for (int i = guest_region_first_end_above(g, gap_start); i < g->nregions;
          i++) {
+        mmap_fastpath_skip_reserved(g, &gap_start, length, align, max_addr);
         /* A region can still slip below gap_start after the ALIGN_UP advance
          * below skips past a smaller adjacent region; keep the cheap guard.
          */
@@ -335,6 +730,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
     }
 
     /* Check trailing space after all regions */
+    mmap_fastpath_skip_reserved(g, &gap_start, length, align, max_addr);
     if (gap_start <= max_addr && length <= max_addr - gap_start)
         return gap_start;
     return UINT64_MAX; /* No suitable gap found */
@@ -714,6 +1110,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
         if (!host)
             goto fail;
         memset(host, 0, BLOCK_2MIB);
+        guest_dirty_clear_zeroed_range(g, gpa, gpa + BLOCK_2MIB);
 
         /* Detect freshness BEFORE guest_map_va_range so the decision is not
          * confused by a prior high-VA mmap into the same 2 MiB block. A fresh
@@ -787,27 +1184,11 @@ populate_existing:
     } else if (prot != LINUX_PROT_NONE) {
         memset(map_host, 0, length);
         replaced_bytes_dirty = replacing_existing;
-        uint8_t *dst = map_host;
-        size_t remaining = length;
-        off_t file_off = (off_t) offset;
-        while (remaining > 0) {
-            ssize_t nr = pread(host_backing_fd, dst, remaining, file_off);
-            if (nr < 0) {
-                if (errno == EINTR)
-                    continue;
-                /* Real host I/O failure (not EINTR); previously the loop broke
-                 * without setting ret and the syscall returned a "successful"
-                 * partially-zero mapping.
-                 */
-                ret = linux_errno();
-                goto fail;
-            }
-            if (nr == 0)
-                break;
-            dst += nr;
-            remaining -= (size_t) nr;
-            file_off += nr;
-        }
+        uint64_t gpa_for_addr = backing_gpa_start + (addr - va_start);
+        ret = read_file_range_to_guest(g, gpa_for_addr, host_backing_fd, offset,
+                                       length);
+        if (ret < 0)
+            goto fail;
     }
 
     /* Install L3 PTEs for the actual mapped range. Fresh blocks were fully
@@ -1017,6 +1398,11 @@ static int read_file_range_to_guest(guest_t *g,
     uint8_t *dst = host_ptr_for_gpa(g, gpa);
     if (!dst)
         return -LINUX_EFAULT;
+    /* A short read, EOF, or later error may still leave nonzero bytes in the
+     * destination. Mark before the first pread so every exit is conservative.
+     */
+    if (len <= UINT64_MAX - gpa)
+        guest_dirty_mark_range(g, gpa, gpa + len);
     size_t remaining = len;
 
     while (remaining > 0) {
@@ -1639,6 +2025,8 @@ static int hvf_apply_file_overlay(guest_t *g,
     thread_quiesce_siblings();
     int err = hvf_apply_file_overlay_quiesced(g, ipa, len, fd, file_off);
     thread_resume_siblings();
+    if (err == 0 && len <= UINT64_MAX - ipa)
+        guest_dirty_mark_range(g, ipa, ipa + len);
     return err;
 }
 
@@ -1677,6 +2065,12 @@ static int hvf_remove_file_overlay_quiesced(guest_t *g,
         hvf_remap_segments_best_effort(g, segments, nsegments);
         return err;
     }
+    /* Restoring shm-backed slab pages may reveal an older nonzero snapshot.
+     * The following munmap/MAP_FIXED path will clear the bit only after it has
+     * actually zeroed a complete 2 MiB block.
+     */
+    if (len <= UINT64_MAX - ipa)
+        guest_dirty_mark_range(g, ipa, ipa + len);
 
     for (int i = 0; i < nsegments; i++) {
         if (hv_vm_map((uint8_t *) g->host_base + segments[i].ipa,
@@ -1860,6 +2254,19 @@ int64_t sys_mmap(guest_t *g,
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
     bool is_prot_none = (prot == LINUX_PROT_NONE);
     bool is_noreserve = is_anon && (flags & LINUX_MAP_NORESERVE) != 0;
+    /* Anonymous mappings defer page-table creation and zeroing to first touch
+     * (guest fault or host-side access), like MAP_NORESERVE always has. This
+     * keeps mmap()/munmap() cost independent of length: a multi-GiB
+     * reservation costs neither an eager PTE walk nor a full-length memset,
+     * and never-touched blocks consume no page-table pool. PROT_NONE stays a
+     * pure reservation (faults deliver SIGSEGV, not materialization), and
+     * MAP_FIXED keeps the eager path because it must atomically replace live
+     * mappings. Shared anonymous memory stays eager unless the caller opted
+     * into MAP_NORESERVE (the historical lazy set), since deferred zeroing
+     * has never been exercised against the fork snapshot paths for it.
+     */
+    bool is_lazy = is_anon && !is_prot_none &&
+                   ((flags & LINUX_MAP_SHARED) == 0 || is_noreserve);
     host_fd_ref_t backing_ref = {.fd = -1, .owned = 0};
     int host_backing_fd = -1, track_backing_fd = -1;
     /* Tracks whether hvf_apply_file_overlay has installed a host
@@ -1887,13 +2294,24 @@ int64_t sys_mmap(guest_t *g,
     region_snapshot_t *replaced_snaps = NULL;
     int replaced_nsnaps = 0;
     bool replaced_regions_removed = false;
+    /* Linux kernel rejects MAP_FIXED with non-page-aligned address (checked
+     * below); the flag itself is needed early because it gates the lazy path.
+     */
+    bool is_fixed =
+        (flags & LINUX_MAP_FIXED) || (flags & LINUX_MAP_FIXED_NOREPLACE);
+    if (is_fixed)
+        is_lazy = false;
     int track_flags =
         ((flags & LINUX_MAP_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE);
     if (is_anon)
         track_flags |= LINUX_MAP_ANONYMOUS;
 
-    /* Preserve MAP_NORESERVE in region metadata before merge checks run. */
-    if (is_noreserve)
+    /* Preserve MAP_NORESERVE in region metadata before merge checks run. The
+     * same bit doubles as the internal lazy marker: guest_region_add_ex
+     * derives the region's deferred-PTE flag from it, and it is not guest
+     * visible (/proc/self/maps prints only prot and shared/private).
+     */
+    if (is_noreserve || is_lazy)
         track_flags |= LINUX_MAP_NORESERVE;
 
     /* The memory syscall layer handles all mmap variants. Aligned file-backed
@@ -1928,9 +2346,17 @@ int64_t sys_mmap(guest_t *g,
     if (length == 0)
         return -LINUX_ENOMEM;
 
+    /* A non-fixed nonzero address is a strong Linux hint. If it lands in the
+     * current (stopped) vCPU's invisible arena tail, release that tail before
+     * gap finding so implementation-only VA preparation does not perturb the
+     * address the application observes. Sibling arenas stay immutable without
+     * quiesce; their disjoint high-water placement makes self-overlap the
+     * normal and important case (allocator hinting near its previous result).
+     */
+    if (!is_fixed && addr != 0)
+        mmap_fastpath_release_current_hint_locked(g, addr, length);
+
     /* Linux kernel rejects MAP_FIXED with non-page-aligned address */
-    bool is_fixed =
-        (flags & LINUX_MAP_FIXED) || (flags & LINUX_MAP_FIXED_NOREPLACE);
     if (is_fixed && (addr & 4095))
         return -LINUX_EINVAL;
 
@@ -1979,6 +2405,7 @@ int64_t sys_mmap(guest_t *g,
         uint64_t fix_end = off + length;
         if (guest_range_hits_infra(g, off, fix_end))
             return -LINUX_EINVAL;
+        guest_materialize_wait_range_locked(g, off, fix_end);
 
         result_off = off;
 
@@ -2376,7 +2803,7 @@ int64_t sys_mmap(guest_t *g,
         guest_invalidate_ptes(g, result_off, result_off + length);
     }
 
-    if (!is_prot_none && !is_fixed && !is_noreserve) {
+    if (!is_prot_none && !is_fixed && !is_lazy) {
         /* Extend page tables for this specific allocation range only.
          * guest_extend_page_tables skips already-mapped blocks, so calling it
          * on pre-mapped regions is a no-op. This avoids creating entries for
@@ -2435,16 +2862,24 @@ int64_t sys_mmap(guest_t *g,
                 g->mmap_end = ext_end;
         }
 
-        /* Zero the mapped region */
+        /* Zero the mapped region. RX mappings cannot be dirtied through their
+         * published PTEs, so a complete-block zero can make them clean again.
+         * Other mappings currently use writable stage-1 entries and must stay
+         * conservatively dirty even if their requested Linux prot is read-only.
+         */
         memset((uint8_t *) g->host_base + result_off, 0, length);
+        if (needs_exec && !(prot & LINUX_PROT_WRITE))
+            guest_dirty_clear_zeroed_range(g, result_off, result_off + length);
     }
 
-    /* MAP_NORESERVE: invalidate any stale PTEs (like PROT_NONE path) but track
-     * the region for lazy materialization on first fault. Page table entries
-     * will be created by guest_materialize_lazy() when the guest first touches
-     * a page in this range.
+    /* Lazy (private anonymous, incl. MAP_NORESERVE): invalidate any stale PTEs
+     * (like the PROT_NONE path) but track the region for lazy materialization
+     * on first fault. Page table entries will be created by
+     * guest_materialize_lazy() when the guest first touches a page in this
+     * range, or by the host-access fault-in path when a syscall targets the
+     * range before the guest ever touches it.
      */
-    if (is_noreserve && !is_fixed) {
+    if (is_lazy) {
         guest_invalidate_ptes(g, result_off, result_off + length);
     }
 
@@ -2512,6 +2947,7 @@ int64_t sys_mmap(guest_t *g,
             overlay_ipa = result_off;
             overlay_len = nf_overlay_len;
         } else {
+            guest_dirty_mark_range(g, result_off, result_off + length);
             uint8_t *dst = (uint8_t *) g->host_base + result_off;
             size_t remaining = length;
             off_t file_off = offset;
@@ -2688,6 +3124,11 @@ int64_t sys_mremap(guest_t *g,
      */
     if (guest_range_hits_infra(g, old_off, old_off + old_size))
         return -LINUX_EINVAL;
+    if (old_off < g->guest_size)
+        guest_materialize_wait_range_locked(g, old_off,
+                                            old_size > g->guest_size - old_off
+                                                ? g->guest_size
+                                                : old_off + old_size);
 
     /* Verify the whole source range is covered by one tracked VMA. mremap()
      * must not copy holes or unrelated adjacent mappings.
@@ -2721,10 +3162,13 @@ int64_t sys_mremap(guest_t *g,
         /* Zero the trimmed region on its real backing (high-VA tails live at
          * gpa_base, not host_base + tail_off).
          */
-        memset(host_ptr_for_gpa(g, src_gpa_base + (tail_off - src_start)), 0,
-               tail_end - tail_off);
+        uint64_t tail_gpa = src_gpa_base + (tail_off - src_start);
+        if (guest_invalidate_ptes(g, tail_off, tail_end) < 0)
+            return -LINUX_ENOMEM;
+        memset(host_ptr_for_gpa(g, tail_gpa), 0, tail_end - tail_off);
+        guest_dirty_clear_zeroed_range(g, tail_gpa,
+                                       tail_gpa + (tail_end - tail_off));
         guest_region_remove(g, tail_off, tail_end);
-        guest_invalidate_ptes(g, tail_off, tail_end);
         if (tail_off < g->mmap_rw_gap_hint)
             g->mmap_rw_gap_hint = tail_off;
         if (tail_off < g->mmap_rx_gap_hint)
@@ -2750,6 +3194,7 @@ int64_t sys_mremap(guest_t *g,
          */
         if (guest_range_hits_infra(g, new_off, new_off + new_size))
             return -LINUX_EINVAL;
+        guest_materialize_wait_range_locked(g, new_off, new_off + new_size);
 
         /* Linux rejects MREMAP_FIXED when old and new ranges overlap */
         uint64_t old_end = old_off + old_size, new_end = new_off + new_size;
@@ -2936,12 +3381,20 @@ int64_t sys_mremap(guest_t *g,
             memset((uint8_t *) g->host_base + new_off + old_size, 0,
                    new_size - old_size);
 
+        if (prot == LINUX_PROT_NONE)
+            guest_dirty_clear_zeroed_range(g, new_off, new_off + new_size);
+        else
+            guest_dirty_mark_range(g, new_off, new_off + new_size);
+
         /* Remove old mapping */
         if (old_size > 0) {
-            memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
-                   old_size);
+            uint64_t old_gpa = src_gpa_base + (old_off - src_start);
+            bool invalidated =
+                guest_invalidate_ptes(g, old_off, old_off + old_size) == 0;
+            memset(host_ptr_for_gpa(g, old_gpa), 0, old_size);
+            if (invalidated)
+                guest_dirty_clear_zeroed_range(g, old_gpa, old_gpa + old_size);
             guest_region_remove(g, old_off, old_off + old_size);
-            guest_invalidate_ptes(g, old_off, old_off + old_size);
             if (old_off < g->mmap_rw_gap_hint)
                 g->mmap_rw_gap_hint = old_off;
             if (old_off < g->mmap_rx_gap_hint)
@@ -3025,6 +3478,9 @@ int64_t sys_mremap(guest_t *g,
                 }
 
                 memset((uint8_t *) g->host_base + grow_off, 0, grow_len);
+                if (!(prot & LINUX_PROT_WRITE))
+                    guest_dirty_clear_zeroed_range(g, grow_off,
+                                                   grow_off + grow_len);
 
                 /* Update region tracking: remove old, add extended */
                 guest_region_remove(g, old_off, old_off + old_size);
@@ -3176,13 +3632,21 @@ int64_t sys_mremap(guest_t *g,
         memset((uint8_t *) g->host_base + new_off + old_size, 0,
                new_size - old_size);
 
+        if (prot == LINUX_PROT_NONE)
+            guest_dirty_clear_zeroed_range(g, new_off, new_off + new_size);
+        else
+            guest_dirty_mark_range(g, new_off, new_off + new_size);
+
         /* Remove old mapping. Any live source overlay was already torn down
          * before the destination range was touched.
          */
-        memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
-               old_size);
+        uint64_t old_gpa = src_gpa_base + (old_off - src_start);
+        bool invalidated =
+            guest_invalidate_ptes(g, old_off, old_off + old_size) == 0;
+        memset(host_ptr_for_gpa(g, old_gpa), 0, old_size);
+        if (invalidated)
+            guest_dirty_clear_zeroed_range(g, old_gpa, old_gpa + old_size);
         guest_region_remove(g, old_off, old_off + old_size);
-        guest_invalidate_ptes(g, old_off, old_off + old_size);
         if (old_off < g->mmap_rw_gap_hint)
             g->mmap_rw_gap_hint = old_off;
         if (old_off < g->mmap_rx_gap_hint)
@@ -3293,6 +3757,8 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
          */
         if (!madvise_range_mapped(g, off, length))
             return -LINUX_ENOMEM;
+        if (in_primary)
+            guest_materialize_wait_range_locked(g, off, off + length);
 
         uint64_t end = off + length;
         for (int i = 0; i < g->nregions; i++) {
@@ -3406,11 +3872,38 @@ static int compare_range_pair(const void *a, const void *b)
     return 0;
 }
 
+/* Coalesced sub-ranges of a munmap that must be zeroed. Sized so that even a
+ * pathologically fragmented lazy mapping (alternating materialized and
+ * untouched blocks) rarely overflows; on overflow the remainder of the region
+ * overlap is zeroed wholesale, which is always correct (zeroing already-zero
+ * slab bytes), just slower.
+ */
+#define MUNMAP_ZERO_RANGES_MAX 128
+
+typedef struct {
+    uint64_t lo, hi;
+} zero_range_t;
+
+static void zero_range_push(zero_range_t *ranges,
+                            int *n,
+                            uint64_t lo,
+                            uint64_t hi)
+{
+    if (lo >= hi)
+        return;
+    if (*n > 0 && ranges[*n - 1].hi == lo) {
+        ranges[*n - 1].hi = hi;
+        return;
+    }
+    ranges[(*n)++] = (zero_range_t) {lo, hi};
+}
+
 static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
 {
     /* Reject munmap targeting VM infrastructure regions. */
     if (guest_range_hits_infra(g, unmap_off, end))
         return -LINUX_EINVAL;
+    guest_materialize_wait_range_locked(g, unmap_off, end);
 
     /* Restore slab backing under any active MAP_SHARED file overlay before
      * zeroing the host VA. Without this, the memset below would write zeros
@@ -3420,14 +3913,19 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
     if (cleanup_err < 0)
         return cleanup_err;
 
-    /* Invalidate PTEs first. This may need to split a 2MiB block which can fail
-     * if the page table pool is exhausted. Failing before region removal keeps
-     * metadata consistent.
+    /* Record which sub-ranges need zeroing BEFORE the PTE invalidation below
+     * destroys the evidence. Eager regions are zeroed across the whole
+     * overlap, as before. Lazy (deferred-PTE) regions only need their
+     * materialized 2MiB blocks zeroed: a block with no L2 mapping was never
+     * touched through PTEs, host-side fault-in materializes before writing,
+     * and the previous unmap of that slab range zeroed it -- so its bytes are
+     * still zero. This keeps munmap cost proportional to memory actually
+     * touched instead of to the mapping length.
      */
-    if (guest_invalidate_ptes(g, unmap_off, end) < 0)
-        return -LINUX_ENOMEM;
+    zero_range_t zr[MUNMAP_ZERO_RANGES_MAX];
+    int nzr = 0;
     for (int i = 0; i < g->nregions; i++) {
-        guest_region_t *r = &g->regions[i];
+        const guest_region_t *r = &g->regions[i];
         if (r->start >= end)
             break;
         if (r->end <= unmap_off)
@@ -3436,7 +3934,50 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
             continue;
         uint64_t zstart = (r->start > unmap_off) ? r->start : unmap_off;
         uint64_t zend = (r->end < end) ? r->end : end;
-        memset((uint8_t *) g->host_base + zstart, 0, zend - zstart);
+        if (!r->noreserve) {
+            if (nzr >= MUNMAP_ZERO_RANGES_MAX) {
+                /* Out of slots: widen the last range instead of dropping any
+                 * span that must be zeroed. Everything between ranges lies
+                 * inside [unmap_off, end) and is being unmapped, so zeroing
+                 * the gap as well is harmless.
+                 */
+                zr[nzr - 1].hi = zend;
+                continue;
+            }
+            zero_range_push(zr, &nzr, zstart, zend);
+            continue;
+        }
+        for (uint64_t b = zstart & ~(BLOCK_2MIB - 1); b < zend;) {
+            if (!guest_va_block_mapped(g, b)) {
+                /* Skip absent 1GiB/512GiB slots wholesale; a huge untouched
+                 * reservation would otherwise pay one walk per 2MiB.
+                 */
+                b = guest_va_next_present_block(g, b + BLOCK_2MIB, zend);
+                continue;
+            }
+            uint64_t lo = (b > zstart) ? b : zstart;
+            uint64_t hi = (b + BLOCK_2MIB < zend) ? b + BLOCK_2MIB : zend;
+            if (nzr >= MUNMAP_ZERO_RANGES_MAX) {
+                /* Out of slots: fold the remainder of this overlap into the
+                 * last range and stop scanning blocks.
+                 */
+                zr[nzr - 1].hi = zend;
+                break;
+            }
+            zero_range_push(zr, &nzr, lo, hi);
+            b += BLOCK_2MIB;
+        }
+    }
+
+    /* Invalidate PTEs first. This may need to split a 2MiB block which can fail
+     * if the page table pool is exhausted. Failing before region removal keeps
+     * metadata consistent.
+     */
+    if (guest_invalidate_ptes(g, unmap_off, end) < 0)
+        return -LINUX_ENOMEM;
+    for (int i = 0; i < nzr; i++) {
+        memset((uint8_t *) g->host_base + zr[i].lo, 0, zr[i].hi - zr[i].lo);
+        guest_dirty_clear_zeroed_range(g, zr[i].lo, zr[i].hi);
     }
     guest_region_remove(g, unmap_off, end);
     if (unmap_off < g->mmap_rw_gap_hint)
@@ -3461,7 +4002,7 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t)
     if (nranges <= 0)
         return;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire(g);
     for (int i = 0; i < nranges; i++) {
         int rc = munmap_guest_range(g, starts[i], ends[i]);
         if (rc < 0) {
@@ -3474,7 +4015,7 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t)
         }
         thread_drop_deferred_stack_unmap(t, starts[i], ends[i]);
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 }
 
 /* sys_munmap. */
@@ -3624,6 +4165,7 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
              */
             if (guest_range_hits_infra(g, mprot_off, mprot_end))
                 return -LINUX_EINVAL;
+            guest_materialize_wait_range_locked(g, mprot_off, mprot_end);
 
             /* Same max_prot check as the high-VA branch above. */
             if ((prot & LINUX_PROT_WRITE) &&
@@ -3641,6 +4183,18 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
 
             if (prot != LINUX_PROT_NONE) {
                 int page_perms = prot_to_perms(prot);
+                /* Materialize lazy blocks in the range at their region's
+                 * current prot before the block-granular extend below. The
+                 * extend stamps whole 2MiB blocks with page_perms; on an
+                 * unmaterialized lazy region that would hand every neighbor
+                 * page OUTSIDE [mprot_off, mprot_end) the sub-range's
+                 * permissions (region says RW, PTE says R-only, host-side
+                 * writes EFAULT). guest_materialize_lazy covers block-within-
+                 * region at region prot, so after this the extend is a no-op
+                 * for lazy regions and update_perms below adjusts only the
+                 * requested range.
+                 */
+                guest_lazy_faultin_locked(g, mprot_off, mprot_end - mprot_off);
                 if (guest_extend_page_tables(g, mprot_off, mprot_end,
                                              page_perms) < 0)
                     return -LINUX_ENOMEM;
@@ -3934,7 +4488,13 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
     if (!txn)
         return -LINUX_ENOMEM;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire(g);
+    /* fork callers have quiesced siblings.  Drain their last publications,
+     * revoke every descriptor, and trim never-consumed arena tails before the
+     * legacy [MMAP_BASE,mmap_next) snapshot range is computed.
+     */
+    mmap_fastpath_revoke_all_locked(g, true);
+    guest_materialize_wait_all_locked(g);
 
     size_t hps = host_page_size_cached();
 
@@ -4081,7 +4641,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             *txn_out = txn;
             return -LINUX_ENOMEM;
         }
@@ -4094,7 +4654,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             *txn_out = txn;
             return nsnaps;
         }
@@ -4134,7 +4694,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         close(fd);
     }
 
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     *txn_out = txn;
     return 0;
 }
@@ -4153,7 +4713,7 @@ int mmap_fork_abort_anon_shared(guest_t *g,
     mmap_fork_anon_shared_txn_t *txn = *txn_ptr;
     int rc = 0;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire(g);
 
     for (int i = txn->noverlays - 1; i >= 0; i--) {
         const fork_overlay_snapshot_t *ovl = &txn->overlays[i];
@@ -4222,7 +4782,7 @@ int mmap_fork_abort_anon_shared(guest_t *g,
         }
     }
 
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     mmap_fork_dispose_anon_shared_txn(txn_ptr);
     return rc;
 }
@@ -4236,7 +4796,7 @@ int mmap_fork_restore_overlays(guest_t *g,
                                const uint64_t *parent_ovl_start,
                                const uint64_t *parent_ovl_end)
 {
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire(g);
     int rc = 0;
 
     for (int i = 0; i < g->nregions; i++) {
@@ -4325,6 +4885,6 @@ int mmap_fork_restore_overlays(guest_t *g,
         }
     }
 
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     return rc;
 }

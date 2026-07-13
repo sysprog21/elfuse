@@ -10,6 +10,7 @@
  */
 
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 
 #include "hvutil.h"
 #include "core/guest.h"
+#include "core/mmap-fastpath.h"
 #include "core/shim-globals.h"
 #include "core/vdso.h"
 #include "debug/log.h"
@@ -95,6 +97,42 @@ _Static_assert(SHIM_GLOBALS_SIZE <= BLOCK_2MIB,
 _Static_assert(SHIM_COUNTERS_OFF + SHIM_COUNTERS_N * 8 <=
                    SHIM_IDENTITY_OFF_PGID,
                "counter array must not overlap the PGID slot");
+_Static_assert(SHIM_MMAP_CONTROL_BASE == 0x20000,
+               "shim.S mmap fast path hard-codes control base 0x20000");
+_Static_assert(SHIM_MMAP_CONTROL_STRIDE == 0x800,
+               "shim.S mmap fast path hard-codes control stride 0x800");
+_Static_assert(SHIM_MMAP_RING_SIZE == 16,
+               "shim.S mmap fast path hard-codes 16 ring entries");
+_Static_assert(offsetof(shim_mmap_control_t, generation) == 0,
+               "shim.S mmap generation offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, consumer_generation) == 4,
+               "shim.S mmap consumer-generation offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, flags) == 8,
+               "shim.S mmap flags offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, head) == 12,
+               "shim.S mmap head offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, tail) == 16,
+               "shim.S mmap tail offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, arena_base) == 24,
+               "shim.S mmap arena-base offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, arena_limit) == 32,
+               "shim.S mmap arena-limit offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, cursor) == 40,
+               "shim.S mmap cursor offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, next_arena_size) == 48,
+               "mmap next-arena-size offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, max_len_seen) == 56,
+               "mmap max-len-seen offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, ring) == 64,
+               "shim.S mmap ring offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, counters) == 0x1C0,
+               "shim.S mmap counter offset drift");
+_Static_assert(sizeof(shim_mmap_control_t) <= SHIM_MMAP_CONTROL_STRIDE,
+               "per-vCPU mmap control exceeds its shim-data stride");
+_Static_assert(SHIM_MMAP_CONTROL_BASE +
+                       MAX_THREADS * SHIM_MMAP_CONTROL_STRIDE <=
+                   BLOCK_2MIB - MAX_THREADS * 4096,
+               "mmap controls overlap per-vCPU EL1 stacks");
 
 static uint8_t *cache_base(const guest_t *g)
 {
@@ -125,7 +163,13 @@ static void urandom_ring_unlock(uint32_t *lock_p)
 
 void shim_globals_init(guest_t *g)
 {
-    memset(cache_base(g), 0, SHIM_GLOBALS_SIZE);
+    /* mmap controls occupy a separate low shim-data range.  Init/exec/fork
+     * child all call this while no sibling can execute, so clearing the whole
+     * control array also prevents a recycled SP_EL1 slot from inheriting an
+     * arena published to its previous owner.
+     */
+    memset(cache_base(g), 0,
+           SHIM_MMAP_CONTROL_BASE + MAX_THREADS * SHIM_MMAP_CONTROL_STRIDE);
 }
 
 void shim_globals_publish_pid(guest_t *g, int64_t pid, int64_t ppid)
@@ -435,11 +479,10 @@ static const char *const counter_names[SHIM_COUNTERS_N] = {
     [SHIM_COUNTER_URANDOM_HIT] = "URANDOM_HIT",
     [SHIM_COUNTER_GETRANDOM_HIT] = "GETRANDOM_HIT",
     [SHIM_COUNTER_PGSID_HIT] = "PGSID_HIT",
-    /* Slots 12..15 (SHIM_COUNTERS_N == 16) are intentionally unnamed; the dump
-     * prints "(reserved)" so they appear in the output when non-zero, which
-     * would flag an out-of-band increment. Bind a name here when a future EL1
-     * service claims one of these slots.
-     */
+    [SHIM_COUNTER_FAULT_MATERIALIZE] = "FAULT_MATERIALIZE",
+    [SHIM_COUNTER_FAULT_TLBI_VAE] = "FAULT_TLBI_VAE",
+    [SHIM_COUNTER_FAULT_TLBI_RVAE] = "FAULT_TLBI_RVAE",
+    [SHIM_COUNTER_FAULT_TLBI_BCAST] = "FAULT_TLBI_BCAST",
 };
 
 uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot)
@@ -450,6 +493,15 @@ uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot)
     const uint64_t *slot_p =
         (const uint64_t *) (page + SHIM_COUNTERS_OFF) + slot;
     return __atomic_load_n(slot_p, __ATOMIC_RELAXED);
+}
+
+void shim_globals_counter_inc(guest_t *g, unsigned slot)
+{
+    if (!shim_globals_stats_enabled() || slot >= SHIM_COUNTERS_N)
+        return;
+    uint8_t *page = (uint8_t *) g->host_base + g->shim_data_base;
+    uint64_t *slot_p = (uint64_t *) (page + SHIM_COUNTERS_OFF) + slot;
+    __atomic_fetch_add(slot_p, 1, __ATOMIC_RELAXED);
 }
 
 void shim_globals_counters_dump(const guest_t *g)
@@ -463,6 +515,62 @@ void shim_globals_counters_dump(const guest_t *g)
         fprintf(stderr, "  %-20s %llu\n", name ? name : "(reserved)",
                 (unsigned long long) v);
     }
+
+    static const char *const mmap_counter_names[SHIM_MMAP_COUNTERS_N] = {
+        [SHIM_MMAP_COUNTER_SHAPE_MISS] = "MMAP_SHAPE_MISS",
+        [SHIM_MMAP_COUNTER_CAPACITY_MISS] = "MMAP_CAPACITY_MISS",
+        [SHIM_MMAP_COUNTER_RING_FULL] = "MMAP_RING_FULL",
+        [SHIM_MMAP_COUNTER_GENERATION_STALE] = "MMAP_GENERATION_STALE",
+        [SHIM_MMAP_COUNTER_ATTENTION] = "MMAP_ATTENTION",
+        [SHIM_MMAP_COUNTER_HIT] = "MMAP_HIT",
+    };
+    uint64_t mmap_counters[SHIM_MMAP_COUNTERS_N] = {0};
+    uint64_t refill_count = 0, recycle_count = 0;
+    uint64_t current_max = 0, peak_max = 0;
+    const uint8_t *shim_data =
+        (const uint8_t *) g->host_base + g->shim_data_base;
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        const shim_mmap_control_t *c =
+            (const shim_mmap_control_t *) (shim_data + SHIM_MMAP_CONTROL_BASE +
+                                           (uint64_t) slot *
+                                               SHIM_MMAP_CONTROL_STRIDE);
+        for (unsigned i = 0; i < SHIM_MMAP_COUNTERS_N; i++)
+            mmap_counters[i] +=
+                atomic_load_explicit(&c->counters[i], memory_order_relaxed);
+        refill_count += c->refill_count;
+        recycle_count += c->recycle_count;
+        if (c->next_arena_size > current_max)
+            current_max = c->next_arena_size;
+        if (c->peak_arena_size > peak_max)
+            peak_max = c->peak_arena_size;
+    }
+    for (unsigned i = 0; i < SHIM_MMAP_COUNTERS_N; i++)
+        fprintf(stderr, "  %-20s %llu\n", mmap_counter_names[i],
+                (unsigned long long) mmap_counters[i]);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_REFILL",
+            (unsigned long long) refill_count);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_RECYCLE",
+            (unsigned long long) recycle_count);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_CURRENT",
+            (unsigned long long) current_max);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_PEAK",
+            (unsigned long long) peak_max);
+    uint64_t high_water =
+        g->mmap_next > MMAP_BASE ? g->mmap_next - MMAP_BASE : 0;
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_HIGH_WATER",
+            (unsigned long long) high_water);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_CLEAN_SKIP",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_CLEAN_SKIP]);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_DIRTY_MEMSET",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_DIRTY_MEMSET]);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_ALREADY_VALID",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_ALREADY_VALID]);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_WINDOW_BYTES",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_WINDOW_BYTES]);
 }
 
 static pthread_once_t stats_once = PTHREAD_ONCE_INIT;

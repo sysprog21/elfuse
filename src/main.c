@@ -33,6 +33,7 @@
 #include "core/rosetta.h"
 #include "core/shim-globals.h"
 #include "core/sysroot.h"
+#include "core/mmap-fastpath.h"
 
 #include "runtime/forkipc.h"
 #include "runtime/futex.h" /* futex_interrupt_request */
@@ -653,6 +654,14 @@ int main(int argc, char **argv)
                                guest_argc, elf_path, sysroot_path);
         return 1;
     }
+
+    /* Tracing/debuggers require every mmap to reach host dispatch so syscall
+     * observation and region state advance in lockstep. This also prevents a
+     * trace-gated shim from leaving invisible arena reservations that perturb
+     * the host slow path's address-hint behavior.
+     */
+    if (verbose || gdb_port > 0)
+        mmap_fastpath_disable(&g);
 
     /* GDB setup must happen before the first run so entry-stop and hardware
      * breakpoints can affect the initial vCPU.

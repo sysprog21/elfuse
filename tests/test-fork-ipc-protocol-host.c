@@ -17,14 +17,17 @@
 #include "runtime/fork-state.h"
 
 #define LEGACY_ELFK_MAGIC 0x454C464BU
+#define LEGACY_ELFL_MAGIC 0x454C464CU
 
-_Static_assert(FORK_IPC_PROTOCOL_MAGIC == 0x454C464CU,
-               "fork IPC protocol magic must remain ELFL until the next "
+_Static_assert(FORK_IPC_PROTOCOL_MAGIC == 0x454C464DU,
+               "fork IPC protocol magic must remain ELFM until the next "
                "incompatible wire-format change");
 _Static_assert(IPC_MAGIC_HEADER == FORK_IPC_PROTOCOL_MAGIC,
                "header magic must be the protocol identity");
 _Static_assert(FORK_IPC_PROTOCOL_MAGIC != LEGACY_ELFK_MAGIC,
                "current protocol must reject old ELFK children/parents");
+_Static_assert(FORK_IPC_PROTOCOL_MAGIC != LEGACY_ELFL_MAGIC,
+               "dirty-bitmap wire must reject old ELFL children/parents");
 _Static_assert(IPC_MAGIC_SENTINEL != FORK_IPC_PROTOCOL_MAGIC,
                "process-state sentinel must not alias the header protocol");
 

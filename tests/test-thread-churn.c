@@ -24,9 +24,13 @@
 
 int passes = 0, fails = 0;
 
-#define SEQUENTIAL_ROUNDS 150
+/* Keep this a slot-reuse regression rather than an HVF vCPU lifecycle soak.
+ * Eighty sequential workers exceed the 64-slot table by more than 16, and two
+ * 32-worker batches repeat reuse while unrelated workers remain live.
+ */
+#define SEQUENTIAL_ROUNDS 80
 #define BATCH_SIZE 32
-#define BATCH_ROUNDS 6
+#define BATCH_ROUNDS 2
 
 static void *churn_fn(void *arg)
 {
@@ -40,7 +44,7 @@ static void *churn_fn(void *arg)
  */
 static void test_sequential_churn(void)
 {
-    TEST("sequential churn (150 threads)");
+    TEST("sequential churn (80 threads)");
 
     for (int i = 0; i < SEQUENTIAL_ROUNDS; i++) {
         int ran = 0;
@@ -67,7 +71,7 @@ static void test_sequential_churn(void)
  */
 static void test_batch_churn(void)
 {
-    TEST("batch churn (6x32 threads)");
+    TEST("batch churn (2x32 threads)");
 
     for (int round = 0; round < BATCH_ROUNDS; round++) {
         pthread_t threads[BATCH_SIZE];

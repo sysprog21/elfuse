@@ -19,7 +19,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4651U /* "ELFQ" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4652U /* "ELFR" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -150,6 +150,7 @@ int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
                                 bool regions_tracker_stale_snapshot,
+                                const uint64_t *dirty_blocks_snapshot,
                                 const guest_region_t *preannounced_snapshot,
                                 uint32_t num_preannounced);
 int fork_ipc_recv_process_state(int ipc_fd,

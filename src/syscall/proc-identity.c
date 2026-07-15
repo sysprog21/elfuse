@@ -131,22 +131,28 @@ int64_t proc_sys_setgid(uint32_t gid)
     return 0;
 }
 
-#define DEFINE_SETRE(suffix, real, eff, saved, perm_fn)    \
-    int64_t proc_sys_setre##suffix(uint32_t r, uint32_t e) \
-    {                                                      \
-        uint32_t old_real = real;                          \
-        if (r != (uint32_t) -1 && r != real && r != eff)   \
-            return -LINUX_EPERM;                           \
-        if (e != (uint32_t) -1 && !perm_fn(e))             \
-            return -LINUX_EPERM;                           \
-        if (r != (uint32_t) -1)                            \
-            real = r;                                      \
-        if (e != (uint32_t) -1) {                          \
-            eff = e;                                       \
-            if (r != (uint32_t) -1 || e != old_real)       \
-                saved = e;                                 \
-        }                                                  \
-        return 0;                                          \
+#define DEFINE_SETRE(suffix, real, eff, saved, perm_fn)                    \
+    int64_t proc_sys_setre##suffix(uint32_t r, uint32_t e)                 \
+    {                                                                      \
+        uint32_t old_real = real;                                          \
+        if (r != (uint32_t) -1 && r != real && r != eff)                   \
+            return -LINUX_EPERM;                                           \
+        if (e != (uint32_t) -1 && !perm_fn(e))                             \
+            return -LINUX_EPERM;                                           \
+        if (r != (uint32_t) -1)                                            \
+            real = r;                                                      \
+        if (e != (uint32_t) -1)                                            \
+            eff = e;                                                       \
+        /* Linux setreuid(2): saved-set-ID is updated to                   \
+         * the new effective ID when the real ID is set                    \
+         * (r != -1) OR when the new effective ID differs                  \
+         * from the old real ID.  Both conditions use the                  \
+         * *new* effective value (eff, which may be                        \
+         * unchanged if e == -1).                                          \
+         */                                                                \
+        if (r != (uint32_t) -1 || (e != (uint32_t) -1 && eff != old_real)) \
+            saved = eff;                                                   \
+        return 0;                                                          \
     }
 
 DEFINE_SETRE(uid, emu_uid, emu_euid, emu_suid, uid_is_permitted)

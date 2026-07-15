@@ -520,9 +520,9 @@ static void resolve_clone_stack_range(guest_t *g,
     if (sp_off == 0 || sp_off > g->guest_size)
         return;
 
-    /* EL1 consumer-mmap entries are drained into regions[] under mmap_lock.
-     * A sibling worker can drain and merge the array while clone resolves its
-     * new stack, so take the same lock and copy the bounds before releasing it.
+    /* EL1 consumer-mmap entries are drained into regions[] under mmap_lock. A
+     * sibling worker can drain and merge the array while clone resolves its new
+     * stack, so take the same lock and copy the bounds before releasing it.
      */
     mmap_lock_acquire(g);
     const guest_region_t *r = guest_region_find(g, sp_off - 1);
@@ -706,11 +706,10 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         return -LINUX_EFAULT;
     }
 
-    /* Create the host pthread (joinable; the main thread joins all live
-     * workers via thread_join_workers before guest teardown, and a worker
-     * that exits on its own is joined when its table slot is reused by
-     * thread_alloc). Threads clean up their TID address via
-     * CLONE_CHILD_CLEARTID + futex wake.
+    /* Create the host pthread (joinable; the main thread joins all live workers
+     * via thread_join_workers before guest teardown, and a worker that exits on
+     * its own is joined when its table slot is reused by thread_alloc). Threads
+     * clean up their TID address via CLONE_CHILD_CLEARTID + futex wake.
      */
     pthread_t host_thread;
     pthread_attr_t attr;
@@ -860,6 +859,13 @@ static void *thread_create_and_run(void *arg)
     WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
     WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
 
+    /* CNTKCTL_EL1.EL0VCTEN|EL0PCTEN: worker vCPUs need EL0 counter access too,
+     * or the vDSO clock_gettime fast path reads 0 from CNTVCT_EL0 and every
+     * non-main thread silently drops to the SVC clock. Same constant bootstrap
+     * sets on the primary vCPU; not thread-specific.
+     */
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTKCTL_EL1, 0x3ULL));
+
     /* All worker vCPUs in the process share the same shim_globals base (one VM
      * per process); a fresh TPIDR_EL1 set is still required because HVF created
      * this vCPU empty. CONTEXTIDR_EL1 holds the per-thread tid that the gettid
@@ -978,8 +984,8 @@ startup_ok:;
      * how pthread_join works in musl: the joining thread does FUTEX_WAIT on
      * this address until it becomes 0.
      *
-     * Drain any deferred munmap before publishing clear_child_tid. A joiner
-     * may observe the zero without ever sleeping in FUTEX_WAIT, then reuse the
+     * Drain any deferred munmap before publishing clear_child_tid. A joiner may
+     * observe the zero without ever sleeping in FUTEX_WAIT, then reuse the
      * freed VA immediately; ordering only the wake after cleanup leaves a
      * window where MAP_FIXED_NOREPLACE still sees the old stack VMA.
      */
@@ -1211,6 +1217,10 @@ static void *vm_clone_thread_run(void *arg)
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, tca->tcr));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
+    /* EL0 counter access for the vDSO clock fast path; see
+     * thread_create_and_run.
+     */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTKCTL_EL1, 0x3ULL));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, tca->sctlr));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, tca->child_stack));
@@ -1306,9 +1316,9 @@ static void *vm_clone_thread_run(void *arg)
          * harmless no-op.
          */
         thread_interrupt_all();
-        /* thread_interrupt_all only reaches threads inside hv_vcpu_run.
-         * Peers parked on fork_cond or another slot's ptrace_cond/resume_cond
-         * see neither the vCPU kick nor this exit, so broadcast separately.
+        /* thread_interrupt_all only reaches threads inside hv_vcpu_run. Peers
+         * parked on fork_cond or another slot's ptrace_cond/resume_cond see
+         * neither the vCPU kick nor this exit, so broadcast separately.
          */
         thread_wake_exit_waiters();
     }

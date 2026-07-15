@@ -1035,8 +1035,8 @@ int guest_install_va_pages(guest_t *g,
                            uint64_t gpa,
                            int perms);
 
-/* Query whether a 2 MiB TTBR0 VA block already has a leaf mapping.
- * Returns true only for a present L2 block descriptor.
+/* Query whether a 2 MiB TTBR0 VA block already has any L2 entry, either a
+ * block descriptor or an L3 table descriptor.
  */
 bool guest_va_block_mapped(const guest_t *g, uint64_t va);
 

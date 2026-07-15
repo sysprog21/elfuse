@@ -128,9 +128,9 @@ void mmap_fastpath_drain_locked(guest_t *g)
                                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS |
                                         LINUX_MAP_NORESERVE,
                                     0, NULL, -1) < 0) {
-                /* EL1 already returned this address to the guest.  Continuing
-                 * without semantic metadata would turn first touch into a
-                 * false SIGSEGV, so fail closed on the violated provisioning
+                /* EL1 already returned this address to the guest. Continuing
+                 * without semantic metadata would turn first touch into a false
+                 * SIGSEGV, so fail closed on the violated provisioning
                  * invariant instead of silently corrupting process state.
                  */
                 log_fatal(
@@ -250,9 +250,9 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
         mmap_fastpath_request_fits(cursor, limit, request_len))
         return;
 
-    /* The owner is parked in HVC. Make the stranded tail immediately
-     * recyclable before the gap scan; mappings already served from the prefix
-     * were drained into regions[] on mmap_lock acquisition.
+    /* The owner is parked in HVC. Make the stranded tail immediately recyclable
+     * before the gap scan; mappings already served from the prefix were drained
+     * into regions[] on mmap_lock acquisition.
      */
     if (flags & SHIM_MMAP_CTRL_ENABLED)
         atomic_store_explicit(&c->cursor, limit, memory_order_relaxed);
@@ -287,12 +287,15 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
     }
     uint64_t new_limit = base + arena_size;
 
-    /* Carve VA only.  Clearing stale descriptors once here makes every later
-     * bump allocation PTE-free without putting page-table work in EL1.
+    /* Carve VA only. Clearing stale descriptors once here makes every later
+     * bump allocation PTE-free without putting page-table work in EL1. Fresh
+     * bump-tail arenas beyond mmap_end cannot contain stale descriptors.
      */
-    if (guest_invalidate_ptes(g, base, new_limit) < 0) {
-        mmap_fastpath_disable_control(c);
-        return;
+    if (recycled || base < g->mmap_end) {
+        if (guest_invalidate_ptes(g, base, new_limit) < 0) {
+            mmap_fastpath_disable_control(c);
+            return;
+        }
     }
     if (!recycled) {
         g->mmap_next = new_limit;
@@ -317,7 +320,7 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
     atomic_store_explicit(&c->flags, SHIM_MMAP_CTRL_ENABLED,
                           memory_order_relaxed);
     /* This vCPU is stopped in HVC (or has never run), so host may acknowledge
-     * the freshly published descriptor on its behalf.  Revocation deliberately
+     * the freshly published descriptor on its behalf. Revocation deliberately
      * does not do this, making an in-flight stale generation bail once.
      */
     atomic_store_explicit(&c->consumer_generation, generation,
@@ -1349,11 +1352,39 @@ fail:
     return ret;
 }
 
+/* Page-table high-water slot (mmap_rx_end / mmap_end) for a TTBR0 mmap offset,
+ * or NULL if @off is not in either mmap arena.
+ */
+static uint64_t *mmap_pt_end_for_off(guest_t *g, uint64_t off)
+{
+    if (off >= MMAP_RX_BASE && off < MMAP_BASE)
+        return &g->mmap_rx_end;
+    if (off >= MMAP_BASE)
+        return &g->mmap_end;
+    return NULL;
+}
+
+/* Advance the allocation high-water mark (mmap_rx_next / mmap_next) that fork
+ * IPC state transfer replays, for whichever arena @off belongs to.
+ */
+static void mmap_bump_next(guest_t *g, uint64_t off, uint64_t end)
+{
+    if (off >= MMAP_RX_BASE && off < MMAP_BASE) {
+        if (end > g->mmap_rx_next)
+            g->mmap_rx_next = end;
+    } else if (off >= MMAP_BASE) {
+        if (end > g->mmap_next)
+            g->mmap_next = end;
+    }
+}
+
 static int mremap_extend_range(guest_t *g,
                                uint64_t off,
                                uint64_t size,
                                int prot)
 {
+    uint64_t *pt_end = mmap_pt_end_for_off(g, off);
+
     if (prot == LINUX_PROT_NONE) {
         guest_invalidate_ptes(g, off, off + size);
         return 0;
@@ -1364,10 +1395,67 @@ static int mremap_extend_range(guest_t *g,
     uint64_t ext_end = ALIGN_UP(off + size, BLOCK_2MIB);
     if (ext_end > g->guest_size)
         ext_end = g->guest_size;
-    if (guest_extend_page_tables(g, ext_start, ext_end, page_perms) < 0)
+    size_t nblocks = pt_end ? (size_t) ((ext_end - ext_start) / BLOCK_2MIB) : 0;
+    bool *block_preexisting = NULL;
+    if (nblocks) {
+        block_preexisting = calloc(nblocks, sizeof(*block_preexisting));
+        if (!block_preexisting)
+            return -1;
+        for (size_t i = 0; i < nblocks; i++)
+            block_preexisting[i] =
+                guest_va_block_mapped(g, ext_start + (uint64_t) i * BLOCK_2MIB);
+    }
+    if (guest_extend_page_tables(g, ext_start, ext_end, page_perms) < 0) {
+        free(block_preexisting);
         return -1;
-    guest_update_perms(g, off, off + size, page_perms);
+    }
+    uint64_t saved_pt_end = pt_end ? *pt_end : 0;
+    if (pt_end && ext_end > *pt_end)
+        *pt_end = ext_end;
+
+    for (size_t i = 0; i < nblocks; i++) {
+        if (block_preexisting[i])
+            continue;
+        uint64_t b = ext_start + (uint64_t) i * BLOCK_2MIB;
+        uint64_t bend = b + BLOCK_2MIB;
+        if (bend > ext_end)
+            bend = ext_end;
+        uint64_t keep_start = off > b ? off : b;
+        uint64_t keep_end = off + size < bend ? off + size : bend;
+        if (keep_start <= b && keep_end >= bend)
+            continue;
+        if (guest_split_block(g, b) < 0)
+            goto fail;
+        if (b < keep_start && guest_invalidate_ptes(g, b, keep_start) < 0)
+            goto fail;
+        if (keep_end < bend && guest_invalidate_ptes(g, keep_end, bend) < 0)
+            goto fail;
+    }
+
+    if (guest_update_perms(g, off, off + size, page_perms) < 0)
+        goto fail;
+    free(block_preexisting);
     return 0;
+
+    /* Roll back: re-invalidate every fresh block whole (idempotent -- the
+     * forward pass already cleared the non-kept subranges) plus the kept [off,
+     * off+size) span, returning the range to its pre-extend state.
+     */
+fail:
+    for (size_t i = 0; i < nblocks; i++) {
+        if (block_preexisting[i])
+            continue;
+        uint64_t b = ext_start + (uint64_t) i * BLOCK_2MIB;
+        uint64_t bend = b + BLOCK_2MIB;
+        if (bend > ext_end)
+            bend = ext_end;
+        (void) guest_invalidate_ptes(g, b, bend);
+    }
+    (void) guest_invalidate_ptes(g, off, off + size);
+    if (pt_end)
+        *pt_end = saved_pt_end;
+    free(block_preexisting);
+    return -1;
 }
 
 static int hvf_apply_file_overlay(guest_t *g,
@@ -1691,12 +1779,16 @@ static int rollback_fresh_mmap_allocation(guest_t *g,
 {
     if (overlay_installed)
         hvf_remove_file_overlay(g, overlay_ipa, overlay_len);
-    if (guest_invalidate_ptes(g, start, start + length) < 0)
+    uint64_t end = start + length;
+    uint64_t cur_mmap_end = g->mmap_end;
+    uint64_t cur_mmap_rx_end = g->mmap_rx_end;
+    if (guest_invalidate_ptes(g, start, end) < 0)
         return -LINUX_ENOMEM;
     g->mmap_next = saved_mmap_next;
-    g->mmap_end = saved_mmap_end;
+    g->mmap_end = cur_mmap_end > saved_mmap_end ? cur_mmap_end : saved_mmap_end;
     g->mmap_rx_next = saved_mmap_rx_next;
-    g->mmap_rx_end = saved_mmap_rx_end;
+    g->mmap_rx_end = cur_mmap_rx_end > saved_mmap_rx_end ? cur_mmap_rx_end
+                                                         : saved_mmap_rx_end;
     g->mmap_rw_gap_hint = saved_rw_gap_hint;
     g->mmap_rx_gap_hint = saved_rx_gap_hint;
     return 0;
@@ -2065,8 +2157,8 @@ static int hvf_remove_file_overlay_quiesced(guest_t *g,
         hvf_remap_segments_best_effort(g, segments, nsegments);
         return err;
     }
-    /* Restoring shm-backed slab pages may reveal an older nonzero snapshot.
-     * The following munmap/MAP_FIXED path will clear the bit only after it has
+    /* Restoring shm-backed slab pages may reveal an older nonzero snapshot. The
+     * following munmap/MAP_FIXED path will clear the bit only after it has
      * actually zeroed a complete 2 MiB block.
      */
     if (len <= UINT64_MAX - ipa)
@@ -2256,14 +2348,14 @@ int64_t sys_mmap(guest_t *g,
     bool is_noreserve = is_anon && (flags & LINUX_MAP_NORESERVE) != 0;
     /* Anonymous mappings defer page-table creation and zeroing to first touch
      * (guest fault or host-side access), like MAP_NORESERVE always has. This
-     * keeps mmap()/munmap() cost independent of length: a multi-GiB
-     * reservation costs neither an eager PTE walk nor a full-length memset,
-     * and never-touched blocks consume no page-table pool. PROT_NONE stays a
-     * pure reservation (faults deliver SIGSEGV, not materialization), and
-     * MAP_FIXED keeps the eager path because it must atomically replace live
-     * mappings. Shared anonymous memory stays eager unless the caller opted
-     * into MAP_NORESERVE (the historical lazy set), since deferred zeroing
-     * has never been exercised against the fork snapshot paths for it.
+     * keeps mmap()/munmap() cost independent of length: a multi-GiB reservation
+     * costs neither an eager PTE walk nor a full-length memset, and
+     * never-touched blocks consume no page-table pool. PROT_NONE stays a pure
+     * reservation (faults deliver SIGSEGV, not materialization), and MAP_FIXED
+     * keeps the eager path because it must atomically replace live mappings.
+     * Shared anonymous memory stays eager unless the caller opted into
+     * MAP_NORESERVE (the historical lazy set), since deferred zeroing has never
+     * been exercised against the fork snapshot paths for it.
      */
     bool is_lazy = is_anon && !is_prot_none &&
                    ((flags & LINUX_MAP_SHARED) == 0 || is_noreserve);
@@ -2307,9 +2399,9 @@ int64_t sys_mmap(guest_t *g,
         track_flags |= LINUX_MAP_ANONYMOUS;
 
     /* Preserve MAP_NORESERVE in region metadata before merge checks run. The
-     * same bit doubles as the internal lazy marker: guest_region_add_ex
-     * derives the region's deferred-PTE flag from it, and it is not guest
-     * visible (/proc/self/maps prints only prot and shared/private).
+     * same bit doubles as the internal lazy marker: guest_region_add_ex derives
+     * the region's deferred-PTE flag from it, and it is not guest visible
+     * (/proc/self/maps prints only prot and shared/private).
      */
     if (is_noreserve || is_lazy)
         track_flags |= LINUX_MAP_NORESERVE;
@@ -2715,9 +2807,7 @@ int64_t sys_mmap(guest_t *g,
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
-            uint64_t rx_hwm = result_off + length;
-            if (rx_hwm > g->mmap_rx_next)
-                g->mmap_rx_next = rx_hwm;
+            mmap_bump_next(g, result_off, result_off + length);
         } else {
             /* RW (or PROT_NONE, or PROT_READ): allocate from main mmap region.
              * Honor the address hint if provided and within bounds. Some
@@ -2776,9 +2866,7 @@ int64_t sys_mmap(guest_t *g,
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
-            uint64_t rw_hwm = result_off + length;
-            if (rw_hwm > g->mmap_next)
-                g->mmap_next = rw_hwm;
+            mmap_bump_next(g, result_off, result_off + length);
         }
         if (!region_has_capacity_after_removes(g, NULL, 0, 1)) {
             host_fd_ref_close(&backing_ref);
@@ -3315,10 +3403,16 @@ int64_t sys_mremap(guest_t *g,
             }
             (void) restore_snapshot_overlays_in_place(g, dest_snaps,
                                                       dest_nsnaps);
+            int pt_err = restore_snapshot_page_tables(
+                g, new_off, new_off + new_size, dest_snaps, dest_nsnaps);
+            if (pt_err < 0)
+                restore_err = pt_err;
             dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
             dispose_region_snapshots(&source_snaps, &source_nsnaps);
             if (track_backing_fd >= 0)
                 close(track_backing_fd);
+            if (restore_err < 0)
+                return restore_err;
             return -LINUX_ENOMEM;
         }
 
@@ -3497,14 +3591,7 @@ int64_t sys_mremap(guest_t *g,
                     mark_region_backing_ro(g, old_off, old_off + new_size);
 
                 /* Update high-water marks */
-                uint64_t hwm = old_off + new_size;
-                if (old_off >= MMAP_RX_BASE && old_off < MMAP_BASE) {
-                    if (hwm > g->mmap_rx_next)
-                        g->mmap_rx_next = hwm;
-                } else if (old_off >= MMAP_BASE) {
-                    if (hwm > g->mmap_next)
-                        g->mmap_next = hwm;
-                }
+                mmap_bump_next(g, old_off, old_off + new_size);
 
                 return (int64_t) old_addr;
             }
@@ -3661,14 +3748,7 @@ int64_t sys_mremap(guest_t *g,
             mark_region_backing_ro(g, new_off, new_off + new_size);
 
         /* Update high-water marks */
-        uint64_t hwm = new_off + new_size;
-        if (new_off >= MMAP_RX_BASE && new_off < MMAP_BASE) {
-            if (hwm > g->mmap_rx_next)
-                g->mmap_rx_next = hwm;
-        } else if (new_off >= MMAP_BASE) {
-            if (hwm > g->mmap_next)
-                g->mmap_next = hwm;
-        }
+        mmap_bump_next(g, new_off, new_off + new_size);
 
         return (int64_t) guest_ipa(g, new_off);
     }
@@ -3914,13 +3994,13 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
         return cleanup_err;
 
     /* Record which sub-ranges need zeroing BEFORE the PTE invalidation below
-     * destroys the evidence. Eager regions are zeroed across the whole
-     * overlap, as before. Lazy (deferred-PTE) regions only need their
-     * materialized 2MiB blocks zeroed: a block with no L2 mapping was never
-     * touched through PTEs, host-side fault-in materializes before writing,
-     * and the previous unmap of that slab range zeroed it -- so its bytes are
-     * still zero. This keeps munmap cost proportional to memory actually
-     * touched instead of to the mapping length.
+     * destroys the evidence. Eager regions are zeroed across the whole overlap,
+     * as before. Lazy (deferred-PTE) regions only need their materialized 2MiB
+     * blocks zeroed: a block with no L2 mapping was never touched through PTEs,
+     * host-side fault-in materializes before writing, and the previous unmap of
+     * that slab range zeroed it -- so its bytes are still zero. This keeps
+     * munmap cost proportional to memory actually touched instead of to the
+     * mapping length.
      */
     zero_range_t zr[MUNMAP_ZERO_RANGES_MAX];
     int nzr = 0;
@@ -3938,8 +4018,8 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
             if (nzr >= MUNMAP_ZERO_RANGES_MAX) {
                 /* Out of slots: widen the last range instead of dropping any
                  * span that must be zeroed. Everything between ranges lies
-                 * inside [unmap_off, end) and is being unmapped, so zeroing
-                 * the gap as well is harmless.
+                 * inside [unmap_off, end) and is being unmapped, so zeroing the
+                 * gap as well is harmless.
                  */
                 zr[nzr - 1].hi = zend;
                 continue;
@@ -4489,7 +4569,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         return -LINUX_ENOMEM;
 
     mmap_lock_acquire(g);
-    /* fork callers have quiesced siblings.  Drain their last publications,
+    /* fork callers have quiesced siblings. Drain their last publications,
      * revoke every descriptor, and trim never-consumed arena tails before the
      * legacy [MMAP_BASE,mmap_next) snapshot range is computed.
      */

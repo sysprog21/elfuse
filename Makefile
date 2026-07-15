@@ -197,6 +197,11 @@ $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# bench-mmap has a multi-threaded mmap_lock-contention section; needs -lpthread.
+$(BUILD_DIR)/bench-mmap: tests/bench-mmap.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
 # test-mmap-lazy races concurrent first touch from several threads.
 $(BUILD_DIR)/test-mmap-lazy: tests/test-mmap-lazy.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

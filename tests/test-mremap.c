@@ -120,6 +120,106 @@ static void test_grow_maymove(void)
     munmap(q, 4096 * 4);
 }
 
+static void test_grow_move_adjacent_fault(void)
+{
+    TEST("mremap fixed move keeps adjacent page unmapped");
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap source");
+        return;
+    }
+    char *dest =
+        mmap(NULL, 4096 * 3, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (dest == MAP_FAILED) {
+        FAIL("mmap dest");
+        munmap(p, 4096);
+        return;
+    }
+    if (munmap(dest + 8192, 4096) < 0) {
+        FAIL("munmap guard");
+        munmap(dest, 8192);
+        munmap(p, 4096);
+        return;
+    }
+    ((char *) p)[0] = 0x5a;
+
+    void *q = mremap(p, 4096, 8192, MREMAP_MAYMOVE | MREMAP_FIXED, dest);
+    if (q == MAP_FAILED) {
+        FAIL("mremap move");
+        munmap(dest, 8192);
+        munmap(p, 4096);
+        return;
+    }
+    if (q != dest || ((char *) q)[0] != 0x5a || ((char *) q)[4096] != 0) {
+        FAIL("mremap data");
+        munmap(q, 8192);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        volatile unsigned char value = *((volatile unsigned char *) q + 8192);
+        (void) value;
+        _exit(1);
+    }
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid) {
+        FAIL("fork/wait");
+        munmap(q, 8192);
+        return;
+    }
+    if ((WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV) ||
+        (WIFEXITED(status) && WEXITSTATUS(status) == 139))
+        PASS();
+    else
+        FAIL("adjacent page became readable");
+    munmap(q, 8192);
+}
+
+static void test_fixed_preserves_neighbor_l3(void)
+{
+    TEST("mremap fixed preserves neighboring lazy PTEs");
+    char *source = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (source == MAP_FAILED) {
+        FAIL("mmap source");
+        return;
+    }
+    char *anchor = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (anchor == MAP_FAILED) {
+        FAIL("mmap anchor");
+        munmap(source, 4096);
+        return;
+    }
+    char *dest = anchor + 4096;
+    if (munmap(dest, 4096) < 0) {
+        FAIL("munmap dest");
+        munmap(anchor, 4096);
+        munmap(source, 4096);
+        return;
+    }
+    source[0] = 0x11;
+    anchor[0] = 0x7e;
+
+    void *moved =
+        mremap(source, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, dest);
+    if (moved == MAP_FAILED) {
+        FAIL("mremap fixed");
+        munmap(anchor, 4096);
+        munmap(source, 4096);
+        return;
+    }
+    if (moved != dest || dest[0] != 0x11 || anchor[0] != 0x7e)
+        FAIL("neighboring lazy page changed");
+    else
+        PASS();
+
+    munmap(dest, 4096);
+    munmap(anchor, 4096);
+}
+
 /* Test 3: grow without MAYMOVE fails if blocked */
 
 static void test_grow_no_maymove(void)
@@ -403,6 +503,8 @@ int main(void)
 
     test_shrink();
     test_grow_maymove();
+    test_grow_move_adjacent_fault();
+    test_fixed_preserves_neighbor_l3();
     test_grow_no_maymove();
     test_fixed();
     test_same_size();

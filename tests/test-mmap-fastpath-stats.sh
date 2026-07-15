@@ -15,7 +15,7 @@ run_case()
     out="$TMPDIR_CASE/$case_name.out"
     err="$TMPDIR_CASE/$case_name.err"
     ELFUSE_SHIM_STATS=1 "$ELFUSE" "$TEST_BIN" "--stats-$case_name" \
-        >"$out" 2>"$err"
+        > "$out" 2> "$err"
 }
 
 counter()

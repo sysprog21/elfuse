@@ -134,6 +134,38 @@ static void test_zero_reuse(void)
     PASS();
 }
 
+static void test_hinted_tail_zero(void)
+{
+    TEST("hinted tail mmap reads zero");
+    size_t size = 2ULL << 20;
+    uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap base");
+        return;
+    }
+    p[0] = 0x3c;
+    p[size - 1] = 0xc3;
+
+    uint8_t *hint = p + size;
+    uint8_t *q = mmap(hint, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (q == MAP_FAILED) {
+        FAIL("mmap hint");
+        munmap(p, size);
+        return;
+    }
+    if (q[0] != 0 || q[size - 1] != 0 || p[0] != 0x3c || p[size - 1] != 0xc3) {
+        FAIL("hinted tail leaked stale bytes or clobbered neighbor");
+        munmap(q, size);
+        munmap(p, size);
+        return;
+    }
+    munmap(q, size);
+    munmap(p, size);
+    PASS();
+}
+
 static void test_partial_block_reuse(void)
 {
     TEST("partial-block reuse preserves neighbor");
@@ -719,6 +751,7 @@ int main(void)
 {
     test_huge_sparse();
     test_zero_reuse();
+    test_hinted_tail_zero();
     test_partial_block_reuse();
     test_fork_clean_reuse();
     test_file_overlay_reuse();

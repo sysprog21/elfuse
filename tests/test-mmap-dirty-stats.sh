@@ -9,7 +9,7 @@ TMPDIR_CASE=$(mktemp -d "${TMPDIR:-/tmp}/elfuse-dirty-map.XXXXXX")
 trap 'rm -rf "$TMPDIR_CASE"' EXIT INT TERM
 
 ELFUSE_SHIM_STATS=1 "$ELFUSE" "$TEST_BIN" \
-    >"$TMPDIR_CASE/out" 2>"$TMPDIR_CASE/err"
+    > "$TMPDIR_CASE/out" 2> "$TMPDIR_CASE/err"
 
 counter()
 {

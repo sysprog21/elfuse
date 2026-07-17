@@ -152,6 +152,72 @@ static void test_tagged_address(void)
     expect(raw_futex_wait((int *) tagged, 1), -EFAULT, "tagged uaddr match");
 }
 
+static void test_lazy_wait_case(int op, int timed, uint32_t expected)
+{
+    const size_t span = 4ULL << 20;
+    uint8_t *p = mmap(NULL, 2 * span, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        failures++;
+        perror("lazy futex mmap");
+        return;
+    }
+
+    /* Each call gets untouched word and timeout pages in separate blocks. */
+    long word = (long) (p + span);
+    long timeout = timed ? (long) p : 0;
+    expect(raw_syscall6(__NR_futex, word, op | FUTEX_PRIVATE_FLAG, expected,
+                        timeout, 0, FUTEX_BITSET_MATCH_ANY),
+           expected ? -EAGAIN : -ETIMEDOUT,
+           expected ? "lazy wait mismatch" : "zero lazy timeout");
+    expect(munmap(p, 2 * span), 0, "lazy futex munmap");
+}
+
+static void test_lazy_wait_inputs(void)
+{
+    const int ops[] = {FUTEX_WAIT, FUTEX_WAIT_BITSET};
+    for (unsigned i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+        test_lazy_wait_case(ops[i], 0, 1);
+        test_lazy_wait_case(ops[i], 1, 1);
+        test_lazy_wait_case(ops[i], 1, 0);
+    }
+}
+
+static void test_page_boundary(void)
+{
+    uint8_t *p = mmap(NULL, 2 * PAGE_SIZE, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        failures++;
+        perror("boundary futex mmap");
+        return;
+    }
+    if (mprotect(p + PAGE_SIZE, PAGE_SIZE, PROT_NONE) != 0) {
+        failures++;
+        perror("boundary futex mprotect");
+        munmap(p, 2 * PAGE_SIZE);
+        return;
+    }
+    const int ops[] = {FUTEX_WAIT, FUTEX_WAIT_BITSET};
+    for (unsigned i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+        expect(raw_syscall6(__NR_futex, (long) (p + PAGE_SIZE - 4),
+                            ops[i] | FUTEX_PRIVATE_FLAG, 1, 0, 0,
+                            FUTEX_BITSET_MATCH_ANY),
+               -EAGAIN, "aligned word at readable page end");
+        for (unsigned back = 1; back < sizeof(uint32_t); back++) {
+            expect(raw_syscall6(__NR_futex, (long) (p + PAGE_SIZE - back),
+                                ops[i] | FUTEX_PRIVATE_FLAG, 1, 0, 0,
+                                FUTEX_BITSET_MATCH_ANY),
+                   -EINVAL, "straddling word is unaligned");
+        }
+        expect(raw_syscall6(__NR_futex, (long) (p + PAGE_SIZE),
+                            ops[i] | FUTEX_PRIVATE_FLAG, 1, 0, 0,
+                            FUTEX_BITSET_MATCH_ANY),
+               -EFAULT, "aligned word in inaccessible page");
+    }
+    expect(munmap(p, 2 * PAGE_SIZE), 0, "boundary futex munmap");
+}
+
 int main(void)
 {
     int word = 1;
@@ -177,6 +243,8 @@ int main(void)
 
     test_unresolvable_addresses();
     test_tagged_address();
+    test_lazy_wait_inputs();
+    test_page_boundary();
     test_matching_word_still_blocks();
 
     if (failures)

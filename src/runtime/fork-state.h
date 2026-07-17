@@ -130,7 +130,7 @@ int fork_ipc_read_all(int fd, void *buf, size_t len);
 int fork_ipc_send_fds(int sock, const int *fds, int count);
 int fork_ipc_recv_fds(int sock, int *fds, int max_count, int *out_count);
 
-int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm);
+int fork_ipc_send_memory_regions(int ipc_sock, guest_t *g, bool use_shm);
 int fork_ipc_recv_memory_regions(int ipc_fd, guest_t *g);
 
 int fork_ipc_send_fd_table(int ipc_sock);

@@ -138,7 +138,7 @@ static void test_grow_move_adjacent_fault(void)
     }
     if (munmap(dest + 8192, 4096) < 0) {
         FAIL("munmap guard");
-        munmap(dest, 8192);
+        munmap(dest, 4096 * 3);
         munmap(p, 4096);
         return;
     }
@@ -196,7 +196,7 @@ static void test_fixed_preserves_neighbor_l3(void)
     char *dest = anchor + 4096;
     if (munmap(dest, 4096) < 0) {
         FAIL("munmap dest");
-        munmap(anchor, 4096);
+        munmap(anchor, 8192);
         munmap(source, 4096);
         return;
     }

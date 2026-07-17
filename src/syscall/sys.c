@@ -267,6 +267,9 @@ int64_t sys_getrandom(guest_t *g,
 
 int64_t sys_getcwd(guest_t *g, uint64_t buf_gva, uint64_t size)
 {
+    if (size)
+        (void) guest_lazy_faultin(
+            g, buf_gva, size < LINUX_PATH_MAX ? size : LINUX_PATH_MAX);
     proc_cwd_view_t view;
     if (proc_acquire_cwd_view(&view) < 0)
         return linux_errno();
@@ -277,7 +280,7 @@ int64_t sys_getcwd(guest_t *g, uint64_t buf_gva, uint64_t size)
         return -LINUX_ERANGE;
     }
 
-    int rc = guest_write_small(g, buf_gva, view.path, write_len);
+    int rc = guest_write_nofault(g, buf_gva, view.path, write_len);
     proc_release_cwd_view(&view);
     if (rc < 0)
         return -LINUX_EFAULT;

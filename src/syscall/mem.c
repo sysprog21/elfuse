@@ -8,6 +8,7 @@
  * Guest memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise, msync
  */
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <sched.h>
 
 #include "debug/log.h"
 #include "debug/syscall-hist.h"
@@ -27,6 +29,7 @@
 #include "core/mmap-fastpath.h"
 
 #include "proved/align.h"
+#include "proved/mmap-fastpath.h"
 
 #include "runtime/thread.h"
 #include "syscall/linux-wire.h"
@@ -38,7 +41,8 @@
  * may call mmap/brk concurrently; without this lock they could get overlapping
  * allocations or corrupt page table structures.
  */
-pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
+static pthread_mutex_t mmap_lock =
+    PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
 
 static pthread_once_t mmap_fastpath_env_once = PTHREAD_ONCE_INIT;
 static bool mmap_fastpath_env_enabled;
@@ -49,6 +53,13 @@ static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t min_addr,
                                     uint64_t max_addr,
                                     uint64_t align);
+static bool mmap_fastpath_rewind_control_if_clean_locked(
+    guest_t *g,
+    shim_mmap_control_t *c);
+static void mmap_fastpath_refill_thread_locked(guest_t *g,
+                                               thread_entry_t *t,
+                                               uint64_t request_len,
+                                               bool speculative);
 
 static void mmap_fastpath_read_env(void)
 {
@@ -75,6 +86,121 @@ static shim_mmap_control_t *mmap_fastpath_control(const guest_t *g, int slot)
                                     (uint64_t) slot * SHIM_MMAP_CONTROL_STRIDE);
 }
 
+
+static _Atomic uint32_t *mmap_fastpath_pt_gate(const guest_t *g)
+{
+    if (!g || !g->host_base)
+        return NULL;
+    return (_Atomic uint32_t *) ((uint8_t *) g->host_base + g->shim_data_base +
+                                 SHIM_MMAP_PT_GATE_OFF);
+}
+
+/* mmap_lock serializes host writers. The gate extends that exclusion to EL1
+ * fast munmap without making the per-vCPU producers contend with each other:
+ * after publishing gate=closed, wait for each producer's private active word.
+ */
+static void mmap_fastpath_host_gate_close(guest_t *g)
+{
+    _Atomic uint32_t *gate = mmap_fastpath_pt_gate(g);
+    if (!gate)
+        return;
+    uint32_t previous =
+        atomic_fetch_add_explicit(gate, 1, memory_order_acq_rel);
+    if (previous != 0)
+        return;
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        while (atomic_load_explicit(&c->retire.producer_active,
+                                    memory_order_acquire) != 0)
+            sched_yield();
+    }
+}
+
+/* Producers are stopped by the gate. Retain reservations for any undrained
+ * entries, then share the remaining region capacity among enabled arenas.
+ * Opening the gate publishes the credits to EL1's acquire load.
+ */
+static void mmap_fastpath_metadata_rebalance_locked(guest_t *g)
+{
+    uint32_t available = GUEST_MAX_REGIONS - g->nregions;
+    unsigned enabled = 0;
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        uint32_t pending =
+            atomic_load_explicit(&c->tail, memory_order_relaxed) -
+            atomic_load_explicit(&c->head, memory_order_relaxed);
+        if (pending > SHIM_MMAP_RING_SIZE || pending > available) {
+            log_fatal("mmap fast path: metadata reservation overflow");
+            abort();
+        }
+        available -= pending;
+        c->metadata_reserved = pending;
+        atomic_store_explicit(&c->metadata_credits, 0, memory_order_relaxed);
+        if (atomic_load_explicit(&c->flags, memory_order_relaxed) &
+            SHIM_MMAP_CTRL_ENABLED)
+            enabled++;
+    }
+    for (int slot = 0; slot < MAX_THREADS && enabled; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        if (!(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+              SHIM_MMAP_CTRL_ENABLED))
+            continue;
+        uint32_t credits = (available + enabled - 1) / enabled;
+        uint32_t room = SHIM_MMAP_RING_SIZE - c->metadata_reserved;
+        if (credits > room)
+            credits = room;
+        atomic_store_explicit(&c->metadata_credits, credits,
+                              memory_order_relaxed);
+        c->metadata_reserved += credits;
+        available -= credits;
+        enabled--;
+    }
+}
+
+static void mmap_fastpath_host_gate_open(guest_t *g)
+{
+    _Atomic uint32_t *gate = mmap_fastpath_pt_gate(g);
+    if (gate) {
+        uint32_t count = atomic_load_explicit(gate, memory_order_relaxed);
+        if (count == 1)
+            mmap_fastpath_metadata_rebalance_locked(g);
+        while (count != 0 && !atomic_compare_exchange_weak_explicit(
+                                 gate, &count, count - 1, memory_order_release,
+                                 memory_order_relaxed)) {
+        }
+
+        /* exec resets the entire shim-data page while holding mmap_lock,
+         * including this implementation-only counter. Seeing zero here is
+         * therefore an already-open gate, not an underflow.
+         */
+    }
+}
+
+static _Thread_local guest_t *mmap_lock_guest;
+static _Thread_local bool mmap_lock_owned;
+
+/* Record a length the guest actually obtained from this arena. Only real
+ * registrations enter the window: a request that missed and was served by the
+ * generic path never became arena traffic, and sizing the next arena for it
+ * would grow arenas for a workload that does not use them.
+ */
+static void mmap_fastpath_note_registration(shim_mmap_control_t *c,
+                                            uint64_t len)
+{
+    if (!len)
+        return;
+    c->publication_window[c->publication_seq &
+                          (MMAP_FAST_PUBLICATION_WINDOW - 1)] = len;
+    c->publication_seq++;
+}
+
+static void mmap_fastpath_window_reset(shim_mmap_control_t *c)
+{
+    for (unsigned i = 0; i < MMAP_FAST_PUBLICATION_WINDOW; i++)
+        c->publication_window[i] = 0;
+    c->publication_seq = 0;
+}
+
 static void mmap_fastpath_disable_control(shim_mmap_control_t *c)
 {
     uint32_t generation =
@@ -85,12 +211,20 @@ static void mmap_fastpath_disable_control(shim_mmap_control_t *c)
     atomic_store_explicit(&c->arena_base, 0, memory_order_relaxed);
     atomic_store_explicit(&c->arena_limit, 0, memory_order_relaxed);
     atomic_store_explicit(&c->cursor, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_start, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_end, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_generation, 0, memory_order_relaxed);
     c->next_arena_size = MMAP_FAST_ARENA_MIN;
-    c->max_len_seen = 0;
+
+    /* Teardown (exec, fast-path disable) ends the workload the history
+     * described, so the next one starts from the minimum arena.
+     */
+    mmap_fastpath_window_reset(c);
+    atomic_store_explicit(&c->pending_work, 0, memory_order_relaxed);
     atomic_store_explicit(&c->generation, generation, memory_order_release);
 }
 
-void mmap_fastpath_drain_locked(guest_t *g)
+static void mmap_fastpath_drain_publications_locked(guest_t *g)
 {
     if (!g || !g->host_base)
         return;
@@ -104,6 +238,7 @@ void mmap_fastpath_drain_locked(guest_t *g)
                 "mmap fast path: corrupt ring in vCPU slot %d "
                 "(head=%u tail=%u)",
                 slot, head, tail);
+            abort();
         }
 
         uint64_t arena_base =
@@ -125,6 +260,11 @@ void mmap_fastpath_drain_locked(guest_t *g)
                     slot, (unsigned long long) addr, (unsigned long long) len,
                     (unsigned long long) arena_base,
                     (unsigned long long) arena_limit);
+                abort();
+            }
+            if (c->metadata_reserved == 0) {
+                log_fatal("mmap fast path: publication without reservation");
+                abort();
             }
             if (guest_region_add_ex(g, addr, addr + len,
                                     LINUX_PROT_READ | LINUX_PROT_WRITE,
@@ -140,91 +280,490 @@ void mmap_fastpath_drain_locked(guest_t *g)
                     "mmap fast path: region metadata exhausted while "
                     "draining vCPU slot %d",
                     slot);
+                abort();
             }
-            if (len > c->max_len_seen)
-                c->max_len_seen = len;
+            mmap_fastpath_note_registration(c, len);
+            c->metadata_reserved--;
             head++;
         }
         atomic_store_explicit(&c->head, head, memory_order_release);
     }
 }
 
+static void munmap_retire_commit_locked(guest_t *g,
+                                        const munmap_retire_entry_t *e,
+                                        uint64_t backing_start,
+                                        uint64_t backing_end)
+{
+    uint64_t start = e->addr;
+    uint64_t end = start + e->length;
+
+    /* Publication drain ran first, so every mapping causally preceding this
+     * retirement is now represented in regions[]. A non-anonymous overlay in an
+     * arena indicates a missing revocation and must fail closed: EL1 has
+     * already invalidated the PTEs, so silently retaining such metadata would
+     * permit a later fault path to recreate them.
+     */
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= end)
+            break;
+        if (r->end <= start)
+            continue;
+        if (!(r->flags & LINUX_MAP_ANONYMOUS) ||
+            (r->flags & LINUX_MAP_SHARED) || r->backing_fd >= 0 ||
+            r->overlay_active) {
+            log_fatal(
+                "munmap retire: non-fast mapping in arena "
+                "[0x%llx-0x%llx)",
+                (unsigned long long) start, (unsigned long long) end);
+            abort();
+        }
+    }
+
+    guest_materialize_wait_range_locked(g, start, end);
+
+    /* The PTE occupancy evidence was consumed by EL1, so use the conservative
+     * dirty bitmap to avoid touching huge never-materialized reservations.
+     * Retain the dirty bits and let a future lazy materialization zero only the
+     * backing that is actually reused. In particular, do not charge an
+     * unrelated VM exit (often the next mapping's first fault) with an eager
+     * memset of the retired range. guest_materialize_lazy_one() zeros dirty
+     * backing before publishing any new descriptor, so a future reader can
+     * never observe stale bytes.
+     *
+     * An earlier version of this function eagerly replaced the backing of large
+     * dirty runs (unmap + F_PUNCHHOLE + fresh mmap + remap) once the run's
+     * page-accurate materialized byte count crossed a size threshold, on the
+     * theory that handing the zero-fill to the host's demand-zero path beats a
+     * future software memset. Round-trip measurement (munmap immediately
+     * followed by a full re-touch of the same range, not just the munmap call
+     * in isolation) showed the opposite at every size tried from 16 MiB to 512
+     * MiB: the replace path's own unmap/remap cost, paid synchronously while
+     * holding mmap_lock, exceeded the deferred memset it was meant to avoid,
+     * and grew faster than linearly with size. Retaining dirty bits
+     * unconditionally is cheaper in every case measured, so this function no
+     * longer special-cases large runs.
+     */
+
+    guest_region_remove(g, start, end);
+    if (backing_end > backing_start)
+        guest_retire_ptes_committed(g, backing_start, backing_end);
+}
+
+void mmap_fastpath_drain_locked(guest_t *g)
+{
+    if (!g || !g->host_base)
+        return;
+
+    /* Clear every advisory pending hint before acquire-snapshotting the rings.
+     * A publication racing this drain either appears in this snapshot or leaves
+     * its hint set for the next opportunistic drain.
+     *
+     * Acquire-snapshot every retirement tail before consuming any mmap
+     * publication. This is the cross-vCPU causal ordering required for "A mmap;
+     * publish pointer; B munmap": the acquire observes B's retire, then
+     * publication drain establishes A's semantic region before removal.
+     */
+    uint32_t retire_tails[MAX_THREADS];
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        atomic_exchange_explicit(&c->pending_work, 0, memory_order_acq_rel);
+        retire_tails[slot] =
+            atomic_load_explicit(&c->retire.tail, memory_order_acquire);
+    }
+
+    mmap_fastpath_drain_publications_locked(g);
+
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *producer = mmap_fastpath_control(g, slot);
+        uint32_t head =
+            atomic_load_explicit(&producer->retire.head, memory_order_relaxed);
+        uint32_t tail = retire_tails[slot];
+        if ((uint32_t) (tail - head) > SHIM_MUNMAP_RETIRE_RING_SIZE) {
+            log_fatal(
+                "munmap retire: corrupt ring in vCPU slot %d "
+                "(head=%u tail=%u)",
+                slot, head, tail);
+            abort();
+        }
+
+        while (head != tail) {
+            const munmap_retire_entry_t *e =
+                &producer->retire
+                     .entries[head & (SHIM_MUNMAP_RETIRE_RING_SIZE - 1)];
+            uint32_t arena_slot =
+                e->flags & SHIM_MUNMAP_RETIRE_F_ARENA_SLOT_MASK;
+            uint64_t charged_pages =
+                (e->flags & SHIM_MUNMAP_RETIRE_F_CHARGE_MASK) >>
+                SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT;
+            uint64_t charged_bytes = charged_pages * GUEST_PAGE_SIZE;
+            if (arena_slot >= MAX_THREADS || !e->length ||
+                (e->addr & (GUEST_PAGE_SIZE - 1)) ||
+                (e->length & (GUEST_PAGE_SIZE - 1)) ||
+                e->addr > UINT64_MAX - e->length || charged_bytes > e->length) {
+                log_fatal("munmap retire: invalid entry in vCPU slot %d", slot);
+                abort();
+            }
+
+            shim_mmap_control_t *arena =
+                mmap_fastpath_control(g, (int) arena_slot);
+            uint32_t generation =
+                atomic_load_explicit(&arena->generation, memory_order_acquire);
+            uint64_t base =
+                atomic_load_explicit(&arena->arena_base, memory_order_relaxed);
+            uint64_t cursor =
+                atomic_load_explicit(&arena->cursor, memory_order_relaxed);
+            uint64_t end = e->addr + e->length;
+            if (generation != e->arena_generation || e->addr < base ||
+                end > cursor) {
+                log_fatal(
+                    "munmap retire: stale arena generation/range "
+                    "(producer=%d arena=%u gen=%u/%u)",
+                    slot, arena_slot, e->arena_generation, generation);
+                abort();
+            }
+
+            uint64_t backing_start = 0, backing_end = 0;
+            if (charged_bytes != 0) {
+                backing_start = atomic_load_explicit(&arena->materialized_start,
+                                                     memory_order_relaxed);
+                backing_end = atomic_load_explicit(&arena->materialized_end,
+                                                   memory_order_relaxed);
+                if (backing_start < e->addr)
+                    backing_start = e->addr;
+                if (backing_end > end)
+                    backing_end = end;
+                if (backing_end <= backing_start) {
+                    log_fatal(
+                        "munmap retire: charged entry has no materialized "
+                        "bounds (producer=%d arena=%u range=0x%llx..0x%llx "
+                        "marker=0x%llx..0x%llx charged=0x%llx)",
+                        slot, arena_slot, (unsigned long long) e->addr,
+                        (unsigned long long) end,
+                        (unsigned long long) atomic_load_explicit(
+                            &arena->materialized_start, memory_order_relaxed),
+                        (unsigned long long) atomic_load_explicit(
+                            &arena->materialized_end, memory_order_relaxed),
+                        (unsigned long long) charged_bytes);
+                    abort();
+                }
+            }
+
+            munmap_retire_commit_locked(g, e, backing_start, backing_end);
+            uint64_t consumed = atomic_load_explicit(
+                &producer->retire.consumed_bytes, memory_order_relaxed);
+            atomic_store_explicit(&producer->retire.consumed_bytes,
+                                  consumed + charged_bytes,
+                                  memory_order_release);
+            head++;
+        }
+        atomic_store_explicit(&producer->retire.head, head,
+                              memory_order_release);
+
+        /* The PT gate is closed while draining, so no producer can race this
+         * acknowledgement. Ring fullness remains the only hard per-vCPU
+         * backpressure; byte pressure is deliberately advisory.
+         */
+        atomic_store_explicit(&producer->retire.cleanup_requested, 0,
+                              memory_order_release);
+    }
+
+    /* A stopped owner whose whole arena retired can collapse all published
+     * sub-extents back into its bump cursor. Like envelope reset, this must
+     * wait for the complete snapshot: overlapping retire records from sibling
+     * producers may otherwise observe a prematurely reset arena.
+     */
+    if (current_thread && current_thread->sp_el1_slot >= 0)
+        mmap_fastpath_rewind_control_if_clean_locked(
+            g, mmap_fastpath_control(g, current_thread->sp_el1_slot));
+
+    /* EL1 may publish several charged retirements before this drain. Their PTEs
+     * are all already invalid, so clearing an arena's materialized envelope
+     * after the first commit would make later entries in the same snapshot lose
+     * their backing bounds. Restore the PTE-empty proof only after every
+     * snapshotted retirement has consumed the old envelope.
+     */
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *arena = mmap_fastpath_control(g, slot);
+        if (!(atomic_load_explicit(&arena->flags, memory_order_relaxed) &
+              SHIM_MMAP_CTRL_ENABLED))
+            continue;
+        uint64_t base =
+            atomic_load_explicit(&arena->arena_base, memory_order_relaxed);
+        uint64_t cursor =
+            atomic_load_explicit(&arena->cursor, memory_order_relaxed);
+        if (base < cursor &&
+            guest_va_next_present_block(g, base, cursor) >= cursor) {
+            atomic_store_explicit(&arena->materialized_start, 0,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&arena->materialized_end, 0,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&arena->materialized_generation, 0,
+                                  memory_order_release);
+        }
+    }
+
+    /* No pt_gen bump: EL1 advanced the PT epoch as it cleared the descriptors,
+     * and the commits above rewrite none.
+     */
+}
+
+/* Top up the calling thread's arena before it runs dry.
+ *
+ * Refills otherwise happen only after the EL1 side has already missed: the fast
+ * path exhausts its arena, bails to HVC, and the host refills on the way
+ * through the slow path, so the mapping that discovers the exhaustion always
+ * pays for it. Any host path that takes mmap_lock is already positioned to
+ * refill for free, having paid for the lock and the gate close.
+ *
+ * The water mark is the largest recent registration rather than a fixed
+ * fraction: what makes an arena useless is being unable to hold the mappings
+ * this workload actually makes, so an arena is spent exactly when its tail no
+ * longer covers one of them. That also bounds what the refill abandons --
+ * relocating strands the unused tail until a later gap scan recovers it, and
+ * this way the strand is one typical mapping rather than a slice of an arena
+ * whose size nothing ties to the workload. A control with no history yet never
+ * triggers, which keeps startup from refilling on its first lock.
+ *
+ * Cheap enough for the lock path: an unavailable fast path or a thread with no
+ * slot costs one predictable branch, and a healthy arena costs three relaxed
+ * loads plus the window scan. Only the caller's own slot is considered;
+ * scanning all of them here would put a MAX_THREADS loop on every acquisition.
+ */
+static void mmap_fastpath_topup_locked(guest_t *g)
+{
+    if (!mmap_fastpath_available(g) || !current_thread ||
+        current_thread->sp_el1_slot < 0)
+        return;
+    shim_mmap_control_t *c =
+        mmap_fastpath_control(g, current_thread->sp_el1_slot);
+    if (!c || !(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+                SHIM_MMAP_CTRL_ENABLED))
+        return;
+
+    uint64_t cursor = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    uint64_t base = atomic_load_explicit(&c->arena_base, memory_order_relaxed);
+    uint64_t limit =
+        atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+    if (cursor > limit)
+        return;
+
+    uint64_t low_water = mmap_fastpath_window_max(c->publication_window);
+    if (!low_water || limit - cursor > low_water)
+        return;
+
+    /* One control block describes one arena generation. Replacing it while a
+     * mapping from the used prefix is live strands that mapping: its later
+     * munmap cannot prove arena ownership and falls back to the host. This is
+     * especially expensive when one large mapping consumes the whole arena. The
+     * acquire above drained publications, so regions[] is authoritative.
+     */
+    int first = guest_region_first_end_above(g, base);
+    if (first < g->nregions && g->regions[first].start < cursor)
+        return;
+
+    mmap_fastpath_refill_thread_locked(g, current_thread, 0, true);
+}
+
+bool mmap_lock_held_by_current_thread(void)
+{
+    return mmap_lock_owned;
+}
+
+void mmap_lock_acquire_raw(void)
+{
+    assert(!mmap_lock_owned);
+    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_owned = true;
+}
+
+void mmap_lock_release_raw(void)
+{
+    assert(mmap_lock_owned);
+    mmap_lock_owned = false;
+    pthread_mutex_unlock(&mmap_lock);
+}
+
+static void mmap_lock_acquire_common(guest_t *g)
+{
+    mmap_lock_acquire_raw();
+    mmap_fastpath_host_gate_close(g);
+    mmap_lock_guest = g;
+    mmap_fastpath_drain_locked(g);
+}
+
 void mmap_lock_acquire(guest_t *g)
 {
-    pthread_mutex_lock(&mmap_lock);
-    mmap_fastpath_drain_locked(g);
+    mmap_lock_acquire_common(g);
+    mmap_fastpath_topup_locked(g);
+}
+
+static void mmap_lock_acquire_for_fork(guest_t *g)
+{
+    /* Fork is about to revoke every arena. Keep the drain-before-region-read
+     * invariant without allocating a replacement arena that cannot survive this
+     * critical section.
+     */
+    mmap_lock_acquire_common(g);
 }
 
 void mmap_lock_release(void)
 {
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_fastpath_host_gate_open(mmap_lock_guest);
+    mmap_lock_guest = NULL;
+    mmap_lock_release_raw();
 }
 
 void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond)
 {
+    mmap_fastpath_host_gate_open(g);
+    mmap_lock_guest = NULL;
+    mmap_lock_owned = false;
     pthread_cond_wait(cond, &mmap_lock);
+    mmap_lock_owned = true;
+
     /* pthread_cond_wait reacquires mmap_lock directly, so preserve the
      * drain-before-region-read invariant of mmap_lock_acquire().
+     */
+    mmap_fastpath_host_gate_close(g);
+    mmap_lock_guest = g;
+    mmap_fastpath_drain_locked(g);
+}
+
+void mmap_lock_drop_keep_gate(void)
+{
+    /* Dirty lazy-materialization drops mmap_lock around a potentially large
+     * memset. Retain this thread's gate reference so EL1 cannot retire the
+     * invalid PTE window and let the materializer recreate it afterwards.
+     * Another host thread may temporarily acquire mmap_lock; the refcounted
+     * gate remains closed until this owner finishes the materialization.
+     */
+    mmap_lock_guest = NULL;
+    mmap_lock_release_raw();
+}
+
+void mmap_lock_reacquire_with_gate(guest_t *g)
+{
+    mmap_lock_acquire_raw();
+    mmap_lock_guest = g;
+
+#if !defined(NDEBUG)
+    /* A retained gate prevents retirement from waiting on this owner's claim.
+     */
+    if (g && g->host_base) {
+        for (int slot = 0; slot < MAX_THREADS; slot++) {
+            shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+            assert(
+                atomic_load_explicit(&c->retire.head, memory_order_relaxed) ==
+                atomic_load_explicit(&c->retire.tail, memory_order_acquire));
+        }
+    }
+#endif /* !defined(NDEBUG) */
+
+    /* EL1 mmap publication does not need the PT gate and may have progressed
+     * during the memset, so refresh semantic metadata before resuming.
      */
     mmap_fastpath_drain_locked(g);
 }
 
-static bool mmap_fastpath_request_fits(uint64_t cursor,
-                                       uint64_t limit,
-                                       uint64_t len)
+static bool mmap_fastpath_has_pending_work(const guest_t *g)
 {
-    if (!len)
-        return cursor < limit;
-    uint64_t start = cursor;
-    if (len >= BLOCK_2MIB) {
-        if (start > UINT64_MAX - (BLOCK_2MIB - 1))
-            return false;
-        start = ALIGN_UP(start, BLOCK_2MIB);
+    if (!g || !g->host_base)
+        return false;
+
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        if (atomic_load_explicit(&c->pending_work, memory_order_acquire))
+            return true;
     }
-    return start <= limit && len <= limit - start;
+    return false;
 }
 
-static uint64_t mmap_fastpath_pow2_clamped(uint64_t value)
+void mmap_fastpath_drain_vmexit(guest_t *g, bool fork_family_pending)
 {
-    if (value <= MMAP_FAST_ARENA_MIN)
-        return MMAP_FAST_ARENA_MIN;
-    if (value >= MMAP_FAST_ARENA_MAX)
-        return MMAP_FAST_ARENA_MAX;
-    value--;
-    value |= value >> 1;
-    value |= value >> 2;
-    value |= value >> 4;
-    value |= value >> 8;
-    value |= value >> 16;
-    value |= value >> 32;
-    return value + 1;
+    if (!mmap_fastpath_has_pending_work(g))
+        return;
+
+    if (fork_family_pending)
+        mmap_lock_acquire_for_fork(g);
+    else
+        mmap_lock_acquire(g);
+    mmap_lock_release();
 }
 
-static uint64_t mmap_fastpath_arena_size(uint64_t max_len_seen,
-                                         uint64_t request_len)
+bool mmap_fastpath_current_producer_active(const guest_t *g)
 {
-    uint64_t adaptive = MMAP_FAST_ARENA_MIN;
-    if (max_len_seen) {
-        uint64_t target =
-            max_len_seen > MMAP_FAST_ARENA_MAX / MMAP_FAST_HISTORY_MULTIPLIER
-                ? MMAP_FAST_ARENA_MAX
-                : max_len_seen * MMAP_FAST_HISTORY_MULTIPLIER;
-        adaptive = mmap_fastpath_pow2_clamped(target);
-    }
-
-    uint64_t covering = MMAP_FAST_ARENA_MIN;
-    if (request_len) {
-        uint64_t target = request_len > MMAP_FAST_ARENA_MAX / 2
-                              ? MMAP_FAST_ARENA_MAX
-                              : request_len * 2;
-        covering = mmap_fastpath_pow2_clamped(target);
-    }
-    return adaptive > covering ? adaptive : covering;
+    if (!g || !current_thread || current_thread->sp_el1_slot < 0)
+        return false;
+    shim_mmap_control_t *c =
+        mmap_fastpath_control(g, current_thread->sp_el1_slot);
+    return c && atomic_load_explicit(&c->retire.producer_active,
+                                     memory_order_acquire) != 0;
 }
 
+void mmap_fastpath_note_materialized_locked(guest_t *g,
+                                            uint64_t start,
+                                            uint64_t end)
+{
+    if (!g || end <= start)
+        return;
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        if (!(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+              SHIM_MMAP_CTRL_ENABLED))
+            continue;
+        uint64_t base =
+            atomic_load_explicit(&c->arena_base, memory_order_relaxed);
+        uint64_t limit =
+            atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+        if (start >= limit || end <= base)
+            continue;
+        uint32_t generation =
+            atomic_load_explicit(&c->generation, memory_order_relaxed);
+        uint64_t lo = start > base ? start : base;
+        uint64_t hi = end < limit ? end : limit;
+        uint32_t materialized = atomic_load_explicit(
+            &c->materialized_generation, memory_order_relaxed);
+        if (materialized == generation) {
+            uint64_t old_lo = atomic_load_explicit(&c->materialized_start,
+                                                   memory_order_relaxed);
+            uint64_t old_hi = atomic_load_explicit(&c->materialized_end,
+                                                   memory_order_relaxed);
+            if (old_lo < lo)
+                lo = old_lo;
+            if (old_hi > hi)
+                hi = old_hi;
+        }
+        atomic_store_explicit(&c->materialized_start, lo, memory_order_relaxed);
+        atomic_store_explicit(&c->materialized_end, hi, memory_order_relaxed);
+        atomic_store_explicit(&c->materialized_generation, generation,
+                              memory_order_release);
+
+        /* Fast-path arenas are allocated from disjoint VA ranges. Once this
+         * block has updated its owner, no later vCPU control can overlap it;
+         * avoid another 63 control-page probes on the single-vCPU hot path.
+         */
+        break;
+    }
+}
+
+/* mmap_fastpath_request_fits, mmap_fastpath_pow2_clamped,
+ * mmap_fastpath_window_max, and mmap_fastpath_arena_size live in
+ * proved/mmap-fastpath.h (included above): they are pure arithmetic over
+ * scalars, unlike everything else in this file, so make verify-mmapfastpath
+ * proves them directly instead of leaving them reviewed-by-eye.
+ */
+
+/* speculative: refill because the arena is nearly spent, not because a request
+ * failed to fit. The fits check below would otherwise abandon such a call
+ * immediately because a zero-length request fits any arena with a byte to
+ * spare.
+ */
 static void mmap_fastpath_refill_thread_locked(guest_t *g,
                                                thread_entry_t *t,
-                                               uint64_t request_len)
+                                               uint64_t request_len,
+                                               bool speculative)
 {
     if (!t || t->sp_el1_slot < 0)
         return;
@@ -242,29 +781,39 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
     if (request_len > MMAP_FAST_ARENA_MAX)
         return;
 
-    if (request_len > c->max_len_seen)
-        c->max_len_seen = request_len;
-
     uint64_t cursor = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    uint64_t arena_base =
+        atomic_load_explicit(&c->arena_base, memory_order_relaxed);
     uint64_t limit =
         atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
     uint32_t flags = atomic_load_explicit(&c->flags, memory_order_relaxed);
-    if ((flags & SHIM_MMAP_CTRL_ENABLED) &&
-        mmap_fastpath_request_fits(cursor, limit, request_len))
-        return;
+    uint64_t arena_size = mmap_fastpath_arena_size(
+        mmap_fastpath_window_max(c->publication_window), request_len);
+    if (!speculative && (flags & SHIM_MMAP_CTRL_ENABLED) &&
+        mmap_fastpath_request_fits(cursor, limit, request_len, BLOCK_2MIB)) {
+        /* A capacity miss enters HVC, whose drain can rewind a completely
+         * retired arena before this refill check. Retaining that undersized
+         * arena merely because one more request fits makes the same miss recur
+         * every few operations and turns mmap latency into a periodic sawtooth.
+         * Grow an empty arena to the adaptive target; never relocate one that
+         * still contains allocations served by the current generation.
+         */
+        bool empty = cursor == arena_base;
+        bool target_sized =
+            arena_base <= limit && limit - arena_base >= arena_size;
+        if (!empty || target_sized)
+            return;
+    }
 
-    /* The owner is parked in HVC. Make the stranded tail immediately recyclable
-     * before the gap scan; mappings already served from the prefix were drained
-     * into regions[] on mmap_lock acquisition.
+    /* The host gate is closed and publications are drained into regions[].
+     * Release the old reservation before searching for its replacement; retain
+     * the publication window for adaptive sizing across generations.
      */
     if (flags & SHIM_MMAP_CTRL_ENABLED)
-        atomic_store_explicit(&c->cursor, limit, memory_order_relaxed);
-
-    uint64_t arena_size =
-        mmap_fastpath_arena_size(c->max_len_seen, request_len);
+        atomic_store_explicit(&c->flags, 0, memory_order_relaxed);
 
     /* Prefer a real hole below the current high-water mark. Active sibling
-     * arena tails are excluded by mmap_fastpath_skip_reserved inside the gap
+     * arenas are excluded by mmap_fastpath_skip_reserved inside the gap
      * allocator. Only grow mmap_next when no recyclable hole fits.
      */
     uint64_t high = g->mmap_next;
@@ -313,15 +862,25 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
     atomic_store_explicit(&c->arena_base, base, memory_order_relaxed);
     atomic_store_explicit(&c->arena_limit, new_limit, memory_order_relaxed);
     atomic_store_explicit(&c->cursor, base, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_start, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_end, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_generation, 0, memory_order_relaxed);
     c->next_arena_size = arena_size;
-    c->max_len_seen = 0;
+
+    /* The window deliberately survives the generation change: sizing the next
+     * arena from the traffic that filled the previous one is the whole point,
+     * and clearing it here would restart the history at every refill.
+     */
     c->refill_count++;
     if (recycled)
         c->recycle_count++;
     if (arena_size > c->peak_arena_size)
         c->peak_arena_size = arena_size;
-    atomic_store_explicit(&c->flags, SHIM_MMAP_CTRL_ENABLED,
-                          memory_order_relaxed);
+    uint32_t control_flags = SHIM_MMAP_CTRL_ENABLED;
+    if (g_tlbi_range_supported)
+        control_flags |= SHIM_MMAP_CTRL_TLBIRANGE;
+    atomic_store_explicit(&c->flags, control_flags, memory_order_relaxed);
+
     /* This vCPU is stopped in HVC (or has never run), so host may acknowledge
      * the freshly published descriptor on its behalf. Revocation deliberately
      * does not do this, making an in-flight stale generation bail once.
@@ -333,7 +892,156 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
 
 void mmap_fastpath_refill_current_locked(guest_t *g, uint64_t request_len)
 {
-    mmap_fastpath_refill_thread_locked(g, current_thread, request_len);
+    mmap_fastpath_refill_thread_locked(g, current_thread, request_len, false);
+}
+
+bool mmap_fastpath_allocate_current_locked(guest_t *g,
+                                           uint64_t request_len,
+                                           uint64_t *addr_out)
+{
+    if (!addr_out || !request_len || !mmap_fastpath_available(g) ||
+        !current_thread || current_thread->sp_el1_slot < 0)
+        return false;
+
+    mmap_fastpath_refill_thread_locked(g, current_thread, request_len, false);
+    shim_mmap_control_t *c =
+        mmap_fastpath_control(g, current_thread->sp_el1_slot);
+    if (!c || !(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+                SHIM_MMAP_CTRL_ENABLED))
+        return false;
+
+    uint64_t start = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    uint64_t limit =
+        atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+    if (request_len >= BLOCK_2MIB) {
+        if (start > UINT64_MAX - (BLOCK_2MIB - 1))
+            return false;
+        start = ALIGN_UP(start, BLOCK_2MIB);
+    }
+    if (start > limit || request_len > limit - start)
+        return false;
+    uint64_t end = start + request_len;
+
+    if (guest_region_add_ex(
+            g, start, end, LINUX_PROT_READ | LINUX_PROT_WRITE,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_NORESERVE, 0,
+            NULL, -1) < 0)
+        return false;
+
+    atomic_store_explicit(&c->cursor, end, memory_order_release);
+    mmap_fastpath_note_registration(c, request_len);
+    if (end > g->mmap_end)
+        g->mmap_end = end;
+    *addr_out = start;
+    return true;
+}
+
+/* Service mmap publication-ring backpressure without turning it into a global
+ * PT-gate rendezvous. The calling vCPU is stopped in HVC, so the host may
+ * advance only that vCPU's existing bump cursor after draining its prior
+ * publications. Sibling EL1 allocators own disjoint arenas and may continue
+ * publishing concurrently.
+ *
+ * This path deliberately refuses every operation that could require a host
+ * writer transaction: a pending retirement, a closed gate, arena refill or
+ * generation change all fall back to mmap_lock_acquire(). The acquire snapshots
+ * of every retire tail preserve the usual drain-before-metadata ordering for
+ * causally prior munmaps.
+ */
+bool mmap_fastpath_allocate_current_publication_only(guest_t *g,
+                                                     uint64_t request_len,
+                                                     uint64_t *addr_out)
+{
+    if (!g || !addr_out || !request_len || !mmap_fastpath_available(g) ||
+        !current_thread || current_thread->sp_el1_slot < 0)
+        return false;
+
+    mmap_lock_acquire_raw();
+    _Atomic uint32_t *gate = mmap_fastpath_pt_gate(g);
+    if (!gate || atomic_load_explicit(gate, memory_order_acquire) != 0)
+        goto miss;
+
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *producer = mmap_fastpath_control(g, slot);
+        uint32_t head =
+            atomic_load_explicit(&producer->retire.head, memory_order_relaxed);
+        uint32_t tail =
+            atomic_load_explicit(&producer->retire.tail, memory_order_acquire);
+        if (head != tail)
+            goto miss;
+    }
+
+    mmap_fastpath_drain_publications_locked(g);
+
+    shim_mmap_control_t *c =
+        mmap_fastpath_control(g, current_thread->sp_el1_slot);
+
+    /* Sibling producers may still consume credits. Their host-owned total
+     * includes both unused credits and publications, even between EL1 stores.
+     */
+    uint32_t available = GUEST_MAX_REGIONS - g->nregions;
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        uint32_t reserved = mmap_fastpath_control(g, slot)->metadata_reserved;
+        if (reserved >= available)
+            goto miss;
+        available -= reserved;
+    }
+    uint32_t generation =
+        atomic_load_explicit(&c->generation, memory_order_acquire);
+    if (!(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+          SHIM_MMAP_CTRL_ENABLED) ||
+        atomic_load_explicit(&c->consumer_generation, memory_order_relaxed) !=
+            generation)
+        goto miss;
+
+    uint64_t start = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    uint64_t base = atomic_load_explicit(&c->arena_base, memory_order_relaxed);
+    uint64_t limit =
+        atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+    if (start == base) {
+        uint64_t target = mmap_fastpath_arena_size(
+            mmap_fastpath_window_max(c->publication_window), request_len);
+        if (base > limit || limit - base < target)
+            goto miss;
+    }
+    if (request_len >= BLOCK_2MIB) {
+        if (start > UINT64_MAX - (BLOCK_2MIB - 1))
+            goto miss;
+        start = ALIGN_UP(start, BLOCK_2MIB);
+    }
+    if (start > limit || request_len > limit - start)
+        goto miss;
+    uint64_t end = start + request_len;
+
+    if (guest_region_add_ex(
+            g, start, end, LINUX_PROT_READ | LINUX_PROT_WRITE,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_NORESERVE, 0,
+            NULL, -1) < 0)
+        goto miss;
+
+    atomic_store_explicit(&c->cursor, end, memory_order_release);
+    mmap_fastpath_note_registration(c, request_len);
+    if (end > g->mmap_end)
+        g->mmap_end = end;
+    *addr_out = start;
+
+    /* Only this producer is stopped. Refill its credits from unreserved
+     * capacity, charging one slot for the host allocation even if it merged.
+     */
+    uint32_t grant = SHIM_MMAP_RING_SIZE - c->metadata_reserved;
+    if (grant > available - 1)
+        grant = available - 1;
+    c->metadata_reserved += grant;
+    uint32_t credits =
+        atomic_load_explicit(&c->metadata_credits, memory_order_relaxed);
+    atomic_store_explicit(&c->metadata_credits, credits + grant,
+                          memory_order_release);
+    mmap_lock_release_raw();
+    return true;
+
+miss:
+    mmap_lock_release_raw();
+    return false;
 }
 
 void mmap_fastpath_release_current_hint_locked(guest_t *g,
@@ -351,29 +1059,84 @@ void mmap_fastpath_release_current_hint_locked(guest_t *g,
     uint64_t cursor = atomic_load_explicit(&c->cursor, memory_order_relaxed);
     uint64_t limit =
         atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
-    if (cursor >= limit || addr >= limit || addr + length <= cursor)
+    if (addr < cursor || addr >= limit)
         return;
 
     /* The owner is stopped in the HVC that reached sys_mmap, so it cannot race
-     * this descriptor update. Revoke its whole unconsumed tail: the explicit
-     * hint must remain semantically free, and the post-syscall refill will
-     * provision a new non-overlapping arena.
+     * this descriptor update. Release an unallocated tail for an explicit hint;
+     * hints in the used prefix must not revoke ownership of its holes.
      */
     mmap_fastpath_disable_control(c);
+}
+
+/* Reuse a fully released arena in place. mmap_lock acquisition has drained this
+ * vCPU's publication ring, and sys_munmap has removed the last semantic region
+ * before calling here. The PTE occupancy index is the final guard: an arena is
+ * rewound only when no live metadata and no valid descriptor remain. The owner
+ * is stopped in HVC, so resetting its private bump cursor cannot race EL1.
+ * Keeping base/limit/generation unchanged avoids a host refill on the next mmap
+ * This matters when one 32 GiB request consumes the entire maximum-sized arena.
+ */
+static bool mmap_fastpath_rewind_control_if_clean_locked(guest_t *g,
+                                                         shim_mmap_control_t *c)
+{
+    if (!g || !c)
+        return false;
+    if (!(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+          SHIM_MMAP_CTRL_ENABLED))
+        return false;
+
+    uint64_t base = atomic_load_explicit(&c->arena_base, memory_order_relaxed);
+    uint64_t limit =
+        atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+    uint64_t cursor = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    if (base >= limit || cursor <= base)
+        return false;
+
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= limit)
+            break;
+        if (r->end > base)
+            return false;
+    }
+    if (guest_va_next_present_block(g, base, limit) < limit)
+        return false;
+
+    /* The stopped owner can safely discard pending sub-extents because the
+     * whole arena is becoming one bump-allocatable extent again.
+     */
+    atomic_store_explicit(&c->cursor, base, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_start, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_end, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->materialized_generation, 0, memory_order_relaxed);
+    c->recycle_count++;
+    return true;
+}
+
+static void mmap_fastpath_rewind_current_if_clean_locked(guest_t *g)
+{
+    if (!g || !current_thread || current_thread->sp_el1_slot < 0)
+        return;
+    mmap_fastpath_rewind_control_if_clean_locked(
+        g, mmap_fastpath_control(g, current_thread->sp_el1_slot));
 }
 
 void mmap_fastpath_prepare_vcpu(guest_t *g, thread_entry_t *t)
 {
     mmap_lock_acquire(g);
-    mmap_fastpath_refill_thread_locked(g, t, 0);
+    mmap_fastpath_refill_thread_locked(g, t, 0, false);
     mmap_lock_release();
 }
 
 void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water)
 {
     mmap_fastpath_drain_locked(g);
-    for (int slot = 0; slot < MAX_THREADS; slot++)
-        mmap_fastpath_disable_control(mmap_fastpath_control(g, slot));
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        if (c)
+            mmap_fastpath_disable_control(c);
+    }
 
     if (!shrink_high_water)
         return;
@@ -416,11 +1179,15 @@ void mmap_fastpath_skip_reserved(const guest_t *g,
             if (!(atomic_load_explicit(&c->flags, memory_order_acquire) &
                   SHIM_MMAP_CTRL_ENABLED))
                 continue;
-            uint64_t cursor =
-                atomic_load_explicit(&c->cursor, memory_order_acquire);
+
+            /* EL1 munmap classifies ownership by arena bounds, including holes
+             * below cursor. Keep those holes reserved until revocation.
+             */
+            uint64_t base =
+                atomic_load_explicit(&c->arena_base, memory_order_relaxed);
             uint64_t limit =
                 atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
-            if (cursor < limit && *start < limit && end > cursor) {
+            if (base < limit && *start < limit && end > base) {
                 *start = ALIGN_UP(limit, align);
                 advanced = true;
                 break;
@@ -1093,6 +1860,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
     for (int i = guest_region_first_end_above(g, gap_start); i < g->nregions;
          i++) {
         mmap_fastpath_skip_reserved(g, &gap_start, length, align, max_addr);
+
         /* A region can still slip below gap_start after the align_up_ok advance
          * below skips past a smaller adjacent region; keep the cheap guard.
          */
@@ -1288,6 +2056,33 @@ static bool high_va_replaceable_gpa_base(guest_t *g,
     return true;
 }
 
+static int mmap_high_va_preflight_locked(guest_t *g,
+                                         uint64_t addr,
+                                         uint64_t length,
+                                         bool replace_existing,
+                                         bool is_noreplace)
+{
+    if (!g->is_rosetta || !length || addr > UINT64_MAX - length ||
+        addr + length > UINT64_MAX - (BLOCK_2MIB - 1) ||
+        guest_kbuf_user_va_overlap(addr, length))
+        return -LINUX_ENOMEM;
+    if (!region_range_overlaps(g, addr, addr + length))
+        return 0;
+
+    /* Replacement rollback keeps a host byte snapshot, capped at 256 MiB. */
+    if (length > ((size_t) 256 << 20))
+        return -LINUX_ENOMEM;
+    if (is_noreplace)
+        return -LINUX_EEXIST;
+    if (!replace_existing ||
+        !high_va_replaceable_gpa_base(g, addr, addr + length, NULL, NULL,
+                                      NULL) ||
+        !region_has_capacity_after_removes(
+            g, &(remove_range_t) {addr, addr + length}, 1, 1))
+        return -LINUX_ENOMEM;
+    return 0;
+}
+
 /* Over the function-size limit on purpose.
  *
  * The Rosetta high-VA mapping loop plus its rollback, which has to undo page
@@ -1303,18 +2098,19 @@ static int64_t sys_mmap_high_va(guest_t *g,
                                 guest_fd_t fd,
                                 uint64_t offset,
                                 bool replace_existing,
-                                bool is_noreplace)
+                                bool is_noreplace,
+                                int materialized_fd)
 {
-    int64_t ret = -LINUX_ENOMEM;
-
-    if (!g->is_rosetta)
-        return -LINUX_ENOMEM;
+    int64_t ret = mmap_high_va_preflight_locked(g, addr, length,
+                                                replace_existing, is_noreplace);
+    if (ret < 0)
+        return ret;
+    ret = -LINUX_ENOMEM;
 
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
     host_fd_ref_t backing_ref = HOST_FD_REF_INIT;
     int host_backing_fd = -1;
     int track_backing_fd = -1;
-    bool close_host_backing_fd = false;
 
     /* High-water mark of VA installed by the mapping loop; reachable from the
      * fail label so the rollback knows what to invalidate. Must be initialized
@@ -1369,21 +2165,6 @@ static int64_t sys_mmap_high_va(guest_t *g,
      * fd) already fell through here and are unchanged.
      */
 
-    /* Reject wrap before reusing addr + length anywhere below. The caller
-     * page-rounds length, but addr is guest-supplied and a huge length against
-     * a high VA can still overflow. Also reject the case where addr + length is
-     * too close to UINT64_MAX for ALIGN_UP to round up the 2 MiB boundary
-     * without wrapping to 0 (which would make va_limit smaller than va_base and
-     * underflow backing_span).
-     */
-    if (length == 0 || addr > UINT64_MAX - length)
-        return -LINUX_ENOMEM;
-    if ((addr + length) > UINT64_MAX - (BLOCK_2MIB - 1))
-        return -LINUX_ENOMEM;
-
-    if (guest_kbuf_user_va_overlap(addr, length))
-        return -LINUX_ENOMEM;
-
     /* Set when this call enters the replace-an-existing-mapping branch
      * (region_range_overlaps + replaceable + snapshots captured). Used
      * everywhere the function needs to decide between the fresh-allocation path
@@ -1395,32 +2176,10 @@ static int64_t sys_mmap_high_va(guest_t *g,
      */
     bool replacing_existing = false;
 
-    /* Cap the byte-snapshot allocation that populate_existing needs for
-     * rollback. The mapping itself can still be arbitrarily large in the
-     * fresh-allocation path; only the replace-an-existing branch needs the
-     * host-side malloc, so the cap only applies to replacement. 256 MiB is
-     * comfortably above realistic Rosetta dynamic-linker reservations and far
-     * below the multi-GiB malloc bombs a hostile guest could otherwise force.
-     * Reject early with -ENOMEM so the caller falls back to a smaller MAP_FIXED
-     * footprint rather than triggering the host OOM killer.
-     */
-    enum { HIGH_VA_SNAPSHOT_MAX = (size_t) 256 << 20 };
-
-    if (region_range_overlaps(g, addr, addr + length) &&
-        length > HIGH_VA_SNAPSHOT_MAX)
-        return -LINUX_ENOMEM;
-
     if (region_range_overlaps(g, addr, addr + length)) {
-        if (is_noreplace)
-            return -LINUX_EEXIST;
-        if (!replace_existing)
-            return -LINUX_ENOMEM;
         if (!high_va_replaceable_gpa_base(g, addr, addr + length,
                                           &replaced_gpa_base, &replaced_flags,
                                           &replaced_offset))
-            return -LINUX_ENOMEM;
-        if (!region_has_capacity_after_removes(
-                g, &(remove_range_t) {addr, addr + length}, 1, 1))
             return -LINUX_ENOMEM;
         if (guest_region_remove_prepare(g, addr, addr + length,
                                         &replaced_remove_fd) < 0)
@@ -1465,25 +2224,8 @@ static int64_t sys_mmap_high_va(guest_t *g,
     }
 
     if (!is_anon) {
-        if (fuse_fd_refuse_mmap(fd)) {
-            char materialized_path[PATH_MAX];
-            int rc = fuse_materialize_fd(fd, materialized_path,
-                                         sizeof(materialized_path));
-            if (rc < 0) {
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return rc;
-            }
-            host_backing_fd = open(materialized_path, O_RDONLY | O_CLOEXEC);
-            int saved_errno = errno;
-            unlink(materialized_path);
-            if (host_backing_fd < 0) {
-                errno = saved_errno;
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return linux_errno();
-            }
-            close_host_backing_fd = true;
+        if (materialized_fd >= 0) {
+            host_backing_fd = materialized_fd;
         } else {
             int64_t ref_err = host_fd_ref_open(fd, &backing_ref);
             if (ref_err < 0) {
@@ -1674,8 +2416,6 @@ populate_existing:
      * steps must not goto fail or the region's backing fd would be
      * double-closed.
      */
-    if (close_host_backing_fd && host_backing_fd >= 0)
-        close(host_backing_fd);
     host_fd_ref_close(&backing_ref);
     if (replaced_snaps) {
         close_region_snapshots(replaced_snaps, replaced_nsnaps);
@@ -1774,8 +2514,6 @@ fail:
     }
     if (replaced_bytes_snap)
         free(replaced_bytes_snap);
-    if (close_host_backing_fd && host_backing_fd >= 0)
-        close(host_backing_fd);
     host_fd_ref_close(&backing_ref);
 
     /* Close the siblings_quiesced bracket as the very last step, so the byte
@@ -1785,6 +2523,56 @@ fail:
     if (siblings_quiesced)
         thread_resume_siblings();
     return ret;
+}
+
+int mmap_prepare_file(guest_t *g,
+                      uint64_t addr,
+                      uint64_t length,
+                      int flags,
+                      int fd,
+                      int64_t offset,
+                      int *materialized_fd)
+{
+    assert(!mmap_lock_held_by_current_thread());
+    *materialized_fd = -1;
+    if (flags & LINUX_MAP_ANONYMOUS)
+        return 0;
+    if (!length || (offset & (GUEST_PAGE_SIZE - 1)))
+        return -LINUX_EINVAL;
+    if (!fuse_fd_refuse_mmap(fd))
+        return 0;
+    if (!g->is_rosetta ||
+        !(flags & (LINUX_MAP_FIXED | LINUX_MAP_FIXED_NOREPLACE)) ||
+        addr < g->guest_size || (flags & LINUX_MAP_SHARED))
+        return -LINUX_ENODEV;
+    if (length > UINT64_MAX - (GUEST_PAGE_SIZE - 1))
+        return -LINUX_ENOMEM;
+    length = PAGE_ALIGN_UP(length);
+    if (addr & (GUEST_PAGE_SIZE - 1))
+        return -LINUX_EINVAL;
+    if (addr > 0x0000FFFFFFFFFFFFULL)
+        return -LINUX_ENOMEM;
+
+    mmap_lock_acquire(g);
+    int rc = mmap_high_va_preflight_locked(
+        g, addr, length, true, (flags & LINUX_MAP_FIXED_NOREPLACE) != 0);
+    mmap_lock_release();
+    if (rc < 0)
+        return rc;
+
+    char path[PATH_MAX];
+    rc = fuse_materialize_fd(fd, path, sizeof(path));
+    if (rc < 0)
+        return rc;
+    int backing_fd = open(path, O_RDONLY | O_CLOEXEC);
+    int saved_errno = errno;
+    unlink(path);
+    if (backing_fd < 0) {
+        errno = saved_errno;
+        return linux_errno();
+    }
+    *materialized_fd = backing_fd;
+    return 0;
 }
 
 /* Page-table high-water slot (mmap_rx_end / mmap_end) for a TTBR0 mmap offset,
@@ -1921,6 +2709,7 @@ static int read_file_range_to_guest(guest_t *g,
     uint8_t *dst = host_ptr_for_gpa(g, gpa);
     if (!dst)
         return -LINUX_EFAULT;
+
     /* A short read, EOF, or later error may still leave nonzero bytes in the
      * destination. Mark before the first pread so every exit is conservative.
      */
@@ -2102,6 +2891,25 @@ static void mark_mremap_source_overlay_metadata(guest_t *g,
             mark_overlay_metadata_range(g, segment->start, segment->end,
                                         segment->overlay_start,
                                         segment->overlay_end);
+    }
+}
+
+/* Invalid pages in an accessible lazy source still contain retired slab bytes.
+ * Hold mmap_lock throughout and zero them before destination PTE creation can
+ * cover the source's edge block. Valid pages retain guest writes.
+ */
+static void zero_mremap_lazy_source(guest_t *g, uint64_t start, uint64_t end)
+{
+    while (start < end) {
+        if (guest_va_pte_valid(g, start)) {
+            start += GUEST_PAGE_SIZE;
+            continue;
+        }
+        uint64_t zero_start = start;
+        do {
+            start += GUEST_PAGE_SIZE;
+        } while (start < end && !guest_va_pte_valid(g, start));
+        memset((uint8_t *) g->host_base + zero_start, 0, start - zero_start);
     }
 }
 
@@ -2873,6 +3681,7 @@ static int hvf_remove_file_overlay_quiesced(guest_t *g,
         hvf_remap_segments_best_effort(g, segments, nsegments);
         return err;
     }
+
     /* Restoring shm-backed slab pages may reveal an older nonzero snapshot. The
      * following munmap/MAP_FIXED path will clear the bit only after it has
      * actually zeroed a complete 2 MiB block.
@@ -3228,7 +4037,8 @@ int64_t sys_mmap(guest_t *g,
                  int prot,
                  int flags,
                  int fd,
-                 int64_t offset)
+                 int64_t offset,
+                 int materialized_fd)
 {
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
@@ -3276,6 +4086,7 @@ int64_t sys_mmap(guest_t *g,
      * free()'d (free(NULL) is a no-op) before return.
      */
     bool replaced_regions_removed = false;
+
     /* Linux kernel rejects MAP_FIXED with non-page-aligned address (checked
      * below); the flag itself is needed early because it gates the lazy path.
      */
@@ -3311,7 +4122,9 @@ int64_t sys_mmap(guest_t *g,
     if (!is_anon && (offset & 4095))
         return -LINUX_EINVAL;
 
-    if (!is_anon && fuse_fd_refuse_mmap(fd)) {
+    if (!is_anon && materialized_fd < 0 && fuse_fd_refuse_mmap(fd))
+        return -LINUX_ENODEV;
+    if (materialized_fd >= 0) {
         bool allow_materialized_fuse_mmap =
             g->is_rosetta &&
             ((flags & LINUX_MAP_FIXED) ||
@@ -3347,6 +4160,14 @@ int64_t sys_mmap(guest_t *g,
      */
     bool is_noreplace = (flags & LINUX_MAP_FIXED_NOREPLACE) != 0;
 
+    /* A fixed mapping may replace an address previously handed out by an EL1
+     * arena with a file/shared/stack-like mapping. Revoke all descriptors
+     * before making that semantic transition so a later fast munmap cannot
+     * classify it from the stale arena bounds.
+     */
+    if (is_fixed)
+        mmap_fastpath_revoke_all_locked(g, false);
+
     uint64_t result_off; /* Result as offset (0-based) */
     if (is_fixed) {
         /* Addresses above TASK_SIZE (bit 63 set or beyond user VA range) are
@@ -3357,7 +4178,7 @@ int64_t sys_mmap(guest_t *g,
 
         if (addr >= g->guest_size)
             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset,
-                                    true, is_noreplace);
+                                    true, is_noreplace, materialized_fd);
 
         /* High-VA MAP_FIXED (rosetta's JIT slabs at 240 TiB, code caches at 85
          * TiB, etc.) is not safe to expose yet. The previous draft could
@@ -3630,7 +4451,7 @@ int64_t sys_mmap(guest_t *g,
         if (g->is_rosetta && addr >= g->guest_size &&
             addr <= 0x0000FFFFFFFFFFFFULL) {
             int64_t high_hint = sys_mmap_high_va(g, addr, length, prot, flags,
-                                                 fd, offset, false, false);
+                                                 fd, offset, false, false, -1);
             if (high_hint >= 0)
                 return high_hint;
         }
@@ -4103,11 +4924,22 @@ int64_t sys_mremap(guest_t *g,
      */
     if (guest_range_hits_infra(g, old_off, old_off + old_size))
         return -LINUX_EINVAL;
-    if (old_off < g->guest_size)
-        guest_materialize_wait_range_locked(g, old_off,
-                                            old_size > g->guest_size - old_off
-                                                ? g->guest_size
-                                                : old_off + old_size);
+
+    /* Wait for both ranges before retaining source metadata: a condition wait
+     * releases mmap_lock and can invalidate region pointers and borrowed fds.
+     * Invalid fixed destinations keep their existing checks below.
+     */
+    uint64_t wait_start = old_off, wait_end = old_off + old_size;
+    if ((flags & LINUX_MREMAP_FIXED) && new_addr >= g->ipa_base) {
+        uint64_t dest = new_addr - g->ipa_base;
+        if (dest <= g->guest_size && new_size <= g->guest_size - dest) {
+            if (dest < wait_start)
+                wait_start = dest;
+            if (dest + new_size > wait_end)
+                wait_end = dest + new_size;
+        }
+    }
+    guest_materialize_wait_range_locked(g, wait_start, wait_end);
 
     /* Verify the whole source range is covered by one logical VMA. A fork-aware
      * growth can split that VMA at the inherited/private boundary, but no
@@ -4172,6 +5004,12 @@ int64_t sys_mremap(guest_t *g,
         return finish_mremap(&source, (int64_t) old_addr);
     }
 
+    bool source_lazy =
+        src_reg->noreserve && (src_reg->flags & LINUX_MAP_ANONYMOUS) &&
+        src_reg->prot != LINUX_PROT_NONE && src_gpa_base == src_start &&
+        old_off < g->guest_size && old_size <= g->guest_size - old_off &&
+        !mremap_source_has_overlay(&source);
+
     /* MREMAP_FIXED: move to a specific new address */
     if (flags & LINUX_MREMAP_FIXED) {
         if (new_addr & 4095)
@@ -4191,8 +5029,6 @@ int64_t sys_mremap(guest_t *g,
          */
         if (guest_range_hits_infra(g, new_off, new_off + new_size))
             return finish_mremap(&source, -LINUX_EINVAL);
-        guest_materialize_wait_range_locked(g, new_off, new_off + new_size);
-
         /* Linux rejects MREMAP_FIXED when old and new ranges overlap */
         uint64_t old_end = old_off + old_size, new_end = new_off + new_size;
         if (old_off < new_end && new_off < old_end)
@@ -4324,6 +5160,9 @@ int64_t sys_mremap(guest_t *g,
             return finish_mremap(&source, cleanup_err);
         }
 
+        uint64_t copy_len = old_size < new_size ? old_size : new_size;
+        if (source_lazy)
+            zero_mremap_lazy_source(g, old_off, old_off + copy_len);
         if (mremap_extend_range(g, new_off, new_size, move.track.prot) < 0) {
             int restore_err = restore_snapshot_overlays_in_place(
                 g, move.source_snaps, move.source_nsnaps);
@@ -4356,7 +5195,6 @@ int64_t sys_mremap(guest_t *g,
          * overlay reapplied), and msync's emulated pwrite-the-diff path keeps
          * subsequent writes consistent.
          */
-        uint64_t copy_len = old_size < new_size ? old_size : new_size;
         if (move.track.prot == LINUX_PROT_NONE) {
             memset((uint8_t *) g->host_base + new_off, 0, new_size);
         } else {
@@ -4482,6 +5320,12 @@ int64_t sys_mremap(guest_t *g,
                     mremap_track_dispose(&track);
                     return finish_mremap(&source, -LINUX_ENOMEM);
                 }
+                if (source_lazy) {
+                    uint64_t tail = ALIGN_DOWN(grow_off, BLOCK_2MIB);
+                    if (tail < old_off)
+                        tail = old_off;
+                    zero_mremap_lazy_source(g, tail, grow_off);
+                }
                 if (mremap_extend_range(g, grow_off, grow_len, track.prot) <
                     0) {
                     mremap_track_dispose(&track);
@@ -4579,6 +5423,8 @@ int64_t sys_mremap(guest_t *g,
             }
         }
 
+        if (source_lazy)
+            zero_mremap_lazy_source(g, old_off, old_off + old_size);
         if (mremap_extend_range(g, new_off, new_size, track.prot) < 0) {
             if (source_overlay) {
                 int restore_err =
@@ -4845,7 +5691,7 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
 int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot)
 {
     return sys_mmap(g, addr, length, prot,
-                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0, -1);
 }
 
 static int compare_range_pair(const void *a, const void *b)
@@ -4913,12 +5759,24 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
     }
 
     /* Record which sub-ranges need zeroing BEFORE the PTE invalidation below
-     * destroys the evidence. Eager regions are zeroed across the whole overlap,
-     * as before. Lazy (deferred-PTE) regions only need their materialized 2MiB
-     * blocks zeroed: a block with no L2 mapping was never touched through PTEs,
-     * host-side fault-in materializes before writing, and the previous unmap of
-     * that slab range zeroed it -- so its bytes are still zero. This keeps
-     * munmap cost proportional to memory actually touched instead of to the
+     * destroys the evidence. A pure anonymous, private, non-overlaid region
+     * needs no eager zeroing at all: its dirty bitmap already reflects every
+     * write that ever touched it. The same guarantee
+     * munmap_retire_commit_locked() relies on to skip zeroing entirely on the
+     * EL1 fast munmap path, gated by the identical
+     * anonymous/private/no-backing-fd/no-overlay check below. Also,
+     * hvf_remove_file_overlay_quiesced() explicitly marks a restored overlay's
+     * backing dirty via guest_dirty_mark_range() before this function ever sees
+     * it. guest_materialize_lazy_one() zeros dirty backing before publishing
+     * any new descriptor, so deferring here costs nothing at reuse time either;
+     * it only stops paying up front to zero bytes a future mapping may never
+     * touch.
+     *
+     * An actual file-backed region, or one whose overlay cleanup above could
+     * not tear down, keeps the eager policy below: eager regions are zeroed
+     * across the whole overlap, and lazy (deferred-PTE, MAP_NORESERVE) regions
+     * only need their materialized 2MiB blocks zeroed. This keeps that
+     * fallback's cost proportional to memory actually touched instead of to the
      * mapping length.
      */
     zero_range_t zr[MUNMAP_ZERO_RANGES_MAX];
@@ -4930,6 +5788,10 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
         if (r->end <= unmap_off)
             continue;
         if (r->prot == LINUX_PROT_NONE)
+            continue;
+        if ((r->flags & LINUX_MAP_ANONYMOUS) &&
+            !(r->flags & LINUX_MAP_SHARED) && r->backing_fd < 0 &&
+            !r->overlay_active)
             continue;
         uint64_t zstart = (r->start > unmap_off) ? r->start : unmap_off;
         uint64_t zend = (r->end < end) ? r->end : end;
@@ -4948,8 +5810,9 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
         }
         for (uint64_t b = zstart & ~(BLOCK_2MIB - 1); b < zend;) {
             if (!guest_va_block_mapped(g, b)) {
-                /* Skip absent 1GiB/512GiB slots wholesale; a huge untouched
-                 * reservation would otherwise pay one walk per 2MiB.
+                /* Jump through the PTE occupancy index to the next materialized
+                 * block. A huge untouched reservation therefore does no work
+                 * proportional to its virtual length.
                  */
                 b = guest_va_next_present_block(g, b + BLOCK_2MIB, zend);
                 continue;
@@ -5092,6 +5955,7 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
             thread_finish_deferred_stack_ranges(txns, nranges);
         }
     }
+    mmap_fastpath_rewind_current_if_clean_locked(g);
     return 0;
 }
 
@@ -5118,6 +5982,12 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
         return -LINUX_EINVAL;
     if (addr > UINT64_MAX - length)
         return -LINUX_EINVAL;
+
+    /* Permission and VMA-shape changes are slow-path boundaries. Retire any
+     * already-published unmaps, then invalidate arena generations before the
+     * metadata/PTE edit so EL1 cannot act on the old anonymous classification.
+     */
+    mmap_fastpath_revoke_all_locked(g, false);
 
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
         if (addr >= g->guest_size) {
@@ -5192,6 +6062,7 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
 
             if (prot != LINUX_PROT_NONE) {
                 int page_perms = prot_to_perms(prot);
+
                 /* Materialize lazy blocks in the range at their region's
                  * current prot before the block-granular extend below. The
                  * extend stamps whole 2MiB blocks with page_perms; on an
@@ -5440,12 +6311,12 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
     int *fsync_fds = NULL;
     int fsync_count = 0;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire_raw();
     uint64_t cursor = off;
     while (cursor < end) {
         const guest_region_t *r = guest_region_find(g, cursor);
         if (!r || r->start > cursor) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release_raw();
             return -LINUX_ENOMEM;
         }
         cursor = r->end < end ? r->end : end;
@@ -5454,7 +6325,7 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
     if (flags & LINUX_MS_SYNC) {
         fsync_fds = calloc((size_t) g->nregions, sizeof(*fsync_fds));
         if (!fsync_fds) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release_raw();
             return -LINUX_ENOMEM;
         }
     }
@@ -5551,7 +6422,7 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
         if (ret < 0)
             break;
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release_raw();
 
     /* Every queued fd is fsynced unconditionally, even if a later region's
      * diff/refresh failed and broke the locked loop early: the original code
@@ -5603,7 +6474,8 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
     if (!txn)
         return -LINUX_ENOMEM;
 
-    mmap_lock_acquire(g);
+    mmap_lock_acquire_for_fork(g);
+
     /* fork callers have quiesced siblings. Drain their last publications,
      * revoke every descriptor, and trim never-consumed arena tails before the
      * legacy [MMAP_BASE,mmap_next) snapshot range is computed.

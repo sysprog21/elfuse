@@ -240,6 +240,10 @@ int64_t sys_timerfd_settime(guest_t *g,
 {
     int64_t ret = 0;
 
+    (void) guest_lazy_faultin(g, new_value_gva, sizeof(linux_itimerspec_t));
+    if (old_value_gva)
+        (void) guest_lazy_faultin(g, old_value_gva, sizeof(linux_itimerspec_t));
+
     pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(fd);
     if (slot < 0) {
@@ -248,7 +252,7 @@ int64_t sys_timerfd_settime(guest_t *g,
     }
 
     linux_itimerspec_t its;
-    if (guest_read_small(g, new_value_gva, &its, sizeof(its)) < 0) {
+    if (guest_read_nofault(g, new_value_gva, &its, sizeof(its)) < 0) {
         ret = -LINUX_EFAULT;
         goto unlock;
     }
@@ -282,7 +286,7 @@ int64_t sys_timerfd_settime(guest_t *g,
                 old.it_value_nsec = remaining % NS_PER_SEC;
             }
         }
-        if (guest_write_small(g, old_value_gva, &old, sizeof(old)) < 0) {
+        if (guest_write_nofault(g, old_value_gva, &old, sizeof(old)) < 0) {
             ret = -LINUX_EFAULT;
             goto unlock;
         }

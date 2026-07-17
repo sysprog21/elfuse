@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ipc.h>
+#include <sys/mman.h>
 #include <sys/shm.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -76,11 +77,39 @@ static void test_shm_rdonly_faults_on_write(void)
     shmctl(shmid, IPC_RMID, NULL);
 }
 
+static void test_shm_detach_unmapped(void)
+{
+    TEST("detach after guest munmap");
+    const size_t len = 2UL << 20;
+    int shmid = shmget(IPC_PRIVATE, len, IPC_CREAT | 0600);
+    if (shmid < 0) {
+        FAIL("shmget");
+        return;
+    }
+    void *p = shmat(shmid, NULL, 0);
+    if (p == (void *) -1) {
+        FAIL("shmat");
+        shmctl(shmid, IPC_RMID, NULL);
+        return;
+    }
+    int unmapped = munmap(p, len);
+    int detached = shmdt(p);
+    int detach_errno = errno;
+    struct shmid_ds info;
+    /* Linux's munmap already detaches; elfuse retains a host attachment. */
+    int ok = unmapped == 0 &&
+             (detached == 0 || (detached == -1 && detach_errno == EINVAL)) &&
+             shmctl(shmid, IPC_STAT, &info) == 0 && info.shm_nattch == 0;
+    shmctl(shmid, IPC_RMID, NULL);
+    EXPECT_TRUE(ok, "detach hung, failed, or leaked its host attachment");
+}
+
 int main(void)
 {
     printf("test-sysv-shm: SysV shared memory tests\n\n");
 
     test_shm_rdonly_faults_on_write();
+    test_shm_detach_unmapped();
 
     SUMMARY("test-sysv-shm");
     return fails > 0 ? 1 : 0;

@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -780,6 +781,21 @@ static void check_answers_without_a_device(void)
     TEST("GET_CAPABILITIES reports no URB capabilities");
     EXPECT_TRUE(io(fd, USBDEVFS_GET_CAPABILITIES, &caps) == 0 && caps == 0,
                 "caps");
+
+    size_t lazy_len = 8UL << 20;
+    uint8_t *lazy = mmap(NULL, lazy_len, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TEST("ioctl and pread into untouched mappings");
+    if (lazy == MAP_FAILED) {
+        FAIL("lazy mmap");
+    } else {
+        uint32_t *lazy_caps = (uint32_t *) (lazy + (2UL << 20));
+        EXPECT_TRUE(io(fd, USBDEVFS_GET_CAPABILITIES, lazy_caps) == 0 &&
+                        *lazy_caps == 0 &&
+                        pread(fd, lazy + (4UL << 20), 18, 0) == 18,
+                    "lazy USB output failed");
+        munmap(lazy, lazy_len);
+    }
 
     TEST("GET_SPEED returns the enum as its value");
     EXPECT_EQ(io(fd, USBDEVFS_GET_SPEED, NULL), 2, "get_speed"); /* FULL */

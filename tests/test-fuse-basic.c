@@ -264,12 +264,29 @@ static size_t append_dirent(uint8_t *buf,
 static void *daemon_main(void *arg)
 {
     daemon_ctx_t *ctx = arg;
-    uint8_t buf[4096];
+    const size_t map_len = 4UL << 20;
+#if defined(__x86_64__)
+    /* Rosetta serializes mmap; allocate before serving a file-mmap request. */
+    void *mapping = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED)
+        exit(1);
+#endif
     for (;;) {
-        ssize_t nr = read(ctx->fusefd, buf, sizeof(buf));
+#if !defined(__x86_64__)
+        /* Each request must reach a buffer the daemon has never touched. */
+        void *mapping = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED)
+            exit(1);
+#endif
+        uint8_t *buf = (uint8_t *) mapping + (2UL << 20);
+        ssize_t nr = read(ctx->fusefd, buf, 4096);
         if (nr < 0) {
-            if (errno == ENOTCONN || errno == EBADF)
+            if (errno == ENOTCONN || errno == EBADF) {
+                munmap(mapping, map_len);
                 return NULL;
+            }
             perror("read(/dev/fuse)");
             exit(1);
         }
@@ -281,6 +298,7 @@ static void *daemon_main(void *arg)
                 if (reply_frame(ctx->fusefd, in->unique, -ctx->init_error, NULL,
                                 0) < 0)
                     exit(1);
+                munmap(mapping, map_len);
                 return NULL;
             }
             struct fuse_init_out out = {
@@ -439,6 +457,9 @@ static void *daemon_main(void *arg)
                 exit(1);
             break;
         }
+#if !defined(__x86_64__)
+        munmap(mapping, map_len);
+#endif
     }
 }
 
@@ -740,13 +761,35 @@ int main(void)
         die("lseek(fuse-file)");
     expect_hello_fd(fd);
 
-    void *map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *map;
+#if !defined(__x86_64__)
+    map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map != MAP_FAILED || errno != ENODEV) {
         fprintf(stderr,
                 "expected mmap ENODEV on FUSE fd, got map=%p errno=%d\n", map,
                 errno);
         return 1;
     }
+#else
+    /* Rosetta materialization waits for this daemon without holding mmap_lock.
+     */
+    void *fixed = (void *) (uintptr_t) (1ULL << 40);
+    map =
+        mmap(fixed, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 0);
+    if (map != fixed || memcmp(map, hello_data, sizeof(hello_data) - 1) != 0) {
+        fprintf(stderr, "FUSE high-VA materialization failed: %p errno=%d\n",
+                map, errno);
+        return 1;
+    }
+    void *conflict =
+        mmap(fixed, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 0);
+    if (conflict != MAP_FAILED || errno != EEXIST ||
+        memcmp(map, hello_data, sizeof(hello_data) - 1) != 0) {
+        fprintf(stderr, "FUSE high-VA NOREPLACE changed an existing mapping\n");
+        return 1;
+    }
+    munmap(map, 4096);
+#endif
     close(fd);
 
     /* Canonicalization: ./ and intermediate-up traversals must collapse to the

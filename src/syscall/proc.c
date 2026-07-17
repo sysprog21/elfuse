@@ -37,6 +37,7 @@
 #include "utils.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 #include "core/vdso.h"
 
 #include "runtime/futex.h"
@@ -79,6 +80,23 @@ static _Atomic bool rosetta_enabled = true;
  * state without threading g through every signature.
  */
 static _Atomic bool rosetta_active = false;
+
+static bool vcpu_exit_is_fork_family_syscall(hv_vcpu_t vcpu,
+                                             const hv_vcpu_exit_t *vexit)
+{
+    if (vexit->reason != HV_EXIT_REASON_EXCEPTION)
+        return false;
+
+    uint64_t syndrome = vexit->exception.syndrome;
+    uint32_t ec = (uint32_t) ((syndrome >> 26) & 0x3f);
+    uint16_t imm = (uint16_t) (syndrome & 0xffff);
+    if (ec != 0x16 || imm != 5)
+        return false;
+
+    uint64_t nr = 0;
+    hv_vcpu_get_reg(vcpu, HV_REG_X8, &nr);
+    return nr == SYS_clone || nr == SYS_clone3;
+}
 
 /* Process table for tracking direct and adopted fork children. Start small so
  * lifecycle tests exercise growth deterministically; expand under pid_lock as
@@ -2765,6 +2783,9 @@ int64_t sys_waitid(guest_t *g,
         return result;
     }
 
+    if (infop_gva)
+        (void) guest_lazy_faultin(g, infop_gva, SIGINFO_SIZE);
+
     /* Search process table for matching entry. P_ALL must scan all children
      * (not block on the first non-exited one), so the wait loop always use
      * WNOHANG in the inner loop and retry with timedwait if the caller
@@ -2880,7 +2901,7 @@ int64_t sys_waitid(guest_t *g,
                 memcpy(si + SIGINFO_OFF_UID, &uid, 4);
                 memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
 
-                if (guest_write_small(g, infop_gva, si, SIGINFO_SIZE) < 0) {
+                if (guest_write_nofault(g, infop_gva, si, SIGINFO_SIZE) < 0) {
                     pthread_mutex_unlock(&pid_lock);
                     return -LINUX_EFAULT;
                 }
@@ -3574,7 +3595,7 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
     /* Hold mmap_lock for page table modifications AND region lookups to prevent
      * races with concurrent mmap/mprotect/munmap from other vCPU threads.
      */
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire_raw();
 
     /* Check if this is a genuine permission violation (not a W^X toggle). If
      * the guest region lacks the required permission, deliver SIGSEGV instead
@@ -3586,7 +3607,7 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
         const guest_region_t *reg = guest_region_find(g, off);
         int required = (type == 1) ? LINUX_PROT_WRITE : LINUX_PROT_EXEC;
         if (reg && !(reg->prot & required)) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release_raw();
             uint64_t esr;
             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
             signal_set_fault_info(LINUX_SEGV_ACCERR, far, esr);
@@ -3612,7 +3633,7 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
     uint64_t block_start = far & ~(BLOCK_2MIB - 1);
     int sr = guest_split_block(g, block_start);
     int ur = guest_update_perms(g, page_start, page_end, new_perms);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release_raw();
     if (verbose && (sr < 0 || ur < 0))
         log_warn(
             "%s: W^X toggle FAILED "
@@ -4725,11 +4746,38 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
 
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
+        drain_external_guest_signal();
+
+        /* An HVF return can land inside the EL1 fast path's producer window,
+         * with retire.producer_active published for this vCPU's own slot. Only
+         * the guest clears that word, and every host path that takes mmap_lock
+         * waits for it in mmap_fastpath_host_gate_close(). Waiting there would
+         * block this thread on a vCPU that cannot run until this very thread
+         * re-enters it. Resume before dispatching either a cancellation or an
+         * exception. The producer window is bounded and non-blocking, so it
+         * retires at once; pending host attention survives to the next exit.
+         */
+        while ((vexit->reason == HV_EXIT_REASON_CANCELED ||
+                vexit->reason == HV_EXIT_REASON_EXCEPTION) &&
+               mmap_fastpath_current_producer_active(g)) {
+            HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
+            drain_external_guest_signal();
+        }
+
+        /* Every return from HVF is a natural retirement point. Drain before
+         * dispatching syscalls, page faults, MAP_FIXED, fork/exec, signals, or
+         * exit so no host path can consult pre-munmap region metadata and
+         * rematerialize an EL1-invalidated page. The helper also drains mmap
+         * publications before the acquire-snapshotted retire entries.
+         */
+        if (!mmap_fastpath_current_producer_active(g))
+            mmap_fastpath_drain_vmexit(
+                g, vcpu_exit_is_fork_family_syscall(vcpu, vexit));
+
+        /* Main: disarm timeout */
         if (is_main)
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 2,
                                   memory_order_relaxed);
-
-        drain_external_guest_signal();
 
         /* Re-check exit_group after waking from hv_vcpu_run */
         if (proc_exit_group_requested()) {

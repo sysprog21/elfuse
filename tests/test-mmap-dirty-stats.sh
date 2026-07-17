@@ -36,6 +36,7 @@ require_ge()
 require_ge FAULT_CLEAN_SKIP 1
 require_ge FAULT_DIRTY_MEMSET 1
 require_ge FAULT_ALREADY_VALID 1
+# One full BLOCK_2MIB materialization accounts for 2 MiB of window bytes.
 require_ge FAULT_WINDOW_BYTES 2097152
 
 printf '  clean-block zero skip         OK\n'

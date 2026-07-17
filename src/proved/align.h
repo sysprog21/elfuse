@@ -60,7 +60,7 @@
   ensures binary: \result == 0 || \result == 1;
   ensures rejects_only_on_wrap:
             \result != 0 <==> (x % align == 0
-                              || (x / align + 1) * align <= UINT64_MAX);
+                              || x / align < UINT64_MAX / align);
   ensures aligned:
             \result != 0 ==> (\exists integer k; *out == k * align);
   ensures never_below: \result != 0 ==> *out >= x;

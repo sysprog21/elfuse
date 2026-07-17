@@ -314,6 +314,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-shebang-host,shebang parser unit test)
 	$(call run-lane,test-shim-futex-stats,futex EL1 fast path is live)
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
+	$(call run-lane,test-materialize-host,lazy materialization and signal-frame boundaries)
+	$(call run-lane,test-pt-epoch-host,EL1 PT epoch retires host translation cache entries)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
 	$(call run-lane,test-busybox,busybox applet validation)
@@ -1379,6 +1381,14 @@ test-shim-futex-stats: $(ELFUSE_BIN) $(TEST_DIR)/test-shim-futex-fast \
 	@bash tests/test-shim-futex-stats.sh $(ELFUSE_BIN) \
 		$(TEST_DIR)/test-shim-futex-fast \
 		$(TEST_DIR)/test-futex-wake-nowaiter
+
+.PHONY: test-materialize-host
+test-materialize-host: $(BUILD_DIR)/test-materialize-host
+	@$(BUILD_DIR)/test-materialize-host
+
+.PHONY: test-pt-epoch-host
+test-pt-epoch-host: $(BUILD_DIR)/test-pt-epoch-host
+	@$(BUILD_DIR)/test-pt-epoch-host
 
 ## Run busybox applet smoke tests
 test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)

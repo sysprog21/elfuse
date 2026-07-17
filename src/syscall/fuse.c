@@ -2474,6 +2474,10 @@ int64_t fuse_dev_read(int guest_fd,
     fuse_session_get_locked(session);
     pthread_mutex_unlock(&fuse_lock);
 
+    if (count)
+        (void) guest_lazy_faultin(
+            g, buf_gva, count < FUSE_FRAME_CAP ? count : FUSE_FRAME_CAP);
+
     /* The state came from the descriptor; the session came from the fd number.
      * A sibling closing and reopening guest_fd between the two makes them
      * describe different objects, and the read would then take its blocking
@@ -2544,7 +2548,7 @@ int64_t fuse_dev_read(int guest_fd,
         host_fd_ref_close(&notify_ref);
         return -LINUX_EINVAL;
     }
-    if (guest_write(g, buf_gva, req->frame, frame_len) < 0) {
+    if (guest_write_nofault(g, buf_gva, req->frame, frame_len) < 0) {
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);

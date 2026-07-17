@@ -21,14 +21,26 @@ typedef struct mmap_fork_anon_shared_txn mmap_fork_anon_shared_txn_t;
 /* brk: set/query program break */
 int64_t sys_brk(guest_t *g, uint64_t addr);
 
-/* mmap: map pages into guest address space */
+/* Prepare FUSE backing without mmap_lock held. On success the caller owns
+ * materialized_fd, or receives -1 when the ordinary fd path applies.
+ */
+int mmap_prepare_file(guest_t *g,
+                      uint64_t addr,
+                      uint64_t length,
+                      int flags,
+                      int fd,
+                      int64_t offset,
+                      int *materialized_fd);
+
+/* Borrows materialized_fd (-1 for ordinary mappings) with mmap_lock held. */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,
                  uint64_t length,
                  int prot,
                  int flags,
                  int fd,
-                 int64_t offset);
+                 int64_t offset,
+                 int materialized_fd);
 
 /* munmap: unmap pages from guest address space */
 int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length);

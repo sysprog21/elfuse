@@ -362,12 +362,12 @@ $(BUILD_DIR)/test-sigsuspend: tests/test-sigsuspend.c | $(BUILD_DIR)
 # bench-mmap has a multi-threaded mmap_lock-contention section; needs -lpthread.
 $(BUILD_DIR)/bench-mmap: tests/bench-mmap.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
-	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 # test-mmap-lazy races concurrent first touch from several threads.
 $(BUILD_DIR)/test-mmap-lazy: tests/test-mmap-lazy.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
-	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 .PHONY: test-mmap-lazy
 test-mmap-lazy: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-lazy
@@ -378,7 +378,7 @@ test-mmap-lazy: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-lazy
 # EL1 consumer-mmap integration/stress test.
 $(BUILD_DIR)/test-mmap-fastpath: tests/test-mmap-fastpath.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
-	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 .PHONY: test-mmap-fastpath
 test-mmap-fastpath: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-fastpath

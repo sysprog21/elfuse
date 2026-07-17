@@ -79,6 +79,7 @@ int main(int argc, char **argv)
         {8ull << 30, 3},   {16ull << 30, 3},   {32ull << 30, 3},
         {64ull << 30, 1},  {128ull << 30, 1},  {256ull << 30, 1},
     };
+
     /* Optional argv[1]: cap size in GiB (eager implementations commit host
      * memory for every byte mapped; the full matrix would thrash small hosts).
      */

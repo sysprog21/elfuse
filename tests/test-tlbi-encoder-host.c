@@ -108,8 +108,8 @@ int main(void)
     verify_operand(0x10000000ULL, 63, 31, 0);
     verify_operand(0x10000000ULL, 64, 31, 0);
 
-    /* SCALE=1 covers 64 pages per NUM step; SCALE=2 covers 2048. A lazy
-     * 2 MiB block is 512 pages and must therefore encode as SCALE=1, NUM=7.
+    /* SCALE=1 covers 64 pages per NUM step; SCALE=2 covers 2048. A lazy 2 MiB
+     * block is 512 pages and must therefore encode as SCALE=1, NUM=7.
      */
     verify_operand(0x10000000ULL, 512, 7, 1);
     verify_operand(0x10000000ULL, 2048, 31, 1);

@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# mmap/munmap performance tests isolated across elfuse processes.
+#
+# Section A launches a brand new elfuse process for every timed mmap/munmap
+# pair. Section B takes an outer median across fresh processes for each size.
+# Section C launches one process per size because its large dirty sweeps are
+# already distributions over individually timed operations. Section D pairs an
+# empty VM exit with the next exit that drains EL1 fast-path work.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ELFUSE="${ELFUSE:-${ROOT_DIR}/build/elfuse}"
+BENCH="${BENCH_MMAP_BIN:-${ROOT_DIR}/build/bench-mmap}"
+
+# One timed call is comparable to CNTVCT's 41.7-ns period. Accumulate corrected
+# ticks across fresh processes before converting them to a per-call result.
+ONESHOT_TARGET_TICKS="${BENCH_MMAP_ONESHOT_TARGET_TICKS:-256}"
+ONESHOT_MAX_RUNS="${BENCH_MMAP_ONESHOT_MAX_RUNS:-4096}"
+MATERIALIZED_GUESTS="${BENCH_MMAP_MATERIALIZED_GUESTS:-15}"
+HOST_DRAIN_SAMPLES="${BENCH_MMAP_HOST_DRAIN_SAMPLES:-31}"
+SIZE_POINTS="${BENCH_MMAP_SIZE_POINTS:-41}"
+
+log_sizes()
+{
+    awk -v min="$1" -v max="$2" -v count="$3" 'BEGIN {
+        page = 4096
+        last = 0
+        span = log(max) - log(min)
+        for (i = 0; i < count; i++) {
+            if (i == 0)
+                value = min
+            else if (i == count - 1)
+                value = max
+            else {
+                exact = exp(log(min) + span * i / (count - 1))
+                value = int((exact + page - 1) / page) * page
+                if (value <= last)
+                    value = last + page
+            }
+            printf "%.0f\n", value
+            last = value
+        }
+    }'
+}
+
+dirty_ops()
+{
+    local size="$1"
+    if [ "$size" -le 65536 ]; then
+        printf '2048\n'
+    elif [ "$size" -le 262144 ]; then
+        printf '1024\n'
+    elif [ "$size" -le 1048576 ]; then
+        printf '512\n'
+    elif [ "$size" -le 2097152 ]; then
+        printf '256\n'
+    elif [ "$size" -le 8388608 ]; then
+        printf '128\n'
+    elif [ "$size" -le 67108864 ]; then
+        printf '32\n'
+    elif [ "$size" -le 268435456 ]; then
+        printf '24\n'
+    else
+        printf '8\n'
+    fi
+}
+
+if [ ! -x "$ELFUSE" ] || [ ! -x "$BENCH" ]; then
+    echo "build build/elfuse and build/bench-mmap first" >&2
+    exit 2
+fi
+if ! [[ "$MATERIALIZED_GUESTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BENCH_MMAP_MATERIALIZED_GUESTS must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "$HOST_DRAIN_SAMPLES" =~ ^[1-9][0-9]*$ ]] ||
+    [ "$HOST_DRAIN_SAMPLES" -gt 100000 ]; then
+    echo "BENCH_MMAP_HOST_DRAIN_SAMPLES must be in 1..100000" >&2
+    exit 2
+fi
+if ! [[ "$SIZE_POINTS" =~ ^[0-9]+$ ]] || [ "$SIZE_POINTS" -lt 35 ] ||
+    [ "$SIZE_POINTS" -gt 45 ]; then
+    echo "BENCH_MMAP_SIZE_POINTS must be in 35..45" >&2
+    exit 2
+fi
+
+# A and B span 4 KiB to 32 GiB. C retains its 4 KiB to 1 GiB bounds.
+SIZES=()
+while IFS= read -r size; do
+    SIZES+=("$size")
+done < <(log_sizes 4096 34359738368 "$SIZE_POINTS")
+
+DIRTY_CASES=()
+while IFS= read -r size; do
+    DIRTY_CASES+=("${size}:$(dirty_ops "$size")")
+done < <(log_sizes 4096 1073741824 "$SIZE_POINTS")
+
+human()
+{
+    awk -v n="$1" 'BEGIN {
+        if (n >= 1073741824) printf "%g GiB", n / 1073741824
+        else if (n >= 1048576) printf "%g MiB", n / 1048576
+        else printf "%g KiB", n / 1024
+    }'
+}
+
+# field <output> <key> Prints the value of the first "<key>=<value>" token in
+# <output>.
+field()
+{
+    local value
+    if ! value="$(awk -v key="$2" '{
+        for (i = 1; i <= NF; i++) {
+            if (index($i, key "=") == 1) {
+                sub("^" key "=", "", $i)
+                print $i
+                found = 1
+                exit
+            }
+        }
+    }
+    END {
+        if (!found)
+            exit 1
+    }' <<< "$1")"; then
+        printf 'benchmark output missing %s field:\n%s\n' "$2" "$1" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+numeric_median()
+{
+    printf '%s\n' "$@" | LC_ALL=C sort -n | awk '{ values[NR] = $1 }
+    END {
+        if (NR % 2)
+            print values[(NR + 1) / 2]
+        else
+            print (values[NR / 2] + values[NR / 2 + 1]) / 2
+    }'
+}
+
+run_a()
+{
+    printf 'A. one timed mmap / munmap fast-path pair per fresh elfuse process\n'
+    printf '   aggregate target: %s corrected CNTVCT ticks per call type\n' \
+        "$ONESHOT_TARGET_TICKS"
+    printf '%-10s %8s %12s %12s\n' size guests 'mmap ns' 'munmap ns'
+    for size in "${SIZES[@]}"; do
+        mmap_ticks=0
+        munmap_ticks=0
+        runs=0
+        ns_per_tick=
+        failed=0
+        while awk -v mmap_ticks="$mmap_ticks" -v munmap_ticks="$munmap_ticks" \
+            -v target="$ONESHOT_TARGET_TICKS" \
+            'BEGIN { exit ! (mmap_ticks < target || munmap_ticks < target) }'; do
+            if [ "$runs" -ge "$ONESHOT_MAX_RUNS" ]; then
+                printf 'one-shot benchmark exceeded %s runs for %s\n' \
+                    "$ONESHOT_MAX_RUNS" "$size" >&2
+                return 1
+            fi
+            if ! out="$("$ELFUSE" "$BENCH" a-one "$size" 2>&1)"; then
+                failed=1
+                break
+            fi
+            raw_mmap_ticks="$(field "$out" mmap_ticks)"
+            raw_munmap_ticks="$(field "$out" munmap_ticks)"
+            read_ticks="$(field "$out" read_ticks)"
+            ns_per_tick="$(field "$out" ns_per_tick)"
+            mmap_ticks="$(awk -v total="$mmap_ticks" -v raw="$raw_mmap_ticks" \
+                -v read="$read_ticks" 'BEGIN { print total + raw - read }')"
+            munmap_ticks="$(awk -v total="$munmap_ticks" \
+                -v raw="$raw_munmap_ticks" -v read="$read_ticks" \
+                'BEGIN { print total + raw - read }')"
+            runs=$((runs + 1))
+        done
+        if [ "$failed" -ne 0 ]; then
+            printf '%-10s %8s %12s %12s\n' "$(human "$size")" - FAILED -
+            continue
+        fi
+        mmap_ns="$(awk -v ticks="$mmap_ticks" -v runs="$runs" \
+            -v ns="$ns_per_tick" 'BEGIN { print ticks * ns / runs }')"
+        munmap_ns="$(awk -v ticks="$munmap_ticks" -v runs="$runs" \
+            -v ns="$ns_per_tick" 'BEGIN { print ticks * ns / runs }')"
+        printf '%-10s %8s %12.1f %12.1f\n' "$(human "$size")" "$runs" \
+            "$mmap_ns" "$munmap_ns"
+    done
+    printf '\n'
+}
+
+run_b()
+{
+    printf 'B. munmap after materializing one 4 KiB page (isolated)\n'
+    printf '   outer median: %s fresh elfuse processes per size\n' \
+        "$MATERIALIZED_GUESTS"
+    printf '%-10s %8s %12s\n' size guests 'munmap ns'
+    for size in "${SIZES[@]}"; do
+        munmap_samples=()
+        failed=0
+        for ((guest = 0; guest < MATERIALIZED_GUESTS; guest++)); do
+            if ! out="$("$ELFUSE" "$BENCH" b-one "$size" 2>&1)"; then
+                failed=1
+                break
+            fi
+            munmap_samples+=("$(field "$out" munmap_ns)")
+        done
+        if [ "$failed" -ne 0 ]; then
+            printf '%-10s %8s %12s\n' "$(human "$size")" - FAILED
+            continue
+        fi
+        munmap_ns="$(numeric_median "${munmap_samples[@]}")"
+        printf '%-10s %8u %12.1f\n' "$(human "$size")" \
+            "$MATERIALIZED_GUESTS" "$munmap_ns"
+    done
+    printf '\n'
+}
+
+run_c()
+{
+    printf 'C. munmap after dirtying every 4 KiB page (isolated)\n'
+    printf '%-10s %8s %12s %12s %12s\n' size ops 'p50 ns' 'p95 ns' 'max ns'
+    for case in "${DIRTY_CASES[@]}"; do
+        size="${case%%:*}"
+        ops="${case##*:}"
+        if ! out="$("$ELFUSE" "$BENCH" c-one "$size" "$ops" 2>&1)"; then
+            printf '%-10s %8s %12s %12s %12s\n' "$(human "$size")" "$ops" \
+                FAILED - -
+            continue
+        fi
+        p50_ns="$(field "$out" p50_ns)"
+        p95_ns="$(field "$out" p95_ns)"
+        max_ns="$(field "$out" max_ns)"
+        printf '%-10s %8s %12.1f %12.1f %12.1f\n' "$(human "$size")" "$ops" \
+            "$p50_ns" "$p95_ns" "$max_ns"
+    done
+    printf '\n'
+}
+
+run_d()
+{
+    "$ELFUSE" "$BENCH" host-drain "$HOST_DRAIN_SAMPLES"
+}
+
+case "${1:-all}" in
+    a) run_a ;;
+    b) run_b ;;
+    c) run_c ;;
+    d) run_d ;;
+    all) run_a; run_b; run_c; run_d ;;
+    *)
+        echo "usage: $0 [a|b|c|d|all]" >&2
+        exit 2
+        ;;
+esac

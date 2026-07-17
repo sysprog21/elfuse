@@ -161,12 +161,18 @@ typedef int host_fd_t;
 extern pthread_mutex_t mmap_lock; /* Lock order: 1, mmap/brk + page tables */
 extern pthread_mutex_t fd_lock;   /* Lock order: 3, FD table */
 
-/* The only supported mmap_lock entry/exit API.  Acquire drains the per-vCPU
- * EL1 mmap rings before any caller can inspect semantic region state.
+/* The only supported mmap_lock entry/exit API. Acquire drains the per-vCPU EL1
+ * mmap rings before any caller can inspect semantic region state.
  */
 void mmap_lock_acquire(guest_t *g);
 void mmap_lock_release(void);
 void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond);
+
+/* Temporarily drop mmap_lock while retaining the host PT-gate reference, then
+ * reacquire without taking a second reference. Used only by lazy zeroing.
+ */
+void mmap_lock_drop_keep_gate(void);
+void mmap_lock_reacquire_with_gate(guest_t *g);
 
 /* FD table (defined in syscall/fdtable.c). */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];

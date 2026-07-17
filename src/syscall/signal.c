@@ -60,12 +60,14 @@
 #include "hvutil.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 #include "core/vdso.h"
 
 #include "runtime/thread.h"
 
 #include "syscall/linux-wire.h"
-#include "syscall/fd.h"   /* signalfd_notify */
+#include "syscall/fd.h" /* signalfd_notify */
+#include "syscall/internal.h"
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
 #include "proved/sigframe.h"
 #include "syscall/signal.h"
@@ -1987,6 +1989,14 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva)
              */
             if (ss.ss_sp > UINT64_MAX - ss.ss_size)
                 return -LINUX_EINVAL;
+
+            /* Alternate stacks have the same lifetime sensitivity as clone
+             * stacks: once registered, their unmap must take the host path
+             * instead of being classified only as an anonymous arena range.
+             */
+            mmap_lock_acquire(g);
+            mmap_fastpath_revoke_all_locked(g, false);
+            mmap_lock_release();
             t->altstack_sp = ss.ss_sp;
             t->altstack_flags = 0;
             t->altstack_size = ss.ss_size;
@@ -2441,13 +2451,13 @@ int signal_take_termination_wait_status(void)
     return status;
 }
 
-/* Pre-fault the candidate signal-frame windows (current stack and altstack
- * top) before sig_lock is taken. The frame write in deliver_signal_locked
- * runs under sig_lock; letting it materialize lazy stack pages there would
- * acquire mmap_lock in descending lock order. The pre-fault is advisory --
- * the write path still faults in as a backstop -- but it makes the
- * under-lock engagement unreachable in practice. Reading the altstack
- * fields without sig_lock is benign for the same reason.
+/* Pre-fault the candidate signal-frame windows (current stack and altstack top)
+ * before sig_lock is taken. The frame write in deliver_signal_locked runs under
+ * sig_lock; letting it materialize lazy stack pages there would acquire
+ * mmap_lock in descending lock order. The pre-fault is advisory -- the write
+ * path still faults in as a backstop -- but it makes the under-lock engagement
+ * unreachable in practice. Reading the altstack fields without sig_lock is
+ * benign for the same reason.
  */
 static void signal_prefault_frame(hv_vcpu_t vcpu, guest_t *g)
 {

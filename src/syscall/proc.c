@@ -37,6 +37,7 @@
 #include "utils.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 #include "core/vdso.h"
 
 #include "runtime/futex.h"
@@ -79,6 +80,23 @@ static _Atomic bool rosetta_enabled = true;
  * state without threading g through every signature.
  */
 static _Atomic bool rosetta_active = false;
+
+static bool vcpu_exit_is_fork_family_syscall(hv_vcpu_t vcpu,
+                                             const hv_vcpu_exit_t *vexit)
+{
+    if (vexit->reason != HV_EXIT_REASON_EXCEPTION)
+        return false;
+
+    uint64_t syndrome = vexit->exception.syndrome;
+    uint32_t ec = (uint32_t) ((syndrome >> 26) & 0x3f);
+    uint16_t imm = (uint16_t) (syndrome & 0xffff);
+    if (ec != 0x16 || imm != 5)
+        return false;
+
+    uint64_t nr = 0;
+    hv_vcpu_get_reg(vcpu, HV_REG_X8, &nr);
+    return nr == SYS_clone || nr == SYS_clone3;
+}
 
 /* Process table for tracking direct and adopted fork children. Start small so
  * lifecycle tests exercise growth deterministically; expand under pid_lock as
@@ -3937,6 +3955,32 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
         drain_external_guest_signal();
+
+        /* An HVF return can land inside the EL1 fast path's producer window,
+         * with retire.producer_active published for this vCPU's own slot. Only
+         * the guest clears that word, and every host path that takes mmap_lock
+         * waits for it in mmap_fastpath_host_gate_close(). Waiting there would
+         * block this thread on a vCPU that cannot run until this very thread
+         * re-enters it. Resume before dispatching either a cancellation or an
+         * exception. The producer window is bounded and non-blocking, so it
+         * retires at once; pending host attention survives to the next exit.
+         */
+        while ((vexit->reason == HV_EXIT_REASON_CANCELED ||
+                vexit->reason == HV_EXIT_REASON_EXCEPTION) &&
+               mmap_fastpath_current_producer_active(g)) {
+            HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
+            drain_external_guest_signal();
+        }
+
+        /* Every return from HVF is a natural retirement point. Drain before
+         * dispatching syscalls, page faults, MAP_FIXED, fork/exec, signals, or
+         * exit so no host path can consult pre-munmap region metadata and
+         * rematerialize an EL1-invalidated page. The helper also drains mmap
+         * publications before the acquire-snapshotted retire entries.
+         */
+        if (!mmap_fastpath_current_producer_active(g))
+            mmap_fastpath_drain_vmexit(
+                g, vcpu_exit_is_fork_family_syscall(vcpu, vexit));
 
         /* Main: disarm timeout */
         if (is_main)

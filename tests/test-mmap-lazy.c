@@ -5,12 +5,12 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Private anonymous mappings defer page-table creation and zeroing to first
- * touch. These tests pin down the guest-visible contract of that laziness:
- * huge reservations succeed and read as zeros, address reuse never leaks
- * stale bytes, host-side syscall access (read/write/futex) works on memory
- * the guest never touched, PROT_NONE stays a faulting reservation, data
- * survives PROT_NONE round trips and fork, and concurrent first touch from
- * multiple threads never loses a write to the deferred zeroing.
+ * touch. These tests pin down the guest-visible contract of that laziness: huge
+ * reservations succeed and read as zeros, address reuse never leaks stale
+ * bytes, host-side syscall access (read/write/futex) works on memory the guest
+ * never touched, PROT_NONE stays a faulting reservation, data survives
+ * PROT_NONE round trips and fork, and concurrent first touch from multiple
+ * threads never loses a write to the deferred zeroing.
  */
 
 #include <errno.h>
@@ -37,10 +37,10 @@ int passes = 0, fails = 0;
 #define FUTEX_WAKE 1
 #endif
 
-/* Largest plain anonymous RW mapping the kernel grants. On elfuse the lazy
- * path must take this well past physical memory; on real Linux the result
- * depends on the overcommit heuristic, so the tests only require >= 1 GiB
- * and probe downward.
+/* Largest plain anonymous RW mapping the kernel grants. On elfuse the lazy path
+ * must take this well past physical memory; on real Linux the result depends on
+ * the overcommit heuristic, so the tests only require >= 1 GiB and probe
+ * downward.
  */
 static void *map_largest(size_t *out_size)
 {
@@ -70,6 +70,7 @@ static void test_huge_sparse(void)
         FAIL("no >=1GiB anonymous mapping granted");
         return;
     }
+
     /* Sparse probes: start, one per size/8 stride, last page. All must read
      * zero and accept writes.
      */
@@ -120,8 +121,9 @@ static void test_zero_reuse(void)
         FAIL("mmap 2");
         return;
     }
-    /* The allocator typically reuses the freed range; either way no byte may
-     * be nonzero. Check one page per 2MiB block plus both ends.
+
+    /* The allocator typically reuses the freed range; either way no byte may be
+     * nonzero. Check one page per 2MiB block plus both ends.
      */
     for (size_t off = 0; off < size; off += 4096) {
         if (q[off] != 0) {
@@ -204,42 +206,26 @@ static void test_partial_block_reuse(void)
     PASS();
 }
 
-static void test_fork_clean_reuse(void)
+static uint8_t *map_clean_block_reuse(void)
 {
-    TEST("fork child sees zero on clean-block reuse");
     uint8_t *p = mmap(NULL, BLOCK_2MIB, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) {
-        FAIL("mmap 1");
-        return;
-    }
+    if (p == MAP_FAILED)
+        return MAP_FAILED;
     memset(p, 0xcc, BLOCK_2MIB);
     if (munmap(p, BLOCK_2MIB) != 0) {
-        FAIL("munmap");
-        return;
+        munmap(p, BLOCK_2MIB);
+        return MAP_FAILED;
     }
+
     uint8_t *q = mmap(p, BLOCK_2MIB, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (q == MAP_FAILED) {
-        FAIL("mmap 2");
-        return;
+    if (q != p) {
+        if (q != MAP_FAILED)
+            munmap(q, BLOCK_2MIB);
+        return MAP_FAILED;
     }
-    pid_t pid = fork();
-    if (pid == 0) {
-        if (q[0] != 0 || q[BLOCK_2MIB - 1] != 0)
-            _exit(1);
-        q[123] = 0x77;
-        _exit(q[124] == 0 ? 0 : 2);
-    }
-    int st = 0;
-    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) ||
-        WEXITSTATUS(st) != 0 || q[123] != 0) {
-        FAIL("fork clean-block state");
-        munmap(q, BLOCK_2MIB);
-        return;
-    }
-    munmap(q, BLOCK_2MIB);
-    PASS();
+    return q;
 }
 
 static void test_file_overlay_reuse(void)
@@ -330,6 +316,7 @@ static void test_read_into_lazy(void)
         FAIL("payload corrupted");
         goto out;
     }
+
     /* A guest touch elsewhere in the same 2MiB block must not re-zero the
      * host-written payload (deferred-zeroing idempotence).
      */
@@ -475,6 +462,7 @@ static void test_prot_none_faults(void)
     }
     sigaction(SIGSEGV, &old_sa, NULL);
     munmap((void *) p, size);
+
     /* A lazy materializer that ignores prot would silently hand the guest a
      * readable zero page here instead of SIGSEGV.
      */
@@ -483,7 +471,7 @@ static void test_prot_none_faults(void)
 
 static void test_fork_lazy(void)
 {
-    TEST("fork with partially touched mapping");
+    TEST("fork with lazy and clean-block reused mappings");
     size_t size = 8ULL << 20;
     uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -491,13 +479,16 @@ static void test_fork_lazy(void)
         FAIL("mmap");
         return;
     }
-    memset(p, 0x42, 4096); /* touch only block 0 */
-    pid_t pid = fork();
-    if (pid < 0) {
-        FAIL("fork");
+
+    uint8_t *clean = map_clean_block_reuse();
+    if (clean == MAP_FAILED) {
+        FAIL("clean-block reuse");
         munmap(p, size);
         return;
     }
+
+    memset(p, 0x42, 4096); /* touch only block 0 */
+    pid_t pid = fork();
     if (pid == 0) {
         /* Child: inherited data intact, untouched block reads zero and is
          * privately writable.
@@ -509,21 +500,24 @@ static void test_fork_lazy(void)
         p[4ULL << 20] = 0x99;
         if (p[(4ULL << 20) + 1] != 0)
             _exit(3);
+        if (clean[0] != 0 || clean[BLOCK_2MIB - 1] != 0)
+            _exit(4);
+        clean[123] = 0x77;
+        if (clean[124] != 0)
+            _exit(5);
         _exit(0);
     }
     int st = 0;
-    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-        FAIL("child saw wrong memory");
-        munmap(p, size);
-        return;
-    }
+    bool ok = pid >= 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+              WEXITSTATUS(st) == 0;
     /* Parent: child's private write must not leak back. */
-    if (p[4ULL << 20] != 0) {
-        FAIL("child write leaked into parent");
-        munmap(p, size);
+    ok = ok && p[4ULL << 20] == 0 && clean[123] == 0;
+    munmap(clean, BLOCK_2MIB);
+    munmap(p, size);
+    if (!ok) {
+        FAIL("fork changed lazy or clean-block reused memory");
         return;
     }
-    munmap(p, size);
     PASS();
 }
 
@@ -564,57 +558,149 @@ static void test_futex_untouched(void)
 #define MT_ITERS 64
 
 typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t start;
+    pthread_cond_t done;
+    pthread_barrier_t touch;
     uint8_t *base;
+    unsigned generation;
+    int completed;
+    bool stop;
+} mt_state_t;
+
+typedef struct {
+    mt_state_t *state;
     int idx;
-    pthread_barrier_t *barrier;
 } mt_arg_t;
+
+static bool mt_state_init(mt_state_t *state)
+{
+    memset(state, 0, sizeof(*state));
+    if (pthread_mutex_init(&state->mutex, NULL) != 0)
+        return false;
+    if (pthread_cond_init(&state->start, NULL) != 0) {
+        pthread_mutex_destroy(&state->mutex);
+        return false;
+    }
+    if (pthread_cond_init(&state->done, NULL) != 0) {
+        pthread_cond_destroy(&state->start);
+        pthread_mutex_destroy(&state->mutex);
+        return false;
+    }
+    if (pthread_barrier_init(&state->touch, NULL, MT_THREADS) != 0) {
+        pthread_cond_destroy(&state->done);
+        pthread_cond_destroy(&state->start);
+        pthread_mutex_destroy(&state->mutex);
+        return false;
+    }
+    return true;
+}
+
+static void mt_state_destroy(mt_state_t *state)
+{
+    pthread_barrier_destroy(&state->touch);
+    pthread_cond_destroy(&state->done);
+    pthread_cond_destroy(&state->start);
+    pthread_mutex_destroy(&state->mutex);
+}
 
 static void *mt_touch(void *argp)
 {
     mt_arg_t *a = argp;
-    pthread_barrier_wait(a->barrier);
-    a->base[a->idx * 64] = (uint8_t) (a->idx + 1);
-    /* Also touch a private block so several materializations race. */
-    a->base[BLOCK_2MIB * (unsigned) (a->idx + 1) + 17] =
-        (uint8_t) (0x10 + a->idx);
+    mt_state_t *state = a->state;
+    unsigned seen = 0;
+
+    pthread_mutex_lock(&state->mutex);
+    for (;;) {
+        while (!state->stop && seen == state->generation)
+            pthread_cond_wait(&state->start, &state->mutex);
+        if (state->stop)
+            break;
+
+        uint8_t *base = state->base;
+        seen = state->generation;
+        pthread_mutex_unlock(&state->mutex);
+
+        pthread_barrier_wait(&state->touch);
+        base[a->idx * 64] = (uint8_t) (a->idx + 1);
+        /* Also touch a private block so several materializations race. */
+        base[BLOCK_2MIB * (unsigned) (a->idx + 1) + 17] =
+            (uint8_t) (0x10 + a->idx);
+
+        pthread_mutex_lock(&state->mutex);
+        state->completed++;
+        if (state->completed == MT_THREADS)
+            pthread_cond_signal(&state->done);
+    }
+    pthread_mutex_unlock(&state->mutex);
     return NULL;
 }
 
 static void test_mt_first_touch(void)
 {
     TEST("concurrent first touch");
-    for (int iter = 0; iter < MT_ITERS; iter++) {
+    mt_state_t state;
+    if (!mt_state_init(&state)) {
+        FAIL("worker synchronization setup");
+        return;
+    }
+    pthread_t th[MT_THREADS];
+    mt_arg_t args[MT_THREADS];
+    int created = 0;
+    bool ok = true;
+
+    /* Reuse workers so all 64 rounds stress materialization rather than glibc
+     * thread-stack allocation and teardown.
+     */
+    for (int i = 0; i < MT_THREADS; i++) {
+        args[i] = (mt_arg_t) {&state, i};
+        if (pthread_create(&th[i], NULL, mt_touch, &args[i]) != 0) {
+            ok = false;
+            break;
+        }
+        created++;
+    }
+
+    for (int iter = 0; ok && iter < MT_ITERS; iter++) {
         size_t size = BLOCK_2MIB * (MT_THREADS + 2);
         uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) {
-            FAIL("mmap");
-            return;
+            ok = false;
+            break;
         }
-        pthread_barrier_t barrier;
-        pthread_barrier_init(&barrier, NULL, MT_THREADS);
-        pthread_t th[MT_THREADS];
-        mt_arg_t args[MT_THREADS];
-        for (int i = 0; i < MT_THREADS; i++) {
-            args[i] = (mt_arg_t) {p, i, &barrier};
-            if (pthread_create(&th[i], NULL, mt_touch, &args[i]) != 0) {
-                FAIL("pthread_create");
-                return;
-            }
-        }
-        for (int i = 0; i < MT_THREADS; i++)
-            pthread_join(th[i], NULL);
-        pthread_barrier_destroy(&barrier);
+
+        pthread_mutex_lock(&state.mutex);
+        state.base = p;
+        state.completed = 0;
+        state.generation++;
+        pthread_cond_broadcast(&state.start);
+        while (state.completed != MT_THREADS)
+            pthread_cond_wait(&state.done, &state.mutex);
+        pthread_mutex_unlock(&state.mutex);
+
         for (int i = 0; i < MT_THREADS; i++) {
             if (p[i * 64] != (uint8_t) (i + 1) ||
                 p[BLOCK_2MIB * (unsigned) (i + 1) + 17] !=
                     (uint8_t) (0x10 + i)) {
-                FAIL("write lost to concurrent materialization");
-                munmap(p, size);
-                return;
+                ok = false;
+                break;
             }
         }
         munmap(p, size);
+    }
+
+    pthread_mutex_lock(&state.mutex);
+    state.stop = true;
+    pthread_cond_broadcast(&state.start);
+    pthread_mutex_unlock(&state.mutex);
+    for (int i = 0; i < created; i++)
+        pthread_join(th[i], NULL);
+    mt_state_destroy(&state);
+
+    if (!ok) {
+        FAIL("setup failed or a write was lost to materialization");
+        return;
     }
     PASS();
 }
@@ -747,13 +833,87 @@ static void test_adjacent_region_extension(void)
     PASS();
 }
 
+static void test_large_retire_reuse(void)
+{
+    TEST("large multi-block retire preserves neighbors and fork zeroes");
+    const size_t body_len = 96ULL << 20;
+    const size_t total_len = body_len + (6ULL << 20);
+    uint8_t *p = mmap(NULL, total_len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+
+    uintptr_t aligned =
+        ((uintptr_t) p + BLOCK_2MIB * 2 - 1) & ~(uintptr_t) (BLOCK_2MIB - 1);
+    uint8_t *body = (uint8_t *) aligned;
+    size_t left_len = (size_t) (body - p);
+    size_t right_len = total_len - left_len - body_len;
+    if (left_len < BLOCK_2MIB || right_len < BLOCK_2MIB) {
+        FAIL("guard alignment");
+        munmap(p, total_len);
+        return;
+    }
+
+    memset(p, 0xa5, total_len);
+    if (munmap(body, body_len) != 0) {
+        FAIL("retire body");
+        munmap(p, total_len);
+        return;
+    }
+
+    /* MAP_FIXED is a metadata-reading slow path, so it must first drain the EL1
+     * retirement. The 96 MiB dirty body spans many 2 MiB blocks, so this
+     * exercises retire-then-reuse at multi-block scale rather than the
+     * single-block case the smaller tests above already cover.
+     */
+    uint8_t *q = mmap(body, body_len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (q != body) {
+        FAIL("fixed reuse");
+        munmap(p, left_len);
+        munmap(body + body_len, right_len);
+        return;
+    }
+
+    bool ok = p[0] == 0xa5 && body[-1] == 0xa5 && body[body_len] == 0xa5 &&
+              p[total_len - 1] == 0xa5;
+    for (size_t off = 0; ok && off < body_len; off += 4096)
+        ok = q[off] == 0;
+
+    pid_t pid = -1;
+    int st = 0;
+    if (ok)
+        pid = fork();
+    if (pid == 0) {
+        for (size_t off = 0; off < body_len; off += BLOCK_2MIB) {
+            if (q[off] != 0)
+                _exit(1);
+        }
+        q[123] = 0x77;
+        _exit(q[124] == 0 ? 0 : 2);
+    }
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) ||
+        WEXITSTATUS(st) != 0 || q[123] != 0)
+        ok = false;
+
+    munmap(p, left_len);
+    munmap(q, body_len);
+    munmap(body + body_len, right_len);
+    if (!ok) {
+        FAIL("reuse leaked data, clobbered a neighbor, or broke fork");
+        return;
+    }
+    PASS();
+}
+
 int main(void)
 {
     test_huge_sparse();
     test_zero_reuse();
     test_hinted_tail_zero();
     test_partial_block_reuse();
-    test_fork_clean_reuse();
     test_file_overlay_reuse();
     test_read_into_lazy();
     test_write_from_lazy();
@@ -765,6 +925,7 @@ int main(void)
     test_mt_first_touch();
     test_claim_mutation_race();
     test_adjacent_region_extension();
+    test_large_retire_reuse();
 
     SUMMARY("test-mmap-lazy");
     return fails ? 1 : 0;

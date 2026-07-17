@@ -27,7 +27,7 @@
  *                            4 = single-shot TLBI RVAE1IS (FEAT_TLBIRANGE);
  *                                X9 carries the pre-encoded RVAE1IS operand
  *                                (baddr | NUM<<39 | SCALE<<44 | TTL<<37 |
- *                                ASID<<48; SCALE=0, TTL=0, ASID=0 today)
+ *                                ASID<<48; TTL=0 and ASID=0)
  *                          X11 carries the I-cache hint for X8 in {1, 3, 4}:
  *                          1 = IC IALLU after the TLBI sequence (new
  *                          executable content visible to EL0), 0 = skip the
@@ -449,16 +449,18 @@ svc_handler:
     b.eq getsid_fast
     cmp x10, #278                      /* SYS_getrandom? */
     b.eq getrandom_fast
+    cmp x10, #215                      /* SYS_munmap? */
+    b.eq mmap_family_fast
     cmp x10, #222                      /* SYS_mmap? */
-    b.eq mmap_anon_fast
+    b.eq mmap_family_fast
     b handle_svc_0
 
-/* The mmap fast path is a freestanding C consumer.  The saved frame remains
+/* mmap and munmap share a freestanding C consumer. The saved frame remains
  * authoritative: false leaves it untouched for HVC #5; true places the
- * completed result in saved X0.  The normal restore tail reloads every other
+ * completed result in saved X0. The normal restore tail reloads every other
  * guest register, so the C ABI's caller-clobbered set is private to EL1.
  */
-mmap_anon_fast:
+mmap_family_fast:
     mov x0, sp
     bl _el1_mmap_fastpath
     cbz w0, handle_svc_0
@@ -1258,7 +1260,8 @@ handle_el0_fault:
 .Lel0_fault_tlbi_rvae:
     /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE). X9 carries the pre-encoded
      * operand (baddr | NUM<<39 | SCALE<<44 | TG=01<<46); X11 the I-cache
-     * hint. */
+     * hint.
+     */
     dsb ishst
     tlbi rvae1is, x9
     dsb ish
@@ -1457,9 +1460,9 @@ tlbi_selective:
     b svc_restore_eret
 
 tlbi_range_large:
-    /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has
-     * encoded the full operand in X9: baddr (VA >> 12), TTL=0, NUM in bits
-     * [43:39], SCALE in bits [45:44], ASID=0. One instruction covers up to
+    /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has encoded
+     * the full operand in X9: baddr (VA >> 12), TTL=0, NUM in bits [43:39],
+     * SCALE in bits [45:44], ASID=0. One instruction covers up to
      * TLBI_RVAE_MAX_PAGES. X11 carries the I-cache hint as in tlbi_full /
      * tlbi_selective.
      */

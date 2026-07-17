@@ -340,6 +340,36 @@ VERIFY_ALIGN_SCAN := src/proved/align.h
 VERIFY_ALIGN_CLAIM := for ANY address, alignment, and search window
 VERIFY_ALIGN_UNPROVED := the region-array walk around them stays test-covered
 
+# Includes align.h: request_fits calls align_up_ok and window_fits, so this
+# proof must discharge their contracts too, not merely assume them, the same
+# reason VERIFY_ELF appends VERIFY_UTILS_FCTS.
+#
+# MIN_GOALS is the complete count from a real run. Keep the floor at that count
+# so a future edit that quietly drops a contract or a runtime-error obligation
+# cannot turn a smaller proof into a pass.
+#
+# mmap_fastpath_pow2_clamped was originally the classic bit-smear
+# round-up-to-power-of-two; that form's bound and power-of-two properties
+# were confirmed unreachable by these provers (a single OR step already
+# times out), the same wall align_up_ok's own history describes one level
+# down. Rewritten to a doubling loop with an axiomatized power-of-two ghost
+# invariant -- same inputs, same outputs, linear arithmetic instead of
+# bitwise -- and it discharges completely; see the comment above it.
+VERIFY_MMAPFASTPATH_SRC  := src/proved/mmap-fastpath.h
+VERIFY_MMAPFASTPATH_FCTS := mmap_fastpath_request_fits mmap_fastpath_pow2_clamped \
+                            mmap_fastpath_window_max mmap_fastpath_arena_size \
+                            align_up_ok window_fits
+VERIFY_MMAPFASTPATH_MIN_GOALS ?= 93
+VERIFY_MMAPFASTPATH_MODEL := typed
+VERIFY_MMAPFASTPATH_SCAN := src/proved/mmap-fastpath.h src/proved/align.h
+VERIFY_MMAPFASTPATH_CLAIM := for ANY cursor/limit/len and ANY registration history
+VERIFY_MMAPFASTPATH_UNPROVED := mmap_fastpath_window_max reporting an actual array member \
+                                rather than just an upper bound (the loop-invariant \
+                                preservation step for that claim times out even with a \
+                                ghost witness index, confirmed unreachable, see the comment \
+                                above it); the atomic control-block bookkeeping around all \
+                                four stays test-covered
+
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
 VERIFY_PATHDEPTH_MIN_GOALS ?= 24

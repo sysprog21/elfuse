@@ -100,35 +100,77 @@ _Static_assert(SHIM_COUNTERS_OFF + SHIM_COUNTERS_N * 8 <=
                    SHIM_IDENTITY_OFF_PGID,
                "counter array must not overlap the PGID slot");
 _Static_assert(SHIM_MMAP_CONTROL_BASE == 0x20000,
-               "shim.S mmap fast path hard-codes control base 0x20000");
-_Static_assert(SHIM_MMAP_CONTROL_STRIDE == 0x800,
-               "shim.S mmap fast path hard-codes control stride 0x800");
-_Static_assert(SHIM_MMAP_RING_SIZE == 16,
-               "shim.S mmap fast path hard-codes 16 ring entries");
+               "EL1 mmap fast path hard-codes control base 0x20000");
+_Static_assert(SHIM_MMAP_CONTROL_STRIDE == 0x1000,
+               "EL1 mmap fast path hard-codes control stride 0x1000");
+_Static_assert(SHIM_MMAP_RING_SIZE == 32,
+               "EL1 mmap fast path hard-codes 32 ring entries");
 _Static_assert(offsetof(shim_mmap_control_t, generation) == 0,
-               "shim.S mmap generation offset drift");
+               "EL1 mmap generation offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, consumer_generation) == 4,
-               "shim.S mmap consumer-generation offset drift");
+               "EL1 mmap consumer-generation offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, flags) == 8,
-               "shim.S mmap flags offset drift");
+               "EL1 mmap flags offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, head) == 12,
-               "shim.S mmap head offset drift");
+               "EL1 mmap head offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, tail) == 16,
-               "shim.S mmap tail offset drift");
+               "EL1 mmap tail offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, arena_base) == 24,
-               "shim.S mmap arena-base offset drift");
+               "EL1 mmap arena-base offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, arena_limit) == 32,
-               "shim.S mmap arena-limit offset drift");
+               "EL1 mmap arena-limit offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, cursor) == 40,
-               "shim.S mmap cursor offset drift");
+               "EL1 mmap cursor offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, next_arena_size) == 48,
                "mmap next-arena-size offset drift");
-_Static_assert(offsetof(shim_mmap_control_t, max_len_seen) == 56,
-               "mmap max-len-seen offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, publication_seq) == 56,
+               "mmap publication-seq offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, ring) == 64,
-               "shim.S mmap ring offset drift");
-_Static_assert(offsetof(shim_mmap_control_t, counters) == 0x1C0,
-               "shim.S mmap counter offset drift");
+               "EL1 mmap ring offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, counters) == 0x340,
+               "EL1 mmap counter offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, materialized_generation) == 0x388,
+               "EL1 mmap materialized-generation offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, materialized_start) == 0x390 &&
+                   offsetof(shim_mmap_control_t, materialized_end) == 0x398,
+               "EL1 mmap materialized bounds offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, retire) == 0x400,
+               "EL1 munmap retire offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, produced_bytes) == 8,
+               "EL1 munmap produced-byte offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, consumed_bytes) == 16,
+               "EL1 munmap consumed-byte offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, producer_active) == 24,
+               "EL1 munmap active offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, cleanup_requested) == 28,
+               "EL1 munmap cleanup-request offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, entries) == 32,
+               "EL1 munmap entries offset drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_RING_SIZE == 32 && MAX_THREADS == 64,
+               "EL1 munmap ring/arena scan constants drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_BYTES_SOFT == 0x10000000ULL,
+               "EL1 munmap byte advisory threshold drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_F_ARENA_SLOT_MASK == 0x3f &&
+                   SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT == 6,
+               "EL1 munmap retire flag encoding drift");
+
+/* Host-only, so no EL1 offset depends on it; the assert pins it past every ring
+ * instead, which is what keeps adding it from moving the shared layout.
+ */
+_Static_assert(offsetof(shim_mmap_control_t, publication_window) >
+                   offsetof(shim_mmap_control_t, retire),
+               "publication window must not precede the EL1-visible rings");
+_Static_assert((MMAP_FAST_PUBLICATION_WINDOW &
+                (MMAP_FAST_PUBLICATION_WINDOW - 1)) == 0,
+               "publication window size must be a power of two");
+_Static_assert((MMAP_FAST_ARENA_MAX >> 12) <=
+                   (SHIM_MUNMAP_RETIRE_F_CHARGE_MASK >>
+                    SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT),
+               "munmap retire flags cannot encode maximum arena charge");
+_Static_assert(SHIM_MMAP_PT_GATE_OFF >= SHIM_GLOBALS_SIZE &&
+                   SHIM_MMAP_PT_GATE_OFF + sizeof(uint32_t) <=
+                       SHIM_MMAP_CONTROL_BASE,
+               "host PT gate overlaps shim globals or mmap controls");
 _Static_assert(sizeof(shim_mmap_control_t) <= SHIM_MMAP_CONTROL_STRIDE,
                "per-vCPU mmap control exceeds its shim-data stride");
 _Static_assert(SHIM_MMAP_CONTROL_BASE +
@@ -165,10 +207,10 @@ static void urandom_ring_unlock(_Atomic uint32_t *lock_p)
 
 void shim_globals_init(guest_t *g)
 {
-    /* mmap controls occupy a separate low shim-data range.  Init/exec/fork
-     * child all call this while no sibling can execute, so clearing the whole
-     * control array also prevents a recycled SP_EL1 slot from inheriting an
-     * arena published to its previous owner.
+    /* mmap controls occupy a separate low shim-data range. Init/exec/fork child
+     * all call this while no sibling can execute, so clearing the whole control
+     * array also prevents a recycled SP_EL1 slot from inheriting an arena
+     * published to its previous owner.
      */
     memset(cache_base(g), 0,
            SHIM_MMAP_CONTROL_BASE + MAX_THREADS * SHIM_MMAP_CONTROL_STRIDE);
@@ -539,6 +581,7 @@ void shim_globals_counters_dump(const guest_t *g)
     uint64_t mmap_counters[SHIM_MMAP_COUNTERS_N] = {0};
     uint64_t refill_count = 0, recycle_count = 0;
     uint64_t current_max = 0, peak_max = 0;
+    uint64_t munmap_retire_near_full = 0;
     const uint8_t *shim_data =
         (const uint8_t *) g->host_base + g->shim_data_base;
     for (int slot = 0; slot < MAX_THREADS; slot++) {
@@ -555,6 +598,8 @@ void shim_globals_counters_dump(const guest_t *g)
             current_max = c->next_arena_size;
         if (c->peak_arena_size > peak_max)
             peak_max = c->peak_arena_size;
+        munmap_retire_near_full += atomic_load_explicit(
+            &c->munmap_retire_near_full, memory_order_relaxed);
     }
     for (unsigned i = 0; i < SHIM_MMAP_COUNTERS_N; i++)
         fprintf(stderr, "  %-20s %llu\n", mmap_counter_names[i],
@@ -563,6 +608,8 @@ void shim_globals_counters_dump(const guest_t *g)
             (unsigned long long) refill_count);
     fprintf(stderr, "  %-20s %llu\n", "MMAP_RECYCLE",
             (unsigned long long) recycle_count);
+    fprintf(stderr, "  %-20s %llu\n", "MUNMAP_RETIRE_NEAR_FULL",
+            (unsigned long long) munmap_retire_near_full);
     fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_CURRENT",
             (unsigned long long) current_max);
     fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_PEAK",

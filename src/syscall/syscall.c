@@ -752,6 +752,7 @@ static int64_t sc_mincore(guest_t *g,
             if (!mapped)
                 has_hole = true;
         }
+
         /* sc_mincore holds mmap_lock while regions[] is swept. Materialize a
          * valid lazy output block through the locked entry point, then use a
          * no-fault copy so an invalid vec returns EFAULT instead of trying to
@@ -1004,10 +1005,21 @@ static int64_t sc_mmap(guest_t *g,
                        bool verbose)
 {
     uint64_t refill_len = mmap_fastpath_eligible_length(x0, x1, x2, x3);
+    uint64_t arena_addr = 0;
+    if (refill_len && mmap_fastpath_allocate_current_publication_only(
+                          g, refill_len, &arena_addr))
+        return (int64_t) arena_addr;
+
     mmap_lock_acquire(g);
-    int64_t r = sys_mmap(g, x0, x1, (int) x2, (int) x3, (int) x4, (int64_t) x5);
-    if (r >= 0 && refill_len)
-        mmap_fastpath_refill_current_locked(g, refill_len);
+    int64_t r;
+    if (refill_len &&
+        mmap_fastpath_allocate_current_locked(g, refill_len, &arena_addr)) {
+        r = (int64_t) arena_addr;
+    } else {
+        r = sys_mmap(g, x0, x1, (int) x2, (int) x3, (int) x4, (int64_t) x5);
+        if (r >= 0 && refill_len)
+            mmap_fastpath_refill_current_locked(g, refill_len);
+    }
     mmap_lock_release();
     log_debug("  mmap(0x%llx, 0x%llx) \xe2\x86\x92 0x%llx",
               (unsigned long long) x0, (unsigned long long) x1,
@@ -1026,6 +1038,7 @@ static int64_t sc_mremap(guest_t *g,
 {
     (void) x5;
     mmap_lock_acquire(g);
+    mmap_fastpath_revoke_all_locked(g, false);
     int64_t r = sys_mremap(g, x0, x1, x2, (int) x3, x4);
     mmap_lock_release();
     log_debug("  mremap(0x%llx, 0x%llx, 0x%llx, 0x%x) \xe2\x86\x92 0x%llx",

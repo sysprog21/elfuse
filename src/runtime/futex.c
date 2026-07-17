@@ -181,6 +181,24 @@ static inline bool futex_uaddr_is_aligned(uint64_t uaddr)
     return (uaddr & 0x3) == 0;
 }
 
+static uint32_t *futex_word_nofault(const guest_t *g,
+                                    uint64_t uaddr,
+                                    int required_perms)
+{
+    uint64_t avail = 0;
+    uint32_t *word = guest_ptr_avail_nofault(g, uaddr, &avail, required_perms);
+    return word && avail >= sizeof(*word) ? word : NULL;
+}
+
+/* Keep materialized futex words off mmap_lock. A miss is resolved before any
+ * bucket lock is held.
+ */
+static void futex_prefault_word(const guest_t *g, uint64_t uaddr)
+{
+    if (!futex_word_nofault(g, uaddr, MEM_PERM_R))
+        guest_lazy_faultin(g, uaddr, sizeof(uint32_t));
+}
+
 /* Unlink a waiter from its bucket's singly-linked list. Caller must hold
  * b->lock. Silently returns if the waiter is not in the list (already unlinked
  * by a wake/requeue).
@@ -689,12 +707,14 @@ static int64_t futex_wait(guest_t *g,
             return -LINUX_EINVAL;
     }
 
+    futex_prefault_word(g, uaddr);
+
     pthread_mutex_lock(&b->lock);
 
     /* Atomically read the futex word while holding the bucket lock. If it does
      * not match, return EAGAIN immediately.
      */
-    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
+    uint32_t *word = futex_word_nofault(g, uaddr, MEM_PERM_R);
     if (!word) {
         pthread_mutex_unlock(&b->lock);
         return -LINUX_EFAULT;
@@ -930,6 +950,9 @@ static int64_t futex_requeue(guest_t *g,
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
 
+    if (do_cmp)
+        futex_prefault_word(g, uaddr);
+
     unsigned idx_src = futex_hash(uaddr);
     unsigned idx_dst = futex_hash(uaddr2);
     futex_bucket_t *b_src = &buckets[idx_src];
@@ -948,7 +971,7 @@ static int64_t futex_requeue(guest_t *g,
 
     /* CMP_REQUEUE: atomically verify *uaddr == expected */
     if (do_cmp) {
-        uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
+        uint32_t *word = futex_word_nofault(g, uaddr, MEM_PERM_R);
         if (!word) {
             if (idx_src != idx_dst)
                 pthread_mutex_unlock(&b_dst->lock);
@@ -1039,22 +1062,6 @@ static int64_t futex_wake_op(guest_t *g,
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
 
-    unsigned idx1 = futex_hash(uaddr);
-    unsigned idx2 = futex_hash(uaddr2);
-    futex_bucket_t *b1 = &buckets[idx1];
-    futex_bucket_t *b2 = &buckets[idx2];
-
-    /* Lock ordering */
-    if (idx1 == idx2) {
-        pthread_mutex_lock(&b1->lock);
-    } else if (idx1 < idx2) {
-        pthread_mutex_lock(&b1->lock);
-        pthread_mutex_lock(&b2->lock);
-    } else {
-        pthread_mutex_lock(&b2->lock);
-        pthread_mutex_lock(&b1->lock);
-    }
-
     /* Decode operation and comparison from val3. Bits 31-28: operation (bit 31
      * = OPARG_SHIFT flag, bits 30-28 = op) Bits 27-24: comparison operator Bits
      * 23-12: op_arg (operand for modify, 12-bit signed) Bits 11-0: cmp_arg
@@ -1072,11 +1079,31 @@ static int64_t futex_wake_op(guest_t *g,
     /* FUTEX_OP_OPARG_SHIFT (bit 3 of wake_op): interpret op_arg as 1<<op_arg */
     int op_shift = (int) (wake_op & 8);
     wake_op &= 7; /* Actual operation is bits 0-2 */
+    if (wake_op > 4 || wake_cmp > 5)
+        return -LINUX_ENOSYS;
     if (op_shift)
         op_arg = (int) (1U << (op_arg & 0x1F));
 
+    futex_prefault_word(g, uaddr2);
+
+    unsigned idx1 = futex_hash(uaddr);
+    unsigned idx2 = futex_hash(uaddr2);
+    futex_bucket_t *b1 = &buckets[idx1];
+    futex_bucket_t *b2 = &buckets[idx2];
+
+    /* Lock ordering */
+    if (idx1 == idx2) {
+        pthread_mutex_lock(&b1->lock);
+    } else if (idx1 < idx2) {
+        pthread_mutex_lock(&b1->lock);
+        pthread_mutex_lock(&b2->lock);
+    } else {
+        pthread_mutex_lock(&b2->lock);
+        pthread_mutex_lock(&b1->lock);
+    }
+
     /* Atomically modify *uaddr2 */
-    uint32_t *word2 = (uint32_t *) guest_ptr_w(g, uaddr2);
+    uint32_t *word2 = futex_word_nofault(g, uaddr2, MEM_PERM_W);
     if (!word2) {
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);
@@ -1594,16 +1621,6 @@ int64_t sys_futex(guest_t *g,
 {
     int cmd = op & FUTEX_CMD_MASK;
 
-    /* Pre-fault lazy mappings before any bucket lock is taken. The word
-     * resolves below run under per-bucket locks, which rank after mmap_lock;
-     * materializing there would invert the lock order. A futex word in a
-     * mapping the guest never touched reads as zero, matching Linux.
-     */
-    guest_lazy_faultin(g, uaddr, sizeof(uint32_t));
-    if (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE ||
-        cmd == FUTEX_WAKE_OP)
-        guest_lazy_faultin(g, uaddr2, sizeof(uint32_t));
-
     switch (cmd) {
     case FUTEX_WAIT:
 #if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
@@ -1847,11 +1864,8 @@ int64_t sys_futex_waitv(guest_t *g,
          */
         if (!futex_uaddr_is_aligned(elts[i].uaddr))
             return -LINUX_EINVAL;
-        /* Pre-fault lazy mappings: the word resolves below run with every
-         * bucket lock held, where materializing would invert the lock order
-         * against mmap_lock.
-         */
-        guest_lazy_faultin(g, elts[i].uaddr, sizeof(uint32_t));
+
+        futex_prefault_word(g, elts[i].uaddr);
     }
 
     waitv_shared_t shared;
@@ -1878,7 +1892,7 @@ int64_t sys_futex_waitv(guest_t *g,
         unsigned idx = futex_hash(uaddr);
         futex_bucket_t *b = &buckets[idx];
 
-        uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
+        uint32_t *word = futex_word_nofault(g, uaddr, MEM_PERM_R);
         if (!word) {
             result_err = -LINUX_EFAULT;
             goto unlock_early;

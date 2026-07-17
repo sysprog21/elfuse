@@ -524,6 +524,14 @@ goes above the structured area, never below. Post-push masking
 
 ### `mmap` Notes
 
+Private anonymous mappings are lazy at 2 MiB materialization granularity. A
+host-side hierarchical bitmap records which low-VA 2 MiB blocks contain any
+valid TTBR0 PTE, independently of the dirty-block bitmap. `munmap` and recycled
+fast-path arenas use this index to visit only materialized blocks, so untouched
+multi-GiB reservations have length-independent teardown. When every mapping in
+a per-vCPU arena has been released and the index confirms that no PTE remains,
+the arena cursor rewinds in place instead of taking a refill HVC.
+
 Aligned file-backed `MAP_SHARED` (fixed or non-fixed) installs a real
 host `mmap(MAP_FIXED|MAP_SHARED, fd)` overlay onto the guest slab so
 the kernel page cache keeps the mapping coherent with the file (and

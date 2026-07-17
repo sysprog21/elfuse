@@ -131,6 +131,41 @@ MUTATIONS = [
         "    return start <= limit && length <= limit - start;",
         "    return start <= limit && length <= limit - start + 1;",
     ),
+    # ---- verify-mmapfastpath ----------------------------------------------
+    (
+        "mmapfastpath",
+        "src/proved/mmap-fastpath.h",
+        "mmap_fastpath_request_fits",
+        "accept every non-empty request (an allocation can pass the limit)",
+        "    return window_fits(start, len, limit);",
+        "    return true;",
+    ),
+    (
+        "mmapfastpath",
+        "src/proved/mmap-fastpath.h",
+        "mmap_fastpath_pow2_clamped",
+        "clamp an oversized arena request to the lower bound",
+        "    if (value >= MMAP_FAST_ARENA_MAX)\n"
+        "        return MMAP_FAST_ARENA_MAX;",
+        "    if (value >= MMAP_FAST_ARENA_MAX)\n"
+        "        return MMAP_FAST_ARENA_MIN;",
+    ),
+    (
+        "mmapfastpath",
+        "src/proved/mmap-fastpath.h",
+        "mmap_fastpath_window_max",
+        "discard a new maximum (the arena can be undersized)",
+        "        if (window[i] > max)\n            max = window[i];",
+        "        if (window[i] > max)\n            max = 0;",
+    ),
+    (
+        "mmapfastpath",
+        "src/proved/mmap-fastpath.h",
+        "mmap_fastpath_arena_size",
+        "return an arena size above the configured maximum",
+        "    return adaptive > covering ? adaptive : covering;",
+        "    return UINT64_MAX;",
+    ),
     # ---- verify-cmsg -------------------------------------------------------
     (
         "cmsg",

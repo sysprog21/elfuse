@@ -310,7 +310,14 @@ static bool build_boot_regions(mem_region_t *regions,
      * to the vDSO page when splitting the block; otherwise vdso_build cannot
      * write into it through guest_ptr.
      */
-    if (!append_boot_region(regions, nregions, g->shim_base,
+    /* EL1 fast munmap walks and atomically clears the live TTBR0 tree.  Give
+     * the page-table pool an identity VA visible only to EL1; EL0 remains
+     * unable to inspect or corrupt descriptors, and every guest syscall still
+     * rejects the encompassing infrastructure range.
+     */
+    if (!append_boot_region(regions, nregions, g->pt_pool_base, g->pt_pool_end,
+                            MEM_PERM_RW_EL1_ONLY) ||
+        !append_boot_region(regions, nregions, g->shim_base,
                             g->shim_base + shim_bin_len, MEM_PERM_RX) ||
         /* shim_data is EL1-only: the guest must not directly read or write the
          * identity cache, attention flag, urandom bitmap, or ring, any of which

@@ -56,6 +56,11 @@ extern pthread_mutex_t fd_lock;   /* Lock order: 3, FD table */
 void mmap_lock_acquire(guest_t *g);
 void mmap_lock_release(void);
 void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond);
+/* Temporarily drop mmap_lock while retaining the host PT-gate reference, then
+ * reacquire without taking a second reference. Used only by lazy zeroing.
+ */
+void mmap_lock_drop_keep_gate(void);
+void mmap_lock_reacquire_with_gate(guest_t *g);
 
 /* FD table (defined in syscall/fdtable.c). */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];

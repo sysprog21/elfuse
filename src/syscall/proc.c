@@ -37,6 +37,7 @@
 #include "utils.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 #include "core/vdso.h"
 
 #include "runtime/futex.h"
@@ -1829,6 +1830,21 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
         drain_external_guest_signal();
+
+        /* Every return from HVF is a natural retirement point.  Drain before
+         * dispatching syscalls, page faults, MAP_FIXED, fork/exec, signals, or
+         * exit so no host path can consult pre-munmap region metadata and
+         * rematerialize an EL1-invalidated page.  The helper also drains mmap
+         * publications before the acquire-snapshotted retire entries.
+         */
+        bool munmap_producer_active = mmap_fastpath_current_producer_active(g);
+        if (!munmap_producer_active)
+            mmap_fastpath_drain_vmexit(g);
+        else if (vexit->reason == HV_EXIT_REASON_EXCEPTION)
+            log_error(
+                "%s: exception exit interrupted an active EL1 munmap "
+                "producer",
+                prefix);
 
         /* Main: disarm timeout */
         if (is_main)

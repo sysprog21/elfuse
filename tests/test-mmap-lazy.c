@@ -747,6 +747,80 @@ static void test_adjacent_region_extension(void)
     PASS();
 }
 
+static void test_large_retire_backing_replacement(void)
+{
+    TEST("large retire replacement preserves neighbors and fork zeroes");
+    const size_t body_len = 48ULL << 20;
+    const size_t total_len = body_len + (6ULL << 20);
+    uint8_t *p = mmap(NULL, total_len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+
+    uintptr_t aligned = ((uintptr_t) p + BLOCK_2MIB * 2 - 1) &
+                        ~(uintptr_t) (BLOCK_2MIB - 1);
+    uint8_t *body = (uint8_t *) aligned;
+    size_t left_len = (size_t) (body - p);
+    size_t right_len = total_len - left_len - body_len;
+    if (left_len < BLOCK_2MIB || right_len < BLOCK_2MIB) {
+        FAIL("guard alignment");
+        munmap(p, total_len);
+        return;
+    }
+
+    memset(p, 0xa5, total_len);
+    if (munmap(body, body_len) != 0) {
+        FAIL("retire body");
+        munmap(p, total_len);
+        return;
+    }
+
+    /* MAP_FIXED is a metadata-reading slow path, so it must first drain the
+     * EL1 retirement. The 48 MiB aligned dirty body exercises the 32 MiB HVF
+     * backing-replacement policy rather than the short-range memset fallback.
+     */
+    uint8_t *q = mmap(body, body_len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (q != body) {
+        FAIL("fixed reuse");
+        munmap(p, left_len);
+        munmap(body + body_len, right_len);
+        return;
+    }
+
+    bool ok = p[0] == 0xa5 && body[-1] == 0xa5 &&
+              body[body_len] == 0xa5 && p[total_len - 1] == 0xa5;
+    for (size_t off = 0; ok && off < body_len; off += 4096)
+        ok = q[off] == 0;
+
+    pid_t pid = -1;
+    int st = 0;
+    if (ok)
+        pid = fork();
+    if (pid == 0) {
+        for (size_t off = 0; off < body_len; off += BLOCK_2MIB) {
+            if (q[off] != 0)
+                _exit(1);
+        }
+        q[123] = 0x77;
+        _exit(q[124] == 0 ? 0 : 2);
+    }
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) ||
+        WEXITSTATUS(st) != 0 || q[123] != 0)
+        ok = false;
+
+    munmap(p, left_len);
+    munmap(q, body_len);
+    munmap(body + body_len, right_len);
+    if (!ok) {
+        FAIL("replacement leaked data, clobbered a neighbor, or broke fork");
+        return;
+    }
+    PASS();
+}
+
 int main(void)
 {
     test_huge_sparse();
@@ -765,6 +839,7 @@ int main(void)
     test_mt_first_touch();
     test_claim_mutation_race();
     test_adjacent_region_extension();
+    test_large_retire_backing_replacement();
 
     SUMMARY("test-mmap-lazy");
     return fails ? 1 : 0;

@@ -15,7 +15,8 @@
  * the ~2 us SVC path and swamps any sub-us operation.
  *
  * Every case takes one untimed warmup pass (to pay the one-time arena carve and
- * page-table extension) and reports the median and min over ITERS runs.
+ * page-table extension).  Most sections report aggregate samples; section H
+ * retains every operation so its normal latency and long tail remain visible.
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -70,23 +71,45 @@ static double median(double *v, int n)
     return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
+/* R-7/sample quantile, matching the common (n - 1) * p interpolation.  The
+ * input must already be sorted. */
+static double sorted_quantile(const double *v, unsigned n, double p)
+{
+    double pos = (double) (n - 1) * p;
+    unsigned lo = (unsigned) pos;
+    unsigned hi = lo + (lo + 1 < n);
+    return v[lo] + (v[hi] - v[lo]) * (pos - lo);
+}
+
 #define ITERS 15
-#define MAXB 64
+#define MIN_TIMED_TICKS 4096
 #define KIB (1ULL << 10)
 #define MIB (1ULL << 20)
 #define GIB (1ULL << 30)
 
-/* Batch size: amortize the coarse counter over B ops while bounding the live
- * address footprint of one timed batch to ~256 MiB.
+/* The counter is too coarse to time a single mmap reliably.  A section-A
+ * sample therefore repeats independent mmap -> munmap pairs until the
+ * aggregate interval is long enough.  This avoids batching altogether: each
+ * allocation is immediately returned to the steady-state free list.
+ *
+ * Per-operation timestamps introduce one rd()/rd() interval per result.  Its
+ * median cost is calibrated over long runs and subtracted, so a one-tick
+ * counter cannot turn a 1-GiB mmap into a spurious 83.3-ns (two-tick) result.
  */
-static int batch_for(uint64_t size)
+static double rd_pair_ticks(void)
 {
-    uint64_t b = (256 * MIB) / size;
-    if (b < 1)
-        b = 1;
-    if (b > MAXB)
-        b = MAXB;
-    return (int) b;
+    enum { CAL_SAMPLES = 15, CAL_OPS = 4096 };
+    double samples[CAL_SAMPLES];
+    for (int sample = 0; sample < CAL_SAMPLES; sample++) {
+        uint64_t total = 0;
+        for (int op = 0; op < CAL_OPS; op++) {
+            uint64_t t0 = rd();
+            uint64_t t1 = rd();
+            total += t1 - t0;
+        }
+        samples[sample] = (double) total / CAL_OPS;
+    }
+    return median(samples, CAL_SAMPLES);
 }
 
 static const char *human(uint64_t s, char *buf)
@@ -100,10 +123,10 @@ static const char *human(uint64_t s, char *buf)
     return buf;
 }
 
-/* A. mmap + munmap latency vs size (steady state) NULL-hint allocate then free,
- * batched. Iterations after the first reuse freed address space, so this is the
- * realistic repeated-allocation number a workload sees, not the one-shot fresh
- * case (that is section B).
+/* A. mmap + munmap latency vs size (steady state).  Each operation allocates
+ * with a NULL hint and immediately frees the result.  This measures the
+ * repeated-allocation path a workload sees, not the one-shot fresh case
+ * (section B), while avoiding a size-dependent batch policy.
  */
 static void bench_size_sweep(void)
 {
@@ -113,52 +136,66 @@ static void bench_size_sweep(void)
     };
     printf(
         "== A. mmap / munmap latency vs size (steady state, NULL hint) ==\n");
-    printf("%-10s %6s %12s %12s\n", "size", "batch", "mmap ns", "munmap ns");
-    void *ptr[MAXB];
+    double timer_ticks = rd_pair_ticks();
+    printf("%-10s %8s %12s %12s\n", "size", "ops", "mmap ns", "munmap ns");
     for (unsigned s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
         uint64_t size = sizes[s];
-        int b = batch_for(size);
         double mm[ITERS], um[ITERS];
+        unsigned reported_ops = 0;
         int ok = 1;
         for (int it = -1; it < ITERS && ok; it++) {
-            uint64_t t0 = rd();
-            for (int i = 0; i < b; i++)
-                ptr[i] = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            uint64_t t1 = rd();
-            for (int i = 0; i < b; i++)
-                if (ptr[i] == MAP_FAILED)
+            uint64_t mmap_ticks = 0, munmap_ticks = 0;
+            unsigned ops = 0;
+            do {
+                uint64_t t0 = rd();
+                void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                uint64_t t1 = rd();
+                mmap_ticks += t1 - t0;
+                if (ptr == MAP_FAILED) {
                     ok = 0;
+                    break;
+                }
+                t0 = rd();
+                int rc = munmap(ptr, size);
+                t1 = rd();
+                munmap_ticks += t1 - t0;
+                if (rc != 0) {
+                    ok = 0;
+                    break;
+                }
+                ops++;
+            } while (ok &&
+                     (mmap_ticks < MIN_TIMED_TICKS || munmap_ticks < MIN_TIMED_TICKS));
             if (!ok)
                 break;
-            uint64_t t2 = rd();
-            for (int i = 0; i < b; i++)
-                munmap(ptr[i], size);
-            uint64_t t3 = rd();
             if (it >= 0) {
-                mm[it] = ns(t1 - t0) / b;
-                um[it] = ns(t3 - t2) / b;
+                mm[it] = ((double) mmap_ticks / ops - timer_ticks) * ns_per_tick;
+                um[it] =
+                    ((double) munmap_ticks / ops - timer_ticks) * ns_per_tick;
+                reported_ops = ops;
             }
         }
         char hb[16];
         if (!ok) {
-            printf("%-10s %6d %12s %12s\n", human(size, hb), b, "FAILED", "-");
+            printf("%-10s %8s %12s %12s\n", human(size, hb), "-", "FAILED",
+                   "-");
             continue;
         }
-        printf("%-10s %6d %12.1f %12.1f\n", human(size, hb), b,
+        printf("%-10s %8u %12.1f %12.1f\n", human(size, hb), reported_ops,
                median(mm, ITERS), median(um, ITERS));
     }
     printf("\n");
 }
 
-/* B. fresh bump-tail mmap (isolates the lazy_fresh_range path) Allocate a
- * bounded sequential run WITHOUT freeing, so every mapping lands at or above
- * the arena high-water -- exactly the case lazy_fresh_range skips the stale-PTE
- * scan for. The run is kept small enough (<= 1000 regions, well under
- * GUEST_MAX_REGIONS, footprint <= 2 GiB) that region bookkeeping and page-table
- * extension do not dominate, and every result is failure-checked. Run this
- * binary against an opt-off build to read the skip's contribution as the
- * difference on this identical code path -- a MAP_FIXED "recycled" compare
+/* B. fresh bump-tail mmap (isolates the lazy_fresh_range path).  Allocate a
+ * sequential run WITHOUT freeing, so every mapping lands at or above the arena
+ * high-water -- exactly the case lazy_fresh_range skips the stale-PTE scan for.
+ * Small mappings use the original 2-GiB footprint cap; large mappings use a
+ * minimum count chosen to retain multiple samples without exceeding 64 GiB of
+ * live fresh VA.
+ * Run this binary against an opt-off build to read the skip's contribution as
+ * the difference on this identical code path -- a MAP_FIXED "recycled" compare
  * would instead measure the region-snapshot replacement path, not the skip.
  */
 static void bench_fresh(void)
@@ -177,6 +214,12 @@ static void bench_fresh(void)
             n = 1;
         if (n > 1000)
             n = 1000;
+        if (size == GIB)
+            n = 8;
+        else if (size == 8 * GIB)
+            n = 4;
+        else if (size == 32 * GIB)
+            n = 2;
         /* warmup one fresh mapping so the arena high-water is already primed */
         void *w = mmap(NULL, size, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -203,6 +246,44 @@ static void bench_fresh(void)
         printf("%-10s %8d %14.1f\n", human(size, hb), n, ns(t1 - t0) / n);
     }
     printf("\n");
+}
+
+/* One fresh bump-tail run for the host-side driver.  A new elfuse process is
+ * used for each invocation, so the driver can accumulate many counter ticks
+ * without exhausting one guest's VA space. */
+static int bench_fresh_one(uint64_t size, int n)
+{
+    void *run[1000];
+    if (n < 1 || n > (int) (sizeof(run) / sizeof(run[0])))
+        return 2;
+
+    void *warmup = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (warmup == MAP_FAILED)
+        return 1;
+    munmap(warmup, size);
+
+    uint64_t t0 = rd();
+    for (int i = 0; i < n; i++)
+        run[i] = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint64_t t1 = rd();
+
+    int failed = 0;
+    for (int i = 0; i < n; i++) {
+        if (run[i] == MAP_FAILED)
+            failed++;
+        else
+            munmap(run[i], size);
+    }
+    if (failed)
+        return 1;
+
+    printf("fresh size=%llu count=%d ticks=%llu read_ticks=%.6f "
+           "ns_per_tick=%.12f\n",
+           (unsigned long long) size, n, (unsigned long long) (t1 - t0),
+           rd_pair_ticks(), ns_per_tick);
+    return 0;
 }
 
 /* C. first-touch page-fault cost Touch one byte per page at a 16 KiB stride so
@@ -441,9 +522,157 @@ static void bench_mt(void)
     printf("\n");
 }
 
-int main(void)
+/* G. Teardown after materialization.  The store is deliberately outside the
+ * timed interval: it takes the lazy first-touch fault and installs the first
+ * page, then the counter brackets only munmap().  The size sweep matches A,
+ * so each row compares a wholly untouched mapping with one that has exactly
+ * one materialized 4-KiB page; touching every page would instead benchmark
+ * faulting and zeroing gigabytes of memory. */
+static void bench_munmap_materialized(void)
+{
+    double timer_ticks = rd_pair_ticks();
+    static const uint64_t sizes[] = {
+        4 * KIB,  16 * KIB,  64 * KIB, 256 * KIB, MIB,      2 * MIB,  8 * MIB,
+        64 * MIB, 256 * MIB, GIB,      4 * GIB,   16 * GIB, 32 * GIB,
+    };
+
+    printf("== G. munmap after materializing one 4 KiB page ==\n");
+    printf("%-10s %8s %12s\n", "size", "ops", "munmap ns");
+    for (unsigned s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        uint64_t size = sizes[s];
+        double unmap_ns[ITERS];
+        unsigned reported_ops = 0;
+        int ok = 1;
+        for (int it = -1; it < ITERS && ok; it++) {
+            uint64_t unmap_ticks = 0;
+            unsigned ops = 0;
+            do {
+                volatile uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (p == MAP_FAILED) {
+                    ok = 0;
+                    break;
+                }
+                p[0] = 1; /* materialize before starting the timed interval */
+                uint64_t t0 = rd();
+                int rc = munmap((void *) p, size);
+                uint64_t t1 = rd();
+                unmap_ticks += t1 - t0;
+                if (rc != 0) {
+                    ok = 0;
+                    break;
+                }
+                ops++;
+            } while (unmap_ticks < MIN_TIMED_TICKS);
+
+            if (it >= 0 && ok) {
+                unmap_ns[it] =
+                    ((double) unmap_ticks / ops - timer_ticks) * ns_per_tick;
+                reported_ops = ops;
+            }
+        }
+
+        char hb[16];
+        if (!ok)
+            printf("%-10s %8s %12s\n", human(size, hb), "-", "FAILED");
+        else
+            printf("%-10s %8u %12.1f\n", human(size, hb), reported_ops,
+                   median(unmap_ns, ITERS));
+    }
+    printf("\n");
+}
+
+/* H. Teardown after every page was dirtied.  Page stores happen before the
+ * timed interval, so this reports only munmap's handling of the materialized,
+ * dirty mapping.  Each size has a fixed operation count and every munmap is
+ * retained separately.  In particular, one slow first operation cannot end an
+ * adaptive batch and become the whole sample.  Counts decrease with size to
+ * bound total dirtying work.  The 1-GiB case uses eight operations so its
+ * untimed page stores remain below elfuse's vCPU watchdog; interpolated p95
+ * still remains distinct from the separately reported maximum.
+ */
+static void bench_munmap_dirty(void)
+{
+    static const struct {
+        uint64_t size;
+        unsigned ops;
+    } cases[] = {
+        {4 * KIB, 2048},   {16 * KIB, 2048}, {64 * KIB, 2048},
+        {256 * KIB, 1024}, {MIB, 512},       {2 * MIB, 256},
+        {8 * MIB, 128},    {64 * MIB, 32},   {256 * MIB, 24},
+        {GIB, 8},
+    };
+    double timer_ticks = rd_pair_ticks();
+
+    printf("== H. munmap after dirtying every 4 KiB page ==\n");
+    printf("%-10s %8s %12s %12s %12s\n", "size", "ops", "p50 ns",
+           "p95 ns", "max ns");
+    for (unsigned s = 0; s < sizeof(cases) / sizeof(cases[0]); s++) {
+        uint64_t size = cases[s].size;
+        unsigned ops = cases[s].ops;
+        double *unmap_ns = malloc((size_t) ops * sizeof(*unmap_ns));
+        int ok = 1;
+        if (!unmap_ns)
+            ok = 0;
+
+        /* One full untimed warmup pays setup without consuming an observation. */
+        for (int64_t op = -1; op < (int64_t) ops && ok; op++) {
+            volatile uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) {
+                ok = 0;
+                break;
+            }
+            for (uint64_t off = 0; off < size; off += 4 * KIB)
+                p[off] = (uint8_t) (off >> 12);
+
+            uint64_t t0 = rd();
+            int rc = munmap((void *) p, size);
+            uint64_t t1 = rd();
+            if (rc != 0) {
+                ok = 0;
+                break;
+            }
+            if (op >= 0) {
+                double ticks = (double) (t1 - t0) - timer_ticks;
+                if (ticks < 0.0)
+                    ticks = 0.0;
+                unmap_ns[op] = ticks * ns_per_tick;
+            }
+        }
+
+        char hb[16];
+        if (!ok) {
+            printf("%-10s %8u %12s %12s %12s\n", human(size, hb), ops,
+                   "FAILED", "-", "-");
+        } else {
+            qsort(unmap_ns, ops, sizeof(*unmap_ns), cmp_d);
+            printf("%-10s %8u %12.1f %12.1f %12.1f\n", human(size, hb), ops,
+                   sorted_quantile(unmap_ns, ops, 0.50),
+                   sorted_quantile(unmap_ns, ops, 0.95), unmap_ns[ops - 1]);
+        }
+        free(unmap_ns);
+    }
+    printf("\n");
+}
+
+int main(int argc, char **argv)
 {
     clock_init();
+    if (argc == 4 && strcmp(argv[1], "fresh") == 0) {
+        char *end = NULL;
+        errno = 0;
+        uint64_t size = strtoull(argv[2], &end, 0);
+        if (errno || !end || *end || size == 0)
+            return 2;
+        errno = 0;
+        long count = strtol(argv[3], &end, 0);
+        if (errno || !end || *end || count < 1 || count > 1000)
+            return 2;
+        return bench_fresh_one(size, (int) count);
+    }
+    if (argc != 1)
+        return 2;
     printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n", ns_per_tick);
     bench_size_sweep();
     bench_fresh();
@@ -451,5 +680,7 @@ int main(void)
     bench_mprotect_split();
     bench_mremap();
     bench_mt();
+    bench_munmap_materialized();
+    bench_munmap_dirty();
     return 0;
 }

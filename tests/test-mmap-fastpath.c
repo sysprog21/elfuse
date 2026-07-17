@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,8 @@
 int passes = 0, fails = 0;
 
 static sigjmp_buf segv_jmp;
+
+static inline void spin_hint(void);
 
 static void segv_handler(int sig)
 {
@@ -64,8 +67,9 @@ static void test_fidelity(void)
 {
     TEST("unconsumed arena is absent and faults");
     struct sigaction sa = {.sa_handler = segv_handler};
+    struct sigaction old_sa;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSEGV, &sa, NULL) != 0) {
+    if (sigaction(SIGSEGV, &sa, &old_sa) != 0) {
         FAIL("sigaction");
         return;
     }
@@ -74,6 +78,7 @@ static void test_fidelity(void)
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         FAIL("mmap");
+        sigaction(SIGSEGV, &old_sa, NULL);
         return;
     }
     p[0] = 0x5a; /* drains the publication through the fault-side lock */
@@ -83,6 +88,7 @@ static void test_fidelity(void)
         (void) *unconsumed;
         FAIL("wild read into unconsumed arena did not SIGSEGV");
         munmap(p, 4096);
+        sigaction(SIGSEGV, &old_sa, NULL);
         return;
     }
 
@@ -91,9 +97,26 @@ static void test_fidelity(void)
         hi != (uintptr_t) p + 4096) {
         FAIL("/proc/self/maps exposed more than the consumed page");
         munmap(p, 4096);
+        sigaction(SIGSEGV, &old_sa, NULL);
         return;
     }
-    munmap(p, 4096);
+    if (munmap(p, 4096) != 0) {
+        FAIL("munmap");
+        sigaction(SIGSEGV, &old_sa, NULL);
+        return;
+    }
+
+    /* No syscall may intervene between munmap and this load: EL1 must have
+     * invalidated the Stage-1 descriptor and completed broadcast TLBI before
+     * returning, even though host region cleanup is still deferred.
+     */
+    if (sigsetjmp(segv_jmp, 1) == 0) {
+        (void) *(volatile uint8_t *) p;
+        FAIL("access immediately after munmap did not SIGSEGV");
+        sigaction(SIGSEGV, &old_sa, NULL);
+        return;
+    }
+    sigaction(SIGSEGV, &old_sa, NULL);
     PASS();
 }
 
@@ -116,6 +139,177 @@ static void test_exhaustion_fallback(void)
     p[len - 1] = 2;
     if (munmap(p, len) != 0) {
         FAIL("munmap");
+        return;
+    }
+    PASS();
+}
+
+typedef struct {
+    volatile uint8_t *p;
+    _Atomic int ready;
+    _Atomic int go;
+    _Atomic int result;
+} large_tlbi_arg_t;
+
+static void *large_tlbi_worker(void *opaque)
+{
+    large_tlbi_arg_t *arg = opaque;
+    if (sigsetjmp(segv_jmp, 1) == 0) {
+        (void) arg->p[0]; /* seed a translation on this sibling vCPU */
+        atomic_store_explicit(&arg->ready, 1, memory_order_release);
+        while (!atomic_load_explicit(&arg->go, memory_order_acquire))
+            spin_hint();
+        (void) arg->p[0];
+        atomic_store_explicit(&arg->result, -1, memory_order_release);
+    } else {
+        atomic_store_explicit(&arg->result, 1, memory_order_release);
+    }
+    return NULL;
+}
+
+static void test_large_l2_range_tlbi(void)
+{
+    TEST("SCALE=3 RVAE1IS invalidates sibling L2 translation");
+    const size_t len = 320ULL << 20; /* exceeds SCALE=2's 256MiB maximum */
+    struct sigaction sa = {.sa_handler = segv_handler};
+    struct sigaction old_sa;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &old_sa) != 0) {
+        FAIL("sigaction");
+        return;
+    }
+
+    volatile uint8_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap");
+        sigaction(SIGSEGV, &old_sa, NULL);
+        return;
+    }
+    /* One touch per 2MiB materializes L2 block descriptors without making the
+     * test resident at every guest page. The resulting TLBI envelope requires
+     * SCALE=3 when FEAT_TLBIRANGE is enabled.
+     */
+    for (size_t off = 0; off < len; off += 2ULL << 20)
+        p[off] = (uint8_t) (off >> 21);
+
+    large_tlbi_arg_t arg = {.p = p};
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, large_tlbi_worker, &arg) != 0) {
+        FAIL("pthread_create");
+        munmap((void *) p, len);
+        sigaction(SIGSEGV, &old_sa, NULL);
+        return;
+    }
+    while (!atomic_load_explicit(&arg.ready, memory_order_acquire))
+        spin_hint();
+
+    if (munmap((void *) p, len) != 0) {
+        FAIL("munmap");
+        atomic_store_explicit(&arg.go, 1, memory_order_release);
+        pthread_join(worker, NULL);
+        sigaction(SIGSEGV, &old_sa, NULL);
+        return;
+    }
+
+    /* No syscall may intervene here: the sibling must observe EL1's broadcast
+     * invalidation before any host drain gets a chance to remove metadata.
+     */
+    atomic_store_explicit(&arg.go, 1, memory_order_release);
+    int result;
+    while (!(result = atomic_load_explicit(&arg.result,
+                                           memory_order_acquire)))
+        spin_hint();
+    pthread_join(worker, NULL);
+    sigaction(SIGSEGV, &old_sa, NULL);
+    if (result < 0) {
+        FAIL("stale sibling translation survived large-range TLBI");
+        return;
+    }
+    PASS();
+}
+
+typedef struct {
+    _Atomic uintptr_t ptr;
+    _Atomic int ready;
+    _Atomic int done;
+    _Atomic int release;
+} handoff_arg_t;
+
+static inline void spin_hint(void)
+{
+    __asm__ volatile("yield" ::: "memory");
+}
+
+static void *handoff_worker(void *opaque)
+{
+    handoff_arg_t *arg = opaque;
+    atomic_store_explicit(&arg->ready, 1, memory_order_release);
+    uintptr_t ptr;
+    while (!(ptr = atomic_load_explicit(&arg->ptr, memory_order_acquire)))
+        spin_hint();
+    int rc = munmap((void *) ptr, 4096);
+    atomic_store_explicit(&arg->done, rc == 0 ? 1 : -1,
+                          memory_order_release);
+    while (!atomic_load_explicit(&arg->release, memory_order_acquire))
+        spin_hint();
+    return NULL;
+}
+
+static void test_cross_vcpu_handoff(void)
+{
+    TEST("cross-vCPU mmap publication then munmap retirement");
+    struct sigaction sa = {.sa_handler = segv_handler};
+    struct sigaction old_sa;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &old_sa) != 0) {
+        FAIL("sigaction");
+        return;
+    }
+
+    handoff_arg_t arg = {0};
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, handoff_worker, &arg) != 0) {
+        FAIL("pthread_create");
+        sigaction(SIGSEGV, &old_sa, NULL);
+        return;
+    }
+    while (!atomic_load_explicit(&arg.ready, memory_order_acquire))
+        spin_hint();
+
+    /* Keep the worker alive after munmap so its next thread-exit syscall
+     * cannot drain either ring.  The fault below is the first natural VM exit
+     * after A's mmap publication and B's retirement.
+     */
+    uint8_t *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        atomic_store_explicit(&arg.release, 1, memory_order_release);
+        pthread_join(worker, NULL);
+        FAIL("mmap");
+        sigaction(SIGSEGV, &old_sa, NULL);
+        return;
+    }
+    atomic_store_explicit(&arg.ptr, (uintptr_t) p, memory_order_release);
+    int done;
+    while (!(done = atomic_load_explicit(&arg.done, memory_order_acquire)))
+        spin_hint();
+
+    int faulted = 0;
+    if (done > 0 && sigsetjmp(segv_jmp, 1) == 0)
+        (void) *(volatile uint8_t *) p;
+    else if (done > 0)
+        faulted = 1;
+
+    atomic_store_explicit(&arg.release, 1, memory_order_release);
+    pthread_join(worker, NULL);
+    sigaction(SIGSEGV, &old_sa, NULL);
+    if (done < 0) {
+        FAIL("worker munmap");
+        return;
+    }
+    if (!faulted) {
+        FAIL("retired cross-vCPU mapping remained accessible");
         return;
     }
     PASS();
@@ -217,6 +411,8 @@ static int stats_stream(size_t len, int iterations, bool release_each)
 
 static int run_stats_case(const char *name)
 {
+    if (strcmp(name, "ring-full") == 0)
+        return stats_stream(64ULL << 10, 40, false);
     if (strcmp(name, "np2-10m") == 0)
         return stats_stream(10ULL << 20, 96, false);
     if (strcmp(name, "np2-48m") == 0)
@@ -240,14 +436,13 @@ static int run_stats_case(const char *name)
     }
     if (strcmp(name, "adaptive-small") == 0)
         return stats_stream(64ULL << 10, 1100, false);
-    if (strcmp(name, "adaptive-decay") == 0) {
-        if (stats_stream(64ULL << 10, 1100, false) != 0 ||
-            stats_stream(500ULL << 20, 1, false) != 0)
+    if (strcmp(name, "adaptive-retention") == 0) {
+        if (stats_stream(64ULL << 10, 1100, false) != 0)
             return 1;
-        /* Ring-full fallbacks do not consume the arena cursor, so exceed the
-         * nominal 16384 pages enough to force a true 1GiB capacity rollover.
+        /* The first request selects a 16GiB arena, the next 32 consume it, and
+         * the last forces a capacity rollover that must retain the target.
          */
-        return stats_stream(64ULL << 10, 18000, false);
+        return stats_stream(500ULL << 20, 34, false);
     }
     if (strcmp(name, "recycle") == 0)
         return stats_stream(64ULL << 10, 6000, true);
@@ -270,6 +465,8 @@ int main(int argc, char **argv)
 
     test_fidelity();
     test_exhaustion_fallback();
+    test_large_l2_range_tlbi();
+    test_cross_vcpu_handoff();
     test_mt_storm_and_fork_exec();
 
     printf("\ntest-mmap-fastpath: %d passed, %d failed - %s\n", passes, fails,

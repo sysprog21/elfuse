@@ -30,12 +30,14 @@
 #include "hvutil.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 #include "core/vdso.h"
 
 #include "runtime/thread.h"
 
 #include "syscall/abi.h"
 #include "syscall/fd.h"   /* signalfd_notify */
+#include "syscall/internal.h"
 #include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
 #include "syscall/signal.h"
@@ -1369,6 +1371,13 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva)
         } else {
             if (ss.ss_size < LINUX_MINSIGSTKSZ)
                 return -LINUX_ENOMEM;
+            /* Alternate stacks have the same lifetime sensitivity as clone
+             * stacks: once registered, their unmap must take the host path
+             * instead of being classified only as an anonymous arena range.
+             */
+            mmap_lock_acquire(g);
+            mmap_fastpath_revoke_all_locked(g, false);
+            mmap_lock_release();
             t->altstack_sp = ss.ss_sp;
             t->altstack_flags = 0;
             t->altstack_size = ss.ss_size;

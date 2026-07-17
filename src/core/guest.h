@@ -420,6 +420,19 @@ typedef struct {
 #define GUEST_DIRTY_BLOCKS_MAX ((1ULL << 40) / BLOCK_2MIB)
 #define GUEST_DIRTY_WORDS (GUEST_DIRTY_BLOCKS_MAX / 64)
 
+/* Host-side occupancy index for low-VA TTBR0 mappings. One bit per 2 MiB
+ * block records whether that block contains at least one valid L2/L3 PTE; a
+ * second-level bitmap records which occupancy words are non-zero. This lets
+ * huge lazy mmap/munmap ranges skip untouched address space without walking
+ * one page-table slot per GiB. The index is separate from dirty_blocks: a
+ * read-only mapping can have valid PTEs without dirty backing bytes.
+ */
+#define GUEST_PTE_PRESENT_BLOCKS_MAX GUEST_DIRTY_BLOCKS_MAX
+#define GUEST_PTE_PRESENT_WORDS (GUEST_PTE_PRESENT_BLOCKS_MAX / 64)
+#define GUEST_PTE_PRESENT_SUMMARY_WORDS (GUEST_PTE_PRESENT_WORDS / 64)
+#define GUEST_PTE_PRESENT_LIMIT \
+    (GUEST_PTE_PRESENT_BLOCKS_MAX * BLOCK_2MIB)
+
 enum {
     GUEST_MATERIALIZE_CLEAN_SKIP = 0,
     GUEST_MATERIALIZE_DIRTY_MEMSET,
@@ -562,6 +575,8 @@ typedef struct {
      */
     _Atomic uint64_t pt_gen;
 
+    uint64_t pte_present_blocks[GUEST_PTE_PRESENT_WORDS];
+    uint64_t pte_present_summary[GUEST_PTE_PRESENT_SUMMARY_WORDS];
     uint64_t dirty_blocks[GUEST_DIRTY_WORDS];
     uint64_t materialize_stats[GUEST_MATERIALIZE_STATS_N];
     guest_materialize_claim_t materialize_claims[GUEST_MATERIALIZE_CLAIMS];
@@ -1040,6 +1055,17 @@ int guest_install_va_pages(guest_t *g,
  */
 bool guest_va_block_mapped(const guest_t *g, uint64_t va);
 
+/* Rebuild the low-VA PTE occupancy index from TTBR0. Used after fork restores
+ * page-table pages into a freshly initialized guest_t.
+ */
+void guest_rebuild_pte_present(guest_t *g);
+
+/* Reconcile the host-only 2 MiB occupancy index after EL1 has invalidated
+ * descriptors in [start,end).  This observes PTEs only; it never writes a
+ * descriptor or requests another TLBI.  Caller holds mmap_lock.
+ */
+void guest_retire_ptes_committed(guest_t *g, uint64_t start, uint64_t end);
+
 /* Returns true when the VA range [va, va+size) overlaps the user-VA kbuf alias
  * window [KBUF_USER_VA, KBUF_USER_VA+KBUF_SIZE). Callers that install TTBR0
  * mappings (the future rosetta_finalize, sys_mmap MAP_FIXED touching this
@@ -1085,10 +1111,10 @@ int guest_lazy_faultin(const guest_t *g, uint64_t gva, uint64_t len);
  */
 int guest_lazy_faultin_locked(const guest_t *g, uint64_t gva, uint64_t len);
 
-/* Smallest block-aligned va' in [va, end) whose 1GiB L1 slot is present in
- * the page tables, or end if none. Lets range walkers skip absent 1GiB /
- * 512GiB slots in O(1) instead of probing every 2MiB block. Locking: callers
- * MUST hold mmap_lock.
+/* Smallest 2MiB-block-aligned va' in [va, end) containing at least one valid
+ * TTBR0 PTE, or end if none. Low VA uses the host-side hierarchical occupancy
+ * bitmap; non-identity/high VA falls back to the page-table hierarchy. Locking:
+ * callers MUST hold mmap_lock.
  */
 uint64_t guest_va_next_present_block(const guest_t *g,
                                      uint64_t va,

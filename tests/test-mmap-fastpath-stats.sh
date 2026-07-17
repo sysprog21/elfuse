@@ -69,10 +69,14 @@ require_le()
     fi
 }
 
+run_case ring-full
+require_ge ring-full MMAP_HIT 32
+require_ge ring-full MMAP_RING_FULL 1
+printf '  32-entry ring fallback        OK\n'
+
 run_case np2-10m
 require_ge np2-10m MMAP_HIT 80
 require_ge np2-10m MMAP_CAPACITY_MISS 1
-require_ge np2-10m MMAP_RING_FULL 1
 printf '  sustained 10 MiB stream       OK\n'
 
 run_case np2-48m
@@ -87,23 +91,23 @@ printf '  sustained 100 MiB stream      OK\n'
 
 run_case escalation
 require_ge escalation MMAP_HIT 45
-require_eq escalation MMAP_ARENA_CURRENT 1073741824
+require_eq escalation MMAP_ARENA_CURRENT 17179869184
 printf '  10 MiB -> 512 MiB escalation  OK\n'
 
 run_case giant-guard
 require_ge giant-guard MMAP_HIT 34
-require_le giant-guard MMAP_ARENA_PEAK 536870912
-printf '  >1 GiB giant request guard    OK\n'
+require_eq giant-guard MMAP_ARENA_PEAK 34359738368
+printf '  2 GiB request uses fast path  OK\n'
 
 run_case adaptive-small
 require_eq adaptive-small MMAP_ARENA_CURRENT 67108864
 require_eq adaptive-small MMAP_ARENA_PEAK 67108864
 printf '  small-stream arena floor      OK\n'
 
-run_case adaptive-decay
-require_eq adaptive-decay MMAP_ARENA_CURRENT 67108864
-require_eq adaptive-decay MMAP_ARENA_PEAK 1073741824
-printf '  one-generation arena decay    OK\n'
+run_case adaptive-retention
+require_eq adaptive-retention MMAP_ARENA_CURRENT 17179869184
+require_eq adaptive-retention MMAP_ARENA_PEAK 17179869184
+printf '  large arena retained           OK\n'
 
 run_case recycle
 require_ge recycle MMAP_RECYCLE 1

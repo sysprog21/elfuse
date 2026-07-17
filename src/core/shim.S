@@ -26,7 +26,7 @@
  *                            4 = single-shot TLBI RVAE1IS (FEAT_TLBIRANGE);
  *                                X9 carries the pre-encoded RVAE1IS operand
  *                                (baddr | NUM<<39 | SCALE<<44 | TTL<<37 |
- *                                ASID<<48; SCALE=0, TTL=0, ASID=0 today)
+ *                                ASID<<48; TTL=0 and ASID=0)
  *                          X11 carries the I-cache hint for X8 in {1, 3, 4}:
  *                          1 = IC IALLU after the TLBI sequence (new
  *                          executable content visible to EL0), 0 = skip the
@@ -251,11 +251,11 @@
 .Lctr_skip_\@:
 .endm
 
-/* Per-vCPU mmap counters live after the 16 x 24-byte publication ring in the
+/* Per-vCPU mmap counters live after the 32 x 24-byte publication ring in the
  * mmap control block. Each vCPU is the sole writer of its own slots. Keep the
  * shared stats gate so normal fast paths do not touch diagnostic cache lines.
  */
-.equ SHIM_MMAP_COUNTERS_OFF, 0x1C0
+.equ SHIM_MMAP_COUNTERS_OFF, 0x340
 .equ MC_SHAPE_MISS,          0
 .equ MC_CAPACITY_MISS,       1
 .equ MC_RING_FULL,           2
@@ -462,6 +462,8 @@ svc_handler:
     b.eq getsid_fast
     cmp x10, #278                      /* SYS_getrandom? */
     b.eq getrandom_fast
+    cmp x10, #215                      /* SYS_munmap? */
+    b.eq munmap_anon_fast
     cmp x10, #222                      /* SYS_mmap? */
     b.eq mmap_anon_fast
     b handle_svc_0
@@ -533,10 +535,10 @@ mmap_anon_fast:
     ldar w22, [x23]
     ldr w23, [x12, #16]                /* producer-owned tail */
     sub w24, w23, w22
-    cmp w24, #16                       /* SHIM_MMAP_RING_SIZE */
+    cmp w24, #32                       /* SHIM_MMAP_RING_SIZE */
     b.hs mmap_ring_full_bail
 
-    and w24, w23, #15
+    and w24, w23, #31
     add x24, x24, x24, lsl #1          /* index * 3 */
     add x25, x12, #64                   /* ring base */
     add x25, x25, x24, lsl #3          /* index * 24 */
@@ -574,6 +576,499 @@ mmap_generation_bail:
      */
     MMAP_COUNTER_INC MC_GENERATION_STALE
     str w13, [x12, #4]
+    b handle_svc_0
+
+/* munmap_anon_fast: invalidate an anonymous arena range synchronously at EL1,
+ * then release-publish a metadata retirement to this vCPU's SPSC ring.  The
+ * host consumes it at a later natural VM exit.  No shared allocator cursor is
+ * modified here.
+ *
+ * The two-pass page-table walk is deliberate.  Pass one proves every partial
+ * 2 MiB block already has an L3 table, so pass two cannot discover a need to
+ * split after it has cleared an earlier descriptor.  Whole L2 blocks and L3
+ * leaves are the only descriptors this path writes.
+ */
+munmap_anon_fast:
+    mrs x12, tpidr_el1                 /* shim-data base */
+    ldar w13, [x12]                    /* attention gate */
+
+    add x20, sp, #0xfff
+    and x20, x20, #~0xfff              /* this vCPU's stack top */
+    add x21, x12, #0x200, lsl #12
+    sub x21, x21, x20
+    lsr x21, x21, #1
+    add x21, x12, x21
+    add x21, x21, #0x20, lsl #12       /* current mmap control */
+
+    cbnz w13, munmap_pre_bail
+    ldr x14, [sp, #0]                  /* addr */
+    ldr x15, [sp, #8]                  /* length */
+    cbz x15, munmap_pre_bail
+    tst x14, #0xfff
+    b.ne munmap_pre_bail
+    tst x15, #0xfff
+    b.ne munmap_pre_bail
+    adds x16, x14, x15                 /* exclusive end */
+    b.cs munmap_pre_bail
+
+    add x17, x21, #0x400               /* private retire ring */
+    add x20, x17, #0
+    ldar w20, [x20]                    /* host head */
+    ldr w19, [x17, #4]                 /* producer tail */
+    sub w22, w19, w20
+    cmp w22, #31                       /* near-full => batched HVC drain */
+    b.hs munmap_pre_bail
+    ldr x18, [x17, #8]                 /* producer byte sequence */
+
+    /* Join the per-vCPU side of the host-writer handshake.  The second gate
+     * read closes the check-vs-announce race: if host closed it in between,
+     * withdraw without touching a PTE.
+     */
+    mrs x20, tpidr_el1
+    add x20, x20, #0x1, lsl #12
+    add x20, x20, #0x160               /* SHIM_MMAP_PT_GATE_OFF */
+    ldar w22, [x20]
+    cbnz w22, munmap_pre_bail
+    mov w22, #1
+    add x25, x17, #24
+    stlr w22, [x25]                    /* producer_active = 1 */
+    ldar w22, [x20]
+    cbnz w22, munmap_active_bail
+
+    /* Locate the one arena generation containing the whole range.  Scanning
+     * 64 cache-cold descriptors is only the cross-vCPU case; the owner's
+     * control normally matches early.  generation is re-read after bounds so
+     * a descriptor publication can never be observed torn.
+     */
+    mrs x25, tpidr_el1
+    add x25, x25, #0x20, lsl #12       /* control[0] */
+    mov w24, #0                        /* arena slot */
+1:  add x26, x25, #8
+    ldar w23, [x26]                    /* arena flags */
+    tbz w23, #0, 2f
+    ldar w22, [x25]                    /* generation snapshot */
+    ldr x26, [x25, #24]                /* arena base */
+    cmp x14, x26
+    b.lo 2f
+    add x27, x25, #40
+    ldar x27, [x27]                    /* consumed cursor */
+    cmp x16, x27
+    b.hi 2f
+    ldar w28, [x25]
+    cmp w22, w28
+    b.eq munmap_arena_found
+2:  add w24, w24, #1
+    add x25, x25, #0x800
+    cmp w24, #64
+    b.lo 1b
+    b munmap_active_bail
+
+munmap_arena_found:
+    /* Reserve and fill, but do not advance tail until PTE+TLBI completion. */
+    and w20, w19, #31
+    add x20, x20, x20, lsl #1          /* index * 3 */
+    add x26, x17, #32                  /* retire.entries */
+    add x26, x26, x20, lsl #3          /* index * 24 */
+    str x14, [x26, #0]
+    str x15, [x26, #8]
+    str w22, [x26, #16]
+    str w24, [x26, #20]
+
+    /* Refill invalidates every stale descriptor before publishing a new
+     * generation.  Until the host records a lazy materialization in that
+     * generation, the entire arena is known PTE-empty and no walk/TLBI is
+     * needed.  The host PT gate makes the generation marker stable here.
+     */
+    add x20, x25, #0x388
+    ldar w20, [x20]
+    cmp w20, w22
+    b.ne munmap_publish
+    ldr x11, [x25, #0x390]            /* materialized lower bound */
+    ldr x12, [x25, #0x398]            /* materialized upper bound */
+    cmp x11, x14
+    csel x11, x11, x14, hi            /* max(addr, materialized_start) */
+    cmp x12, x16
+    csel x12, x12, x16, lo            /* min(end, materialized_end) */
+    cmp x11, x12
+    b.hs munmap_publish
+
+    /* Common large-anonymous case: the materialized envelope is 2 MiB
+     * aligned and consists only of L2 block descriptors (or holes retired by
+     * a sibling). Walk L0 once, then L1 once per 1 GiB window and scan the L2
+     * entries linearly. The generic path below remains the fallback for any
+     * L3 table or unusual upper-level shape.
+     */
+    mov w10, #0                        /* generic mutation by default */
+    orr x20, x11, x12
+    tst x20, #0x1fffff
+    b.ne munmap_validate_generic
+    sub x20, x12, #1
+    eor x20, x20, x11
+    lsr x20, x20, #39                 /* must stay in one L0 slot */
+    cbnz x20, munmap_validate_generic
+
+    mov x13, #0
+    mrs x25, ttbr0_el1
+    ubfx x25, x25, #12, #36
+    lsl x25, x25, #12                 /* L0 table */
+    ubfx x26, x11, #39, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cbz x28, munmap_validate_l2_fast_done
+    cmp x28, #3
+    b.ne munmap_validate_generic
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12                 /* L1 table */
+
+    mov x20, x11
+munmap_validate_l2_fast_window:
+    ubfx x26, x20, #30, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    lsr x29, x20, #30
+    add x29, x29, #1
+    lsl x30, x29, #30                 /* next 1 GiB boundary */
+    cmp x30, x12
+    csel x30, x30, x12, lo            /* this window's end */
+    cbz x28, munmap_validate_l2_fast_next_window
+    cmp x28, #3
+    b.ne munmap_validate_generic
+    ubfx x26, x27, #12, #36
+    lsl x26, x26, #12                 /* L2 table */
+    ubfx x29, x20, #21, #9
+    add x26, x26, x29, lsl #3
+munmap_validate_l2_fast_entry:
+    ldr x27, [x26]
+    and x28, x27, #3
+    cbz x28, 1f
+    cmp x28, #1                       /* L2 block, never L3 table */
+    b.ne munmap_validate_generic
+    add x13, x13, #512
+1:  add x26, x26, #8
+    add x20, x20, #0x200000
+    cmp x20, x30
+    b.lo munmap_validate_l2_fast_entry
+    b 2f
+munmap_validate_l2_fast_next_window:
+    mov x20, x30
+2:  cmp x20, x12
+    b.lo munmap_validate_l2_fast_window
+munmap_validate_l2_fast_done:
+    mov w10, #1
+    b munmap_clear_begin
+
+    /* Validation pass. x20 is the current VA; x13 counts valid target pages.
+     * Pending bytes are charged by materialized backing rather than virtual
+     * length. Crossing the soft threshold records cleanup_requested but never
+     * forces this producer to HVC; another natural exit will consume the ring.
+     */
+munmap_validate_generic:
+    mov w10, #0
+    mov x13, #0
+    mov x20, x11
+munmap_validate_block:
+    cmp x20, x12
+    b.hs munmap_clear_begin
+    mrs x25, ttbr0_el1
+    ubfx x25, x25, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x20, #39, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cbz x28, munmap_validate_absent
+    cmp x28, #3
+    b.ne munmap_active_bail
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x20, #30, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cbz x28, munmap_validate_absent
+    cmp x28, #3
+    b.ne munmap_active_bail
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x20, #21, #9
+    add x26, x25, x26, lsl #3          /* &L2[index] */
+    ldar x27, [x26]
+    and x28, x27, #3
+    cbz x28, munmap_validate_absent
+    cmp x28, #3
+    b.eq munmap_validate_l3
+    cmp x28, #1
+    b.ne munmap_active_bail
+    /* An L2 block can only be cleared as a whole. */
+    lsr x29, x20, #21
+    lsl x29, x29, #21                  /* block start */
+    cmp x14, x29
+    b.hi munmap_active_bail
+    add x30, x29, #0x200000
+    cmp x16, x30
+    b.lo munmap_active_bail
+    add x13, x13, #512
+    b munmap_validate_advance
+
+munmap_validate_l3:
+    ubfx x25, x27, #12, #36            /* L3 table VA */
+    lsl x25, x25, #12
+    lsr x29, x20, #21
+    lsl x29, x29, #21
+    add x30, x29, #0x200000
+    cmp x30, x12
+    csel x30, x30, x12, lo
+1:  ubfx x26, x20, #12, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    tbz x27, #0, 2f
+    add x13, x13, #1
+2:  add x20, x20, #0x1000
+    cmp x20, x30
+    b.lo 1b
+    b munmap_validate_block
+
+munmap_validate_absent:
+    lsr x29, x20, #21
+    add x29, x29, #1
+    lsl x20, x29, #21
+    b munmap_validate_block
+munmap_validate_advance:
+    mov x20, x30
+    b munmap_validate_block
+
+    /* Mutation pass.  Host writers are gated; sibling fast munmaps can only
+     * change the same descriptors to zero, so repeated invalidation is safe.
+     */
+munmap_clear_begin:
+    /* Encode the charged 4 KiB page count in the retire flags so the host's
+     * single-writer consumed sequence advances by exactly the same amount.
+     */
+    and w20, w19, #31
+    add x20, x20, x20, lsl #1
+    add x26, x17, #32
+    add x26, x26, x20, lsl #3
+    lsl w29, w13, #6
+    orr w29, w29, w24
+    str w29, [x26, #20]
+    cbz x13, munmap_publish
+
+    add x20, x17, #16
+    ldar x20, [x20]                    /* host-consumed byte sequence */
+    sub x29, x18, x20                  /* pending materialized bytes */
+    lsl x30, x13, #12                  /* this retirement's charge */
+    adds x29, x29, x30
+    b.cs munmap_active_bail
+    adds x18, x18, x30                 /* next producer byte sequence */
+    b.cs munmap_active_bail
+    mov x20, #0x10000000               /* 256 MiB soft advisory */
+    cmp x29, x20
+    b.ls 1f
+    mov w20, #1
+    add x25, x17, #28
+    stlr w20, [x25]                    /* never makes this vCPU exit */
+1:
+
+    cbnz w10, munmap_clear_l2_fast_begin
+    mov x20, x11
+munmap_clear_block:
+    cmp x20, x12
+    b.hs munmap_tlbi
+    mrs x25, ttbr0_el1
+    ubfx x25, x25, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x20, #39, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cmp x28, #3
+    b.ne munmap_clear_next_block
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x20, #30, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cmp x28, #3
+    b.ne munmap_clear_next_block
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x20, #21, #9
+    add x26, x25, x26, lsl #3          /* &L2[index] */
+    ldar x27, [x26]
+    and x28, x27, #3
+    cbz x28, munmap_clear_next_block
+    cmp x28, #1
+    b.eq munmap_clear_l2
+    cmp x28, #3
+    b.ne munmap_active_bail             /* validation invariant */
+
+    ubfx x25, x27, #12, #36            /* L3 table VA */
+    lsl x25, x25, #12
+    lsr x29, x20, #21
+    lsl x29, x29, #21                  /* block start */
+    add x30, x29, #0x200000
+    cmp x30, x12
+    csel x30, x30, x12, lo             /* page-loop end */
+munmap_clear_l3_page:
+    ubfx x26, x20, #12, #9
+    add x26, x25, x26, lsl #3
+    stlr xzr, [x26]
+    add x20, x20, #0x1000
+    cmp x20, x30
+    b.lo munmap_clear_l3_page
+    b munmap_clear_block
+
+munmap_clear_l2:
+    stlr xzr, [x26]
+munmap_clear_next_block:
+    lsr x29, x20, #21
+    add x29, x29, #1
+    lsl x20, x29, #21
+    b munmap_clear_block
+
+munmap_clear_l2_fast_begin:
+    /* Validation proved one L0 table and L2-block-only leaves. Re-walk L1 once
+     * per 1 GiB window, then use ordinary aligned 64-bit stores. Those stores
+     * are atomic; the DSB ISHST below supplies the required publication order,
+     * so a release store on every descriptor is unnecessary.
+     */
+    mrs x25, ttbr0_el1
+    ubfx x25, x25, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x11, #39, #9
+    add x26, x25, x26, lsl #3
+    ldr x27, [x26]
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12                 /* L1 table */
+    mov x20, x11
+munmap_clear_l2_fast_window:
+    ubfx x26, x20, #30, #9
+    add x26, x25, x26, lsl #3
+    ldr x27, [x26]
+    and x28, x27, #3
+    lsr x29, x20, #30
+    add x29, x29, #1
+    lsl x30, x29, #30
+    cmp x30, x12
+    csel x30, x30, x12, lo
+    cbz x28, munmap_clear_l2_fast_next_window
+    ubfx x26, x27, #12, #36
+    lsl x26, x26, #12
+    ubfx x29, x20, #21, #9
+    add x26, x26, x29, lsl #3
+munmap_clear_l2_fast_entry:
+    /* Validation plus the closed host gate proves this slot is a block or
+     * already zero. A sibling producer can only move it toward zero, so an
+     * unconditional aligned store is safe and avoids a second load/branch.
+     */
+    str xzr, [x26]
+    add x26, x26, #8
+    add x20, x20, #0x200000
+    cmp x20, x30
+    b.lo munmap_clear_l2_fast_entry
+    b 2f
+munmap_clear_l2_fast_next_window:
+    mov x20, x30
+2:  cmp x20, x12
+    b.lo munmap_clear_l2_fast_window
+    b munmap_tlbi
+
+munmap_tlbi:
+    /* Descriptor stores -> broadcast invalidation -> completed visibility,
+     * before the retire tail release makes metadata cleanup eligible.
+     */
+    dsb ishst
+    sub x20, x12, x11
+    lsr x20, x20, #12                  /* changed-page envelope */
+    cmp x20, #8
+    b.hi munmap_tlbi_large
+    ubfx x25, x11, #12, #44
+3:  tlbi vae1is, x25
+    add x25, x25, #1
+    subs x20, x20, #1
+    b.ne 3b
+    b munmap_tlbi_done
+
+munmap_tlbi_large:
+    /* Encode SCALE=0..3 RVAE1IS batches directly from the changed envelope.
+     * Each instruction covers up to 32 scale units: 64 pages at SCALE=0,
+     * 2048 at SCALE=1, 65536 at SCALE=2, and 2097152 (8 GiB) at SCALE=3.
+     * Widening to the scale-unit boundary only invalidates neighboring TLB
+     * entries; it cannot change mappings. Ranges larger than one instruction
+     * are emitted as adjacent batches while retaining a single completion DSB.
+     */
+    tbz w23, #1, munmap_tlbi_full
+    cmp x20, #64
+    b.hi 1f
+    mov x27, #13                       /* 2 pages = 8 KiB */
+    mov x28, #0                        /* SCALE=0 */
+    b munmap_tlbi_rvae_normalize
+1:  cmp x20, #0x800
+    b.hi 2f
+    mov x27, #18                       /* 64 pages = 256 KiB */
+    mov x28, #1                        /* SCALE=1 */
+    b munmap_tlbi_rvae_normalize
+2:  mov x29, #0x10000
+    cmp x20, x29
+    b.hi 3f
+    mov x27, #23                       /* 2048 pages = 8 MiB */
+    mov x28, #2                        /* SCALE=2 */
+    b munmap_tlbi_rvae_normalize
+3:  mov x27, #28                       /* 65536 pages = 256 MiB */
+    mov x28, #3                        /* SCALE=3 */
+
+munmap_tlbi_rvae_normalize:
+    mov x29, #1
+    lsl x29, x29, x27
+    sub x29, x29, #1                   /* scale-unit byte mask */
+    bic x25, x11, x29                  /* widened start */
+    adds x26, x12, x29
+    b.cs munmap_tlbi_full
+    bic x26, x26, x29                  /* widened end */
+munmap_tlbi_rvae_batch:
+    sub x20, x26, x25
+    lsrv x20, x20, x27                 /* remaining scale units */
+    mov x30, #32
+    cmp x20, x30
+    csel x20, x20, x30, lo            /* this instruction's units */
+    ubfx x29, x25, #12, #37            /* BaseADDR */
+    sub x30, x20, #1                   /* NUM */
+    lsl x30, x30, #39
+    orr x29, x29, x30
+    lsl x30, x28, #44                  /* SCALE */
+    orr x29, x29, x30
+    mov x30, #1
+    lsl x30, x30, #46                  /* TG=01 (4 KiB) */
+    orr x29, x29, x30
+    tlbi rvae1is, x29
+    lslv x20, x20, x27
+    add x25, x25, x20
+    cmp x25, x26
+    b.lo munmap_tlbi_rvae_batch
+    b munmap_tlbi_done
+munmap_tlbi_full:
+    tlbi vmalle1is
+munmap_tlbi_done:
+    dsb ish
+    isb
+
+munmap_publish:
+    str x18, [x17, #8]                 /* publish producer byte sequence */
+    add w19, w19, #1
+    add x20, x17, #4
+    stlr w19, [x20]                    /* publish retire record */
+    add x20, x17, #24
+    stlr wzr, [x20]                    /* leave writer handshake */
+    mov x0, #0
+    b svc_restore_eret
+
+munmap_active_bail:
+    add x20, x17, #24
+    stlr wzr, [x20]
+munmap_pre_bail:
     b handle_svc_0
 
 identity_class_fast:

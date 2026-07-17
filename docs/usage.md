@@ -32,7 +32,8 @@ Setting `--timeout 0` disables this watchdog for long-running CPU-bound guests.
 ### mmap call fast path
 
 The aarch64 EL1 consumer fast path is enabled by default for
-`mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, ...)`.
+`mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, ...)` up to
+32 GiB per request.
 Set `ELFUSE_MMAP_FASTPATH=0` to disable it. Unsupported mmap shapes, exhausted
 arenas, and full consumption rings fall back to the normal host syscall path.
 Verbose tracing, the syscall histogram, GDB, and Rosetta keep mmap on the host

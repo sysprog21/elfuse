@@ -101,8 +101,8 @@ _Static_assert(SHIM_MMAP_CONTROL_BASE == 0x20000,
                "shim.S mmap fast path hard-codes control base 0x20000");
 _Static_assert(SHIM_MMAP_CONTROL_STRIDE == 0x800,
                "shim.S mmap fast path hard-codes control stride 0x800");
-_Static_assert(SHIM_MMAP_RING_SIZE == 16,
-               "shim.S mmap fast path hard-codes 16 ring entries");
+_Static_assert(SHIM_MMAP_RING_SIZE == 32,
+               "shim.S mmap fast path hard-codes 32 ring entries");
 _Static_assert(offsetof(shim_mmap_control_t, generation) == 0,
                "shim.S mmap generation offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, consumer_generation) == 4,
@@ -125,8 +125,40 @@ _Static_assert(offsetof(shim_mmap_control_t, max_len_seen) == 56,
                "mmap max-len-seen offset drift");
 _Static_assert(offsetof(shim_mmap_control_t, ring) == 64,
                "shim.S mmap ring offset drift");
-_Static_assert(offsetof(shim_mmap_control_t, counters) == 0x1C0,
+_Static_assert(offsetof(shim_mmap_control_t, counters) == 0x340,
                "shim.S mmap counter offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, materialized_generation) == 0x388,
+               "shim.S mmap materialized-generation offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, materialized_start) == 0x390 &&
+                   offsetof(shim_mmap_control_t, materialized_end) == 0x398,
+               "shim.S mmap materialized bounds offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, retire) == 0x400,
+               "shim.S munmap retire offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, produced_bytes) == 8,
+               "shim.S munmap produced-byte offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, consumed_bytes) == 16,
+               "shim.S munmap consumed-byte offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, producer_active) == 24,
+               "shim.S munmap active offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, cleanup_requested) == 28,
+               "shim.S munmap cleanup-request offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, entries) == 32,
+               "shim.S munmap entries offset drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_RING_SIZE == 32 && MAX_THREADS == 64,
+               "shim.S munmap ring/arena scan constants drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_BYTES_SOFT == 0x10000000ULL,
+               "shim.S munmap byte advisory threshold drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_F_ARENA_SLOT_MASK == 0x3f &&
+                   SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT == 6,
+               "shim.S munmap retire flag encoding drift");
+_Static_assert((MMAP_FAST_ARENA_MAX >> 12) <=
+                   (SHIM_MUNMAP_RETIRE_F_CHARGE_MASK >>
+                    SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT),
+               "munmap retire flags cannot encode maximum arena charge");
+_Static_assert(SHIM_MMAP_PT_GATE_OFF >= SHIM_GLOBALS_SIZE &&
+                   SHIM_MMAP_PT_GATE_OFF + sizeof(uint32_t) <=
+                       SHIM_MMAP_CONTROL_BASE,
+               "host PT gate overlaps shim globals or mmap controls");
 _Static_assert(sizeof(shim_mmap_control_t) <= SHIM_MMAP_CONTROL_STRIDE,
                "per-vCPU mmap control exceeds its shim-data stride");
 _Static_assert(SHIM_MMAP_CONTROL_BASE +

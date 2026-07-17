@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Accumulate fresh bump-tail mmap timing across independent elfuse processes.
+# One process cannot retain enough large fresh mappings to overcome CNTVCT's
+# 41.7-ns tick without exhausting guest VA.  Each invocation below gets a new
+# guest, while its in-guest timer excludes process startup from the measurement.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ELFUSE="${ELFUSE:-${ROOT_DIR}/build/elfuse}"
+BENCH="${BENCH_MMAP_BIN:-${ROOT_DIR}/build/bench-mmap}"
+# 1024 ticks = about 42.7 us on Apple Silicon.  This bounds the aggregate
+# counter quantization to roughly 0.1%, while keeping the largest cases timely.
+TARGET_TICKS="${BENCH_MMAP_FRESH_TARGET_TICKS:-1024}"
+MAX_RUNS="${BENCH_MMAP_FRESH_MAX_RUNS:-8192}"
+
+# size in bytes : mappings per fresh guest run
+CASES=(
+    "4096:1000"
+    "65536:1000"
+    "1048576:1000"
+    "2097152:1000"
+    "8388608:256"
+    "134217728:16"
+    "1073741824:8"
+    "8589934592:4"
+    "34359738368:2"
+)
+
+# Optional positional cases use the same size:count spelling as CASES, e.g.
+# tests/bench-mmap-fresh 1073741824:8 8589934592:4
+if [ "$#" -gt 0 ]; then
+    CASES=("$@")
+fi
+
+if [ ! -x "$ELFUSE" ] || [ ! -x "$BENCH" ]; then
+    echo "build build/elfuse and build/bench-mmap first" >&2
+    exit 2
+fi
+
+printf 'fresh bump-tail mmap: target %s aggregate CNTVCT ticks\n' "$TARGET_TICKS"
+printf '%-10s %8s %6s %14s\n' size count runs 'fresh mmap ns'
+
+for case in "${CASES[@]}"; do
+    size="${case%%:*}"
+    count="${case##*:}"
+    total_ticks=0
+    total_ops=0
+    runs=0
+    ns_per_tick=
+
+    while awk -v ticks="$total_ticks" -v target="$TARGET_TICKS" \
+        'BEGIN { exit !(ticks < target) }'; do
+        if [ "$runs" -ge "$MAX_RUNS" ]; then
+            echo "fresh benchmark exceeded ${MAX_RUNS} runs for ${size}" >&2
+            exit 1
+        fi
+        if ! output="$("$ELFUSE" "$BENCH" fresh "$size" "$count" 2>&1)"; then
+            echo "fresh guest run failed for size=${size}, count=${count}:" >&2
+            echo "$output" >&2
+            exit 1
+        fi
+        raw_ticks="$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^ticks=/) {sub(/^ticks=/, "", $i); print $i}}' <<< "$output")"
+        read_ticks="$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^read_ticks=/) {sub(/^read_ticks=/, "", $i); print $i}}' <<< "$output")"
+        ns_per_tick="$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^ns_per_tick=/) {sub(/^ns_per_tick=/, "", $i); print $i}}' <<< "$output")"
+        if [ -z "$raw_ticks" ] || [ -z "$read_ticks" ] || [ -z "$ns_per_tick" ]; then
+            echo "unexpected benchmark output: $output" >&2
+            exit 1
+        fi
+        total_ticks="$(awk -v total="$total_ticks" -v raw="$raw_ticks" -v read="$read_ticks" 'BEGIN { print total + raw - read }')"
+        total_ops=$((total_ops + count))
+        runs=$((runs + 1))
+    done
+
+    ns_per_op="$(awk -v ticks="$total_ticks" -v ops="$total_ops" -v ns="$ns_per_tick" 'BEGIN { printf "%.2f", ticks * ns / ops }')"
+    human="$(awk -v n="$size" 'BEGIN { if (n >= 1073741824) printf "%g GiB", n / 1073741824; else if (n >= 1048576) printf "%g MiB", n / 1048576; else printf "%g KiB", n / 1024 }')"
+    printf '%-10s %8s %6s %14s\n' "$human" "$count" "$runs" "$ns_per_op"
+done

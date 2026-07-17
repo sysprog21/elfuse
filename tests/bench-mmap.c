@@ -288,19 +288,20 @@ static int bench_fresh_one(uint64_t size, int n)
     return 0;
 }
 
-/* C. first-touch page-fault cost Touch one byte per page at a 16 KiB stride so
- * no two touches share a macOS host page; every touch is a genuine fault (HVC
- * #11 -> host fault handler -> page-table install + zero). Reports per-fault
- * ns.
+/* C. first-touch cost. Touch one byte per macOS 16 KiB host page. Each access
+ * demands a distinct physical backing page, but it is not necessarily a
+ * distinct HVC: elfuse installs Stage-1 descriptors in 2 MiB windows and the
+ * fault-around policy may install several windows per exit. Report both the
+ * whole sweep and its per-host-page amortization; calling the latter a
+ * "per-fault" cost would substantially overcount guest translation faults.
  */
-static void bench_fault(void)
+static void bench_fault(int pages, int drain_between)
 {
     const uint64_t stride = 16 * KIB;
-    const int pages = 512;
     uint64_t size = stride * (uint64_t) (pages + 1);
-    printf("== C. first-touch fault cost (16 KiB stride, %d pages) ==\n",
-           pages);
-    double per[ITERS];
+    printf("== C. first-touch fault cost (16 KiB stride, %d pages%s) ==\n",
+           pages, drain_between ? ", forced retire drain" : "");
+    double sweep[ITERS];
     for (int it = -1; it < ITERS; it++) {
         volatile uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -313,11 +314,20 @@ static void bench_fault(void)
             p[(uint64_t) i * stride] = 1;
         uint64_t t1 = rd();
         munmap((void *) p, size);
+        if (drain_between)
+            (void) fcntl(-1, F_GETFD);
         if (it >= 0)
-            per[it] = ns(t1 - t0) / pages;
+            sweep[it] = ns(t1 - t0);
     }
-    printf("  per-fault: median %.1f ns  min %.1f ns\n\n", median(per, ITERS),
-           per[0]);
+    qsort(sweep, ITERS, sizeof(*sweep), cmp_d);
+    printf("  sweep: p50 %.1f us  p95 %.1f us  max %.1f us\n",
+           sorted_quantile(sweep, ITERS, 0.50) / 1000.0,
+           sorted_quantile(sweep, ITERS, 0.95) / 1000.0,
+           sweep[ITERS - 1] / 1000.0);
+    printf("  amortized/touch: p50 %.1f ns  p95 %.1f ns  max %.1f ns\n\n",
+           sorted_quantile(sweep, ITERS, 0.50) / pages,
+           sorted_quantile(sweep, ITERS, 0.95) / pages,
+           sweep[ITERS - 1] / pages);
 }
 
 /* D. mprotect split cost Flip the middle 4 KiB of a 2 MiB RW block to
@@ -688,6 +698,35 @@ int main(int argc, char **argv)
         bench_munmap_dirty();
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "f") == 0) {
+        printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n",
+               ns_per_tick);
+        bench_mt();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "c") == 0) {
+        printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n",
+               ns_per_tick);
+        bench_fault(512, 0);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "c") == 0) {
+        char *end = NULL;
+        errno = 0;
+        long pages = strtol(argv[2], &end, 0);
+        if (errno || !end || *end || pages < 1 || pages > 1048576)
+            return 2;
+        printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n",
+               ns_per_tick);
+        bench_fault((int) pages, 0);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "c-drain") == 0) {
+        printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n",
+               ns_per_tick);
+        bench_fault(512, 1);
+        return 0;
+    }
     if (argc == 4 && strcmp(argv[1], "fresh") == 0) {
         char *end = NULL;
         errno = 0;
@@ -705,7 +744,7 @@ int main(int argc, char **argv)
     printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n", ns_per_tick);
     bench_size_sweep();
     bench_fresh();
-    bench_fault();
+    bench_fault(512, 0);
     bench_mprotect_split();
     bench_mremap();
     bench_mt();

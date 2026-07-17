@@ -475,10 +475,11 @@ svc_handler:
  *        MAP_PRIVATE|MAP_ANONYMOUS[|MAP_NORESERVE], fd, off)
  *
  * The control is selected without another system register.  SP_EL1 stack tops
- * are shim_data_end - slot*4KiB; controls are shim_data+0x20000 + slot*2KiB,
- * so (shim_data_end - ALIGN_UP(sp,4KiB))/2 is the control-array displacement.
- * Each vCPU is the sole producer of its ring and cursor.  The host acquire-
- * drains all rings whenever it takes mmap_lock.
+ * are shim_data_end - slot*4KiB; controls are shim_data+0x20000 + slot*4KiB,
+ * so shim_data_end - ALIGN_UP(sp,4KiB) is the control-array displacement.
+ * Each vCPU is the sole producer of its mmap publication ring and cursor, and
+ * the sole consumer of its host-committed reuse ring. The host acquire-drains
+ * all publications whenever it takes mmap_lock.
  */
 mmap_anon_fast:
     mrs x12, tpidr_el1                 /* shared shim-data base */
@@ -488,7 +489,6 @@ mmap_anon_fast:
     and x14, x14, #~0xfff              /* this vCPU's stack top */
     add x15, x12, #0x200, lsl #12      /* shim_data + 2MiB */
     sub x15, x15, x14                  /* slot * 4KiB */
-    lsr x15, x15, #1                   /* slot * 2KiB */
     add x12, x12, x15
     add x12, x12, #0x20, lsl #12       /* control base + 0x20000 */
 
@@ -510,6 +510,22 @@ mmap_anon_fast:
     b.cs mmap_shape_bail                /* PAGE_ALIGN_UP overflow */
     and x15, x15, #~0xfff
 
+    /* Join the same host-writer handshake as fast munmap.  Arena revoke,
+     * refill, and reuse publication all run with the gate closed; announcing
+     * this per-vCPU producer prevents the host from invalidating a descriptor
+     * between our generation check and mmap publication. */
+    mrs x20, tpidr_el1
+    add x20, x20, #0x1, lsl #12
+    add x20, x20, #0x160               /* SHIM_MMAP_PT_GATE_OFF */
+    ldar w22, [x20]
+    cbnz w22, mmap_gate_bail
+    add x24, x12, #0x400
+    add x24, x24, #24                  /* retire.producer_active */
+    mov w22, #1
+    stlr w22, [x24]
+    ldar w22, [x20]
+    cbnz w22, mmap_active_capacity_bail
+
     ldar w13, [x12]                    /* descriptor generation */
     ldr w14, [x12, #4]                 /* consumer generation */
     cmp w13, w14
@@ -517,6 +533,58 @@ mmap_anon_fast:
     ldr w13, [x12, #8]                 /* SHIM_MMAP_CTRL_ENABLED */
     tbz w13, #0, mmap_capacity_bail
 
+    /* Reserve publication capacity before mutating either the bump cursor or
+     * a host-committed reuse extent. */
+    add x23, x12, #12                  /* &mmap publication head */
+    ldar w22, [x23]
+    ldr w23, [x12, #16]                /* producer-owned tail */
+    sub w24, w23, w22
+    cmp w24, #32                       /* SHIM_MMAP_RING_SIZE */
+    b.hs mmap_ring_full_bail
+
+    /* Prefer committed holes returned by the host.  The host release-publishes
+     * immutable entries through reuse.tail; after acquiring tail, this EL1
+     * consumer owns every pending slot and may shorten it in place.  First-fit
+     * handles mixed allocation sizes.  Large requests retain the bump path's
+     * 2 MiB start-alignment promise; an unaligned extent is simply skipped. */
+    add x26, x12, #0x720               /* host -> EL1 reuse ring */
+    ldr w27, [x26, #0]                 /* consumer-owned head */
+    add x25, x26, #4
+    ldar w28, [x25]                    /* host-published tail */
+    mov w29, w27
+mmap_reuse_scan:
+    cmp w29, w28
+    b.eq mmap_reuse_miss
+    and w30, w29, #31
+    add x25, x26, #32                  /* reuse.entries */
+    add x25, x25, x30, lsl #4
+    ldr x19, [x25, #0]                 /* extent address */
+    ldr x24, [x25, #8]                 /* extent length; zero = consumed */
+    cbz x24, mmap_reuse_next
+    cmp x24, x15
+    b.lo mmap_reuse_next
+    mov x20, #0x200000
+    cmp x15, x20
+    b.lo mmap_reuse_fit
+    sub x20, x20, #1
+    tst x19, x20
+    b.ne mmap_reuse_next
+mmap_reuse_fit:
+    adds x21, x19, x15
+    b.cs mmap_reuse_next                /* corrupt extent cannot be used */
+    sub x24, x24, x15
+    str x21, [x25, #0]                  /* retain suffix in this slot */
+    str x24, [x25, #8]                  /* zero marks full consumption */
+    ldr x20, [x26, #24]                 /* per-vCPU reuse hits */
+    add x20, x20, #1
+    str x20, [x26, #24]
+    mov w28, #0                         /* address came from reuse ring */
+    b mmap_addr_ready
+mmap_reuse_next:
+    add w29, w29, #1
+    b mmap_reuse_scan
+
+mmap_reuse_miss:
     ldr x19, [x12, #40]                /* private bump cursor */
     mov x20, #0x200000
     cmp x15, x20
@@ -530,14 +598,9 @@ mmap_anon_fast:
     b.cs mmap_capacity_bail
     cmp x21, x20
     b.hi mmap_capacity_bail
+    mov w28, #1                         /* bump cursor must advance */
 
-    add x23, x12, #12                  /* &head */
-    ldar w22, [x23]
-    ldr w23, [x12, #16]                /* producer-owned tail */
-    sub w24, w23, w22
-    cmp w24, #32                       /* SHIM_MMAP_RING_SIZE */
-    b.hs mmap_ring_full_bail
-
+mmap_addr_ready:
     and w24, w23, #31
     add x24, x24, x24, lsl #1          /* index * 3 */
     add x25, x12, #64                   /* ring base */
@@ -545,10 +608,38 @@ mmap_anon_fast:
     str x19, [x25, #0]
     str x15, [x25, #8]
     str x16, [x25, #16]
-    str x21, [x12, #40]                /* publish cursor before entry */
+    cbz w28, 2f
+    str x21, [x12, #40]                /* publish bump cursor before entry */
+2:
     add w23, w23, #1
     add x25, x12, #16
     stlr w23, [x25]                    /* release-publish ring entry */
+
+    /* Only after the mmap publication is visible may fully consumed reuse
+     * slots be released to the host producer.  Skip zero tombstones at the
+     * head; first-fit may have consumed a later slot, which will be reclaimed
+     * when all earlier entries have drained. */
+    add x26, x12, #0x720
+    ldr w27, [x26, #0]
+    add x25, x26, #4
+    ldar w29, [x25]
+    mov w30, w27
+3:  cmp w30, w29
+    b.eq 5f
+    and w24, w30, #31
+    add x25, x26, #32
+    add x25, x25, x24, lsl #4
+    ldr x24, [x25, #8]
+    cbnz x24, 5f
+    add w30, w30, #1
+    b 3b
+5:  cmp w30, w27
+    b.eq 6f
+    stlr w30, [x26]
+6:
+    add x24, x12, #0x400
+    add x24, x24, #24
+    stlr wzr, [x24]                    /* producer_active = 0 */
     mov x0, x19
     MMAP_COUNTER_INC MC_HIT
     b svc_restore_eret
@@ -558,11 +649,25 @@ mmap_shape_bail:
     b handle_svc_0
 
 mmap_capacity_bail:
+    add x24, x12, #0x400
+    add x24, x24, #24
+    stlr wzr, [x24]
     MMAP_COUNTER_INC MC_CAPACITY_MISS
     b handle_svc_0
 
 mmap_ring_full_bail:
+    add x24, x12, #0x400
+    add x24, x24, #24
+    stlr wzr, [x24]
     MMAP_COUNTER_INC MC_RING_FULL
+    b handle_svc_0
+
+mmap_active_capacity_bail:
+    add x24, x12, #0x400
+    add x24, x24, #24
+    stlr wzr, [x24]
+mmap_gate_bail:
+    MMAP_COUNTER_INC MC_CAPACITY_MISS
     b handle_svc_0
 
 mmap_attention_bail:
@@ -576,6 +681,9 @@ mmap_generation_bail:
      */
     MMAP_COUNTER_INC MC_GENERATION_STALE
     str w13, [x12, #4]
+    add x24, x12, #0x400
+    add x24, x24, #24
+    stlr wzr, [x24]
     b handle_svc_0
 
 /* munmap_anon_fast: invalidate an anonymous arena range synchronously at EL1,
@@ -596,7 +704,6 @@ munmap_anon_fast:
     and x20, x20, #~0xfff              /* this vCPU's stack top */
     add x21, x12, #0x200, lsl #12
     sub x21, x21, x20
-    lsr x21, x21, #1
     add x21, x12, x21
     add x21, x21, #0x20, lsl #12       /* current mmap control */
 
@@ -658,7 +765,7 @@ munmap_anon_fast:
     cmp w22, w28
     b.eq munmap_arena_found
 2:  add w24, w24, #1
-    add x25, x25, #0x800
+    add x25, x25, #0x1000
     cmp w24, #64
     b.lo 1b
     b munmap_active_bail

@@ -99,8 +99,8 @@ _Static_assert(SHIM_COUNTERS_OFF + SHIM_COUNTERS_N * 8 <=
                "counter array must not overlap the PGID slot");
 _Static_assert(SHIM_MMAP_CONTROL_BASE == 0x20000,
                "shim.S mmap fast path hard-codes control base 0x20000");
-_Static_assert(SHIM_MMAP_CONTROL_STRIDE == 0x800,
-               "shim.S mmap fast path hard-codes control stride 0x800");
+_Static_assert(SHIM_MMAP_CONTROL_STRIDE == 0x1000,
+               "shim.S mmap fast path hard-codes control stride 0x1000");
 _Static_assert(SHIM_MMAP_RING_SIZE == 32,
                "shim.S mmap fast path hard-codes 32 ring entries");
 _Static_assert(offsetof(shim_mmap_control_t, generation) == 0,
@@ -151,6 +151,15 @@ _Static_assert(SHIM_MUNMAP_RETIRE_BYTES_SOFT == 0x10000000ULL,
 _Static_assert(SHIM_MUNMAP_RETIRE_F_ARENA_SLOT_MASK == 0x3f &&
                    SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT == 6,
                "shim.S munmap retire flag encoding drift");
+_Static_assert(offsetof(shim_mmap_control_t, reuse) == 0x720,
+               "shim.S mmap reuse offset drift");
+_Static_assert(offsetof(mmap_reuse_ring_t, published) == 8 &&
+                   offsetof(mmap_reuse_ring_t, dropped) == 16 &&
+                   offsetof(mmap_reuse_ring_t, hits) == 24 &&
+                   offsetof(mmap_reuse_ring_t, entries) == 32,
+               "shim.S mmap reuse-ring layout drift");
+_Static_assert(SHIM_MMAP_REUSE_RING_SIZE == 32,
+               "shim.S mmap reuse-ring size drift");
 _Static_assert((MMAP_FAST_ARENA_MAX >> 12) <=
                    (SHIM_MUNMAP_RETIRE_F_CHARGE_MASK >>
                     SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT),
@@ -558,6 +567,8 @@ void shim_globals_counters_dump(const guest_t *g)
     };
     uint64_t mmap_counters[SHIM_MMAP_COUNTERS_N] = {0};
     uint64_t refill_count = 0, recycle_count = 0;
+    uint64_t reuse_published = 0, reuse_dropped = 0, reuse_hits = 0;
+    uint64_t reuse_pending = 0;
     uint64_t current_max = 0, peak_max = 0;
     const uint8_t *shim_data =
         (const uint8_t *) g->host_base + g->shim_data_base;
@@ -571,6 +582,17 @@ void shim_globals_counters_dump(const guest_t *g)
                 atomic_load_explicit(&c->counters[i], memory_order_relaxed);
         refill_count += c->refill_count;
         recycle_count += c->recycle_count;
+        reuse_published += atomic_load_explicit(&c->reuse.published,
+                                                memory_order_relaxed);
+        reuse_dropped += atomic_load_explicit(&c->reuse.dropped,
+                                              memory_order_relaxed);
+        reuse_hits +=
+            atomic_load_explicit(&c->reuse.hits, memory_order_relaxed);
+        uint32_t reuse_head =
+            atomic_load_explicit(&c->reuse.head, memory_order_relaxed);
+        uint32_t reuse_tail =
+            atomic_load_explicit(&c->reuse.tail, memory_order_relaxed);
+        reuse_pending += (uint32_t) (reuse_tail - reuse_head);
         if (c->next_arena_size > current_max)
             current_max = c->next_arena_size;
         if (c->peak_arena_size > peak_max)
@@ -583,6 +605,14 @@ void shim_globals_counters_dump(const guest_t *g)
             (unsigned long long) refill_count);
     fprintf(stderr, "  %-20s %llu\n", "MMAP_RECYCLE",
             (unsigned long long) recycle_count);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_REUSE_PUBLISH",
+            (unsigned long long) reuse_published);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_REUSE_DROP",
+            (unsigned long long) reuse_dropped);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_REUSE_HIT",
+            (unsigned long long) reuse_hits);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_REUSE_PENDING",
+            (unsigned long long) reuse_pending);
     fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_CURRENT",
             (unsigned long long) current_max);
     fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_PEAK",

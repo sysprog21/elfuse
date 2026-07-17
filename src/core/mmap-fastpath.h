@@ -1,10 +1,11 @@
 /*
  * Per-vCPU EL1 anonymous-mmap consumer rings.
  *
- * The host is the sole producer of arenas and the sole consumer of ring
- * entries.  EL1 only bump-allocates VA and appends descriptions.  Control
- * blocks live in the EL1-only shim-data mapping and are selected from SP_EL1's
- * per-thread stack slot, so no guest-visible register ABI is consumed.
+ * The host produces arenas, consumes mmap/munmap publications, and returns
+ * metadata-committed holes through a reverse SPSC ring. EL1 first-fit consumes
+ * those private extents before bump-allocating fresh VA. Control blocks live
+ * in the EL1-only shim-data mapping and are selected from SP_EL1's per-thread
+ * stack slot, so no guest-visible register ABI is consumed.
  */
 
 #pragma once
@@ -19,7 +20,7 @@
 typedef struct thread_entry thread_entry_t;
 
 #define SHIM_MMAP_CONTROL_BASE 0x20000u
-#define SHIM_MMAP_CONTROL_STRIDE 0x800u
+#define SHIM_MMAP_CONTROL_STRIDE 0x1000u
 #define SHIM_MMAP_RING_SIZE 32u
 #define SHIM_MMAP_CTRL_ENABLED 0x1u
 #define SHIM_MMAP_CTRL_TLBIRANGE 0x2u
@@ -38,6 +39,9 @@ typedef struct thread_entry thread_entry_t;
 #define SHIM_MUNMAP_RETIRE_F_ARENA_SLOT_MASK 0x3fu
 #define SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT 6u
 #define SHIM_MUNMAP_RETIRE_F_CHARGE_MASK 0xffffffc0u
+
+#define SHIM_MMAP_REUSE_RING_SIZE 32u
+#define SHIM_MMAP_REUSE_OFF 0x720u
 
 #define MMAP_FAST_ARENA_MIN (64ULL * 1024 * 1024)
 #define MMAP_FAST_ARENA_MAX (32ULL * 1024 * 1024 * 1024)
@@ -77,6 +81,25 @@ typedef struct munmap_retire_ring {
     munmap_retire_entry_t entries[SHIM_MUNMAP_RETIRE_RING_SIZE];
 } munmap_retire_ring_t;
 
+typedef struct mmap_reuse_entry {
+    uint64_t addr;
+    uint64_t length;
+} mmap_reuse_entry_t;
+
+/* Host producer -> EL1 consumer.  Entries transfer committed, quarantined VA
+ * extents back to their owning arena only after semantic metadata and PTE
+ * retirement have completed.  EL1 may shorten an acquired entry in place;
+ * the host does not touch its slot again until the release-published head has
+ * advanced past it. */
+typedef struct mmap_reuse_ring {
+    _Atomic uint32_t head; /* EL1 consumer */
+    _Atomic uint32_t tail; /* host producer */
+    _Atomic uint64_t published;
+    _Atomic uint64_t dropped;
+    _Atomic uint64_t hits; /* EL1 producer */
+    mmap_reuse_entry_t entries[SHIM_MMAP_REUSE_RING_SIZE];
+} mmap_reuse_ring_t;
+
 typedef struct {
     _Atomic uint32_t generation;          /* host publish word */
     _Atomic uint32_t consumer_generation; /* EL1 generation ack */
@@ -100,10 +123,13 @@ typedef struct {
     _Atomic uint64_t materialized_end;
     uint8_t _pad2[SHIM_MUNMAP_RETIRE_OFF - 0x3a0];
     munmap_retire_ring_t retire;
+    mmap_reuse_ring_t reuse;
 } shim_mmap_control_t;
 
 _Static_assert(offsetof(shim_mmap_control_t, retire) == SHIM_MUNMAP_RETIRE_OFF,
                "shim.S retire-ring offset ABI");
+_Static_assert(offsetof(shim_mmap_control_t, reuse) == SHIM_MMAP_REUSE_OFF,
+               "shim.S reuse-ring offset ABI");
 _Static_assert(sizeof(shim_mmap_control_t) <= SHIM_MMAP_CONTROL_STRIDE,
                "mmap control exceeds per-vCPU stride");
 
@@ -146,6 +172,9 @@ void mmap_fastpath_refill_current_locked(guest_t *g, uint64_t request_len);
 bool mmap_fastpath_allocate_current_locked(guest_t *g,
                                            uint64_t request_len,
                                            uint64_t *addr_out);
+bool mmap_fastpath_allocate_current_publication_only(guest_t *g,
+                                                      uint64_t request_len,
+                                                      uint64_t *addr_out);
 
 /* Give an explicit slow-path hint precedence over this stopped vCPU's
  * unconsumed arena tail. Caller holds mmap_lock.

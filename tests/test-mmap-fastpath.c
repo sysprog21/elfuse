@@ -315,6 +315,89 @@ static void test_cross_vcpu_handoff(void)
     PASS();
 }
 
+static void test_mixed_size_committed_reuse(void)
+{
+    TEST("mixed-size committed extents split and read zero");
+    static const size_t sizes[] = {
+        64ULL << 10, 3ULL << 20, 20ULL << 10, 1ULL << 20,
+        5ULL << 20, 96ULL << 10, 2ULL << 20, 512ULL << 10,
+    };
+
+    for (int i = 0; i < 128; i++) {
+        size_t len = sizes[i % (int) (sizeof(sizes) / sizeof(sizes[0]))];
+        volatile uint8_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            FAIL("mmap");
+            return;
+        }
+        if (p[0] != 0 || p[len / 2] != 0 || p[len - 1] != 0) {
+            munmap((void *) p, len);
+            FAIL("reused extent exposed stale bytes");
+            return;
+        }
+        p[0] = (uint8_t) (i + 1);
+        p[len / 2] = (uint8_t) (i ^ 0x5a);
+        p[len - 1] = (uint8_t) (i ^ 0xa5);
+        if (munmap((void *) p, len) != 0) {
+            FAIL("munmap");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void test_repeated_munmap_not_double_reused(void)
+{
+    TEST("repeated munmap does not double-publish an extent");
+    const size_t len = 64ULL << 10;
+    volatile uint8_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("initial mmap");
+        return;
+    }
+    p[0] = 1;
+    if (munmap((void *) p, len) != 0 || munmap((void *) p, len) != 0) {
+        FAIL("repeated munmap");
+        return;
+    }
+
+    /* This fault drains both retire records. Only the first still has region
+     * coverage and may publish a reusable extent. */
+    volatile uint8_t *bridge = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (bridge == MAP_FAILED) {
+        FAIL("bridge mmap");
+        return;
+    }
+    bridge[0] = 2;
+
+    volatile uint8_t *a = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    volatile uint8_t *b = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED || b == MAP_FAILED || a == b) {
+        if (a != MAP_FAILED)
+            munmap((void *) a, len);
+        if (b != MAP_FAILED && b != a)
+            munmap((void *) b, len);
+        munmap((void *) bridge, len);
+        FAIL("duplicate extent allocation");
+        return;
+    }
+    a[0] = 0x31;
+    b[0] = 0x42;
+    if (a[0] != 0x31 || b[0] != 0x42) {
+        FAIL("distinct mappings aliased");
+        return;
+    }
+    munmap((void *) a, len);
+    munmap((void *) b, len);
+    munmap((void *) bridge, len);
+    PASS();
+}
+
 typedef struct {
     int iterations;
     _Atomic int *failed;
@@ -409,6 +492,28 @@ static int stats_stream(size_t len, int iterations, bool release_each)
     return 0;
 }
 
+static int stats_mixed_reuse(void)
+{
+    static const size_t sizes[] = {
+        64ULL << 10, 3ULL << 20, 20ULL << 10, 1ULL << 20,
+        5ULL << 20, 96ULL << 10, 2ULL << 20, 512ULL << 10,
+    };
+    for (int i = 0; i < 160; i++) {
+        size_t len = sizes[i % (int) (sizeof(sizes) / sizeof(sizes[0]))];
+        volatile uint8_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            return 1;
+        if (p[0] != 0 || p[len - 1] != 0)
+            return 1;
+        p[0] = 1;
+        p[len - 1] = 2;
+        if (munmap((void *) p, len) != 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int run_stats_case(const char *name)
 {
     if (strcmp(name, "ring-full") == 0)
@@ -453,6 +558,8 @@ static int run_stats_case(const char *name)
         return stats_stream(8ULL << 20, 41, true);
     if (strcmp(name, "recycle") == 0)
         return stats_stream(64ULL << 10, 6000, true);
+    if (strcmp(name, "reuse-mixed") == 0)
+        return stats_mixed_reuse();
     return 2;
 }
 
@@ -474,6 +581,8 @@ int main(int argc, char **argv)
     test_exhaustion_fallback();
     test_large_l2_range_tlbi();
     test_cross_vcpu_handoff();
+    test_mixed_size_committed_reuse();
+    test_repeated_munmap_not_double_reused();
     test_mt_storm_and_fork_exec();
 
     printf("\ntest-mmap-fastpath: %d passed, %d failed - %s\n", passes, fails,

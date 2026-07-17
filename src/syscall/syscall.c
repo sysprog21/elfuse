@@ -972,8 +972,12 @@ static int64_t sc_mmap(guest_t *g,
                        bool verbose)
 {
     uint64_t refill_len = mmap_fastpath_eligible_length(x0, x1, x2, x3);
-    mmap_lock_acquire(g);
     uint64_t arena_addr = 0;
+    if (refill_len && mmap_fastpath_allocate_current_publication_only(
+                          g, refill_len, &arena_addr))
+        return (int64_t) arena_addr;
+
+    mmap_lock_acquire(g);
     int64_t r;
     if (refill_len &&
         mmap_fastpath_allocate_current_locked(g, refill_len, &arena_addr)) {

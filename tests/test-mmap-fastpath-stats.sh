@@ -119,4 +119,11 @@ require_ge recycle MMAP_RECYCLE 1
 require_le recycle MMAP_HIGH_WATER 201326592
 printf '  arena VA recycling            OK\n'
 
+run_case reuse-mixed
+require_ge reuse-mixed MMAP_REUSE_PUBLISH 100
+require_ge reuse-mixed MMAP_REUSE_HIT 100
+require_eq reuse-mixed MMAP_REUSE_DROP 0
+require_le reuse-mixed MMAP_HIGH_WATER 134217728
+printf '  mixed-size committed reuse    OK\n'
+
 printf 'test-mmap-fastpath-stats: PASS\n'

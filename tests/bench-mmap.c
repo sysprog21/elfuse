@@ -358,8 +358,43 @@ static void bench_mprotect_split(void)
         if (it >= 0)
             sp[it] = ns(t1 - t0);
     }
-    printf("  split: median %.1f ns  min %.1f ns\n\n", median(sp, ITERS),
+    printf("  split:     median %.1f ns  min %.1f ns\n", median(sp, ITERS),
            sp[0]);
+}
+
+/* Once the block has an L3 table, R<->RW on one anonymous arena page can stay
+ * in EL1 and defer only region metadata through the publication ring.
+ */
+static void bench_mprotect_fast_leaf(void)
+{
+    double leaf[ITERS];
+    uint8_t *p = mmap(NULL, 2 * MIB, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        printf("  fast leaf mmap FAILED\n\n");
+        return;
+    }
+    if (mprotect(p + MIB, 4 * KIB, PROT_READ) != 0) {
+        munmap(p, 2 * MIB);
+        printf("  fast leaf setup FAILED: %s\n\n", strerror(errno));
+        return;
+    }
+    for (int it = -1; it < ITERS; it++) {
+        int prot = (it & 1) ? PROT_READ : PROT_READ | PROT_WRITE;
+        uint64_t t0 = rd();
+        int rc = mprotect(p + MIB, 4 * KIB, prot);
+        uint64_t t1 = rd();
+        if (rc != 0) {
+            munmap(p, 2 * MIB);
+            printf("  fast leaf mprotect FAILED: %s\n\n", strerror(errno));
+            return;
+        }
+        if (it >= 0)
+            leaf[it] = ns(t1 - t0);
+    }
+    munmap(p, 2 * MIB);
+    printf("  fast leaf: median %.1f ns  min %.1f ns\n\n",
+           median(leaf, ITERS), leaf[0]);
 }
 
 /* E. mremap grow: in-place vs forced move */
@@ -686,6 +721,11 @@ static void bench_munmap_dirty(void)
 int main(int argc, char **argv)
 {
     clock_init();
+    if (argc == 2 && strcmp(argv[1], "d") == 0) {
+        bench_mprotect_split();
+        bench_mprotect_fast_leaf();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "a") == 0) {
         printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n",
                ns_per_tick);
@@ -746,6 +786,7 @@ int main(int argc, char **argv)
     bench_fresh();
     bench_fault(512, 0);
     bench_mprotect_split();
+    bench_mprotect_fast_leaf();
     bench_mremap();
     bench_mt();
     bench_munmap_materialized();

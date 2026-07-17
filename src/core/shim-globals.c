@@ -211,6 +211,8 @@ void shim_globals_init(guest_t *g)
      */
     memset(cache_base(g), 0,
            SHIM_MMAP_CONTROL_BASE + MAX_THREADS * SHIM_MMAP_CONTROL_STRIDE);
+    atomic_store_explicit(&g->mmap_fastpath_active_slots, 0,
+                          memory_order_relaxed);
 }
 
 void shim_globals_publish_pid(guest_t *g, int64_t pid, int64_t ppid)

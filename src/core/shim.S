@@ -466,6 +466,151 @@ svc_handler:
     b.eq munmap_anon_fast
     cmp x10, #222                      /* SYS_mmap? */
     b.eq mmap_anon_fast
+    cmp x10, #226                      /* SYS_mprotect? */
+    b.eq mprotect_page_fast
+    b handle_svc_0
+
+/* mprotect_page_fast: change one already-materialized L3 page between R and
+ * RW without exiting to the host. The mapping must belong to this vCPU's
+ * enabled anonymous arena. PTE + broadcast TLBI complete synchronously here;
+ * a tagged mmap-ring entry defers only the host region metadata update.
+ * Anything requiring L2 splitting, lazy materialization, PROT_NONE, execute
+ * permission, or broader validation falls back to HVC.
+ */
+mprotect_page_fast:
+    mrs x12, tpidr_el1
+    ldar w13, [x12]                    /* attention / tracing gate */
+    cbnz w13, handle_svc_0
+
+    add x20, sp, #0xfff
+    and x20, x20, #~0xfff              /* this vCPU's stack top */
+    add x21, x12, #0x200, lsl #12
+    sub x21, x21, x20
+    add x21, x12, x21
+    add x21, x21, #0x20, lsl #12       /* current mmap control */
+
+    ldr x14, [sp, #0]                  /* addr */
+    tst x14, #0xfff
+    b.ne handle_svc_0
+    ldr x15, [sp, #8]                  /* Linux accepts len 1..4096 */
+    cbz x15, handle_svc_0
+    cmp x15, #0x1000
+    b.hi handle_svc_0
+    ldr x16, [sp, #16]                 /* prot */
+    cmp x16, #1                        /* PROT_READ */
+    b.eq 1f
+    cmp x16, #3                        /* PROT_READ|PROT_WRITE */
+    b.ne handle_svc_0
+
+1:  /* Join the host-writer gate before validating the control or PTE. */
+    add x20, x12, #0x1, lsl #12
+    add x20, x20, #0x160               /* SHIM_MMAP_PT_GATE_OFF */
+    ldar w22, [x20]
+    cbnz w22, handle_svc_0
+    add x24, x21, #0x400
+    add x24, x24, #24                  /* retire.producer_active */
+    mov w22, #1
+    stlr w22, [x24]
+    ldar w22, [x20]
+    cbnz w22, mprotect_active_bail
+
+    ldar w22, [x21]                    /* generation */
+    ldr w23, [x21, #4]                 /* consumer generation */
+    cmp w22, w23
+    b.ne mprotect_active_bail
+    ldr w23, [x21, #8]                 /* control flags */
+    tbz w23, #0, mprotect_active_bail
+
+    ldr x25, [x21, #24]                /* arena base */
+    cmp x14, x25
+    b.lo mprotect_active_bail
+    ldr x25, [x21, #40]                /* consumed cursor */
+    add x17, x14, #0x1000
+    cmp x17, x25
+    b.hi mprotect_active_bail
+
+    /* Reserve the same SPSC publication ring used by fast mmap. */
+    add x23, x21, #12                  /* host head */
+    ldar w22, [x23]
+    ldr w23, [x21, #16]                /* producer tail */
+    sub w25, w23, w22
+    cmp w25, #32
+    b.hs mprotect_active_bail
+
+    /* Walk TTBR0 and require L0/L1/L2 table descriptors plus a valid L3 page.
+     * A block or invalid descriptor needs host materialization/splitting.
+     */
+    mrs x25, ttbr0_el1
+    ubfx x25, x25, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x14, #39, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cmp x28, #3
+    b.ne mprotect_active_bail
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x14, #30, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cmp x28, #3
+    b.ne mprotect_active_bail
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12
+    ubfx x26, x14, #21, #9
+    add x26, x25, x26, lsl #3
+    ldar x27, [x26]
+    and x28, x27, #3
+    cmp x28, #3
+    b.ne mprotect_active_bail
+    ubfx x25, x27, #12, #36
+    lsl x25, x25, #12
+    ubfx x28, x14, #12, #9
+    add x26, x25, x28, lsl #3         /* target L3 entry */
+    ldar x27, [x26]
+    tbz x27, #0, mprotect_active_bail
+
+    /* Preserve output address and attributes; replace only AP[2:1]. */
+    bic x27, x27, #0xc0
+    cmp x16, #3
+    mov x28, #0xc0                     /* AP=11: EL0 read-only */
+    mov x29, #0x40                     /* AP=01: EL0 read-write */
+    csel x28, x29, x28, eq
+    orr x27, x27, x28
+    stlr x27, [x26]
+
+    dsb ishst
+    ubfx x25, x14, #12, #44
+    tlbi vae1is, x25
+    dsb ish
+    isb
+
+    /* Tag the publication as metadata-only mprotect. Host drains it before
+     * consulting regions[] on any later VM exit.
+     */
+    and w22, w23, #31
+    add x22, x22, x22, lsl #1
+    add x25, x21, #64
+    add x25, x25, x22, lsl #3
+    str x14, [x25, #0]
+    mov x22, #0x1000
+    str x22, [x25, #8]
+    mov x22, #1
+    lsl x22, x22, #63
+    orr x22, x22, x16
+    str x22, [x25, #16]
+    add w23, w23, #1
+    add x25, x21, #16
+    stlr w23, [x25]
+
+    stlr wzr, [x24]                    /* producer_active = 0 */
+    mov x0, #0
+    b svc_restore_eret
+
+mprotect_active_bail:
+    stlr wzr, [x24]
     b handle_svc_0
 
 /* mmap_anon_fast: consume a host-prepared, per-vCPU VA arena for the exact
@@ -753,6 +898,7 @@ munmap_anon_fast:
 1:  add x26, x25, #8
     ldar w23, [x26]                    /* arena flags */
     tbz w23, #0, 2f
+    tbnz w23, #2, 2f                  /* host mprotect => slow munmap */
     ldar w22, [x25]                    /* generation snapshot */
     ldr x26, [x25, #24]                /* arena base */
     cmp x14, x26

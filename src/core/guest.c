@@ -1883,6 +1883,8 @@ void guest_reset(guest_t *g)
     g->mmap_rx_end = MMAP_RX_INITIAL_END;
     g->mmap_rw_gap_hint = 0;
     g->mmap_rx_gap_hint = 0;
+    atomic_store_explicit(&g->mmap_fastpath_active_slots, 0,
+                          memory_order_relaxed);
     g->ttbr0 = 0;
     memset(g->pte_present_blocks, 0, sizeof(g->pte_present_blocks));
     memset(g->pte_present_summary, 0, sizeof(g->pte_present_summary));

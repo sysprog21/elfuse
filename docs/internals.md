@@ -226,6 +226,17 @@ Splitting is triggered by:
 block needs splitting, splits it if so, then updates the affected L3 page
 entries. Whole-block permission changes are done in place without splitting.
 
+After a private anonymous mmap-arena block already has an L3 table, the EL1
+shim specializes a one-page `PROT_READ` ↔ `PROT_READ|PROT_WRITE` transition:
+it validates the current arena generation, updates only AP[2:1], broadcasts
+`TLBI VAE1IS`, and returns without an HVC exit. A tagged entry in the existing
+mmap publication ring defers the matching region-metadata update to the next
+host drain. The host always drains that ring before consulting `regions[]`;
+the producer-active/PT-gate handshake prevents a host page-table writer from
+racing the EL1 update. Lazy materialization, L2 splitting, executable or
+`PROT_NONE` transitions, multi-page ranges, and non-arena mappings retain the
+host path.
+
 `mmap` itself uses a gap-finding allocator that walks the sorted region array
 to find free address space. `PROT_EXEC` requests go to the RX region
 (`MMAP_RX_BASE = 0x10000000`); other requests go to the RW region

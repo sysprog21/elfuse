@@ -575,6 +575,13 @@ typedef struct {
      */
     _Atomic uint64_t pt_gen;
 
+    /* Host-only index of shim mmap controls that are currently enabled. A bit
+     * is published only after the control descriptor is complete and cleared
+     * only while mmap_lock has closed the EL1 producer gate. This lets the
+     * common one-vCPU path avoid touching 63 cold control pages per drain.
+     */
+    _Atomic uint64_t mmap_fastpath_active_slots;
+
     uint64_t pte_present_blocks[GUEST_PTE_PRESENT_WORDS];
     uint64_t pte_present_summary[GUEST_PTE_PRESENT_SUMMARY_WORDS];
     uint64_t dirty_blocks[GUEST_DIRTY_WORDS];

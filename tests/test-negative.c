@@ -208,6 +208,49 @@ static void test_mmap_prot(void)
         munmap(p, 4096);
         EXPECT_TRUE(saw_segv, "write to read-only mapping succeeded");
     }
+
+    TEST("fast single-page mprotect drains publication ring");
+    {
+        volatile int *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            FAIL("mmap failed");
+            return;
+        }
+        *p = 1; /* Materialize a partial block, which installs an L3 table. */
+        for (int i = 0; i < 96; i++) {
+            int prot = (i & 1) ? PROT_READ : PROT_READ | PROT_WRITE;
+            if (mprotect((void *) p, 4096, prot) != 0) {
+                munmap((void *) p, 4096);
+                FAIL("mprotect toggle failed");
+                return;
+            }
+        }
+
+        struct sigaction old_sa;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_sigsegv;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGSEGV, &sa, &old_sa) != 0) {
+            munmap((void *) p, 4096);
+            FAIL("sigaction failed");
+            return;
+        }
+        saw_segv = 0;
+        if (sigsetjmp(segv_jmp, 1) == 0)
+            *p = 2;
+        sigaction(SIGSEGV, &old_sa, NULL);
+
+        int restored = mprotect((void *) p, 4096,
+                                PROT_READ | PROT_WRITE) == 0;
+        if (restored)
+            *p = 3;
+        int final = *p;
+        munmap((void *) p, 4096);
+        EXPECT_TRUE(saw_segv && restored && final == 3,
+                    "fast mprotect permissions or ring drain were stale");
+    }
 }
 
 /* Test 7: fcntl on invalid FD */

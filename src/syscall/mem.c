@@ -87,6 +87,20 @@ static shim_mmap_control_t *mmap_fastpath_control(const guest_t *g, int slot)
                                     (uint64_t) slot * SHIM_MMAP_CONTROL_STRIDE);
 }
 
+static uint64_t mmap_fastpath_active_slots(const guest_t *g)
+{
+    return g ? atomic_load_explicit(&g->mmap_fastpath_active_slots,
+                                    memory_order_acquire)
+             : 0;
+}
+
+static int mmap_fastpath_pop_slot(uint64_t *slots)
+{
+    int slot = __builtin_ctzll(*slots);
+    *slots &= *slots - 1;
+    return slot;
+}
+
 static void mmap_fastpath_reuse_reset(shim_mmap_control_t *c)
 {
     if (!c)
@@ -217,7 +231,9 @@ static void mmap_fastpath_host_gate_close(guest_t *g)
         atomic_fetch_add_explicit(gate, 1, memory_order_acq_rel);
     if (previous != 0)
         return;
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
+    uint64_t slots = mmap_fastpath_active_slots(g);
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
         shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
         while (atomic_load_explicit(&c->retire.producer_active,
                                     memory_order_acquire) != 0)
@@ -243,8 +259,11 @@ static void mmap_fastpath_host_gate_open(guest_t *g)
 
 static _Thread_local guest_t *mmap_lock_guest;
 
-static void mmap_fastpath_disable_control(shim_mmap_control_t *c)
+static void mmap_fastpath_disable_control(guest_t *g, int slot)
 {
+    shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+    if (!c)
+        return;
     uint32_t generation =
         atomic_load_explicit(&c->generation, memory_order_relaxed) + 1;
     if (generation == 0)
@@ -261,14 +280,39 @@ static void mmap_fastpath_disable_control(shim_mmap_control_t *c)
     c->next_arena_size = MMAP_FAST_ARENA_MIN;
     c->max_len_seen = 0;
     atomic_store_explicit(&c->generation, generation, memory_order_release);
+    atomic_fetch_and_explicit(&g->mmap_fastpath_active_slots, ~BIT64(slot),
+                              memory_order_release);
 }
 
-static void mmap_fastpath_drain_publications_locked(guest_t *g)
+static void mmap_fastpath_mark_mprotect_locked(guest_t *g,
+                                               uint64_t start,
+                                               uint64_t end)
+{
+    if (!g || end <= start)
+        return;
+    uint64_t slots = mmap_fastpath_active_slots(g);
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        uint64_t base =
+            atomic_load_explicit(&c->arena_base, memory_order_relaxed);
+        uint64_t limit =
+            atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+        if (start < limit && end > base)
+            atomic_fetch_or_explicit(&c->flags,
+                                     SHIM_MMAP_CTRL_NO_FAST_MUNMAP,
+                                     memory_order_release);
+    }
+}
+
+static void mmap_fastpath_drain_publications_locked(guest_t *g,
+                                                    uint64_t slots)
 {
     if (!g || !g->host_base)
         return;
 
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
         shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
         uint32_t head = atomic_load_explicit(&c->head, memory_order_relaxed);
         uint32_t tail = atomic_load_explicit(&c->tail, memory_order_acquire);
@@ -288,6 +332,27 @@ static void mmap_fastpath_drain_publications_locked(guest_t *g)
                 &c->ring[head & (SHIM_MMAP_RING_SIZE - 1)];
             uint64_t addr = e->addr;
             uint64_t len = e->len;
+            if (e->prot & SHIM_MMAP_ENTRY_MPROTECT) {
+                uint64_t prot = e->prot & ~SHIM_MMAP_ENTRY_MPROTECT;
+                if ((addr & (GUEST_PAGE_SIZE - 1)) ||
+                    len != GUEST_PAGE_SIZE || addr < arena_base ||
+                    addr > arena_limit || len > arena_limit - addr ||
+                    (prot != LINUX_PROT_READ &&
+                     prot != (LINUX_PROT_READ | LINUX_PROT_WRITE))) {
+                    log_fatal(
+                        "mprotect fast path: invalid entry in vCPU slot %d "
+                        "(addr=0x%llx len=0x%llx prot=0x%llx)",
+                        slot, (unsigned long long) addr,
+                        (unsigned long long) len,
+                        (unsigned long long) prot);
+                }
+                guest_region_set_prot(g, addr, addr + len, (int) prot);
+                if (prot & LINUX_PROT_WRITE)
+                    guest_dirty_mark_range(g, addr, addr + len);
+                guest_pt_gen_bump(g);
+                head++;
+                continue;
+            }
             if ((addr & (GUEST_PAGE_SIZE - 1)) || !len ||
                 (len & (GUEST_PAGE_SIZE - 1)) || addr < arena_base ||
                 addr > arena_limit || len > arena_limit - addr ||
@@ -466,16 +531,21 @@ void mmap_fastpath_drain_locked(guest_t *g)
      * then publication drain establishes A's semantic region before removal.
      */
     uint32_t retire_tails[MAX_THREADS];
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
+    uint64_t active_slots = mmap_fastpath_active_slots(g);
+    uint64_t slots = active_slots;
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
         shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
         retire_tails[slot] =
             atomic_load_explicit(&c->retire.tail, memory_order_acquire);
     }
 
-    mmap_fastpath_drain_publications_locked(g);
+    mmap_fastpath_drain_publications_locked(g, active_slots);
 
     bool retired_any = false;
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
+    slots = active_slots;
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
         shim_mmap_control_t *producer = mmap_fastpath_control(g, slot);
         uint32_t head =
             atomic_load_explicit(&producer->retire.head, memory_order_relaxed);
@@ -616,7 +686,9 @@ void mmap_fastpath_drain_locked(guest_t *g)
      * envelope after the first commit would make later entries in the same
      * snapshot lose their backing bounds.  Restore the PTE-empty proof only
      * after every snapshotted retirement has consumed the old envelope. */
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
+    slots = active_slots;
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
         shim_mmap_control_t *arena = mmap_fastpath_control(g, slot);
         if (!(atomic_load_explicit(&arena->flags, memory_order_relaxed) &
               SHIM_MMAP_CTRL_ENABLED))
@@ -716,7 +788,9 @@ void mmap_fastpath_note_materialized_locked(guest_t *g,
 {
     if (!g || end <= start)
         return;
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
+    uint64_t slots = mmap_fastpath_active_slots(g);
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
         shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
         if (!(atomic_load_explicit(&c->flags, memory_order_relaxed) &
               SHIM_MMAP_CTRL_ENABLED))
@@ -815,11 +889,12 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
 {
     if (!t || t->sp_el1_slot < 0)
         return;
-    shim_mmap_control_t *c = mmap_fastpath_control(g, t->sp_el1_slot);
+    int slot = t->sp_el1_slot;
+    shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
     if (!c)
         return;
     if (!mmap_fastpath_available(g)) {
-        mmap_fastpath_disable_control(c);
+        mmap_fastpath_disable_control(g, slot);
         return;
     }
 
@@ -879,12 +954,12 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
 
     if (!recycled) {
         if (g->mmap_next > UINT64_MAX - (BLOCK_2MIB - 1)) {
-            mmap_fastpath_disable_control(c);
+            mmap_fastpath_disable_control(g, slot);
             return;
         }
         base = ALIGN_UP(g->mmap_next, BLOCK_2MIB);
         if (base > g->mmap_limit || arena_size > g->mmap_limit - base) {
-            mmap_fastpath_disable_control(c);
+            mmap_fastpath_disable_control(g, slot);
             return;
         }
     }
@@ -896,7 +971,7 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
      */
     if (recycled || base < g->mmap_end) {
         if (guest_invalidate_ptes(g, base, new_limit) < 0) {
-            mmap_fastpath_disable_control(c);
+            mmap_fastpath_disable_control(g, slot);
             return;
         }
     }
@@ -936,6 +1011,8 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
     atomic_store_explicit(&c->consumer_generation, generation,
                           memory_order_relaxed);
     atomic_store_explicit(&c->generation, generation, memory_order_release);
+    atomic_fetch_or_explicit(&g->mmap_fastpath_active_slots, BIT64(slot),
+                             memory_order_release);
 }
 
 void mmap_fastpath_refill_current_locked(guest_t *g, uint64_t request_len)
@@ -1008,7 +1085,10 @@ bool mmap_fastpath_allocate_current_publication_only(guest_t *g,
     if (!gate || atomic_load_explicit(gate, memory_order_acquire) != 0)
         goto miss;
 
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
+    uint64_t slots = mmap_fastpath_active_slots(g);
+    uint64_t pending_slots = slots;
+    while (pending_slots) {
+        int slot = mmap_fastpath_pop_slot(&pending_slots);
         shim_mmap_control_t *producer = mmap_fastpath_control(g, slot);
         uint32_t head = atomic_load_explicit(&producer->retire.head,
                                              memory_order_relaxed);
@@ -1018,7 +1098,7 @@ bool mmap_fastpath_allocate_current_publication_only(guest_t *g,
             goto miss;
     }
 
-    mmap_fastpath_drain_publications_locked(g);
+    mmap_fastpath_drain_publications_locked(g, slots);
 
     shim_mmap_control_t *c =
         mmap_fastpath_control(g, current_thread->sp_el1_slot);
@@ -1095,7 +1175,7 @@ void mmap_fastpath_release_current_hint_locked(guest_t *g,
      * the explicit hint must take precedence over every EL1-reserved hole, and
      * the post-syscall refill will provision a new non-overlapping arena.
      */
-    mmap_fastpath_disable_control(c);
+    mmap_fastpath_disable_control(g, current_thread->sp_el1_slot);
 }
 
 /* Reuse a fully released arena in place. mmap_lock acquisition has drained
@@ -1163,8 +1243,11 @@ void mmap_fastpath_prepare_vcpu(guest_t *g, thread_entry_t *t)
 void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water)
 {
     mmap_fastpath_drain_locked(g);
-    for (int slot = 0; slot < MAX_THREADS; slot++)
-        mmap_fastpath_disable_control(mmap_fastpath_control(g, slot));
+    uint64_t slots = mmap_fastpath_active_slots(g);
+    while (slots) {
+        int slot = mmap_fastpath_pop_slot(&slots);
+        mmap_fastpath_disable_control(g, slot);
+    }
 
     if (!shrink_high_water)
         return;
@@ -1177,33 +1260,6 @@ void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water)
     g->mmap_next = high;
     if (g->mmap_rw_gap_hint > high)
         g->mmap_rw_gap_hint = high;
-}
-
-void mmap_fastpath_revoke_range_locked(guest_t *g,
-                                       uint64_t start,
-                                       uint64_t end)
-{
-    if (!g || end <= start)
-        return;
-
-    /* mmap_lock_acquire() closed the producer gate and drained every ring
-     * before the syscall reached this point. An arena outside the edited VA
-     * range retains the same anonymous/noreserve classification and can keep
-     * serving its owner; only an overlapping arena could let a later EL1
-     * munmap act on metadata changed by this mprotect.
-     */
-    for (int slot = 0; slot < MAX_THREADS; slot++) {
-        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
-        if (!(atomic_load_explicit(&c->flags, memory_order_relaxed) &
-              SHIM_MMAP_CTRL_ENABLED))
-            continue;
-        uint64_t base =
-            atomic_load_explicit(&c->arena_base, memory_order_relaxed);
-        uint64_t limit =
-            atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
-        if (start < limit && end > base)
-            mmap_fastpath_disable_control(c);
-    }
 }
 
 void mmap_fastpath_disable(guest_t *g)
@@ -1229,7 +1285,9 @@ void mmap_fastpath_skip_reserved(const guest_t *g,
         if (*start > max_addr || length > max_addr - *start)
             return;
         uint64_t end = *start + length;
-        for (int slot = 0; slot < MAX_THREADS; slot++) {
+        uint64_t slots = mmap_fastpath_active_slots(g);
+        while (slots) {
+            int slot = mmap_fastpath_pop_slot(&slots);
             shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
             if (!(atomic_load_explicit(&c->flags, memory_order_acquire) &
                   SHIM_MMAP_CTRL_ENABLED))
@@ -5147,11 +5205,12 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
     if (addr > UINT64_MAX - length)
         return -LINUX_EINVAL;
 
-    /* Permission and VMA-shape changes are slow-path boundaries.  Retire any
-     * already-published unmaps, then invalidate arena generations before the
-     * metadata/PTE edit so EL1 cannot act on the old anonymous classification.
+    /* mmap_lock acquisition already drained EL1 publications. Permission-only
+     * edits do not change an arena mapping's private/anonymous/noreserve
+     * classification, so keep its control enabled: once this call has created
+     * an L3 table, later single-page R<->RW transitions can stay in EL1.
      */
-    mmap_fastpath_revoke_range_locked(g, addr, addr + length);
+    mmap_fastpath_mark_mprotect_locked(g, addr, addr + length);
 
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
         if (addr >= g->guest_size) {

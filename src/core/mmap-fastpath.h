@@ -24,6 +24,11 @@ typedef struct thread_entry thread_entry_t;
 #define SHIM_MMAP_RING_SIZE 32u
 #define SHIM_MMAP_CTRL_ENABLED 0x1u
 #define SHIM_MMAP_CTRL_TLBIRANGE 0x2u
+/* Host mprotect changed region/PTE shape inside this arena. mmap remains safe,
+ * and EL1 mprotect validates L3 directly, but fast munmap falls back so its
+ * cleanup is not deferred across the changed metadata.
+ */
+#define SHIM_MMAP_CTRL_NO_FAST_MUNMAP 0x4u
 
 /* Host page-table writers set this gate before changing an arena descriptor or
  * a stage-1 PTE.  Each EL1 producer announces itself in its private control
@@ -42,6 +47,11 @@ typedef struct thread_entry thread_entry_t;
 
 #define SHIM_MMAP_REUSE_RING_SIZE 32u
 #define SHIM_MMAP_REUSE_OFF 0x720u
+
+/* The mmap publication ring also carries completed EL1 single-page mprotect
+ * metadata updates. The tag lives outside the Linux PROT_* namespace.
+ */
+#define SHIM_MMAP_ENTRY_MPROTECT (1ULL << 63)
 
 #define MMAP_FAST_ARENA_MIN (64ULL * 1024 * 1024)
 #define MMAP_FAST_ARENA_MAX (32ULL * 1024 * 1024 * 1024)
@@ -186,14 +196,6 @@ void mmap_fastpath_release_current_hint_locked(guest_t *g,
 /* Revoke all arenas while sibling vCPUs are quiesced. Caller holds mmap_lock.
  */
 void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water);
-
-/* Revoke only arenas whose reserved VA span intersects [start, end). The
- * caller holds mmap_lock, whose acquisition has already drained publication
- * and retirement rings and closed the EL1 page-table gate.
- */
-void mmap_fastpath_revoke_range_locked(guest_t *g,
-                                       uint64_t start,
-                                       uint64_t end);
 
 /* Disable the feature before first guest entry (debugger/observability). */
 void mmap_fastpath_disable(guest_t *g);

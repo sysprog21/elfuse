@@ -647,12 +647,28 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
         c->max_len_seen = request_len;
 
     uint64_t cursor = atomic_load_explicit(&c->cursor, memory_order_relaxed);
+    uint64_t arena_base =
+        atomic_load_explicit(&c->arena_base, memory_order_relaxed);
     uint64_t limit =
         atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
     uint32_t flags = atomic_load_explicit(&c->flags, memory_order_relaxed);
+    uint64_t arena_size =
+        mmap_fastpath_arena_size(c->max_len_seen, request_len);
     if ((flags & SHIM_MMAP_CTRL_ENABLED) &&
-        mmap_fastpath_request_fits(cursor, limit, request_len))
-        return;
+        mmap_fastpath_request_fits(cursor, limit, request_len)) {
+        /* A capacity miss enters HVC, whose drain can rewind a completely
+         * retired arena before this refill check.  Retaining that undersized
+         * arena merely because one more request fits makes the same miss recur
+         * every few operations and turns mmap latency into a periodic sawtooth.
+         * Grow an empty arena to the adaptive target; never relocate one that
+         * still contains allocations served by the current generation.
+         */
+        bool empty = cursor == arena_base;
+        bool target_sized = arena_base <= limit &&
+                            limit - arena_base >= arena_size;
+        if (!empty || target_sized)
+            return;
+    }
 
     /* The owner is parked in HVC. Make the stranded tail immediately recyclable
      * before the gap scan; mappings already served from the prefix were drained
@@ -660,9 +676,6 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
      */
     if (flags & SHIM_MMAP_CTRL_ENABLED)
         atomic_store_explicit(&c->cursor, limit, memory_order_relaxed);
-
-    uint64_t arena_size =
-        mmap_fastpath_arena_size(c->max_len_seen, request_len);
 
     /* Prefer a real hole below the current high-water mark. Active sibling
      * arena tails are excluded by mmap_fastpath_skip_reserved inside the gap

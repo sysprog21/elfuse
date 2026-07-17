@@ -444,6 +444,13 @@ static int run_stats_case(const char *name)
          */
         return stats_stream(500ULL << 20, 34, false);
     }
+    if (strcmp(name, "adaptive-rewind-growth") == 0)
+        /* The first 64MiB arena holds eight 8MiB mappings.  The ninth mmap
+         * takes the capacity fallback after the matching munmaps let host
+         * drain rewind the arena; refill must grow it to the 32-entry target
+         * instead of retaining an arena that will miss every eight calls.
+         */
+        return stats_stream(8ULL << 20, 41, true);
     if (strcmp(name, "recycle") == 0)
         return stats_stream(64ULL << 10, 6000, true);
     return 2;

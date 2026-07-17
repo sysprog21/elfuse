@@ -109,6 +109,11 @@ require_eq adaptive-retention MMAP_ARENA_CURRENT 17179869184
 require_eq adaptive-retention MMAP_ARENA_PEAK 17179869184
 printf '  large arena retained           OK\n'
 
+run_case adaptive-rewind-growth
+require_ge adaptive-rewind-growth MMAP_CAPACITY_MISS 1
+require_eq adaptive-rewind-growth MMAP_ARENA_CURRENT 268435456
+printf '  rewound arena grows to target  OK\n'
+
 run_case recycle
 require_ge recycle MMAP_RECYCLE 1
 require_le recycle MMAP_HIGH_WATER 201326592

@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -86,6 +87,7 @@ static double sorted_quantile(const double *v, unsigned n, double p)
 #define KIB (1ULL << 10)
 #define MIB (1ULL << 20)
 #define GIB (1ULL << 30)
+#define DIRTY_VMEXIT_STRIDE (8 * MIB)
 
 /* The counter is too coarse to time a single mmap reliably.  A section-A
  * sample therefore repeats independent mmap -> munmap pairs until the
@@ -587,9 +589,9 @@ static void bench_munmap_materialized(void)
  * dirty mapping.  Each size has a fixed operation count and every munmap is
  * retained separately.  In particular, one slow first operation cannot end an
  * adaptive batch and become the whole sample.  Counts decrease with size to
- * bound total dirtying work.  The 1-GiB case uses eight operations so its
- * untimed page stores remain below elfuse's vCPU watchdog; interpolated p95
- * still remains distinct from the separately reported maximum.
+ * bound total dirtying work.  The 1-GiB case uses eight operations, and the
+ * untimed store loop takes periodic VM exits so every vCPU-run interval stays
+ * below elfuse's watchdog; interpolated p95 remains distinct from max.
  */
 static void bench_munmap_dirty(void)
 {
@@ -623,8 +625,23 @@ static void bench_munmap_dirty(void)
                 ok = 0;
                 break;
             }
-            for (uint64_t off = 0; off < size; off += 4 * KIB)
+            for (uint64_t off = 0; off < size; off += 4 * KIB) {
                 p[off] = (uint8_t) (off >> 12);
+                /* Large already-backed runs can execute in EL0 long enough
+                 * for the benchmark's 10-second vCPU watchdog to fire under
+                 * macOS memory pressure.  This deliberately failing fcntl is
+                 * a guaranteed, side-effect-free HVC outside the timed region.
+                 * It also drains the preceding retirement in bounded chunks.
+                 */
+                if (off != 0 && (off & (DIRTY_VMEXIT_STRIDE - 1)) == 0)
+                    (void) fcntl(-1, F_GETFD);
+            }
+
+            /* Establish an identical clean host-retirement boundary before
+             * every measurement.  The interval below then contains EL1's
+             * descriptor/TLBI path, never the previous operation's cleanup.
+             */
+            (void) fcntl(-1, F_GETFD);
 
             uint64_t t0 = rd();
             int rc = munmap((void *) p, size);
@@ -659,6 +676,18 @@ static void bench_munmap_dirty(void)
 int main(int argc, char **argv)
 {
     clock_init();
+    if (argc == 2 && strcmp(argv[1], "a") == 0) {
+        printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n",
+               ns_per_tick);
+        bench_size_sweep();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "h") == 0) {
+        printf("elfuse mmap benchmark (CNTVCT %.2f ns/tick)\n\n",
+               ns_per_tick);
+        bench_munmap_dirty();
+        return 0;
+    }
     if (argc == 4 && strcmp(argv[1], "fresh") == 0) {
         char *end = NULL;
         errno = 0;

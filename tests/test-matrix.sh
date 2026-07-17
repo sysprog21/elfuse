@@ -644,8 +644,9 @@ test_pipe()
 #
 # This is the full aarch64 unit-test surface: every tests/manifest.txt ("make
 # check") binary except the handful that assert elfuse-internal implementation
-# details with no meaningful counterpart on a real kernel. Test-shim-* and
-# test-shim-cred-race probe elfuse's own shim_data block and identity cache;
+# details with no meaningful counterpart on a real kernel. Most test-shim-*
+# binaries probe elfuse's own shim_data block and identity cache;
+# test-shim-futex-fast is included because it asserts Linux futex semantics.
 # test-mmap-fastpath probes elfuse's arena and TLBI protocol; test-mremap-infra
 # guards elfuse's guest-IPA infra reserve; test-oom-proc documents its reason in
 # its own header. test-mremap-tail-emfile is listed here as an elfuse-lane

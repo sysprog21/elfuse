@@ -191,7 +191,7 @@ int fork_ipc_recv_fds(int sock, int *fds, int max_count, int *out_count)
     return 0;
 }
 
-int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm)
+int fork_ipc_send_memory_regions(int ipc_sock, guest_t *g, bool use_shm)
 {
     if (use_shm) {
         uint32_t zero_regions = 0;
@@ -202,7 +202,7 @@ int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm)
 #define MAX_USED_REGIONS 16
     used_region_t used[MAX_USED_REGIONS];
     unsigned int shim_sz = proc_get_shim_size();
-    mmap_lock_acquire((guest_t *) (uintptr_t) g);
+    mmap_lock_acquire(g);
     int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
     mmap_lock_release();
 

@@ -1179,6 +1179,33 @@ void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water)
         g->mmap_rw_gap_hint = high;
 }
 
+void mmap_fastpath_revoke_range_locked(guest_t *g,
+                                       uint64_t start,
+                                       uint64_t end)
+{
+    if (!g || end <= start)
+        return;
+
+    /* mmap_lock_acquire() closed the producer gate and drained every ring
+     * before the syscall reached this point. An arena outside the edited VA
+     * range retains the same anonymous/noreserve classification and can keep
+     * serving its owner; only an overlapping arena could let a later EL1
+     * munmap act on metadata changed by this mprotect.
+     */
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        shim_mmap_control_t *c = mmap_fastpath_control(g, slot);
+        if (!(atomic_load_explicit(&c->flags, memory_order_relaxed) &
+              SHIM_MMAP_CTRL_ENABLED))
+            continue;
+        uint64_t base =
+            atomic_load_explicit(&c->arena_base, memory_order_relaxed);
+        uint64_t limit =
+            atomic_load_explicit(&c->arena_limit, memory_order_relaxed);
+        if (start < limit && end > base)
+            mmap_fastpath_disable_control(c);
+    }
+}
+
 void mmap_fastpath_disable(guest_t *g)
 {
     atomic_store_explicit(&mmap_fastpath_forced_off, true,
@@ -5124,7 +5151,7 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
      * already-published unmaps, then invalidate arena generations before the
      * metadata/PTE edit so EL1 cannot act on the old anonymous classification.
      */
-    mmap_fastpath_revoke_all_locked(g, false);
+    mmap_fastpath_revoke_range_locked(g, addr, addr + length);
 
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
         if (addr >= g->guest_size) {

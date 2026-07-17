@@ -187,6 +187,14 @@ void mmap_fastpath_release_current_hint_locked(guest_t *g,
  */
 void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water);
 
+/* Revoke only arenas whose reserved VA span intersects [start, end). The
+ * caller holds mmap_lock, whose acquisition has already drained publication
+ * and retirement rings and closed the EL1 page-table gate.
+ */
+void mmap_fastpath_revoke_range_locked(guest_t *g,
+                                       uint64_t start,
+                                       uint64_t end);
+
 /* Disable the feature before first guest entry (debugger/observability). */
 void mmap_fastpath_disable(guest_t *g);
 

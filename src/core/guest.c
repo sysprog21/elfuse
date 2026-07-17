@@ -171,11 +171,13 @@ static int compute_infra_layout(guest_t *g)
     return 0;
 }
 
-/* Allocate a zeroed 4KiB page from the page table pool.
- * Returns GPA of the page, or 0 on pool exhaustion. Acquires pt_lock
- * internally. Caller typically holds mmap_lock.
+/* Allocate a 4KiB page from the page table pool. Returns its GPA, or 0 on
+ * exhaustion. Acquires pt_lock internally; caller typically holds mmap_lock.
+ * Most callers need a zero-filled page because they publish only some entries.
+ * split_l2_block instead overwrites all 512 entries before publication and can
+ * skip the redundant clear.
  */
-static uint64_t pt_alloc_page(guest_t *g)
+static uint64_t pt_alloc_page_impl(guest_t *g, bool clear)
 {
     pthread_mutex_lock(&pt_lock);
     if (g->pt_pool_next + PAGE_SIZE > g->pt_pool_end) {
@@ -202,12 +204,20 @@ static uint64_t pt_alloc_page(guest_t *g)
         pt_pool_warned = true;
     }
 
-    /* Zero the page while still holding the lock so no other thread can observe
-     * a partially-zeroed page table page.
-     */
-    memset((uint8_t *) g->host_base + gpa, 0, PAGE_SIZE);
+    if (clear)
+        memset((uint8_t *) g->host_base + gpa, 0, PAGE_SIZE);
     pthread_mutex_unlock(&pt_lock);
     return gpa;
+}
+
+static uint64_t pt_alloc_page(guest_t *g)
+{
+    return pt_alloc_page_impl(g, true);
+}
+
+static uint64_t pt_alloc_page_uninitialized(guest_t *g)
+{
+    return pt_alloc_page_impl(g, false);
 }
 
 /* Get host pointer to a page table entry array at a given GPA */
@@ -3333,7 +3343,7 @@ static int split_l2_block(guest_t *g, uint64_t *l2_entry)
 
     int old_perms = desc_to_perms(*l2_entry);
 
-    uint64_t l3_gpa = pt_alloc_page(g);
+    uint64_t l3_gpa = pt_alloc_page_uninitialized(g);
     if (!l3_gpa)
         return -1;
     uint64_t *l3 = pt_at(g, l3_gpa);

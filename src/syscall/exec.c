@@ -1744,6 +1744,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * executing the old image's code, winds down against the memory and fd
      * table its guest still expects.
      */
+
     /* Teardown must run without mmap_lock: a sibling blocked in an mmap-family
      * syscall or its deferred stack unmap cannot reach a stop check while the
      * lock is held. sys_execve acquires the lock below, immediately before the
@@ -1822,9 +1823,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     }
 
     /* Input copying above may fault in argv/env strings from lazy anonymous
-     * mappings, so it must run without mmap_lock held. Serialize only after
-     * all recoverable validation is complete and immediately before replacing
-     * the guest address space. From this point every failure is fatal and both
+     * mappings, so it must run without mmap_lock held. Serialize only after all
+     * recoverable validation is complete and immediately before replacing the
+     * guest address space. From this point every failure is fatal and both
      * successful return paths release the lock explicitly.
      */
     mmap_lock_acquire(g);

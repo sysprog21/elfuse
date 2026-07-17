@@ -1,11 +1,11 @@
 /*
- * Freestanding EL1 mmap fast path.
+ * Freestanding EL1 mmap-family fast paths.
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
  * The assembly exception shim owns the saved-register frame and calls this
- * module only for mmap.  A true return means X0 in the saved
+ * module only for mmap-family syscalls. A true return means X0 in the saved
  * frame contains the completed syscall result; false asks the shim to forward
  * the original frame to HVC #5 unchanged.
  */

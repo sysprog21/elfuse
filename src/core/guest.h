@@ -355,8 +355,8 @@ typedef enum {
 #define RVAE_OPERAND_TG_4KB (1ULL << 46)
 
 /* Pure encoder: build the TLBI RVAE1IS Xt operand from a 4 KiB-aligned VA and a
- * page count in the supported SCALE=0..2 range. Lives in the header so the
- * emit path and host unit tests use the same expression. Each NUM step covers
+ * page count in the supported SCALE=0..2 range. Lives in the header so the emit
+ * path and host unit tests use the same expression. Each NUM step covers
  * 2^(5*SCALE+1) pages; the normalizer aligns and widens callers to that unit.
  * pages < 2 is clamped to 2 because SCALE=0 NUM=0 is the smallest encodable
  * range. Single-page callers normally use VAE1IS instead.
@@ -395,7 +395,8 @@ typedef struct {
     uint8_t icache_flush; /* 1 = the change introduced executable content
                            *     visible to EL0, so the shim must IC IALLU
                            *     after the TLBI sequence. 0 = data-only
-                           *     change, skip the I-cache invalidation. */
+                           *     change, skip the I-cache invalidation.
+                           */
     uint16_t pages;       /* Page count for either range kind (1..MAX) */
     uint64_t start;       /* Page-aligned VA for either range kind */
 } tlbi_request_t;
@@ -457,6 +458,18 @@ typedef struct {
 #define GUEST_DIRTY_BLOCKS_MAX ((1ULL << 40) / BLOCK_2MIB)
 #define GUEST_DIRTY_WORDS (GUEST_DIRTY_BLOCKS_MAX / 64)
 
+/* Host-side occupancy index for low-VA TTBR0 mappings. One bit per 2 MiB block
+ * records whether that block contains at least one valid L2/L3 PTE; a
+ * second-level bitmap records which occupancy words are non-zero. This lets
+ * huge lazy mmap/munmap ranges skip untouched address space without walking one
+ * page-table slot per GiB. The index is separate from dirty_blocks: a read-only
+ * mapping can have valid PTEs without dirty backing bytes.
+ */
+#define GUEST_PTE_PRESENT_BLOCKS_MAX GUEST_DIRTY_BLOCKS_MAX
+#define GUEST_PTE_PRESENT_WORDS (GUEST_PTE_PRESENT_BLOCKS_MAX / 64)
+#define GUEST_PTE_PRESENT_SUMMARY_WORDS (GUEST_PTE_PRESENT_WORDS / 64)
+#define GUEST_PTE_PRESENT_LIMIT (GUEST_PTE_PRESENT_BLOCKS_MAX * BLOCK_2MIB)
+
 enum {
     GUEST_MATERIALIZE_CLEAN_SKIP = 0,
     GUEST_MATERIALIZE_DIRTY_MEMSET,
@@ -467,8 +480,8 @@ enum {
 
 /* Dirty-block zeroing claims. A claim makes its block's invalid PTE window
  * stable while the expensive host memset runs without mmap_lock. Waiters use
- * one guest-wide condition variable; the fixed table bounds host allocation
- * and is ample for the vCPU limit.
+ * one guest-wide condition variable; the fixed table bounds host allocation and
+ * is ample for the vCPU limit.
  */
 #define GUEST_MATERIALIZE_CLAIMS 64
 typedef struct {
@@ -603,6 +616,8 @@ typedef struct {
      */
     _Atomic uint64_t pt_gen;
 
+    uint64_t pte_present_blocks[GUEST_PTE_PRESENT_WORDS];
+    uint64_t pte_present_summary[GUEST_PTE_PRESENT_SUMMARY_WORDS];
     uint64_t dirty_blocks[GUEST_DIRTY_WORDS];
     uint64_t materialize_stats[GUEST_MATERIALIZE_STATS_N];
     guest_materialize_claim_t materialize_claims[GUEST_MATERIALIZE_CLAIMS];
@@ -1102,10 +1117,21 @@ int guest_install_va_pages(guest_t *g,
                            uint64_t gpa,
                            int perms);
 
-/* Query whether a 2 MiB TTBR0 VA block already has any L2 entry, either a
- * block descriptor or an L3 table descriptor.
+/* Query whether a 2 MiB TTBR0 VA block already has any L2 entry, either a block
+ * descriptor or an L3 table descriptor.
  */
 bool guest_va_block_mapped(const guest_t *g, uint64_t va);
+
+/* Rebuild the low-VA PTE occupancy index from TTBR0. Used after fork restores
+ * page-table pages into a freshly initialized guest_t.
+ */
+void guest_rebuild_pte_present(guest_t *g);
+
+/* Reconcile the host-only 2 MiB occupancy index after EL1 has invalidated
+ * descriptors in [start,end). This observes PTEs only; it never writes a
+ * descriptor or requests another TLBI. Caller holds mmap_lock.
+ */
+void guest_retire_ptes_committed(guest_t *g, uint64_t start, uint64_t end);
 
 /* Returns true when the VA range [va, va+size) overlaps the user-VA kbuf alias
  * window [KBUF_USER_VA, KBUF_USER_VA+KBUF_SIZE). Callers that install TTBR0
@@ -1135,7 +1161,7 @@ static inline bool guest_kbuf_user_va_overlap(uint64_t va, uint64_t size)
 void *guest_ptr(const guest_t *g, uint64_t gva);
 
 /* Like guest_ptr_avail but never triggers lazy fault-in. For callers that
- * already hold mmap_lock.
+ * already hold mmap_lock or must avoid acquiring it.
  */
 void *guest_ptr_avail_nofault(const guest_t *g,
                               uint64_t gva,
@@ -1143,24 +1169,25 @@ void *guest_ptr_avail_nofault(const guest_t *g,
                               int required_perms);
 
 /* Materialize any lazy (deferred-PTE) blocks intersecting [gva, gva+len) so
- * later resolves under locks that rank after mmap_lock (futex buckets) do
- * not have to. Takes mmap_lock; call only from lock-free context. Returns 0
- * if anything was (or already is) materialized, -1 otherwise; callers that
- * merely pre-fault can ignore the result.
+ * later resolves under locks that rank after mmap_lock (futex buckets) do not
+ * have to. Takes mmap_lock; call only from lock-free context.
+ *
+ * Returns 0 if anything was (or already is) materialized, -1 otherwise; callers
+ * that merely pre-fault can ignore the result.
  */
 int guest_lazy_faultin(const guest_t *g, uint64_t gva, uint64_t len);
 
 /* Same as guest_lazy_faultin for callers that already hold mmap_lock (e.g.
- * SC_LOCKED syscall handlers about to guest_read/guest_write a lazy range:
- * the resolve-time hook would self-deadlock re-acquiring mmap_lock, so they
- * must materialize up front through this variant).
+ * SC_LOCKED syscall handlers about to guest_read/guest_write a lazy range: the
+ * resolve-time hook would self-deadlock re-acquiring mmap_lock, so they must
+ * materialize up front through this variant).
  */
 int guest_lazy_faultin_locked(const guest_t *g, uint64_t gva, uint64_t len);
 
-/* Smallest block-aligned va' in [va, end) whose 1GiB L1 slot is present in
- * the page tables, or end if none. Lets range walkers skip absent 1GiB /
- * 512GiB slots in O(1) instead of probing every 2MiB block. Locking: callers
- * MUST hold mmap_lock.
+/* Smallest 2MiB-block-aligned va' in [va, end) containing at least one valid
+ * TTBR0 PTE, or end if none. Low VA uses the host-side hierarchical occupancy
+ * bitmap; non-identity/high VA falls back to the page-table hierarchy. Locking:
+ * callers MUST hold mmap_lock.
  */
 uint64_t guest_va_next_present_block(const guest_t *g,
                                      uint64_t va,
@@ -1506,18 +1533,17 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
                                               uint64_t start,
                                               uint64_t end);
 
-/* Try to materialize a lazy (deferred-PTE: private anonymous or
- * MAP_NORESERVE) page at the given offset. Called from the data/instruction
- * abort handler when the faulting address falls within a lazy region, and
- * from the host-access fault-in path when a syscall targets a lazy range the
- * guest has not touched yet. Creates page table entries for one 2MiB block
- * containing the fault address. A slab block known to be clean skips zeroing;
- * a possibly-dirty block zeros invalid pages before publishing them. A block
- * that is already valid returns success without re-zeroing
- * (concurrent-fault idempotence).
- * Returns 0 on success (caller should TLBI and retry), -1 if the offset is
- * not in a lazy region or the region is PROT_NONE.
- * Locking: callers MUST hold mmap_lock.
+/* Try to materialize a lazy (deferred-PTE: private anonymous or MAP_NORESERVE)
+ * page at the given offset. Called from the data/instruction abort handler when
+ * the faulting address falls within a lazy region, and from the host-access
+ * fault-in path when a syscall targets a lazy range the guest has not touched
+ * yet. Creates page table entries for one 2MiB block containing the fault
+ * address. A slab block known to be clean skips zeroing; a possibly-dirty block
+ * zeros invalid pages before publishing them. A block that is already valid
+ * returns success without re-zeroing (concurrent-fault idempotence).
+ * Returns 0 on success (caller should TLBI and retry), -1 if the offset is not
+ * in a lazy region or the region is PROT_NONE. Locking: callers MUST hold
+ * mmap_lock.
  */
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset);
 
@@ -1533,7 +1559,7 @@ void guest_materialize_wait_range_locked(guest_t *g,
                                          uint64_t end);
 void guest_materialize_wait_all_locked(guest_t *g);
 
-/* Whether the 4KiB page containing va has a valid stage-1 descriptor.
- * Locking: callers MUST hold mmap_lock.
+/* Whether the 4KiB page containing va has a valid stage-1 descriptor. Locking:
+ * callers MUST hold mmap_lock.
  */
 bool guest_va_pte_valid(guest_t *g, uint64_t va);

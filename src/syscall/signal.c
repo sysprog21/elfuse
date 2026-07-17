@@ -60,12 +60,14 @@
 #include "hvutil.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 #include "core/vdso.h"
 
 #include "runtime/thread.h"
 
 #include "syscall/linux-wire.h"
-#include "syscall/fd.h"   /* signalfd_notify */
+#include "syscall/fd.h" /* signalfd_notify */
+#include "syscall/internal.h"
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
 #include "proved/sigframe.h"
 #include "syscall/signal.h"
@@ -1987,6 +1989,14 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva)
              */
             if (ss.ss_sp > UINT64_MAX - ss.ss_size)
                 return -LINUX_EINVAL;
+
+            /* Alternate stacks have the same lifetime sensitivity as clone
+             * stacks: once registered, their unmap must take the host path
+             * instead of being classified only as an anonymous arena range.
+             */
+            mmap_lock_acquire(g);
+            mmap_fastpath_revoke_all_locked(g, false);
+            mmap_lock_release();
             t->altstack_sp = ss.ss_sp;
             t->altstack_flags = 0;
             t->altstack_size = ss.ss_size;
@@ -2123,7 +2133,8 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         pthread_mutex_unlock(&sig_lock);
         return 0;
     }
-    linux_sigaction_t *act = &sig_state.actions[idx];
+    linux_sigaction_t action = sig_state.actions[idx];
+    const linux_sigaction_t *act = &action;
 
     /* Check handler type */
     if (act->sa_handler == LINUX_SIG_IGN) {
@@ -2152,6 +2163,15 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
             return 0; /* Ignore (STOP/CONT not meaningful for elfuse) */
         }
     }
+
+    /* Snapshot and reset the action before dropping sig_lock. Guest-memory
+     * access below may fault in lazy pages and acquire mmap_lock.
+     */
+    if (act->sa_flags & LINUX_SA_RESETHAND) {
+        sig_state.actions[idx].sa_handler = LINUX_SIG_DFL;
+        sig_state.actions[idx].sa_flags &= ~LINUX_SA_SIGINFO;
+    }
+    pthread_mutex_unlock(&sig_lock);
 
     /* Deliver to user handler: build rt_sigframe on guest stack */
 
@@ -2206,7 +2226,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
             hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, saved_pc);
         if (rseq_rc == -1) {
             *exit_code = 128 + 11; /* SIGSEGV */
-            pthread_mutex_unlock(&sig_lock);
             return -1;
         }
     }
@@ -2320,7 +2339,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
             (unsigned long long) (use_altstack && thr ? thr->altstack_sp : 0),
             signum);
         *exit_code = 128 + signum;
-        pthread_mutex_unlock(&sig_lock);
         return -1;
     }
 
@@ -2346,7 +2364,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         if (pushed_cookie)
             sigreturn_cookie_depth--;
         *exit_code = 128 + signum;
-        pthread_mutex_unlock(&sig_lock);
         return -1;
     }
 
@@ -2405,12 +2422,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     if (use_altstack && thr)
         thr->on_altstack = true;
 
-    /* 7. Reset to SIG_DFL if SA_RESETHAND is set */
-    if (act->sa_flags & LINUX_SA_RESETHAND) {
-        act->sa_handler = LINUX_SIG_DFL;
-        act->sa_flags &= ~LINUX_SA_SIGINFO;
-    }
-
     /* If delivery happens while returning from the syscall HVC path, the shim
      * still has the interrupted syscall frame on its EL1 stack. Tell it to drop
      * that frame so the handler PC/SP/LR/args installed above are not
@@ -2423,7 +2434,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     if (!el0_preempt)
         hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
 
-    pthread_mutex_unlock(&sig_lock);
     return 1;
 }
 
@@ -2441,31 +2451,6 @@ int signal_take_termination_wait_status(void)
     return status;
 }
 
-/* Pre-fault the candidate signal-frame windows (current stack and altstack
- * top) before sig_lock is taken. The frame write in deliver_signal_locked
- * runs under sig_lock; letting it materialize lazy stack pages there would
- * acquire mmap_lock in descending lock order. The pre-fault is advisory --
- * the write path still faults in as a backstop -- but it makes the
- * under-lock engagement unreachable in practice. Reading the altstack
- * fields without sig_lock is benign for the same reason.
- */
-static void signal_prefault_frame(hv_vcpu_t vcpu, guest_t *g)
-{
-    /* Worst-case alignment slack the frame can cost, matching the static_assert
-     * above: a larger margin would exceed LINUX_MINSIGSTKSZ and silently skip
-     * prefaulting a minimum-sized altstack.
-     */
-    uint64_t need = sizeof(linux_rt_sigframe_t) + SIGFRAME_ALIGN - 1;
-    uint64_t sp = 0;
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp);
-    if (sp > need && sp <= g->guest_size)
-        guest_lazy_faultin(g, sp - need, need);
-    thread_entry_t *thr = current_thread;
-    if (thr && thr->altstack_sp != 0 &&
-        !(thr->altstack_flags & LINUX_SS_DISABLE) && thr->altstack_size > need)
-        guest_lazy_faultin(g, thr->altstack_sp + thr->altstack_size - need,
-                           need);
-}
 
 /* signal_deliver_one() consumed a signal the guest never observes, so the
  * caller should look at the next one. Distinct from the documented 0/1/-1
@@ -2477,8 +2462,6 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
 
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 {
-    signal_prefault_frame(vcpu, g);
-
     /* Callers invoke this once per syscall epilogue, so stopping at the first
      * signal that turns out to be discarded (SIG_IGN, or a SIG_DFL disposition
      * of ignore/stop/continue) would let a lower-numbered ignored signal mask a
@@ -2576,7 +2559,6 @@ int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
      * threads faulting on the same signal collapse into one bit so one fault is
      * lost. Deliver directly here, never touching sig_state.pending.
      */
-    signal_prefault_frame(vcpu, g);
     pthread_mutex_lock(&sig_lock);
 
     /* Linux force_sig_info_to_task(): a forced synchronous fault cannot be

@@ -79,12 +79,29 @@ int main(int argc, char **argv)
         {8ull << 30, 3},   {16ull << 30, 3},   {32ull << 30, 3},
         {64ull << 30, 1},  {128ull << 30, 1},  {256ull << 30, 1},
     };
+
     /* Optional argv[1]: cap size in GiB (eager implementations commit host
      * memory for every byte mapped; the full matrix would thrash small hosts).
      */
     uint64_t cap = ~0ull;
-    if (argc > 1)
-        cap = (uint64_t) atoll(argv[1]) << 30;
+    if (argc > 2) {
+        fprintf(stderr, "usage: %s [positive-cap-GiB]\n", argv[0]);
+        return 2;
+    }
+    if (argc == 2) {
+        char *end;
+        errno = 0;
+        unsigned long long gib = strtoull(argv[1], &end, 10);
+        if (argv[1][0] < '0' || argv[1][0] > '9' || *end != '\0' ||
+            errno == ERANGE || gib == 0 || gib > (UINT64_MAX >> 30)) {
+            fprintf(stderr,
+                    "cap must be a positive integer GiB value no greater than "
+                    "%llu\n",
+                    (unsigned long long) (UINT64_MAX >> 30));
+            return 2;
+        }
+        cap = (uint64_t) gib << 30;
+    }
 
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("anon private mmap latency vs size\n");

@@ -2,12 +2,16 @@
 #
 # shim.S + freestanding shim-mmap.c -> shim.o -> shim.bin -> shim_blob.h
 
+# Disable RCpc codegen so acquire loads remain cumulative LDARs.  The retire
+# snapshot rule carries cross-vCPU causality through different atomic words;
+# LDAPR is intentionally too weak for that protocol.
 SHIM_CFLAGS := -O2 -Wall -Wextra -Wpedantic -Wshadow \
 	-Wstrict-prototypes -Wmissing-prototypes -Wformat=2 \
 	-Wimplicit-fallthrough -Wundef -Wnull-dereference \
 	-Wno-unused-parameter -ffreestanding -fno-builtin \
 	-fno-stack-protector -fno-unwind-tables \
-	-fno-asynchronous-unwind-tables -mno-outline-atomics
+	-fno-asynchronous-unwind-tables -mno-outline-atomics \
+	-Xclang -target-feature -Xclang -rcpc
 SHIM_LD ?= ld
 
 $(BUILD_DIR)/shim-asm.o: src/core/shim.S | $(BUILD_DIR)

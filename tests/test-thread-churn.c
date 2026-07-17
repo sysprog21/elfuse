@@ -25,8 +25,8 @@
 int passes = 0, fails = 0;
 
 /* Keep this a slot-reuse regression rather than an HVF vCPU lifecycle soak.
- * Eighty sequential workers exceed the 64-slot table by more than 16, and two
- * 32-worker batches repeat reuse while unrelated workers remain live.
+ * Eighty sequential workers exceed the 64-slot table by 16, and two 32-worker
+ * batches repeat reuse while unrelated workers remain live.
  */
 #define SEQUENTIAL_ROUNDS 80
 #define BATCH_SIZE 32

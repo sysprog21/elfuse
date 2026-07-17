@@ -142,6 +142,10 @@ $(ELFUSE_BIN): $(OBJS) | $(BUILD_DIR)
 
 # Native test binaries (macOS, Hypervisor.framework)
 
+$(BUILD_DIR)/test-materialize-host: $(BUILD_DIR)/test-materialize-host.o \
+        $(filter-out $(BUILD_DIR)/main.o,$(OBJS)) | $(BUILD_DIR)
+	$(call link-and-sign,$@,$^)
+
 ## Build the multi-vCPU HVF validation test (native macOS binary)
 $(BUILD_DIR)/test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu.o | $(BUILD_DIR)
 	$(call link-and-sign,$@,$<)
@@ -432,12 +436,12 @@ $(BUILD_DIR)/test-sigsuspend: tests/test-sigsuspend.c | $(BUILD_DIR)
 # bench-mmap has a multi-threaded mmap_lock-contention section; needs -lpthread.
 $(BUILD_DIR)/bench-mmap: tests/bench-mmap.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
-	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 # test-mmap-lazy races concurrent first touch from several threads.
 $(BUILD_DIR)/test-mmap-lazy: tests/test-mmap-lazy.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
-	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 .PHONY: test-mmap-lazy
 test-mmap-lazy: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-lazy
@@ -448,7 +452,7 @@ test-mmap-lazy: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-lazy
 # EL1 consumer-mmap integration/stress test.
 $(BUILD_DIR)/test-mmap-fastpath: tests/test-mmap-fastpath.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
-	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 .PHONY: test-mmap-fastpath
 test-mmap-fastpath: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-fastpath

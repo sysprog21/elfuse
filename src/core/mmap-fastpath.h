@@ -52,6 +52,22 @@ typedef struct thread_entry thread_entry_t;
  * metadata updates. The tag lives outside the Linux PROT_* namespace.
  */
 #define SHIM_MMAP_ENTRY_MPROTECT (1ULL << 63)
+/* The mprotect also installed the first L3 table for a clean, fully-owned
+ * 2 MiB lazy block.  The host must reconcile its PTE/dirty indexes when the
+ * deferred metadata entry drains.
+ */
+#define SHIM_MMAP_ENTRY_MPROTECT_SPLIT (1ULL << 62)
+/* Permission metadata changed while the target PTE remained lazy/invalid.
+ * The next fault drains the entry before consulting regions[].
+ */
+#define SHIM_MMAP_ENTRY_MPROTECT_LAZY (1ULL << 61)
+
+/* A cache batch covers a rolling 32-block (64 MiB) arena window. Unused pages
+ * stay attached to the vCPU across arena generations, so refills do not leak a
+ * batch each time the VA reservation rolls over.
+ */
+#define SHIM_MMAP_L3_CACHE_PAGES 32u
+#define SHIM_MMAP_SPLIT_CLEAN_BLOCKS 32u
 
 #define MMAP_FAST_ARENA_MIN (64ULL * 1024 * 1024)
 #define MMAP_FAST_ARENA_MAX (32ULL * 1024 * 1024 * 1024)
@@ -134,6 +150,14 @@ typedef struct {
     uint8_t _pad2[SHIM_MUNMAP_RETIRE_OFF - 0x3a0];
     munmap_retire_ring_t retire;
     mmap_reuse_ring_t reuse;
+    _Atomic uint64_t l3_cache_next; /* EL1-owned bump cursor (GPA) */
+    uint64_t l3_cache_end;          /* host-published exclusive end */
+    uint64_t split_clean_base;      /* 2 MiB-aligned arena window */
+    uint64_t split_clean_bitmap;    /* one clean-backing bit per block */
+    uint64_t split_prep_miss;
+    uint64_t split_owner_miss;
+    uint64_t split_hit;
+    uint64_t lazy_mprotect_hit;
 } shim_mmap_control_t;
 
 _Static_assert(offsetof(shim_mmap_control_t, retire) == SHIM_MUNMAP_RETIRE_OFF,

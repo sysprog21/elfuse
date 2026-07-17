@@ -220,6 +220,38 @@ static uint64_t pt_alloc_page_uninitialized(guest_t *g)
     return pt_alloc_page_impl(g, false);
 }
 
+uint64_t guest_reserve_pt_pages_uninitialized(guest_t *g, unsigned count)
+{
+    if (!g || count == 0)
+        return 0;
+    uint64_t bytes = (uint64_t) count * PAGE_SIZE;
+
+    pthread_mutex_lock(&pt_lock);
+    if (g->pt_pool_next > g->pt_pool_end ||
+        bytes > g->pt_pool_end - g->pt_pool_next) {
+        log_error(
+            "guest: page table pool exhausted reserving %u pages "
+            "(used %llu / %llu bytes)",
+            count, (unsigned long long) (g->pt_pool_next - g->pt_pool_base),
+            (unsigned long long) (g->pt_pool_end - g->pt_pool_base));
+        pthread_mutex_unlock(&pt_lock);
+        return 0;
+    }
+    uint64_t gpa = g->pt_pool_next;
+    g->pt_pool_next += bytes;
+
+    uint64_t used = g->pt_pool_next - g->pt_pool_base;
+    uint64_t total = g->pt_pool_end - g->pt_pool_base;
+    if (!pt_pool_warned && used > (total * 4 / 5)) {
+        log_debug("guest: page table pool at %llu%% (%llu / %llu bytes)",
+                  (unsigned long long) (used * 100 / total),
+                  (unsigned long long) used, (unsigned long long) total);
+        pt_pool_warned = true;
+    }
+    pthread_mutex_unlock(&pt_lock);
+    return gpa;
+}
+
 /* Get host pointer to a page table entry array at a given GPA */
 static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
 {
@@ -3010,6 +3042,56 @@ int guest_extend_page_tables(guest_t *g,
     if (!bcast && changed_hi > changed_lo)
         tlbi_request_range(base + changed_lo, base + changed_hi);
     guest_pt_gen_bump(g);
+    return 0;
+}
+
+int guest_prepare_l2_tables(guest_t *g, uint64_t start, uint64_t end)
+{
+    if (!g || !g->ttbr0 || start >= end || end > g->guest_size ||
+        end > UINT64_MAX - (BLOCK_2MIB - 1))
+        return -1;
+
+    uint64_t base = g->ipa_base;
+    uint64_t *l0 = pt_at(g, g->ttbr0 - base);
+    uint64_t addr_start = ALIGN_2MIB_DOWN(start);
+    uint64_t addr_end = ALIGN_2MIB_UP(end);
+
+    for (uint64_t addr = addr_start; addr < addr_end;) {
+        uint64_t ipa = base + addr;
+        unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GIB));
+        if (l0_idx >= 512)
+            return -1;
+
+        if (!(pte_load_acquire(&l0[l0_idx]) & PT_VALID)) {
+            uint64_t l1_gpa = pt_alloc_page(g);
+            if (!l1_gpa)
+                return -1;
+            pte_store_release(&l0[l0_idx],
+                              (base + l1_gpa) | PT_VALID | PT_TABLE);
+        }
+        uint64_t l0e = pte_load_acquire(&l0[l0_idx]);
+        if ((l0e & 3) != (PT_VALID | PT_TABLE))
+            return -1;
+        uint64_t *l1 = pt_at(g, (l0e & 0xFFFFFFFFF000ULL) - base);
+        unsigned l1_idx =
+            (unsigned) ((ipa % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
+
+        if (!(pte_load_acquire(&l1[l1_idx]) & PT_VALID)) {
+            uint64_t l2_gpa = pt_alloc_page(g);
+            if (!l2_gpa)
+                return -1;
+            pte_store_release(&l1[l1_idx],
+                              (base + l2_gpa) | PT_VALID | PT_TABLE);
+        }
+        uint64_t l1e = pte_load_acquire(&l1[l1_idx]);
+        if ((l1e & 3) != (PT_VALID | PT_TABLE))
+            return -1;
+
+        uint64_t next = ALIGN_UP(addr + 1, BLOCK_1GIB);
+        if (next <= addr || next > addr_end)
+            next = addr_end;
+        addr = next;
+    }
     return 0;
 }
 

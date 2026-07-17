@@ -1216,6 +1216,19 @@ int guest_extend_page_tables(guest_t *g,
                              uint64_t end,
                              int perms);
 
+/* Prepare only the upper TTBR0 chain needed to reach L2 entries in
+ * [start,end); all L2 leaf descriptors remain untouched/invalid.  This lets
+ * the host provision an arena for a later EL1-owned L3 install without ever
+ * transiently mapping unallocated user memory.
+ */
+int guest_prepare_l2_tables(guest_t *g, uint64_t start, uint64_t end);
+
+/* Reserve a contiguous run of uninitialized 4 KiB pages from the page-table
+ * pool.  The caller/EL1 producer must overwrite every entry before publishing
+ * any page as a table descriptor.  Returns the first GPA, or 0 on exhaustion.
+ */
+uint64_t guest_reserve_pt_pages_uninitialized(guest_t *g, unsigned count);
+
 /* Split a 2MiB block descriptor into 512 x 4KiB L3 page descriptors. block_gpa
  * must be within a currently-mapped 2MiB block. The block's permissions are
  * inherited by all 512 page entries. If the block is already split (L2 entry is

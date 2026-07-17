@@ -160,6 +160,19 @@ _Static_assert(offsetof(mmap_reuse_ring_t, published) == 8 &&
                "shim.S mmap reuse-ring layout drift");
 _Static_assert(SHIM_MMAP_REUSE_RING_SIZE == 32,
                "shim.S mmap reuse-ring size drift");
+_Static_assert(offsetof(shim_mmap_control_t, l3_cache_next) == 0x940 &&
+                   offsetof(shim_mmap_control_t, l3_cache_end) == 0x948 &&
+                   offsetof(shim_mmap_control_t, split_clean_base) == 0x950 &&
+                   offsetof(shim_mmap_control_t, split_clean_bitmap) == 0x958,
+               "shim.S mmap L3-cache layout drift");
+_Static_assert(offsetof(shim_mmap_control_t, split_prep_miss) == 0x960 &&
+                   offsetof(shim_mmap_control_t, split_owner_miss) == 0x968 &&
+                   offsetof(shim_mmap_control_t, split_hit) == 0x970 &&
+                   offsetof(shim_mmap_control_t, lazy_mprotect_hit) == 0x978,
+               "shim.S mmap L3 diagnostic layout drift");
+_Static_assert(SHIM_MMAP_L3_CACHE_PAGES == 32 &&
+                   SHIM_MMAP_SPLIT_CLEAN_BLOCKS == 32,
+               "shim.S mmap L3-cache constants drift");
 _Static_assert((MMAP_FAST_ARENA_MAX >> 12) <=
                    (SHIM_MUNMAP_RETIRE_F_CHARGE_MASK >>
                     SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT),
@@ -572,6 +585,9 @@ void shim_globals_counters_dump(const guest_t *g)
     uint64_t reuse_published = 0, reuse_dropped = 0, reuse_hits = 0;
     uint64_t reuse_pending = 0;
     uint64_t current_max = 0, peak_max = 0;
+    uint64_t l3_cache_available = 0, split_clean_blocks = 0;
+    uint64_t split_prep_miss = 0, split_owner_miss = 0, split_hit = 0;
+    uint64_t lazy_mprotect_hit = 0;
     const uint8_t *shim_data =
         (const uint8_t *) g->host_base + g->shim_data_base;
     for (int slot = 0; slot < MAX_THREADS; slot++) {
@@ -584,10 +600,10 @@ void shim_globals_counters_dump(const guest_t *g)
                 atomic_load_explicit(&c->counters[i], memory_order_relaxed);
         refill_count += c->refill_count;
         recycle_count += c->recycle_count;
-        reuse_published += atomic_load_explicit(&c->reuse.published,
-                                                memory_order_relaxed);
-        reuse_dropped += atomic_load_explicit(&c->reuse.dropped,
-                                              memory_order_relaxed);
+        reuse_published +=
+            atomic_load_explicit(&c->reuse.published, memory_order_relaxed);
+        reuse_dropped +=
+            atomic_load_explicit(&c->reuse.dropped, memory_order_relaxed);
         reuse_hits +=
             atomic_load_explicit(&c->reuse.hits, memory_order_relaxed);
         uint32_t reuse_head =
@@ -599,6 +615,16 @@ void shim_globals_counters_dump(const guest_t *g)
             current_max = c->next_arena_size;
         if (c->peak_arena_size > peak_max)
             peak_max = c->peak_arena_size;
+        uint64_t l3_next =
+            atomic_load_explicit(&c->l3_cache_next, memory_order_relaxed);
+        if (l3_next < c->l3_cache_end)
+            l3_cache_available += (c->l3_cache_end - l3_next) / 4096;
+        split_clean_blocks +=
+            (uint64_t) __builtin_popcountll(c->split_clean_bitmap);
+        split_prep_miss += c->split_prep_miss;
+        split_owner_miss += c->split_owner_miss;
+        split_hit += c->split_hit;
+        lazy_mprotect_hit += c->lazy_mprotect_hit;
     }
     for (unsigned i = 0; i < SHIM_MMAP_COUNTERS_N; i++)
         fprintf(stderr, "  %-20s %llu\n", mmap_counter_names[i],
@@ -619,6 +645,18 @@ void shim_globals_counters_dump(const guest_t *g)
             (unsigned long long) current_max);
     fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_PEAK",
             (unsigned long long) peak_max);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_L3_AVAILABLE",
+            (unsigned long long) l3_cache_available);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_SPLIT_CLEAN",
+            (unsigned long long) split_clean_blocks);
+    fprintf(stderr, "  %-20s %llu\n", "MPROT_SPLIT_PREP_MISS",
+            (unsigned long long) split_prep_miss);
+    fprintf(stderr, "  %-20s %llu\n", "MPROT_SPLIT_OWNER_MISS",
+            (unsigned long long) split_owner_miss);
+    fprintf(stderr, "  %-20s %llu\n", "MPROT_SPLIT_HIT",
+            (unsigned long long) split_hit);
+    fprintf(stderr, "  %-20s %llu\n", "MPROT_LAZY_HIT",
+            (unsigned long long) lazy_mprotect_hit);
     uint64_t high_water =
         g->mmap_next > MMAP_BASE ? g->mmap_next - MMAP_BASE : 0;
     fprintf(stderr, "  %-20s %llu\n", "MMAP_HIGH_WATER",

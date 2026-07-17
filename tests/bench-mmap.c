@@ -330,34 +330,47 @@ static void bench_fault(int pages, int drain_between)
            sweep[ITERS - 1] / pages);
 }
 
-/* D. mprotect split cost Flip the middle 4 KiB of a 2 MiB RW block to
- * PROT_READ, forcing guest_split_block to convert the L2 block into 512 L3
- * pages. Restore between iterations so each run does a fresh split.
+/* D. mprotect split cost. Touch the mapping before timing so lazy mmap has an
+ * actual L2 block descriptor; otherwise the EL1 lazy-metadata specialization
+ * can correctly defer PTE creation and this would measure a 1-2 tick metadata
+ * publication rather than a block-to-table split. Flip the middle 4 KiB to
+ * PROT_READ, forcing conversion into 512 L3 pages. Keep every mapping live
+ * until the samples finish so allocator reuse cannot hand a later iteration
+ * an already-existing (but empty) L3 table.
  */
 static void bench_mprotect_split(void)
 {
     printf(
         "== D. mprotect split (2 MiB block -> L3, protect middle 4 KiB) ==\n");
     double sp[ITERS];
+    uint8_t *held[ITERS + 1];
+    int nheld = 0;
     for (int it = -1; it < ITERS; it++) {
         uint8_t *p = mmap(NULL, 2 * MIB, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) {
+            for (int i = 0; i < nheld; i++)
+                munmap(held[i], 2 * MIB);
             printf("  mmap FAILED\n\n");
             return;
         }
+        held[nheld++] = p;
+        p[0] = 1; /* materialize a real 2 MiB L2 block before timing */
         uint8_t *mid = p + MIB;
         uint64_t t0 = rd();
         int rc = mprotect(mid, 4 * KIB, PROT_READ);
         uint64_t t1 = rd();
-        munmap(p, 2 * MIB);
         if (rc != 0) {
+            for (int i = 0; i < nheld; i++)
+                munmap(held[i], 2 * MIB);
             printf("  mprotect FAILED: %s\n\n", strerror(errno));
             return;
         }
         if (it >= 0)
             sp[it] = ns(t1 - t0);
     }
+    for (int i = 0; i < nheld; i++)
+        munmap(held[i], 2 * MIB);
     printf("  split:     median %.1f ns  min %.1f ns\n", median(sp, ITERS),
            sp[0]);
 }
@@ -374,6 +387,7 @@ static void bench_mprotect_fast_leaf(void)
         printf("  fast leaf mmap FAILED\n\n");
         return;
     }
+    p[0] = 1; /* ensure setup below creates an L3 table, not lazy metadata */
     if (mprotect(p + MIB, 4 * KIB, PROT_READ) != 0) {
         munmap(p, 2 * MIB);
         printf("  fast leaf setup FAILED: %s\n\n", strerror(errno));
@@ -393,8 +407,8 @@ static void bench_mprotect_fast_leaf(void)
             leaf[it] = ns(t1 - t0);
     }
     munmap(p, 2 * MIB);
-    printf("  fast leaf: median %.1f ns  min %.1f ns\n\n",
-           median(leaf, ITERS), leaf[0]);
+    printf("  fast leaf: median %.1f ns  min %.1f ns\n\n", median(leaf, ITERS),
+           leaf[0]);
 }
 
 /* E. mremap grow: in-place vs forced move */

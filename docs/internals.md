@@ -226,16 +226,26 @@ Splitting is triggered by:
 block needs splitting, splits it if so, then updates the affected L3 page
 entries. Whole-block permission changes are done in place without splitting.
 
-After a private anonymous mmap-arena block already has an L3 table, the EL1
-shim specializes a one-page `PROT_READ` ↔ `PROT_READ|PROT_WRITE` transition:
-it validates the current arena generation, updates only AP[2:1], broadcasts
-`TLBI VAE1IS`, and returns without an HVC exit. A tagged entry in the existing
-mmap publication ring defers the matching region-metadata update to the next
-host drain. The host always drains that ring before consulting `regions[]`;
-the producer-active/PT-gate handshake prevents a host page-table writer from
-racing the EL1 update. Lazy materialization, L2 splitting, executable or
-`PROT_NONE` transitions, multi-page ranges, and non-arena mappings retain the
-host path.
+For a private anonymous mmap-arena block, the EL1 shim specializes a one-page
+`PROT_READ` ↔ `PROT_READ|PROT_WRITE` transition. Arena refill prepares the
+upper TTBR0 chain, a per-vCPU batch of 32 L3 table pages, and a clean-backing
+bitmap for a rolling window of 32 two-megabyte blocks. A slow-path miss moves
+that window to the current allocation area. If an undrained mmap publication
+proves that one anonymous RW mapping owns a complete clean block, EL1 may
+populate a prepared L3 page and install the first table descriptor itself. A
+previously retired, empty L3 table is reused in place. Existing valid L3 leaves
+need only an AP[2:1] update.
+
+The shim issues `TLBI RVAE1IS` for first materialization or `TLBI VAE1IS` for
+an existing leaf and returns without an HVC exit. A tagged entry in the mmap
+publication ring defers region metadata plus host-only PTE/dirty-index
+reconciliation to the next drain. The producer-active/PT-gate handshake
+prevents a host page-table writer from racing the EL1 update. Dirty backing,
+but still-lazy target pages use a metadata-only tag and keep their PTE invalid;
+their eventual fault drains the new protection before materializing data.
+Partial ownership, an already-consumed publication, an exhausted table cache,
+executable or `PROT_NONE` transitions, multi-page ranges, and non-arena mappings
+retain the host path.
 
 `mmap` itself uses a gap-finding allocator that walks the sorted region array
 to find free address space. `PROT_EXEC` requests go to the RX region

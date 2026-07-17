@@ -242,14 +242,75 @@ static void test_mmap_prot(void)
             *p = 2;
         sigaction(SIGSEGV, &old_sa, NULL);
 
-        int restored = mprotect((void *) p, 4096,
-                                PROT_READ | PROT_WRITE) == 0;
+        int restored = mprotect((void *) p, 4096, PROT_READ | PROT_WRITE) == 0;
         if (restored)
             *p = 3;
         int final = *p;
         munmap((void *) p, 4096);
         EXPECT_TRUE(saw_segv && restored && final == 3,
                     "fast mprotect permissions or ring drain were stale");
+    }
+
+    TEST("first lazy 2MiB block mprotect materializes safely");
+    {
+        const size_t block_size = 2 * 1024 * 1024;
+        volatile unsigned char *seed =
+            mmap(NULL, block_size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (seed == MAP_FAILED) {
+            FAIL("seed mmap failed");
+            return;
+        }
+        seed[1024 * 1024] = 0x7f;
+        munmap((void *) seed, block_size);
+        /* Force retirement so the next mmap can reuse backing whose dirty bit
+         * remains conservative. mprotect must update lazy metadata without
+         * exposing the stale byte; the later read performs the zeroing fault.
+         */
+        (void) fcntl(-1, F_GETFD);
+
+        volatile unsigned char *p =
+            mmap(NULL, block_size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            FAIL("mmap failed");
+            return;
+        }
+        volatile unsigned char *mid = p + 1024 * 1024;
+        if (mprotect((void *) mid, 4096, PROT_READ) != 0) {
+            munmap((void *) p, block_size);
+            FAIL("first-block mprotect failed");
+            return;
+        }
+
+        int zeroed = p[0] == 0 && mid[0] == 0 && p[block_size - 1] == 0;
+        p[0] = 0x31;
+        p[block_size - 1] = 0x32;
+
+        struct sigaction old_sa;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_sigsegv;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGSEGV, &sa, &old_sa) != 0) {
+            munmap((void *) p, block_size);
+            FAIL("sigaction failed");
+            return;
+        }
+        saw_segv = 0;
+        if (sigsetjmp(segv_jmp, 1) == 0)
+            mid[0] = 0x33;
+        sigaction(SIGSEGV, &old_sa, NULL);
+
+        int restored =
+            mprotect((void *) mid, 4096, PROT_READ | PROT_WRITE) == 0;
+        if (restored)
+            mid[0] = 0x34;
+        int neighbors = p[0] == 0x31 && p[block_size - 1] == 0x32;
+        int target = mid[0] == 0x34;
+        munmap((void *) p, block_size);
+        EXPECT_TRUE(zeroed && saw_segv && restored && neighbors && target,
+                    "first-block split exposed stale bytes or wrong perms");
     }
 }
 

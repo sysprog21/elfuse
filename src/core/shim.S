@@ -273,6 +273,16 @@
 .Lmmap_ctr_skip_\@:
 .endm
 
+.macro MPROTECT_COUNTER_INC byte_off
+    mrs x29, tpidr_el1
+    ldrb w30, [x29, #SHIM_STATS_EN_OFF]
+    cbz w30, .Lmprotect_ctr_skip_\@
+    ldr x29, [x21, #\byte_off]
+    add x29, x29, #1
+    str x29, [x21, #\byte_off]
+.Lmprotect_ctr_skip_\@:
+.endm
+
 /* BAD_VEC: vector-table entry that reports an unexpected exception.
  * Each table slot is 128 bytes; the leading .align 7 places this entry at the
  * next 128-byte boundary.
@@ -470,12 +480,13 @@ svc_handler:
     b.eq mprotect_page_fast
     b handle_svc_0
 
-/* mprotect_page_fast: change one already-materialized L3 page between R and
- * RW without exiting to the host. The mapping must belong to this vCPU's
- * enabled anonymous arena. PTE + broadcast TLBI complete synchronously here;
- * a tagged mmap-ring entry defers only the host region metadata update.
- * Anything requiring L2 splitting, lazy materialization, PROT_NONE, execute
- * permission, or broader validation falls back to HVC.
+/* mprotect_page_fast: change one L3 page between R and RW without exiting to
+ * the host. Besides an existing L3 leaf, EL1 may consume a host-prepared table
+ * page to split an existing L2 block or materialize a clean 2 MiB lazy block.
+ * The latter is allowed only while an undrained mmap publication proves that
+ * this vCPU owns the complete block; this prevents neighboring arena holes
+ * from becoming accessible. PTE + broadcast TLBI complete synchronously here;
+ * a tagged mmap-ring entry defers host region/index reconciliation.
  */
 mprotect_page_fast:
     mrs x12, tpidr_el1
@@ -537,8 +548,8 @@ mprotect_page_fast:
     cmp w25, #32
     b.hs mprotect_active_bail
 
-    /* Walk TTBR0 and require L0/L1/L2 table descriptors plus a valid L3 page.
-     * A block or invalid descriptor needs host materialization/splitting.
+    /* Walk TTBR0. Arena refill has prepared the upper chain for the first
+     * clean window, while older/out-of-window mappings may still bail here.
      */
     mrs x25, ttbr0_el1
     ubfx x25, x25, #12, #36
@@ -548,7 +559,7 @@ mprotect_page_fast:
     ldar x27, [x26]
     and x28, x27, #3
     cmp x28, #3
-    b.ne mprotect_active_bail
+    b.ne mprotect_split_prep_bail
     ubfx x25, x27, #12, #36
     lsl x25, x25, #12
     ubfx x26, x14, #30, #9
@@ -556,21 +567,196 @@ mprotect_page_fast:
     ldar x27, [x26]
     and x28, x27, #3
     cmp x28, #3
-    b.ne mprotect_active_bail
+    b.ne mprotect_split_prep_bail
     ubfx x25, x27, #12, #36
     lsl x25, x25, #12
     ubfx x26, x14, #21, #9
-    add x26, x25, x26, lsl #3
+    add x26, x25, x26, lsl #3         /* target L2 entry */
     ldar x27, [x26]
     and x28, x27, #3
     cmp x28, #3
-    b.ne mprotect_active_bail
+    b.eq mprotect_existing_l3
+    cmp x28, #1
+    b.eq mprotect_install_l3_block
+    cbnz x28, mprotect_active_bail
+    mov w20, #0                        /* needs a prepared table page */
+
+mprotect_validate_lazy_block:
+    /* An invalid L2 slot can be materialized only when the host's snapshot
+     * says the identity backing is clean and a still-pending mmap publication
+     * covers this whole 2 MiB block.
+     */
+    lsr x11, x14, #21
+    lsl x11, x11, #21                  /* block start */
+    mov x17, x11                       /* retain exact block for bookkeeping */
+    ldr x12, [x21, #0x950]             /* clean-window base */
+    cmp x11, x12
+    b.lo mprotect_split_prep_bail
+    sub x13, x11, x12
+    lsr x13, x13, #21                  /* clean-window bit */
+    cmp x13, #32
+    b.hs mprotect_split_prep_bail
+    ldr x12, [x21, #0x958]             /* clean bitmap */
+    lsrv x12, x12, x13
+    and w9, w12, #1                    /* full-block materialization is safe */
+
+    mov w10, w22                       /* host head snapshot */
+mprotect_find_full_block_mapping:
+    cmp w10, w23
+    b.eq mprotect_split_owner_bail
+    and w12, w10, #31
+    add x12, x12, x12, lsl #1
+    add x13, x21, #64
+    add x12, x13, x12, lsl #3
+    ldr x13, [x12, #16]                /* mmap prot / entry tag */
+    tbnz x13, #63, mprotect_find_full_block_next
+    cmp x13, #3
+    b.ne mprotect_find_full_block_next
+    ldr x13, [x12, #0]                 /* mapping start */
+    cmp x14, x13
+    b.lo mprotect_find_full_block_next
+    ldr x12, [x12, #8]                 /* mapping length */
+    adds x12, x13, x12
+    b.cs mprotect_active_bail
+    add x15, x14, #0x1000
+    cmp x12, x15
+    b.lo mprotect_find_full_block_next
+    cbz w9, mprotect_publish_lazy_only
+    cmp x11, x13
+    b.lo mprotect_find_full_block_next
+    add x13, x11, #0x200000
+    cmp x12, x13
+    b.hs mprotect_install_l3_lazy
+mprotect_find_full_block_next:
+    add w10, w10, #1
+    b mprotect_find_full_block_mapping
+
+mprotect_install_l3_block:
+    mov w18, #0                        /* split preserves materialization */
+    mov x10, x27
+    orr x10, x10, #2                   /* L2 block -> L3 page type */
+    b mprotect_install_l3_common
+
+mprotect_install_l3_lazy:
+    mov w18, #1                        /* first lazy materialization */
+    mov x10, #0x767                    /* AF|ISH|NS|ATTR1|RW_EL0|PAGE */
+    movk x10, #0x60, lsl #48           /* UXN|PXN */
+    orr x10, x10, x11                  /* first identity page */
+    cbnz w20, mprotect_fill_existing_empty_l3
+
+mprotect_install_l3_common:
+    ldr x25, [x21, #0x940]             /* prepared L3 page */
+    ldr x29, [x21, #0x948]
+    cmp x25, x29
+    b.hs mprotect_split_prep_bail
+    add x29, x25, #0x1000
+    str x29, [x21, #0x940]             /* sole EL1 consumer */
+    MPROTECT_COUNTER_INC 0x970
+    mov x19, x26                       /* preserve target L2 entry */
+    mov x12, x25                       /* L3 fill cursor */
+    mov x13, #512
+mprotect_fill_l3:
+    str x10, [x12], #8
+    add x10, x10, #0x1000
+    subs x13, x13, #1
+    b.ne mprotect_fill_l3
+
+    /* Tighten the requested page before publishing the table. */
+    ubfx x28, x14, #12, #9
+    add x26, x25, x28, lsl #3
+    ldr x27, [x26]
+    bic x27, x27, #0xc0
+    cmp x16, #3
+    mov x28, #0xc0                     /* AP=11: EL0 read-only */
+    mov x29, #0x40                     /* AP=01: EL0 read-write */
+    csel x28, x29, x28, eq
+    orr x27, x27, x28
+    str x27, [x26]
+    orr x27, x25, #3                   /* L2 table descriptor */
+    stlr x27, [x19]
+
+    b mprotect_lazy_l3_installed
+
+mprotect_fill_existing_empty_l3:
+    /* A previous materialize/retire cycle may leave an empty L3 table in the
+     * L2 slot. Prove every entry is zero before reusing it. The target page is
+     * installed with its final AP first so a sibling can never observe a
+     * transient RW permission while this mprotect requests read-only.
+     */
+    mov x12, x25
+    mov x13, #512
+1:  ldr x27, [x12], #8
+    cbnz x27, mprotect_split_prep_bail
+    subs x13, x13, #1
+    b.ne 1b
+
+    ubfx x28, x14, #12, #9             /* target page index */
+    lsl x29, x28, #12
+    add x27, x10, x29                  /* target page descriptor */
+    bic x27, x27, #0xc0
+    cmp x16, #3
+    mov x29, #0xc0
+    mov x19, #0x40
+    csel x29, x19, x29, eq
+    orr x27, x27, x29
+    add x26, x25, x28, lsl #3
+    stlr x27, [x26]
+
+    mov x12, x25
+    mov x13, #0                        /* current page index */
+2:  cmp x13, x28
+    b.eq 3f
+    str x10, [x12]
+3:  add x12, x12, #8
+    add x10, x10, #0x1000
+    add x13, x13, #1
+    cmp x13, #512
+    b.lo 2b
+    MPROTECT_COUNTER_INC 0x970
+
+mprotect_lazy_l3_installed:
+
+    cbz w18, mprotect_pte_changed
+
+    /* Make the materialized envelope visible before a following fast munmap,
+     * and consume the clean proof so it cannot authorize a second install.
+     */
+    ldr w22, [x21]
+    ldr w12, [x21, #0x388]
+    add x13, x11, #0x200000
+    cmp w12, w22
+    b.ne 1f
+    ldr x10, [x21, #0x390]
+    ldr x12, [x21, #0x398]
+    cmp x10, x11
+    csel x11, x10, x11, lo
+    cmp x12, x13
+    csel x13, x12, x13, hi
+1:  str x11, [x21, #0x390]
+    str x13, [x21, #0x398]
+    add x10, x21, #0x388
+    stlr w22, [x10]
+    ldr x10, [x21, #0x950]
+    sub x10, x17, x10
+    lsr x10, x10, #21
+    mov x12, #1
+    lsl x12, x12, x10
+    ldr x13, [x21, #0x958]
+    bic x13, x13, x12
+    str x13, [x21, #0x958]
+    b mprotect_pte_changed
+
+mprotect_existing_l3:
     ubfx x25, x27, #12, #36
     lsl x25, x25, #12
     ubfx x28, x14, #12, #9
     add x26, x25, x28, lsl #3         /* target L3 entry */
     ldar x27, [x26]
-    tbz x27, #0, mprotect_active_bail
+    tbnz x27, #0, 1f
+    mov w20, #1                        /* reuse this published empty table */
+    b mprotect_validate_lazy_block
+1:
+    mov w18, #0
 
     /* Preserve output address and attributes; replace only AP[2:1]. */
     bic x27, x27, #0xc0
@@ -581,12 +767,35 @@ mprotect_page_fast:
     orr x27, x27, x28
     stlr x27, [x26]
 
+mprotect_pte_changed:
     dsb ishst
+    cbnz w18, mprotect_tlbi_lazy_block
     ubfx x25, x14, #12, #44
     tlbi vae1is, x25
+    b mprotect_tlbi_done
+mprotect_tlbi_lazy_block:
+    ldr w25, [x21, #8]
+    tbz w25, #1, mprotect_tlbi_full
+    lsr x25, x14, #21
+    lsl x25, x25, #9                   /* block VA >> 12 */
+    mov x27, #7                        /* 8 x 256 KiB scale units */
+    lsl x27, x27, #39                  /* NUM */
+    orr x25, x25, x27
+    mov x27, #1
+    lsl x27, x27, #44                  /* SCALE=1 */
+    orr x25, x25, x27
+    mov x27, #1
+    lsl x27, x27, #46                  /* TG=01 (4 KiB) */
+    orr x25, x25, x27
+    tlbi rvae1is, x25
+    b mprotect_tlbi_done
+mprotect_tlbi_full:
+    tlbi vmalle1is
+mprotect_tlbi_done:
     dsb ish
     isb
 
+mprotect_publish_entry:
     /* Tag the publication as metadata-only mprotect. Host drains it before
      * consulting regions[] on any later VM exit.
      */
@@ -600,6 +809,17 @@ mprotect_page_fast:
     mov x22, #1
     lsl x22, x22, #63
     orr x22, x22, x16
+    cmp w18, #1
+    b.ne 1f
+    mov x26, #1
+    lsl x26, x26, #62
+    orr x22, x22, x26
+1:  cmp w18, #2
+    b.ne 2f
+    mov x26, #1
+    lsl x26, x26, #61
+    orr x22, x22, x26
+2:
     str x22, [x25, #16]
     add w23, w23, #1
     add x25, x21, #16
@@ -609,9 +829,26 @@ mprotect_page_fast:
     mov x0, #0
     b svc_restore_eret
 
+mprotect_publish_lazy_only:
+    /* The target belongs to a pending anonymous mapping but its backing is not
+     * proven clean. Keep the PTE invalid and defer only the VMA permission
+     * update; a later fault drains this entry before materializing the page.
+     */
+    MPROTECT_COUNTER_INC 0x978
+    mov w18, #2
+    b mprotect_publish_entry
+
 mprotect_active_bail:
     stlr wzr, [x24]
     b handle_svc_0
+
+mprotect_split_prep_bail:
+    MPROTECT_COUNTER_INC 0x960
+    b mprotect_active_bail
+
+mprotect_split_owner_bail:
+    MPROTECT_COUNTER_INC 0x968
+    b mprotect_active_bail
 
 /* mmap_anon_fast: consume a host-prepared, per-vCPU VA arena for the exact
  * anonymous RW shape used by allocators:

@@ -11,13 +11,13 @@ all: $(OUT)/app.bin
 $(OUT):
 	mkdir -p $(OUT)
 
-$(OUT)/core_mod_%.obj: core/mod_%.src runtime.h | $(OUT)
+$(OUT)/core_mod_%.obj: core/mod_%.c runtime.h | $(OUT)
 	sed 's/syscall_entry_/obj_entry_/' $< > $@
 
-$(OUT)/fs_mod_%.obj: fs/mod_%.src runtime.h | $(OUT)
+$(OUT)/fs_mod_%.obj: fs/mod_%.c runtime.h | $(OUT)
 	sed 's/syscall_entry_/obj_entry_/' $< > $@
 
-$(OUT)/net_mod_%.obj: net/mod_%.src runtime.h | $(OUT)
+$(OUT)/net_mod_%.obj: net/mod_%.c runtime.h | $(OUT)
 	sed 's/syscall_entry_/obj_entry_/' $< > $@
 
 $(OUT)/app.bin: $(OBJS)

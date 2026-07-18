@@ -25,6 +25,8 @@ if [ -z "${CLANG_FORMAT:-}" ]; then
 fi
 
 ret=0
+# The benchmark corpus is fixed input data. Formatting it would invalidate its
+# performance baseline, so keep it out of the C source set.
 while IFS= read -r -d '' file; do
     expected=$(mktemp)
     "$CLANG_FORMAT" "$file" > "$expected" 2> /dev/null
@@ -33,6 +35,6 @@ while IFS= read -r -d '' file; do
     fi
     rm -f "$expected"
 done < <(git ls-files -z -- 'src/*.c' 'src/*.h' 'src/**/*.c' 'src/**/*.h' \
-    'tests/*.c' 'tests/*.h')
+    'tests/*.c' 'tests/*.h' ':(exclude)tests/bench-corpus/**')
 
 exit $ret

@@ -401,17 +401,13 @@ jobs:
             check_target: check-sanitizer
             brew_pkgs: binutils
 
-    # contents: read for the checkout; pull-requests: read so the guard can
-    # query the PR's current HEAD. (actions: write would let the guard
-    # cancel the run instead of failing it, but repo policy caps the token
-    # at actions: read, so the guard fails fast with a clear reason instead.)
     permissions:
       contents: read
-      pull-requests: read
 
+    # Serialize each trusted sanitizer lane without cancelling main runs.
     concurrency:
       group: runtime-macos-${{ matrix.sanitizer }}-${{ github.ref }}
-      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+      cancel-in-progress: false
 
     env:
       LINUX_TOOLCHAIN: /opt/toolchain/aarch64-linux-gnu
@@ -432,42 +428,6 @@ jobs:
       MAKEFLAGS: -j8
 
     steps:
-      # Fail fast if this run targets a commit that is no longer the PR's
-      # HEAD. cancel-in-progress covers "commit 2 pushed while commit 1 is
-      # still running", but NOT a manual "Re-run jobs" on an old run: a
-      # re-run replays the original event payload (a frozen head.sha)
-      # against this single self-hosted runner, which would otherwise burn
-      # the full job timeout re-testing stale code. Compare the frozen
-      # head.sha against the live PR HEAD; when they differ, exit 1 with a
-      # clear "commit is no longer the latest" message. We fail (rather than
-      # cancel) because repo policy caps the token at actions: read, so the
-      # cancel API is unavailable. exit 1 also stops the job, so the later
-      # steps are skipped automatically -- no per-step guard needed. The
-      # lookup fails open: if HEAD can't be determined the job runs.
-      - name: Fail fast if superseded by a newer PR commit
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          RUN_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -uo pipefail
-          # curl and system python3 are always present on macOS; jq/gh are
-          # not guaranteed on a self-hosted runner, so don't depend on them.
-          latest=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])') \
-            || latest=""
-          echo "Run targets : $RUN_SHA"
-          echo "PR HEAD now : ${latest:-<unknown>}"
-          if [ -n "$latest" ] && [ "$latest" != "$RUN_SHA" ]; then
-            echo "::error::This run targets $RUN_SHA, but PR #$PR_NUMBER HEAD is now $latest -- the commit is no longer the latest. Failing instead of re-testing stale code on the self-hosted runner; re-run CI on the current commit."
-            exit 1
-          fi
-
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -477,26 +437,16 @@ jobs:
         if: >
           matrix.run_matrix && github.ref == 'refs/heads/main' &&
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-        # actions/checkout's default clean:true runs `git clean -ffdx`, which
-        # wipes externals/test-fixtures (gitignored) on this self-hosted
-        # runner even though its disk otherwise persists across runs.
-        # fetch-fixtures.sh is already idempotent -- it skips re-downloading
-        # Alpine packages when externals/test-fixtures/versions.lock still
-        # matches -- so stash that tree outside the workspace and restore it
-        # here as a real directory. The qemu lane in tests/test-matrix.sh
-        # shares the workspace root with the guest over virtio-9p, and a
-        # symlink pointing outside that root does not resolve inside the
-        # guest, so this must be a real copy, not a symlink.
-        run: |
-          cache="$HOME/.cache/elfuse-ci/test-fixtures"
-          if [ -d "$cache" ]; then
-            mkdir -p externals
-            rm -rf externals/test-fixtures
-            cp -Rc "$cache" externals/test-fixtures
-            echo "Restored test fixtures ($(du -sh externals/test-fixtures | cut -f1), lock: $(head -1 externals/test-fixtures/versions.lock 2>/dev/null || echo none))"
-          else
-            echo "No fixtures cache at $cache; tests fetch on demand"
-          fi
+        # GitHub scopes caches by ref and prevents low-trust PR runs from
+        # writing into the default branch's cache scope. Moving fixtures off
+        # the runner's persistent HOME also makes every legacy local cache
+        # ineligible for restore after this rollout.
+        uses: actions/cache/restore@v5
+        with:
+          path: externals/test-fixtures
+          key: fixtures-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/fetch-fixtures.sh', 'tests/lib/bash-compat.sh') }}-lookup
+          restore-keys: |
+            fixtures-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/fetch-fixtures.sh', 'tests/lib/bash-compat.sh') }}-
 
       - name: Host info
         run: |
@@ -536,6 +486,16 @@ jobs:
           "$GNU_OBJCOPY" --version | head -1
           qemu-aarch64 --version | head -1 || true
           python3 --version
+
+      - name: Prepare trusted test fixtures
+        id: prepare-fixtures
+        if: >
+          matrix.run_matrix && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          set -euo pipefail
+          INCLUDE_X86_64=1 bash tests/fetch-fixtures.sh
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Check Rosetta for Linux
         # Rosetta is exercised only by test-matrix (release leg); the
@@ -600,23 +560,39 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      - name: Save test fixtures cache
-        # Persist externals/test-fixtures outside the workspace so the next
-        # run's "Restore cached test fixtures" step can skip re-downloading
-        # unchanged Alpine packages. Runs even if an earlier step failed, as
-        # long as the job wasn't cancelled, so a fixture-unrelated test
-        # failure doesn't cost the next run its cache.
+      - name: Remove generated fixture credentials
+        id: sanitize-fixtures
+        # Default-branch caches are readable by PR workflows, so generated SSH
+        # credentials must be removed before the fixture tree is persisted.
+        # Drop the initramfs containing the corresponding public key as well;
+        # the trusted preparation step rebuilds it with a fresh key next time.
         if: >
-          !cancelled() && matrix.sanitizer == 'release' &&
+          success() && matrix.sanitizer == 'release' &&
           github.ref == 'refs/heads/main' &&
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          steps.prepare-fixtures.outputs.ready == 'true'
         run: |
-          if [ -d externals/test-fixtures ]; then
-            cache="$HOME/.cache/elfuse-ci/test-fixtures"
-            mkdir -p "$(dirname "$cache")"
-            rm -rf "$cache"
-            cp -Rc externals/test-fixtures "$cache"
-            echo "Saved test fixtures ($(du -sh "$cache" | cut -f1))"
-          else
-            echo "No externals/test-fixtures to save"
-          fi
+          set -euo pipefail
+          test -s externals/test-fixtures/versions.lock
+          test -s externals/test-fixtures/aarch64-musl/staticbin/bin/busybox
+          test -s externals/test-fixtures/x86_64-musl/staticbin/bin/busybox
+          test -s externals/test-fixtures/initramfs.cpio.gz
+          rm -f externals/test-fixtures/keys/ssh_key \
+            externals/test-fixtures/keys/ssh_key.pub \
+            externals/test-fixtures/initramfs.cpio.gz
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save test fixtures cache
+        # The resolved-version suffix creates a new immutable entry only when
+        # the selected fixture set changes. The trusted main ref is the sole
+        # writer; restore-keys above selects its newest matching generation.
+        if: >
+          success() && matrix.sanitizer == 'release' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          steps.prepare-fixtures.outputs.ready == 'true' &&
+          steps.sanitize-fixtures.outputs.ready == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: externals/test-fixtures
+          key: fixtures-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/fetch-fixtures.sh', 'tests/lib/bash-compat.sh') }}-${{ hashFiles('externals/test-fixtures/versions.lock') }}

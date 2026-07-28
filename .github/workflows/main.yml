@@ -337,9 +337,13 @@ jobs:
   runtime-macos:
     name: Runtime (${{ matrix.name }})
     needs: build-macos
+    # Never run guest code or touch the persistent runner for pull requests;
+    # only trusted main-branch pushes and an explicitly selected main dispatch
+    # may enter the self-hosted HVF lane.
     if: >
       github.repository == 'sysprog21/elfuse' &&
-      (github.event_name == 'push' || github.event_name == 'pull_request')
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: [self-hosted, macOS, arm64]
     # Sanitizer builds run several times slower than the release build, so the
     # job budget and the per-test TEST_TIMEOUT are widened per leg. Without
@@ -470,7 +474,9 @@ jobs:
       - name: Restore cached test fixtures
         # Only the release leg needs fixtures: the sanitizer legs run the
         # fixture-free check-sanitizer subset.
-        if: ${{ matrix.run_matrix }}
+        if: >
+          matrix.run_matrix && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         # actions/checkout's default clean:true runs `git clean -ffdx`, which
         # wipes externals/test-fixtures (gitignored) on this self-hosted
         # runner even though its disk otherwise persists across runs.
@@ -600,7 +606,10 @@ jobs:
         # unchanged Alpine packages. Runs even if an earlier step failed, as
         # long as the job wasn't cancelled, so a fixture-unrelated test
         # failure doesn't cost the next run its cache.
-        if: ${{ !cancelled() && matrix.sanitizer == 'release' }}
+        if: >
+          !cancelled() && matrix.sanitizer == 'release' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         run: |
           if [ -d externals/test-fixtures ]; then
             cache="$HOME/.cache/elfuse-ci/test-fixtures"

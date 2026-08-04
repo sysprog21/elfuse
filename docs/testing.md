@@ -118,6 +118,8 @@ What they do:
 - `make test-gdbstub`: debugger integration checks against the built-in GDB stub
 - `make test-matrix`: cross-check `elfuse` (aarch64), QEMU (aarch64),
   and `elfuse` (x86_64-via-Rosetta) on overlapping corpora
+- `make bench`: two-tier performance benchmark suite (see Performance
+  Benchmarks below); `make bench-ci` is the strict CI variant
 - `make lint`: static analysis through `clang-tidy`
 
 ## Quick Iteration
@@ -132,11 +134,7 @@ make test-matrix-elfuse-aarch64
 
 `make check` alone only covers elfuse-internal plumbing and the sanitizer
 subset now; `test-matrix-elfuse-aarch64` is what actually exercises the full
-unit-test surface against `build/elfuse` (no qemu boot needed, so it is about
-as fast to iterate with as `make check` was before the split). For changes
-that touch procfs, path handling, `/dev`, FUSE, networking, dynamic linking,
-or guest process semantics, also cross-check against the qemu reference
-kernel:
+unit-test surface against `build/elfuse`.
 
 ```sh
 make test-matrix-qemu-aarch64
@@ -144,191 +142,209 @@ make test-matrix-qemu-aarch64
 
 or run all matrix modes back-to-back with `make test-matrix`.
 
-`make check` already runs the BusyBox applet suite as a second stage, so a
-green `make check` covers BusyBox validation. Use `make test-busybox` to
-iterate on a single applet failure without rerunning the unit suite.
+## Performance Benchmarks
+
+`make bench` runs `tests/bench-suite.sh`, the two-tier suite, and
+writes `build/bench-results.json`:
+
+- Tier 1 -- lmbench (issue #195): `lat_syscall`
+  (null/read/write/stat/open) for syscall entry/forwarding cost,
+  `lat_proc` (fork, fork+execve) for process creation and the ELF-load
+  path, and `lat_fs -s 1024` (1 KiB create/delete only).
+
+- Tier 2 -- application workloads over the fixed corpus in
+  `tests/bench-corpus/` using Alpine fixture tools: `python3 -c pass`,
+  `git status`, `rg`, `zstd`, and `make`. `rg` searches 512 deterministic
+  copies of the source tree (~87 MiB, tens of thousands of files) and
+  `zstd` compresses a matching ~87 MiB input -- fixed sizes chosen so
+  command startup and scheduler jitter don't dominate what would
+  otherwise be millisecond-scale workloads
+
+Each metric runs warmup + timed iterations and reports the median plus
+raw samples. `scripts/bench-compare.py` diffs the results against
+`tests/bench-baseline.json` and exits non-zero on a metric regressing
+past the threshold (default +20%, `BENCH_REGRESSION_THRESHOLD`) or
+missing from the current run; `BENCH_REPORT_ONLY=1` downgrades that to
+a log-only signal, which is how the CI `Benchmark` leg runs.
+
+CI measures only the `elfuse-aarch64` column. `qemu-aarch64` (a real
+Linux kernel on the same silicon) and the optional `orbstack` column
+are static references, captured manually per the refresh procedure
+below.
+
+`BENCH_ENV=qemu-aarch64 make bench` produces the `qemu-aarch64`
+reference column; `BENCH_ENV=orbstack` runs the workloads inside the
+default OrbStack machine (Tier-2 tools must be installed there);
+`BENCH_ENV=native` also works on an aarch64 Linux host.
+
+Do not edit `tests/bench-corpus/` -- the corpus is part of the benchmark
+definition, and any change to it invalidates the baseline.
+
+### Manual / Ad-hoc Runs
+
+Prefer the Makefile targets (`bench` / `bench-ci`, `BENCH_ENV` picks the
+column) for a full run -- they build the prerequisites and wire up
+`ELFUSE`/`BENCH_BIN_DIR`. The commands below drive the same pieces
+directly, useful for iterating on one case or comparing an existing
+results file without rerunning everything.
+
+**Full suite with custom env/output:**
+
+```sh
+BENCH_ENV=elfuse-aarch64 BENCH_ITERATIONS=20 BENCH_WARMUP=3 \
+    bash tests/bench-suite.sh -o build/bench-results.json
+```
+
+`BENCH_ENV` selects the column (`elfuse-aarch64` default,
+`qemu-aarch64`, `orbstack`, `native`); the CI variant just adds
+`BENCH_STRICT=1` (fetch fixtures on demand, fail hard instead of
+skipping Tier 2 when they're missing).
+
+**One Tier-1 benchmark without the suite harness:**
+
+```sh
+tests/fetch-fixtures.sh                # builds the lmbench fixtures once
+env ENOUGH=100000 ./build/elfuse \
+    externals/test-fixtures/aarch64-musl/staticbin/bin/busybox \
+    sh -c '"$0" "$@"; exit $?' \
+    externals/test-fixtures/aarch64-musl/lmbench/lat_syscall -N 5 null
+```
+
+**One Tier-2 workload's wall-clock cost:**
+
+```sh
+./build/elfuse --sysroot externals/test-fixtures/rootfs \
+    ./build/bench-timeit /bin/busybox true
+```
+
+**Compare an existing results file against baseline without rerunning:**
+
+```sh
+python3 scripts/bench-compare.py --results build/bench-results.json \
+    --baseline tests/bench-baseline.json --threshold 0.20 \
+    --report-json build/bench-pr-report.json
+```
+
+Add `--report-only` (or `BENCH_REPORT_ONLY=1`) to print regressions
+without a non-zero exit. Any file matching the schema in
+`tests/bench-suite.sh`'s header works, including one captured with
+`BENCH_ENV=qemu-aarch64`/`orbstack`/`native`.
+
+**Promote a captured results file into the baseline:**
+
+```sh
+python3 scripts/bench-promote.py --results build/bench-results.json \
+    --baseline tests/bench-baseline.json
+```
+
+**Environment variables** (all optional; defaults shown):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BENCH_ENV` | `elfuse-aarch64` | column: `elfuse-aarch64` \| `qemu-aarch64` \| `orbstack` \| `native` |
+| `BENCH_ITERATIONS` | `10` | timed Tier-2 samples per metric |
+| `BENCH_WARMUP` | `2` | discarded leading Tier-2 samples per metric |
+| `BENCH_LMBENCH_REPS` | `1` | lmbench `-N` repetitions per Tier-1 outer sample; outer samples provide the median |
+| `BENCH_LMBENCH_RETRIES` | `1` | extra attempts for a failed/hung Tier-1 benchmark before its `ERR` row |
+| `BENCH_LMBENCH_TIMEOUT` | `60` | per-lmbench-invocation timeout in seconds |
+| `BENCH_LMBENCH_ENOUGH` | `100000` | lmbench `ENOUGH` (us per timing interval); empty restores lmbench auto-calibration |
+| `LMBENCH_DIR` | fixtures `aarch64-musl/lmbench` | directory holding the lmbench fixture binaries |
+| `BENCH_STRICT` | `0` | `1` = missing fixtures are fatal and fetched on demand (what `bench-ci` sets) |
+| `ELFUSE` | `build/elfuse` | elfuse binary driving the elfuse-aarch64 column |
+| `BENCH_BIN_DIR` | `build/` | directory holding `bench-timeit` |
+| `TEST_TIMEOUT` | `120` | per-invocation timeout in seconds |
+| `BENCH_QEMU_NULL_CEILING` | `180` | ns/op; the qemu boot-calibration probe reboots the VM above this (efficiency-core placement) |
+| `BENCH_QEMU_BOOT_RETRIES` | `2` | qemu boot-calibration retry attempts before proceeding with a warning |
+| `BENCH_REGRESSION_THRESHOLD` | `0.20` | fractional regression that fails `bench-compare.py` |
+| `BENCH_REPORT_ONLY` | unset | `1` = `bench-compare.py` reports regressions but exits 0 |
 
 ## Test Matrix
 
-The matrix driver lives in `tests/test-matrix.sh`. It currently covers three
+The matrix driver lives in `tests/test-matrix.sh` and covers three
 execution modes:
 
-- `elfuse-aarch64`: every binary is executed via `build/elfuse` on macOS
+- `elfuse-aarch64`: every binary executed via `build/elfuse` on macOS
 - `qemu-aarch64`: the same binaries run natively inside an Alpine
   `aarch64-linux-musl` minirootfs booted by `qemu-system-aarch64`
-- `elfuse-x86_64`: Rosetta-for-Linux acceptance scripts against the staged
-  Alpine x86_64 fixture tree
+- `elfuse-x86_64`: Rosetta-for-Linux acceptance scripts against the
+  staged Alpine x86_64 fixture tree
 
-The goal is not to compare performance. The goal is to compare guest-observable
-behavior against a ground-truth Linux AArch64 environment so that any divergence
-in syscall translation, procfs emulation, or process semantics is caught early.
+The goal is to compare guest-observable behavior against a
+ground-truth Linux AArch64 environment, not performance, so any
+divergence in syscall translation, procfs emulation, or process
+semantics is caught early.
 
-`run_unit_tests` in `tests/test-matrix.sh` is the full aarch64 unit-test
-surface -- every binary that is meaningful to run against a real kernel, which
-is almost everything. It deliberately excludes only the handful of tests that
-assert elfuse-internal implementation details with no meaningful counterpart
-on a real kernel (the EL1 shim fast-path suite, `test-mremap-infra`,
-`test-oom-proc` -- these live solely in `tests/manifest.txt` / `make check`,
-see that file's header for the full split rationale). There is no separate
-"core" vs "extended" test set inside the matrix; a test that has a real,
-understood divergence from the qemu reference kernel is listed in
-`QEMU_SKIP` with a comment explaining why instead -- see that variable in
-`tests/test-matrix.sh` for the current list and rationale. `run_unit_tests`
-runs in both `elfuse-aarch64` and `qemu-aarch64` modes, so most tests are
-exercised twice per matrix run: once against `build/elfuse`, once against the
-real kernel.
-
-The x86_64 mode is narrower: it aggregates the Rosetta-specific acceptance
-scripts and their per-binary summaries into the same matrix runner, including
-the Rosetta thread/signal audit smoke, the LuaJIT guest-JIT probe, and the
-glibc dynamic-binary acceptance helper.
+`run_unit_tests` runs almost the entire aarch64 unit-test surface, in
+both `elfuse-aarch64` and `qemu-aarch64` modes -- excluding only the
+elfuse-internal tests already covered by `make check` (see
+`tests/manifest.txt`) and the known divergences listed in `QEMU_SKIP`.
+The x86_64 mode aggregates the Rosetta-specific acceptance scripts
+instead.
 
 Run a single mode with `bash tests/test-matrix.sh elfuse-aarch64`,
-`bash tests/test-matrix.sh qemu-aarch64`, or
-`bash tests/test-matrix.sh elfuse-x86_64`; `all` runs all three back-to-back.
-
-Fixture handling is self-contained:
-
-- On first use, `tests/fetch-fixtures.sh` downloads the required Alpine
-  packages and the `linux-virt` kernel into `externals/test-fixtures/` and
-  assembles an initramfs. Subsequent runs are zero-config.
-- The same fixture tree is reused across the matrix modes.
-- When Rosetta mode is requested and the translator is installed,
-  `tests/test-matrix.sh` auto-fetches the x86_64 fixture tree
-  (`INCLUDE_X86_64=1`) on demand.
-- QEMU mode requires `qemu-system-aarch64` on `PATH` (Homebrew `qemu` provides it).
-- musl is the only Alpine libc; the glibc-dynamic suite is skipped unless
-  `GUEST_GLIBC_*` environment variables point at an external sysroot.
+`qemu-aarch64`, or `elfuse-x86_64`; `all` runs all three back-to-back.
 
 ## Rosetta Limitations
 
-`elfuse-x86_64` is expected to inherit two Rosetta-internal limitations that are
-not treated as elfuse regressions:
+`elfuse-x86_64` inherits two Rosetta-internal limitations not treated
+as elfuse regressions:
 
-- `SA_RESETHAND` is not reset reliably because Rosetta shadows guest signal
-  handler state internally.
+- `SA_RESETHAND` is not reset reliably (Rosetta shadows guest signal
+  handler state internally).
 - `clone(..., CLONE_SETTLS, tls=0, ...)` can hang.
 
-The x86_64 matrix branch is therefore a Rosetta acceptance gate, not a claim
-that translated guests fully match native Linux thread and signal semantics.
+The x86_64 matrix branch is a Rosetta acceptance gate, not a claim of
+full native Linux thread/signal parity.
 
 ## x86_64 Acceptance Inventory and Per-Host Baselines
 
-The `elfuse-x86_64` matrix mode aggregates seven sub-suites. Each one
+The `elfuse-x86_64` matrix mode aggregates seven sub-suites. Each
 emits a deterministic per-binary pass list; the matrix runner sums
-those into a single `Results:` line and compares against a per-host
-baseline. The exact labels each sub-suite emits, and the contract
-they verify, are:
+them into one `Results:` line and compares against a per-host
+baseline:
 
-- `tests/test-rosetta-cli.sh` (4): `rosetta-disabled-flag`,
-  `rosetta-disabled-env`, `rosetta-gdb`, `rosetta-default` --
-  command-line gating of the translator path (opt-out flag, env
-  override, `--gdb` rejection, install-hint surface).
-
-- `tests/test-rosetta-failure-modes.sh` (3): `no-rosetta-flag`,
-  `no-rosetta-env`, `gdb-x86_64` -- command-line rejection paths.
-  Self-contained against a synthesized minimal x86_64 ELF; no
-  external fixture tree required. The dynamic-linker bring-up and
-  mid-process execve scenarios that used to live here are now
-  exclusively in the glibc and statics suites against the vendored
-  rootfs (see `glibc-hello` / `glibc-hello-via-ldso` and
-  `env-execve`).
-
-- `tests/test-rosetta-statics.sh` (20): `echo`, `true`, `false`,
-  `printenv`, `expr-zero`, `expr-mul`, `basename`, `dirname`,
-  `stat-self`, `factor`, `seq`, `sha256sum`, `md5sum`, `uname-m`, `arch`,
-  `busybox-arch-subcommand`, `date-utc`, `id-u`, `nproc`,
-  `env-execve` -- statically-linked Alpine busybox applets,
-  exercising VZ ioctl gate, `/proc/self/exe` redirect, high-VA mmap,
-  and the kbuf alias.
-
-- `tests/test-rosetta-alpine.sh` (33): `cat-fruits-first-line`,
-  `wc-l-fruits`, `wc-l-lines`, `wc-c-lines`, `ls-data`, `stat-data`,
-  `find-by-name`, `du-sk-data`, `sha256-fruits`,
-  `sha256-lines-matches-host`, `sha512-lines`, `md5-fruits`,
-  `cksum-fruits`, `sort-first`, `sort-reverse-first`, `pipe-sort-wc`,
-  `pipe-tr-uppercase`, `pipe-cat-grep`, `pipe-sed-subst`,
-  `pipe-awk-field`, `head-n3`, `tail-n3`, `pipe-sort-uniq`,
-  `pipe-cut-field`, `pipe-rev`, `tac-reverse-first-line`, `seq-1-5`,
-  `seq-step`, `factor-prime`, `factor-composite`, `diff-identical`,
-  `diff-differs`, `pipe-base64-decode` -- broader file I/O, text
-  processing, and host-shell pipelines stitched through Rosetta on
-  every stage.
-
-- `tests/test-rosetta-audit.sh` (2): `audit-known-limitations`,
-  `tls0-known-hang` -- bookkeeping probe that asserts the documented
-  Rosetta shadowing failures (above) remain the only divergences;
-  fails loudly if a new threading/signal-state edge case starts
-  diverging.
-
-- `tests/test-rosetta-jit.sh` (2): `luajit-trace`,
-  `luajit-coroutine` -- guest-side JIT under translation
-  (LuaJIT trace emission + coroutine allocation), covering the
-  small-mprotect RW->RX and per-thread icache observation path that
-  rosetta's own JIT does not exercise.
-
-- `tests/test-rosetta-glibc.sh` (7): `glibc-hello`,
-  `glibc-hello-via-ldso`, `glibc-hello-list`, `glibc-dlopen`,
-  `glibc-tls`, `glibc-gdtls`, `glibc-pthread-tls` --
-  dynamically-linked glibc x86_64 binary acceptance through
-  `--sysroot` against the staged minimal glibc rootfs under
-  `externals/test-fixtures/x86_64-glibc/rootfs/`. The first three
-  cover load-time `PT_INTERP` resolution and `ld.so --list`
-  introspection. `glibc-dlopen` runs `dlopen("libm.so.6")` plus a
-  `dlsym(sqrt)` round-trip to exercise the runtime fresh-`.so`-mmap
-  codepath, which is distinct from the load-time path the first
-  three probes touch. `glibc-tls` reads and writes two
-  initial-exec `__thread` variables (one integer, one pointer) so a
-  broken FS-register to `TPIDR_EL0` translation surfaces as a
-  value mismatch rather than as a silent skip. `glibc-gdtls`
-  `dlopen`s a companion `libgdtls.so` whose `__thread` variable
-  must use the general-dynamic model (calls `__tls_get_addr`);
-  this is the only probe that exercises that lowering path, which
-  the initial-exec probe cannot reach. `glibc-pthread-tls`
-  `pthread_create`s a worker thread that reads and writes its own
-  `__thread` slot; the probe asserts the worker saw its own
-  default value (not the main thread's overwritten marker) and that
-  the main thread's slot survives the worker's write, so a broken
-  per-thread `TPIDR_EL0` setup on additional threads surfaces as
-  isolation failure rather than as a silent crash.
+- `tests/test-rosetta-cli.sh` (4) -- command-line gating of the
+  translator path (opt-out flag, env override, `--gdb` rejection,
+  install-hint surface).
+- `tests/test-rosetta-failure-modes.sh` (3) -- command-line rejection
+  paths, self-contained against a synthesized minimal x86_64 ELF.
+- `tests/test-rosetta-statics.sh` (20) -- statically-linked Alpine
+  busybox applets, exercising the VZ ioctl gate, `/proc/self/exe`
+  redirect, high-VA mmap, and the kbuf alias.
+- `tests/test-rosetta-alpine.sh` (33) -- broader file I/O, text
+  processing, and host-shell pipelines through Rosetta.
+- `tests/test-rosetta-audit.sh` (2) -- bookkeeping probe asserting the
+  documented Rosetta shadowing failures (above) remain the only
+  divergences.
+- `tests/test-rosetta-jit.sh` (2) -- guest-side JIT under translation
+  (LuaJIT trace emission + coroutine allocation).
+- `tests/test-rosetta-glibc.sh` (7) -- dynamically-linked glibc x86_64
+  binary acceptance through `--sysroot` against the staged minimal
+  glibc rootfs: load-time `PT_INTERP`/`ld.so` resolution, `dlopen`,
+  and TLS (initial-exec, general-dynamic, per-thread).
 
 Total: 71 expected passes, 0 expected failures.
 
 ### Per-Host Baseline Capture
 
 The matrix runner keys its `elfuse-x86_64` baseline by detected host
-SoC class. Two classes matter because `sys_mmap_fixed_high_va` takes
-different paths under different IPA widths:
+SoC class, since `sys_mmap_fixed_high_va` takes different paths under
+different IPA widths:
 
-- `apple-m1-m2`: 36-bit native IPA, exercises the overflow-segment
-  path. Captured on this codebase against Apple M1 hardware
-  (MacBookAir10,1). The seven sub-suites land at 71/0/0.
+- `apple-m1-m2`: 36-bit native IPA (overflow-segment path). Captured
+  on Apple M1 hardware; lands at 71/0/0.
+- `apple-m3-plus`: 40-bit native IPA (bisected-slab path). Currently
+  held equal to `apple-m1-m2` pending real M3+ hardware capture.
+- `apple-unknown`: fallback for unrecognized SoC strings; inherits the
+  M1/M2 numbers with a one-line warning.
 
-- `apple-m3-plus`: 40-bit native IPA, exercises the bisected-slab
-  path (and the M5 slab-bisection variant). Currently held equal to
-  `apple-m1-m2` pending operator capture on real M3+ hardware. When
-  that capture lands, only the
-  `"elfuse-x86_64:apple-m3-plus|<min_pass>|<max_fail>"` row in the
-  `EXPECTED_BASELINES` array in `tests/test-matrix.sh` moves; the
-  M1/M2 row stays intact.
+Class detection reads `sysctl -n machdep.cpu.brand_string`. Override
+with `MATRIX_HOST_CLASS_OVERRIDE=apple-m3-plus` (or `apple-m1-m2`,
+`apple-unknown`) to exercise a different row without changing host.
 
-- `apple-unknown`: fallback for SoC brand strings the detector does
-  not recognise. Inherits the M1/M2 numbers and triggers a one-line
-  warning so a new SoC does not silently graft onto an existing row.
-
-Class detection reads `sysctl -n machdep.cpu.brand_string` and matches
-against `Apple M1`/`Apple M2` (M1/M2) and `Apple M3`/`Apple M4`/`Apple
-M5` (M3+). To exercise the M3+ row from an M1/M2 host (and vice
-versa) without changing the detector, set
-`MATRIX_HOST_CLASS_OVERRIDE=apple-m3-plus` (or `apple-m1-m2`,
-`apple-unknown`) before invoking `tests/test-matrix.sh`.
-
-When the seven sub-suites grow or trim a test, the per-sub-suite
-counts in the comment block above `EXPECTED_BASELINES` and the
-inventory list above must move in the same commit so the per-host
-baseline stays in sync with reality. Each `EXPECTED_BASELINES` entry
-is a pipe-separated `mode-key|min_pass|max_fail` triple parsed by
-`expected_baseline_get()` in `tests/test-matrix.sh`.
+When the sub-suites change, update the per-suite counts in
+`EXPECTED_BASELINES` (`tests/test-matrix.sh`) and the inventory above
+in the same commit so the baseline stays in sync.
 
 ## Test Inventory
 

@@ -1,0 +1,172 @@
+# Publish benchmark changes from an unprivileged pull_request run. This file
+# must live on the default branch for workflow_run to grant its scoped token.
+name: Benchmark PR report
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    name: Comment on benchmark changes
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Find benchmark report artifact
+        id: artifact
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.payload.workflow_run.id,
+                per_page: 100,
+              }
+            );
+            const report = artifacts.find(
+              artifact => artifact.name === 'bench-pr-report' && !artifact.expired
+            );
+            if (report && report.size_in_bytes > 128 * 1024) {
+              core.setFailed(`Benchmark report artifact is unexpectedly large: ${report.size_in_bytes} bytes`);
+              core.setOutput('found', false);
+              return;
+            }
+            core.setOutput('found', report !== undefined);
+
+      - name: Checkout trusted reporter
+        if: ${{ steps.artifact.outputs.found == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Download benchmark report
+        if: ${{ steps.artifact.outputs.found == 'true' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: bench-pr-report
+          path: ${{ runner.temp }}/bench-pr-report
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Render benchmark comment
+        if: ${{ steps.artifact.outputs.found == 'true' }}
+        id: render
+        env:
+          COMMENT_PATH: ${{ runner.temp }}/bench-comment.md
+          REPORT_PATH: ${{ runner.temp }}/bench-pr-report/bench-pr-report.json
+        run: |
+          set -euo pipefail
+          python3 scripts/bench-report.py \
+            --report "$REPORT_PATH" --output "$COMMENT_PATH" \
+            --environment elfuse-aarch64 --threshold 0.20
+          if [ -s "$COMMENT_PATH" ]; then
+            echo 'should-comment=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'should-comment=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update benchmark comment
+        if: ${{ steps.render.outputs.should-comment == 'true' }}
+        uses: actions/github-script@v9
+        env:
+          COMMENT_PATH: ${{ runner.temp }}/bench-comment.md
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- elfuse-benchmark-report -->';
+            const run = context.payload.workflow_run;
+            const runHead = run.head_sha;
+            const headRepository = run.head_repository;
+            const headOwner = headRepository && headRepository.owner && headRepository.owner.login;
+            const headBranch = run.head_branch;
+            if (typeof runHead !== 'string' || !/^[0-9a-f]{40}$/i.test(runHead)) {
+              core.setFailed('The workflow run has no valid head SHA');
+              return;
+            }
+            if (typeof headOwner !== 'string' || !headOwner ||
+                typeof headBranch !== 'string' || !headBranch ||
+                !headRepository.full_name) {
+              core.setFailed('The workflow run has no valid head repository/ref');
+              return;
+            }
+
+            // workflow_run.pull_requests is empty for fork runs in this repo.
+            // Resolve the PR from trusted workflow-run identity fields, then
+            // require its current head to match before using the write token.
+            const candidates = await github.paginate(
+              github.rest.pulls.list,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                base: context.payload.repository.default_branch,
+                head: `${headOwner}:${headBranch}`,
+                per_page: 100,
+              }
+            );
+            const matches = candidates.filter(pull =>
+              pull.head && pull.head.sha === runHead && pull.head.repo &&
+              pull.head.repo.full_name === headRepository.full_name
+            );
+            if (matches.length !== 1) {
+              core.notice(`Expected one current pull request for ${headRepository.full_name}:${headBranch}@${runHead}, got ${matches.length}`);
+              return;
+            }
+            const pullNumber = matches[0].number;
+
+            const {data: pull} = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullNumber,
+            });
+            if (pull.head.sha !== runHead) {
+              core.notice(`Skipping stale benchmark for ${runHead}; current HEAD is ${pull.head.sha}`);
+              return;
+            }
+
+            const report = fs.readFileSync(process.env.COMMENT_PATH, 'utf8').trim();
+            if (!report) {
+              return;
+            }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${run.id}`;
+            const body = `${marker}\n${report}\n\n[Workflow run](${runUrl}) · commit \`${runHead.slice(0, 12)}\`\n`;
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullNumber,
+                per_page: 100,
+              }
+            );
+            const previous = comments.find(comment =>
+              comment.user && comment.user.login === 'github-actions[bot]' &&
+              typeof comment.body === 'string' && comment.body.includes(marker)
+            );
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullNumber,
+                body,
+              });
+            }

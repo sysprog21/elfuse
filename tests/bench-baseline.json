@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "comment": "Per-environment baseline medians for scripts/bench-compare.py. Refresh procedure: header of tests/bench-suite.sh. CI measures and gates only elfuse-aarch64. qemu-aarch64 is the same-Apple-Silicon Linux comparison target; orbstack is informational. Both static columns are captured manually and do not change with elfuse patches. A metric absent from a column reports NEW and does not gate until promoted.",
+  "tooling": {
+    "lmbench": {
+      "repository": "https://github.com/intel/lmbench",
+      "commit": "a33716428dc2e717ce3e7dfce767302583eb8fdc",
+      "source_sha256": "7769d4758dcbdfb54b443b2e44d65bd0b6c47d49efa87380d83fd12d5ad36f76"
+    }
+  },
+  "captured": {
+    "elfuse-aarch64": {
+      "date": "2026-07-16T17:00:27Z",
+      "host": "Darwin 24.4.0 arm64 (Apple M4)",
+      "iterations": 10,
+      "note": "Tier-2 samples are timed in-guest by bench-timeit (workload only); startup_ms is the per-command VM + sysroot setup + static ELF-load cost"
+    },
+    "qemu-aarch64": {
+      "date": "2026-07-16T16:40:52Z",
+      "host": "Darwin 24.4.0 arm64 (Apple M4)",
+      "iterations": 10,
+      "note": "qemu guest root is tmpfs (initramfs): lat_fs and write-heavy application metrics measure tmpfs, not a disk filesystem; Tier-2 samples timed in-guest by bench-timeit (workload only); startup_ms is the per-command ssh entry cost"
+    },
+    "orbstack": {
+      "date": "2026-07-16T17:20:09Z",
+      "host": "Darwin 24.4.0 arm64 (Apple M4)",
+      "iterations": 10,
+      "note": "workloads run on the OrbStack machine's own filesystem (machine-local /tmp), timed in-machine by bench-timeit (workload only); startup_ms is the orb run session cost"
+    }
+  },
+  "environments": {
+    "elfuse-aarch64": {
+      "applications": {
+        "git_status_ms": 113.327,
+        "make_ms": 5850.394,
+        "python_startup_ms": 117.826,
+        "ripgrep_ms": 2870.226,
+        "startup_ms": 20.094,
+        "zstd_ms": 112.975
+      },
+      "lmbench": {
+        "lat_syscall": {
+          "null": 0.0232,
+          "read": 1.72295,
+          "write": 1.7114,
+          "stat": 2.5146,
+          "open": 11.3016
+        },
+        "lat_proc": {
+          "fork": 116097.05,
+          "exec": 112392.15
+        },
+        "lat_fs": {
+          "create": 51.92,
+          "delete": 40.295
+        }
+      }
+    },
+    "orbstack": {
+      "applications": {
+        "git_status_ms": 0.895,
+        "make_ms": 21.649,
+        "python_startup_ms": 4.278,
+        "ripgrep_ms": 30.139,
+        "startup_ms": 16.952,
+        "zstd_ms": 15.444
+      },
+      "lmbench": {
+        "lat_syscall": {
+          "null": 0.07225,
+          "read": 0.093,
+          "write": 0.0898,
+          "stat": 0.1542,
+          "open": 0.29625
+        },
+        "lat_proc": {
+          "fork": 36.98875,
+          "exec": 46.6929
+        },
+        "lat_fs": {
+          "create": 1.7155,
+          "delete": 0.807
+        }
+      }
+    },
+    "qemu-aarch64": {
+      "applications": {
+        "git_status_ms": 1.185,
+        "make_ms": 28.076,
+        "python_startup_ms": 5.87,
+        "ripgrep_ms": 48.901,
+        "startup_ms": 16.104,
+        "zstd_ms": 12.581
+      },
+      "lmbench": {
+        "lat_syscall": {
+          "null": 0.1452,
+          "read": 0.1814,
+          "write": 0.17975,
+          "stat": 0.3841,
+          "open": 0.63405
+        },
+        "lat_proc": {
+          "fork": 60.50535,
+          "exec": 72.82645
+        },
+        "lat_fs": {
+          "create": 1.414,
+          "delete": 0.7085
+        }
+      }
+    }
+  }
+}

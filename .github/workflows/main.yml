@@ -7,7 +7,9 @@
 #   scan-macos    : LLVM scan-build via `make analyze`
 #   infer-macos   : Facebook Infer capture + analyze over the full build
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
-#                   including release, ASAN, UBSAN, and TSAN variants
+#                   including release, ASAN, UBSAN, and TSAN variants,
+#                   plus a Benchmark leg (tests/bench-suite.sh) that
+#                   compares against tests/bench-baseline.json
 #
 # Runtime and sanitizer tests require Hypervisor.framework, which
 # GitHub-hosted macOS runners do not expose. Those tests run on self-hosted
@@ -341,11 +343,17 @@ jobs:
       github.repository == 'sysprog21/elfuse' &&
       (github.event_name == 'push' || github.event_name == 'pull_request')
     runs-on: [self-hosted, macOS, arm64]
-    # Sanitizer builds run several times slower than the release build, so the
-    # job budget and the per-test TEST_TIMEOUT are widened per leg. Without
-    # that, a TSAN-slowed guest overruns the 10s default TEST_TIMEOUT and the
-    # 20-minute job budget, surfacing as TIMEOUT reds indistinguishable from a
-    # real hang.
+    # Sanitizers run several times slower than Release, so job_timeout and
+    # per-test TEST_TIMEOUT are widened per leg -- a slow-but-healthy TSAN
+    # guest would otherwise overrun the 10s default TEST_TIMEOUT and read
+    # as TIMEOUT, indistinguishable from a real hang.
+    #
+    # job_timeout also has to cover queueing for the shared host lock (see
+    # "Acquire shared host lock" below): the Benchmark leg holds it
+    # exclusively for its ~10-minute run, so other legs budget a 15-minute
+    # queue on top of their own runtime. The Benchmark leg's 95-minute
+    # budget stacks its own 15-minute queue, the longest sibling's
+    # 60-minute budget, its ~10-minute run, and setup margin.
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
@@ -359,7 +367,8 @@ jobs:
             ubsan_options: ''
             tsan_options: ''
             test_timeout: ''
-            job_timeout: 20
+            job_timeout: 35
+            shared_lock_wait: 15
             run_matrix: true
             check_target: check
             brew_pkgs: binutils qemu
@@ -370,7 +379,8 @@ jobs:
             ubsan_options: ''
             tsan_options: ''
             test_timeout: '30'
-            job_timeout: 30
+            job_timeout: 45
+            shared_lock_wait: 15
             run_matrix: false
             check_target: check-sanitizer
             brew_pkgs: binutils
@@ -381,7 +391,8 @@ jobs:
             ubsan_options: halt_on_error=1:print_stacktrace=1
             tsan_options: ''
             test_timeout: '30'
-            job_timeout: 30
+            job_timeout: 45
+            shared_lock_wait: 15
             run_matrix: false
             check_target: check-sanitizer
             brew_pkgs: binutils
@@ -392,10 +403,29 @@ jobs:
             ubsan_options: ''
             tsan_options: halt_on_error=1
             test_timeout: '60'
-            job_timeout: 45
+            job_timeout: 60
+            shared_lock_wait: 15
             run_matrix: false
             check_target: check-sanitizer
             brew_pkgs: binutils
+          # Benchmark leg: runs `make bench-ci`'s two-tier
+          # suite on a Release build, compares against the committed
+          # baseline(elfuse, orbstack, qemu-aarch64), and uploads the 
+	  # results as an artifact.
+          - name: Benchmark
+            sanitizer: bench
+            extra_cflags: ''
+            asan_options: ''
+            ubsan_options: ''
+            tsan_options: ''
+            test_timeout: ''
+            job_timeout: 95
+            shared_lock_wait: 15
+            lock_wait: 60
+            run_matrix: false
+            run_bench: true
+            check_target: ''
+            brew_pkgs: binutils qemu
 
     # contents: read for the checkout; pull-requests: read so the guard can
     # query the PR's current HEAD. (actions: write would let the guard
@@ -428,18 +458,6 @@ jobs:
       MAKEFLAGS: -j8
 
     steps:
-      # Fail fast if this run targets a commit that is no longer the PR's
-      # HEAD. cancel-in-progress covers "commit 2 pushed while commit 1 is
-      # still running", but NOT a manual "Re-run jobs" on an old run: a
-      # re-run replays the original event payload (a frozen head.sha)
-      # against this single self-hosted runner, which would otherwise burn
-      # the full job timeout re-testing stale code. Compare the frozen
-      # head.sha against the live PR HEAD; when they differ, exit 1 with a
-      # clear "commit is no longer the latest" message. We fail (rather than
-      # cancel) because repo policy caps the token at actions: read, so the
-      # cancel API is unavailable. exit 1 also stops the job, so the later
-      # steps are skipped automatically -- no per-step guard needed. The
-      # lookup fails open: if HEAD can't be determined the job runs.
       - name: Fail fast if superseded by a newer PR commit
         if: github.event_name == 'pull_request'
         env:
@@ -467,20 +485,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Acquire shared host lock (normal runtime load)
+        # Multiple runners share this physical machine, so a compile on
+        # the sibling runner would spike a benchmark's microsecond-scale
+        # measurements. Every leg holds a machine-global shared lock during
+        # setup/build and still coexists with other readers. The benchmark
+        # releases it and takes the exclusive lock immediately around
+        # make bench-ci, so normal legs never queue behind artifact work.
+        run: |
+          CI_HOST_LOCK_WAIT_MIN=${{ matrix.shared_lock_wait }} \
+            scripts/ci-host-lock.sh acquire shared
+
       - name: Restore cached test fixtures
-        # Only the release leg needs fixtures: the sanitizer legs run the
-        # fixture-free check-sanitizer subset.
-        if: ${{ matrix.run_matrix }}
-        # actions/checkout's default clean:true runs `git clean -ffdx`, which
-        # wipes externals/test-fixtures (gitignored) on this self-hosted
-        # runner even though its disk otherwise persists across runs.
-        # fetch-fixtures.sh is already idempotent -- it skips re-downloading
-        # Alpine packages when externals/test-fixtures/versions.lock still
-        # matches -- so stash that tree outside the workspace and restore it
-        # here as a real directory. The qemu lane in tests/test-matrix.sh
-        # shares the workspace root with the guest over virtio-9p, and a
-        # symlink pointing outside that root does not resolve inside the
-        # guest, so this must be a real copy, not a symlink.
+        if: ${{ matrix.run_matrix || matrix.run_bench }}
         run: |
           cache="$HOME/.cache/elfuse-ci/test-fixtures"
           if [ -d "$cache" ]; then
@@ -552,10 +569,6 @@ jobs:
           ls -l "$ROSETTA"
 
       - name: Build elfuse
-        # make does not track EXTRA_CFLAGS changes, so an object built for one
-        # sanitizer must not be reused for another. Checkout already wipes
-        # build/ (git clean -ffdx), but clean explicitly so the leg builds from
-        # scratch even on a workspace that was not freshly cleaned.
         run: |
           make clean
           make EXTRA_CFLAGS="$EXTRA_CFLAGS" elfuse
@@ -574,9 +587,7 @@ jobs:
           make EXTRA_CFLAGS="$EXTRA_CFLAGS" test-multi-vcpu
 
       - name: make check
-        # Release runs the full check suite; sanitizer legs run check-sanitizer,
-        # a representative internal-implementation subset (the release lane plus
-        # test-matrix already cover Linux syscall compatibility).
+        if: ${{ matrix.check_target != '' }}
         run: |
           make EXTRA_CFLAGS="$EXTRA_CFLAGS" ${{ matrix.check_target }}
 
@@ -584,6 +595,46 @@ jobs:
         if: ${{ matrix.run_matrix }}
         run: |
           bash tests/test-matrix.sh all
+
+      - name: Benchmark suite (make bench-ci)
+        if: ${{ matrix.run_bench }}
+        run: |
+          scripts/ci-host-lock.sh release
+          CI_HOST_LOCK_WAIT_MIN=${{ matrix.lock_wait }} \
+            scripts/ci-host-lock.sh acquire exclusive
+          trap 'scripts/ci-host-lock.sh release' EXIT
+          make bench-ci
+
+      - name: Compare against baseline (soft regressions)
+        # Soft signal for now: the self-hosted runner's run-to-run variance
+        # is not yet characterized, so a regression prints loudly in the log
+        # but does not fail the leg. Flip criterion: once the leg has run
+        # for ~2 weeks / ~20 runs with every ratio inside the +20% threshold,
+        # drop BENCH_REPORT_ONLY=1 so regressions hard-fail. Missing metrics
+        # remain hard failures: they mean a benchmark errored or timed out and
+        # must not silently remove coverage during the ramp.
+        if: ${{ matrix.run_bench }}
+        run: |
+          BENCH_REPORT_ONLY=1 python3 scripts/bench-compare.py \
+            --fail-on-missing --report-json build/bench-pr-report.json
+
+      - name: Upload benchmark PR report
+        if: ${{ matrix.run_bench && !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-pr-report
+          path: build/bench-pr-report.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload benchmark results
+        if: ${{ matrix.run_bench && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-${{ runner.os }}-${{ runner.arch }}
+          path: build/bench-results.json
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Upload runtime binary
         if: ${{ !cancelled() }}
@@ -595,13 +646,14 @@ jobs:
           if-no-files-found: warn
 
       - name: Save test fixtures cache
-        # Persist externals/test-fixtures outside the workspace so the next
-        # run's "Restore cached test fixtures" step can skip re-downloading
-        # unchanged Alpine packages. Runs even if an earlier step failed, as
-        # long as the job wasn't cancelled, so a fixture-unrelated test
-        # failure doesn't cost the next run its cache.
-        if: ${{ !cancelled() && matrix.sanitizer == 'release' }}
+        if: ${{ !cancelled() && (matrix.sanitizer == 'release' || matrix.run_bench) }}
         run: |
+          if [ "${{ matrix.sanitizer }}" = "bench" ]; then
+            scripts/ci-host-lock.sh release
+            CI_HOST_LOCK_WAIT_MIN=${{ matrix.shared_lock_wait }} \
+              scripts/ci-host-lock.sh acquire shared
+            trap 'scripts/ci-host-lock.sh release' EXIT
+          fi
           if [ -d externals/test-fixtures ]; then
             cache="$HOME/.cache/elfuse-ci/test-fixtures"
             mkdir -p "$(dirname "$cache")"
@@ -611,3 +663,7 @@ jobs:
           else
             echo "No externals/test-fixtures to save"
           fi
+
+      - name: Release host lock
+        if: ${{ always() }}
+        run: scripts/ci-host-lock.sh release

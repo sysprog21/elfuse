@@ -16,6 +16,8 @@
 #     aarch64-musl/
 #       staticbin/bin/             # busybox-static + applet symlinks
 #       dyn-bin/                   # relative symlinks into rootfs
+#       lmbench/                   # lat_syscall/lat_proc/lat_fs + hello-s,
+#                                  # cross-compiled from pinned source
 #     x86_64-musl/                 # only when INCLUDE_X86_64=1
 #       rootfs/                    # x86_64 minirootfs + apk overlays
 #       staticbin/bin/             # x86_64 busybox-static + applets
@@ -102,6 +104,32 @@ PKGS=(
     "main:sqlite"
     "main:sqlite-libs"
     "main:tree"
+    # Tier-2 application benchmark tools for tests/bench-suite.sh plus their
+    # runtime dependency closure as resolved against the v3.21 APKINDEX
+    # (so:* dependencies mapped back to their providing packages).
+    "main:git"
+    "main:make"
+    "main:python3"
+    "main:zstd"
+    "main:zstd-libs"
+    "main:libcurl"
+    "main:ca-certificates-bundle"
+    "main:brotli-libs"
+    "main:c-ares"
+    "main:libidn2"
+    "main:libunistring"
+    "main:libpsl"
+    "main:nghttp2-libs"
+    "main:libssl3"
+    "main:libexpat"
+    "main:libbz2"
+    "main:libffi"
+    "main:gdbm"
+    "main:xz-libs"
+    "main:mpdecimal"
+    "main:libstdc++"
+    "main:libpanelw"
+    "community:ripgrep"
 )
 
 # "repo:name:version" tuples, populated by resolve_versions() from live APKINDEX
@@ -146,6 +174,19 @@ STATIC_APPLETS=(
     chmod chown ln rm mkdir rmdir mv pwd
     cmp diff find sed grep awk
 )
+
+# lmbench source pin for the Tier-1 microbenchmarks of tests/bench-suite.sh
+# (issue #195). Alpine ships no lmbench package, so unlike everything above
+# these are compiled from a pinned source snapshot rather than pulled as an
+# apk. The intel/lmbench fork is the community build-fix fork of lmbench3;
+# the sources are compiled UNMODIFIED -- lmbench's COPYING-2 permits
+# publishing results only from unmodified benchmarks -- and the only build
+# glue is a pair of stub <rpc/*.h> headers injected via -I (bench.h includes
+# SunRPC headers unconditionally, musl and modern glibc ship neither, and no
+# compiled benchmark calls an RPC symbol).
+LMBENCH_COMMIT="a33716428dc2e717ce3e7dfce767302583eb8fdc"
+LMBENCH_SHA256="7769d4758dcbdfb54b443b2e44d65bd0b6c47d49efa87380d83fd12d5ad36f76"
+LMBENCH_URL="https://github.com/intel/lmbench/archive/${LMBENCH_COMMIT}.tar.gz"
 
 # Resolved by resolve_minirootfs() before staging.
 MINIROOTFS_TGZ=""
@@ -326,6 +367,121 @@ extract_apk_to()
         --exclude='.pre-deinstall' \
         --exclude='.post-deinstall' \
         --exclude='.trigger' 2> /dev/null || true
+}
+
+sha256_of()
+{
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Resolve an aarch64-Linux cross C compiler for the lmbench build. Preference
+# order: explicit LMBENCH_CC, the repo's CROSS_COMPILE convention (same
+# toolchain that builds the guest test binaries, see mk/toolchain.mk), then
+# the common Homebrew/installed names and the mk/toolchain.mk default path.
+lmbench_cc()
+{
+    if [ -n "${LMBENCH_CC:-}" ]; then
+        echo "$LMBENCH_CC"
+        return 0
+    fi
+    if [ -n "${CROSS_COMPILE:-}" ] \
+        && command -v "${CROSS_COMPILE}gcc" > /dev/null 2>&1; then
+        echo "${CROSS_COMPILE}gcc"
+        return 0
+    fi
+    local cand
+    for cand in aarch64-linux-musl-gcc aarch64-linux-gnu-gcc \
+        /opt/toolchain/aarch64-linux-gnu/bin/aarch64-linux-gnu-gcc; do
+        if command -v "$cand" > /dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Fetch the pinned lmbench source snapshot and cross-compile the three
+# Tier-1 benchmarks (plus hello: lat_proc exec spawns the compiled-in
+# path /tmp/hello-s) into aarch64-musl/lmbench/. Static binaries, so the
+# same artifacts serve the elfuse, qemu (over the 9p share), native and
+# orbstack bench columns. Skipped with a warning when no cross compiler
+# is available -- bench-suite.sh then reports Tier 1 as unavailable.
+stage_lmbench()
+{
+    local lmdir="${FIXTURES}/aarch64-musl/lmbench"
+    local stamp="${lmdir}/VERSION"
+    local tarball="${CACHE}/lmbench-${LMBENCH_COMMIT}.tar.gz"
+
+    local cc
+    if ! cc="$(lmbench_cc)"; then
+        printf '%s %s\n' "$(c_yellow '     skip:')" \
+            "lmbench: no aarch64-linux cross compiler (set CROSS_COMPILE or LMBENCH_CC); bench-suite Tier 1 will be unavailable"
+        return 0
+    fi
+
+    if [ "${FORCE:-0}" != "1" ] && [ -x "${lmdir}/lat_syscall" ] \
+        && [ -x "${lmdir}/lat_proc" ] && [ -x "${lmdir}/lat_fs" ] \
+        && [ -x "${lmdir}/hello-s" ] \
+        && grep -q "$LMBENCH_COMMIT" "$stamp" 2> /dev/null; then
+        ok "lmbench: cached (${LMBENCH_COMMIT:0:7})"
+        return 0
+    fi
+
+    fetch "$LMBENCH_URL" "$tarball"
+    local got
+    got="$(sha256_of "$tarball")"
+    if [ "$got" != "$LMBENCH_SHA256" ]; then
+        echo "error: lmbench tarball sha256 mismatch (got $got, want $LMBENCH_SHA256)" >&2
+        exit 1
+    fi
+
+    log "build lmbench ($(basename "$cc"))"
+    local stage
+    stage="$(mktemp -d)"
+    tar xzf "$tarball" -C "$stage" --strip-components=1
+
+    # Stub SunRPC headers (see the pin comment above): bench.h references
+    # these types only in two extern prototypes no compiled benchmark uses.
+    mkdir -p "${stage}/rpc-stub/rpc"
+    printf 'typedef void SVCXPRT;\ntypedef void CLIENT;\n' \
+        > "${stage}/rpc-stub/rpc/rpc.h"
+    : > "${stage}/rpc-stub/rpc/types.h"
+
+    rm -rf "$lmdir"
+    mkdir -p "$lmdir"
+    # -DSTATIC: pure static linking is what makes one artifact set portable
+    # across all four bench environments, and it selects /tmp/hello-s as
+    # lat_proc's exec target. The support sources are the subset of
+    # lmbench.a that lat_syscall/lat_proc/lat_fs actually link against.
+    local t out src lib
+    local libs="lib_timing.c lib_stats.c lib_debug.c lib_sched.c getopt.c lib_unix.c"
+    for t in lat_syscall lat_proc lat_fs hello; do
+        out="$t"
+        [ "$t" = "hello" ] && out="hello-s"
+        src=("${stage}/src/${t}.c")
+        for lib in $libs; do
+            src+=("${stage}/src/${lib}")
+        done
+        "$cc" -static -O2 -DSTATIC -I "${stage}/rpc-stub" \
+            -o "${lmdir}/${out}" "${src[@]}" -lm || {
+            echo "error: lmbench build failed for $t (cc: $cc)" >&2
+            rm -rf "$stage"
+            exit 1
+        }
+    done
+    rm -rf "$stage"
+    {
+        echo "source: ${LMBENCH_URL}"
+        echo "commit: ${LMBENCH_COMMIT}"
+        echo "sha256: ${LMBENCH_SHA256}"
+        echo "cc: $(basename "$cc")"
+        echo "sources: unmodified (stub rpc headers injected via -I only)"
+    } > "$stamp"
+    ok "lmbench: lat_syscall lat_proc lat_fs hello-s"
 }
 
 main()
@@ -533,6 +689,8 @@ EOF
     fi
     ok "static-bin: ${STATICBIN}/busybox + ${#STATIC_APPLETS[@]} applets"
 
+    stage_lmbench
+
     if [ "${INCLUDE_X86_64:-0}" = "1" ]; then
         fetch_x86_64_userspace
     fi
@@ -547,6 +705,9 @@ EOF
     printf 'initramfs:       %s\n' "$INITRAMFS"
     printf 'ssh key:         %s\n' "${KEYS_DIR}/ssh_key"
     printf 'static bin tree: %s\n' "$STATICBIN"
+    if [ -x "${FIXTURES}/aarch64-musl/lmbench/lat_syscall" ]; then
+        printf 'lmbench:         %s\n' "${FIXTURES}/aarch64-musl/lmbench"
+    fi
     if [ "${INCLUDE_X86_64:-0}" = "1" ]; then
         printf 'x86_64 rootfs:   %s\n' "${FIXTURES}/x86_64-musl/rootfs"
         printf 'x86_64 staticbin:%s\n' "${FIXTURES}/x86_64-musl/staticbin/bin"

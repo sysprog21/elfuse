@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -40,6 +41,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -791,6 +793,200 @@ int main(void)
                     "read did not report the hangup as EIO");
             }
             close(hup_master);
+        }
+    }
+
+    /* The same hangup through epoll. poll and epoll answer from the same pty
+     * bookkeeping, but they are separate readiness paths: epoll_wait needs its
+     * own wiring, and a terminal that waits with epoll (foot does) hangs on
+     * exit without it.
+     */
+    {
+        int ep_master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        unsigned int ep_ptyno = (unsigned int) -1;
+        int ep_unlock = 0;
+        if (ep_master < 0 || ioctl(ep_master, TIOCGPTN, &ep_ptyno) != 0 ||
+            ioctl(ep_master, TIOCSPTLCK, &ep_unlock) != 0) {
+            TEST("epoll reports EPOLLHUP once the slave closes");
+            FAIL("could not stage a master");
+            if (ep_master >= 0)
+                close(ep_master);
+        } else {
+            char ep_path[32];
+            snprintf(ep_path, sizeof(ep_path), "/dev/pts/%u", ep_ptyno);
+            int ep_slave = open(ep_path, O_RDWR | O_NOCTTY);
+            int ep = epoll_create1(0);
+            if (ep_slave < 0 || ep < 0) {
+                TEST("epoll reports EPOLLHUP once the slave closes");
+                FAIL("could not stage slave/epoll fd");
+                if (ep_slave >= 0)
+                    close(ep_slave);
+            } else {
+                close(ep_slave);
+
+                struct epoll_event reg = {.events = EPOLLIN};
+                reg.data.u64 = 0x5eed;
+                int added = epoll_ctl(ep, EPOLL_CTL_ADD, ep_master, &reg);
+
+                /* A finite timeout: before the fix this returned 0 here and
+                 * blocked forever on the -1 an actual terminal passes.
+                 */
+                struct epoll_event ev;
+                memset(&ev, 0, sizeof(ev));
+                int er = added == 0 ? epoll_wait(ep, &ev, 1, 2000) : -1;
+
+                TEST("epoll reports EPOLLHUP once the slave closes");
+                EXPECT_TRUE(er > 0 && (ev.events & EPOLLHUP),
+                            "no EPOLLHUP after the last slave closed");
+
+                TEST("EPOLLHUP carries the registered epoll_data");
+                EXPECT_TRUE(er > 0 && ev.data.u64 == 0x5eed,
+                            "hangup event lost its user data");
+
+                /* An already-pending hangup must not be held until the
+                 * caller's deadline: the host never makes the fd ready, so a
+                 * finite wait that only checks after kevent returns would
+                 * block for the full timeout before reporting.
+                 */
+                struct timespec t0, t1;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                memset(&ev, 0, sizeof(ev));
+                int er2 = epoll_wait(ep, &ev, 1, 10000);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+                                  (t1.tv_nsec - t0.tv_nsec) / 1000000;
+
+                TEST("a pending EPOLLHUP does not wait out a finite timeout");
+                EXPECT_TRUE(
+                    er2 > 0 && (ev.events & EPOLLHUP) && elapsed_ms < 2000,
+                    "hangup was delayed until the epoll_wait deadline");
+            }
+            if (ep >= 0)
+                close(ep);
+            close(ep_master);
+        }
+    }
+
+    /* A slave obtained through TIOCGPTPEER has to count toward the same
+     * accounting as a /dev/pts/N open. It has been the recommended way to reach
+     * the peer since Linux 4.13, and a master whose only slave arrived that way
+     * would otherwise never report a hangup at all.
+     */
+    {
+        int gp_master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        int gp_unlock = 0;
+        unsigned int gp_ptyno = (unsigned int) -1;
+        if (gp_master < 0 || ioctl(gp_master, TIOCGPTN, &gp_ptyno) != 0 ||
+            ioctl(gp_master, TIOCSPTLCK, &gp_unlock) != 0) {
+            TEST("TIOCGPTPEER slave counts toward the hangup");
+            FAIL("could not stage a master");
+            if (gp_master >= 0)
+                close(gp_master);
+        } else {
+            int gp_slave = ioctl(gp_master, TIOCGPTPEER, O_RDWR | O_NOCTTY);
+            if (gp_slave < 0) {
+                /* Matches the existing TIOCGPTPEER case above, which accepts
+                 * ENOTTY on hosts without peer support.
+                 */
+                TEST("TIOCGPTPEER slave counts toward the hangup");
+                EXPECT_TRUE(
+                    errno == ENOTTY,
+                    "TIOCGPTPEER failed for a reason other than ENOTTY");
+            } else {
+                close(gp_slave);
+
+                struct pollfd gp = {.fd = gp_master, .events = POLLIN};
+                int gr = poll(&gp, 1, 2000);
+                TEST("TIOCGPTPEER slave counts toward the hangup");
+                EXPECT_TRUE(gr > 0 && (gp.revents & POLLHUP),
+                            "no POLLHUP after the TIOCGPTPEER slave closed");
+            }
+            close(gp_master);
+        }
+    }
+
+    /* The shape a real terminal has: the master stays in this process and the
+     * slave lives in a forked child, which is the shell. "exit" in the terminal
+     * is that child going away.
+     *
+     * A guest fork is a posix_spawn of a fresh elfuse process, so the child
+     * keeps its own keepalive table and nothing about its slave reaches the
+     * parent's accounting by itself. Without the shared per-pty counters this
+     * reports no hangup on either readiness path, and foot's window stays open
+     * after the shell exits even though the same-process cases above pass.
+     */
+    {
+        int fk_master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        unsigned int fk_ptyno = (unsigned int) -1;
+        int fk_unlock = 0;
+        if (fk_master < 0 || ioctl(fk_master, TIOCGPTN, &fk_ptyno) != 0 ||
+            ioctl(fk_master, TIOCSPTLCK, &fk_unlock) != 0) {
+            TEST("master reports POLLHUP when a forked child's slave closes");
+            FAIL("could not stage a master");
+            if (fk_master >= 0)
+                close(fk_master);
+        } else {
+            char fk_path[32];
+            snprintf(fk_path, sizeof(fk_path), "/dev/pts/%u", fk_ptyno);
+
+            pid_t fk_pid = fork();
+            if (fk_pid == 0) {
+                /* The shell: take the slave, say something, leave. */
+                int slave = open(fk_path, O_RDWR | O_NOCTTY);
+                if (slave < 0)
+                    _exit(3);
+                write(slave, "bye", 3);
+                close(slave);
+                _exit(0);
+            }
+
+            int fk_status = 0;
+            bool reaped =
+                fk_pid > 0 && waitpid(fk_pid, &fk_status, 0) == fk_pid;
+            bool child_ok =
+                reaped && WIFEXITED(fk_status) && WEXITSTATUS(fk_status) == 0;
+
+            if (!child_ok) {
+                TEST(
+                    "master reports POLLHUP when a forked child's slave "
+                    "closes");
+                FAIL("child could not open the slave");
+            } else {
+                /* Queued output still comes first, exactly as in the
+                 * same-process case: drain before judging the hangup.
+                 */
+                char fk_buf[32];
+                struct pollfd fk_drain = {.fd = fk_master, .events = POLLIN};
+                if (poll(&fk_drain, 1, 1000) > 0 && (fk_drain.revents & POLLIN))
+                    read(fk_master, fk_buf, sizeof(fk_buf));
+
+                struct pollfd fp = {.fd = fk_master, .events = POLLIN};
+                int fr = poll(&fp, 1, 2000);
+                TEST(
+                    "master reports POLLHUP when a forked child's slave "
+                    "closes");
+                EXPECT_TRUE(fr > 0 && (fp.revents & POLLHUP),
+                            "no POLLHUP after the forked child's slave closed");
+
+                int fep = epoll_create1(0);
+                struct epoll_event freg = {.events = EPOLLIN};
+                freg.data.u64 = 0xf00d;
+                struct epoll_event fev;
+                memset(&fev, 0, sizeof(fev));
+                int fer = -1;
+                if (fep >= 0 &&
+                    epoll_ctl(fep, EPOLL_CTL_ADD, fk_master, &freg) == 0)
+                    fer = epoll_wait(fep, &fev, 1, 2000);
+                TEST(
+                    "epoll reports EPOLLHUP when a forked child's slave "
+                    "closes");
+                EXPECT_TRUE(fer > 0 && (fev.events & EPOLLHUP),
+                            "no EPOLLHUP after the forked child's slave "
+                            "closed");
+                if (fep >= 0)
+                    close(fep);
+            }
+            close(fk_master);
         }
     }
 

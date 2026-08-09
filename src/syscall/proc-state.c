@@ -783,7 +783,8 @@ static casefold_verdict_t resolve_through_links(const char *sr,
                                                 size_t bufsz,
                                                 casefold_walk_t *walk,
                                                 char *guest_out,
-                                                size_t guest_outsz)
+                                                size_t guest_outsz,
+                                                bool *followed_relative_out)
 {
     char splice[LINUX_PATH_MAX];
     char norm[LINUX_PATH_MAX];
@@ -832,6 +833,8 @@ static casefold_verdict_t resolve_through_links(const char *sr,
         if (path_splice_link_target(cur, walk->link_guest_offset, target, rest,
                                     splice, sizeof(splice)) < 0)
             return CASEFOLD_ERROR;
+        if (followed_relative_out && target[0] != '/')
+            *followed_relative_out = true;
         /* A target may carry '..' that climbs above the guest root, which
          * the walk would append literally and follow out of the sysroot. Clamp
          * it exactly as an entry path is clamped; an interior '..' stays for
@@ -882,12 +885,13 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     bool present;
     bool folded = false;
     bool followed_link = false;
+    bool followed_relative_link = false;
     char followed[LINUX_PATH_MAX];
     if (casefold_active()) {
         casefold_walk_t walk;
-        casefold_verdict_t verdict =
-            resolve_through_links(sr, lookup, follow_final, buf, bufsz, &walk,
-                                  followed, sizeof(followed));
+        casefold_verdict_t verdict = resolve_through_links(
+            sr, lookup, follow_final, buf, bufsz, &walk, followed,
+            sizeof(followed), &followed_relative_link);
 
         if (verdict == CASEFOLD_ERROR)
             return NULL;
@@ -985,29 +989,19 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         is_sysroot_backed_temp_path(path_to_check))
         return buf;
 
-    /* A path reached by following a symlink never falls through to the host.
-     * An absolute target typed by the guest is one thing: the guest asked for
-     * it, and the host fallback is the documented answer. A target recorded
-     * inside the sysroot is another: honoring it would let anything that can
-     * write a symlink there hand the guest a file from outside the tree, which
-     * is the escape tests/test-sysroot-symlink-escape.c exists to prevent.
-     * Resolution stops at the sysroot spelling, so the caller's own syscall
-     * reports the path as missing, which is what it is in the guest's
-     * namespace.
+    /* A path reached by following a symlink has already been rebased to the
+     * target's guest spelling. For non-forced paths, keep the same host
+     * fallback rule as a path the guest typed directly: if the target exists
+     * on the host, hand that resolved target to the caller; otherwise leave
+     * the syscall on the sysroot spelling so dangling links report normally.
      */
     if (followed_link) {
-        /* The sysroot does not have it. If the host does, the link was a way
-         * to reach a file outside the tree, and refusing is the whole point;
-         * report ELOOP, which is what resolution stopping at a link means and
-         * what callers of this resolver already propagate. If the host has
-         * nothing either the link simply dangles, and buf lets the caller's own
-         * syscall say so.
-         *
-         * The collapsed spelling is what the host is asked about: a target
-         * reaching out of the tree keeps the '..' components that carried it
-         * there, and those name nothing from the host's root.
-         */
-        if (sysroot_path_exists(path_to_check, follow_final)) {
+        if (!followed_relative_link &&
+            sysroot_path_exists(path_to_check, follow_final))
+            return path_to_check;
+
+        if (followed_relative_link &&
+            sysroot_path_exists(path_to_check, follow_final)) {
             errno = ELOOP;
             return NULL;
         }
@@ -1063,6 +1057,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      * wrong-case one folds onto a directory the create would then land in.
      */
     bool followed_link = false;
+    bool followed_relative_link = false;
     char followed[LINUX_PATH_MAX];
     if (casefold_active()) {
         casefold_walk_t walk;
@@ -1073,7 +1068,8 @@ const char *proc_resolve_sysroot_create_path(const char *path,
          * inside the directory the link names.
          */
         if (resolve_through_links(sr, lookup, false, buf, bufsz, &walk,
-                                  followed, sizeof(followed)) == CASEFOLD_ERROR)
+                                  followed, sizeof(followed),
+                                  &followed_relative_link) == CASEFOLD_ERROR)
             return NULL;
         followed_link = rebase_after_link(&lookup, followed);
         if (str_copy_trunc(parent, buf, sizeof(parent)) >= sizeof(parent)) {

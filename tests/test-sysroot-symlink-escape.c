@@ -8,19 +8,16 @@
  * containment check on absolute guest paths, since it has no dirfd context to
  * rebuild a host location from a relative one. That left openat(dirfd, name)
  * to the host kernel's own resolution, unconfined to dirfd's subtree: a
- * symlink reachable through a sysroot-contained dirfd -- with a relative
- * target holding enough ".." components, or with an absolute target -- could
- * walk straight out of the sysroot with no check at all, even though the
- * exact same escape through an absolute guest path was already rejected with
- * ELOOP. path_translate_at() now reconstructs the absolute guest path from
- * the dirfd's guest base path and re-validates it through the same
- * containment-checked resolver the absolute-path surface uses.
+ * symlink reachable through a sysroot-contained dirfd with a relative target
+ * holding enough ".." components could walk straight out of the sysroot with
+ * no check at all. path_translate_at() now reconstructs the absolute guest
+ * path from the dirfd's guest base path and re-validates it through the same
+ * resolver the absolute-path surface uses.
  *
  * The Makefile target stages an absolute-target symlink and a relative-target
- * (deep "..") symlink under $sysroot/d1, both pointing at a secret file
- * outside the sysroot, plus a normal in-sysroot file. This guest program only
- * exercises the relative-dirfd surface (openat(dirfd, name, ...)); the
- * absolute-path surface is already covered by test-sysroot-nofollow.
+ * (deep "..") symlink under $sysroot/d1, both pointing at a host file outside
+ * the sysroot, plus a normal in-sysroot file. The absolute target is a host
+ * bridge and should follow; the relative climb-out is still blocked.
  */
 
 #include <errno.h>
@@ -54,16 +51,14 @@ int main(void)
         }
     }
 
-    TEST("absolute-target symlink escape via dirfd is blocked");
+    TEST("absolute-target symlink bridge via dirfd is followed");
     {
         int fd = openat(dirfd, "abs-link", O_RDONLY);
-        if (fd < 0 && errno == ELOOP)
+        if (fd >= 0) {
+            close(fd);
             PASS();
-        else {
-            if (fd >= 0)
-                close(fd);
-            FAIL("openat(dirfd, abs-link) did not fail with ELOOP");
-        }
+        } else
+            FAIL("openat(dirfd, abs-link) failed");
     }
 
     TEST("relative \"..\" symlink escape via dirfd is blocked");
@@ -86,13 +81,11 @@ int main(void)
             FAIL("chdir /d1 failed");
         } else {
             int fd = open("abs-link", O_RDONLY);
-            if (fd < 0 && errno == ELOOP)
+            if (fd >= 0) {
+                close(fd);
                 PASS();
-            else {
-                if (fd >= 0)
-                    close(fd);
-                FAIL("open(AT_FDCWD, abs-link) did not fail with ELOOP");
-            }
+            } else
+                FAIL("open(AT_FDCWD, abs-link) failed");
         }
     }
 

@@ -530,6 +530,7 @@ test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-tar
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
+	ln -s "$$HOME" "$$tmpdir/host-home-link"; \
 	had_target=0; [ -e "/symlink-target" ] && had_target=1; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
 	    $(BUILD_DIR)/test-sysroot-symlink-target; \

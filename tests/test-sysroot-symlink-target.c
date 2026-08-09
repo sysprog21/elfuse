@@ -121,6 +121,10 @@ int main(void)
     TEST("  and reads through to it");
     EXPECT_TRUE(reads("abs-escaped", "escaped") == 0, "content");
 
+    TEST("a staged host symlink is followed");
+    EXPECT_TRUE(stat("/host-home-link", &st) == 0 && S_ISDIR(st.st_mode),
+                "stat follows host link");
+
     /* readlink reports the disk. A relative target is stored verbatim, so
      * the guest's own bytes come back; an absolute one was rewritten at
      * symlink() time to the sysroot-relative spelling (see the header), and

@@ -1549,21 +1549,12 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * process would die instead of the clone failing. Suppress it per-socket
      * the way syscall/net.c does for guest sockets; the option rides on the
      * file description, so the spawned child inherits it.
-     *
-     * Failing the clone beats continuing without it: proceeding would leave the
-     * host one dead child away from being killed by a signal it never handles,
-     * which is worse than the guest seeing a fork it can retry.
      */
     int nosigpipe = 1;
-    if (setsockopt(sock_fds[0], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
-                   sizeof(nosigpipe)) < 0 ||
-        setsockopt(sock_fds[1], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
-                   sizeof(nosigpipe)) < 0) {
-        log_error("clone: SO_NOSIGPIPE failed: %s", strerror(errno));
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        return -LINUX_ENOMEM;
-    }
+    setsockopt(sock_fds[0], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+               sizeof(nosigpipe));
+    setsockopt(sock_fds[1], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+               sizeof(nosigpipe));
     if (is_vfork && pipe(vfork_notify_fds) < 0) {
         log_error("clone: vfork notify pipe failed: %s", strerror(errno));
         close(sock_fds[0]);

@@ -27,6 +27,7 @@ SRCS := \
     core/vdso.c \
     core/shim-globals.c \
     core/bootstrap.c \
+    core/guest-env.c \
     core/launch.c \
     core/rosetta.c \
     core/sysroot.c \
@@ -258,6 +259,13 @@ $(BUILD_DIR)/test-string-builder-host: \
 $(BUILD_DIR)/test-dynamic-array-host: \
 		$(BUILD_DIR)/test-dynamic-array-host.o \
 		$(BUILD_DIR)/dynamic-array.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the guest environment merge host test (native macOS binary)
+# guest-env.o's only dependency is the log macro, which the test stubs.
+$(BUILD_DIR)/test-guest-env-host: $(BUILD_DIR)/test-guest-env-host.o \
+		$(BUILD_DIR)/core/guest-env.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

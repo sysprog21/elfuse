@@ -76,8 +76,11 @@ then entered, the same way a guest `chdir` into a real directory is handled,
 with one launch-time restriction: the resolved directory must sit inside the
 sysroot. For a path the sysroot does not hold, a guest syscall falls back to
 the host, but a workdir that exists only on the host would start the guest
-outside the requested tree, so the launch refuses it. FUSE-mounted and
-`/proc`-virtual directories are not supported through this flag.
+outside the requested tree, so the launch refuses it. FUSE-mounted,
+`/proc`-virtual, and `/dev/shm` directories are not supported through this
+flag: a guest `chdir` into `/dev/shm` does two things this flag does not (it
+refuses a symlink leaf, and it keeps `getcwd` reporting the `/dev/shm`
+spelling rather than the backing location).
 
 ## Common Launch Patterns
 

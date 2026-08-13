@@ -145,6 +145,15 @@ int elfuse_launch(const launch_args_t *args)
                       args->cwd_guest, strerror(errno));
             goto fail;
         }
+        /* A shm leaf needs sys_chdir's O_NOFOLLOW fd and virtual-cwd publish;
+         * entering it here would add a holder of the never-follow invariant
+         * dev_shm_resolve_path() enumerates. Refuse instead.
+         */
+        if (tx.is_dev_shm) {
+            log_error("--workdir %s: /dev/shm is not supported",
+                      args->cwd_guest);
+            goto fail;
+        }
         /* proc_resolve_sysroot_path() hands back the host spelling for a path
          * the sysroot does not hold, the overlay contract for guest syscalls,
          * but that would start the guest in a same-named host directory

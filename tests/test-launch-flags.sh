@@ -66,8 +66,14 @@ check accept "--fakeroot with an explicit root --user" '' --fakeroot --user 0:0
 # lands in /var/folders, outside is_sysroot_backed_temp_path()'s /tmp prefix,
 # so proc_resolve_sysroot_path's host fallback is reachable here.
 scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
-mkdir -p "$scratch/sysroot/inroot" "$scratch/hostonly"
+# elfuse backs guest /dev/shm with a private host directory that outlives the
+# run, so create the leaf: the check must measure the refusal, not a missing
+# directory. chmod because create_private_dir() rejects a group or other bit.
+shm_root="/tmp/elfuse-shm-$(id -u)"
+shm_wd="$shm_root/launch-flags-wd"
+trap 'rm -rf "$scratch" "$shm_wd"' EXIT
+mkdir -p "$scratch/sysroot/inroot" "$scratch/hostonly" "$shm_wd"
+chmod 700 "$shm_root"
 
 check reject "--workdir absent in the sysroot, present on the host" \
     "does not resolve inside the sysroot" \
@@ -79,6 +85,10 @@ check accept "--workdir present in the sysroot" '' \
 # Pins elfuse_launch's "--sysroot /" carve-out: a bare separator must not
 # reject every workdir under it.
 check accept "--workdir under a root sysroot" '' --sysroot / --workdir /var/tmp
+
+# Refusal rationale in elfuse_launch; see dev_shm_resolve_path().
+check reject "--workdir under /dev/shm" "not supported" \
+    --workdir /dev/shm/launch-flags-wd
 
 report_summary
 # shellcheck disable=SC2154  # fail is incremented in tests/lib/report.sh

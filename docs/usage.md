@@ -23,6 +23,8 @@ Supported user-facing options:
 | `--fakeroot` | Start the guest as uid/gid 0 with full emulated capabilities (also `ELFUSE_FAKEROOT=1`) |
 | `--gdb PORT` | Listen for a GDB RSP client on `PORT` (aarch64 guests only) |
 | `--gdb-stop-on-entry` | Stop before the first guest instruction |
+| `--user UID[:GID]` | Run the guest as `UID`, and `GID` when given (defaults to `UID`). Numeric only |
+| `--workdir DIR` | Guest-absolute initial working directory, resolved under `--sysroot` |
 | `--` | End `elfuse` option parsing; remaining tokens are guest argv |
 
 `ELFUSE_FAKEROOT_EXEC` has no flag form. It names one executable, by absolute
@@ -45,6 +47,37 @@ absolute path is rejected at startup rather than ignored.
 only bounds a single `hv_vcpu_run()` iteration before the host regains control,
 which is what allows host-side timers and signals to be observed promptly.
 Setting `--timeout 0` disables this watchdog for long-running CPU-bound guests.
+
+## Guest Identity And Working Directory
+
+`--user` and `--workdir` select what the guest starts as and where it starts.
+A contradictory `--user` request is rejected before the VM is created, and
+`--workdir` is resolved during bring-up, before the first guest instruction,
+so a bad request fails with a diagnostic instead of launching a guest that
+runs as something other than what was asked for.
+
+`--user UID[:GID]` sets the identity the guest reports through `getuid` and
+`getgid`. It does not change the host process credentials: elfuse translates the
+guest's syscalls, so the number the guest sees is elfuse's to choose. The spec is
+numeric, and a bare `UID` sets the group to the same value. Symbolic names are
+resolved against the image `/etc/passwd` and `/etc/group` one layer up, by
+`elfuse-oci`.
+
+`--fakeroot` cannot be combined with a non-root `--user`. Fakeroot starts the guest
+as uid/gid 0, and the setuid permission check grants every id switch on that basis,
+so a guest that reported an unprivileged uid could still call `setuid(0)` at will.
+Both halves must be root, which makes `--fakeroot --user 0:0` valid and
+`--fakeroot --user 0:1000` a refusal.
+
+`--workdir DIR` takes a guest-absolute path and is rejected otherwise. A relative
+path would be resolved against the host working directory, silently starting the
+guest outside the intended tree. The path is translated through `--sysroot` and
+then entered, the same way a guest `chdir` into a real directory is handled,
+with one launch-time restriction: the resolved directory must sit inside the
+sysroot. For a path the sysroot does not hold, a guest syscall falls back to
+the host, but a workdir that exists only on the host would start the guest
+outside the requested tree, so the launch refuses it. FUSE-mounted and
+`/proc`-virtual directories are not supported through this flag.
 
 ## Common Launch Patterns
 

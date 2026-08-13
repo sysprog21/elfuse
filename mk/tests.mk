@@ -25,7 +25,8 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-config \
         test-mremap-tail-emfile \
         test-proctitle-host test-proctitle-low-stack \
-        test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
+        test-sysroot-procfs-exec test-timeout-disable test-launch-flags \
+        test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
@@ -233,6 +234,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
 	$(call run-lane,test-case-collision-fallback,case collisions on a folding sysroot)
 	$(call run-lane,test-fuse-alpine,Alpine sysroot FUSE validation)
 	$(call run-lane,test-timeout-disable,timeout=0 validation)
+	$(call run-lane,test-launch-flags,launch flag rejection)
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 
@@ -1012,6 +1014,11 @@ test-sysroot-procfs-exec: $(ELFUSE_BIN) $(BUILD_DIR)/test-procfs-exec
 
 test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@$(ELFUSE_BIN) --timeout 0 $(TEST_DIR)/test-hello > /dev/null
+
+## Verify --user / --workdir / --fakeroot reject contradictory requests before
+## guest bring-up.
+test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
+	@bash tests/test-launch-flags.sh $(ELFUSE_BIN) $(TEST_DIR)/test-hello
 
 ## Check the --help and argument-error usage synopses against each other
 test-usage-synopsis: $(ELFUSE_BIN)

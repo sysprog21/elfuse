@@ -4,9 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * elfuse_launch is the single entry point for "run a guest binary in a
- * fresh HVF VM until it exits". main() is its only in-tree caller; keeping
- * bring-up behind one struct is what lets another front end (the planned
- * OCI run helper) reuse this path instead of growing a second bring-up.
+ * fresh HVF VM until it exits". main() is its only caller: every launcher
+ * reaches it through the CLI, including `elfuse-oci run`, which execs elfuse
+ * with the flags that fill launch_args_t rather than linking against it.
+ * Keeping bring-up behind one struct is what lets a front end select the
+ * guest identity and cwd without a second bring-up path.
  *
  * The function owns the guest_t, the vCPU, the GDB stub, the run loop, the
  * diagnostic dumps, and guest teardown; it does NOT own the elf_path /
@@ -33,9 +35,9 @@ typedef struct {
 
     /* elf_path is a FUSE-materialized temp to unlink once
      * guest_bootstrap_prepare has loaded it (kept for Rosetta guests, which
-     * reopen the path). The caller owns the unlink on any pre-prepare
-     * failure; elfuse_launch owns it from the prepare call onward,
-     * including a prepare that fails.
+     * reopen the path). Ownership of the unlink transfers to elfuse_launch
+     * at the call: every failure path inside it, refusals before the
+     * prepare call included, unlinks a temp elf_path.
      */
     bool elf_host_temp;
 
@@ -51,6 +53,21 @@ typedef struct {
      */
     int guest_argc;
     const char **guest_argv;
+
+    /* When true, stage uid/gid as the guest identity before bring-up so the
+     * auxv AT_UID/AT_GID snapshot and getuid()/getgid() agree. When false,
+     * uid/gid are ignored and the guest runs under the compile-time default
+     * GUEST_UID/GUEST_GID (0 under fakeroot), never the host identity; a
+     * launcher that wants the host identity must set has_creds and pass
+     * getuid()/getgid().
+     */
+    bool has_creds;
+    uint32_t uid, gid;
+
+    /* Guest-absolute initial working directory. NULL inherits the host
+     * cwd (the caller may chdir first to control it).
+     */
+    const char *cwd_guest;
 
     /* GDB Remote Serial Protocol port (0 disables the stub) and whether
      * to halt before the first guest instruction.

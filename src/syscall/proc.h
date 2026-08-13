@@ -140,6 +140,21 @@ bool proc_set_fakeroot_exec_path(const char *path);
  */
 const char *proc_fakeroot_exec_path(void);
 
+/* Stage the initial guest credentials (--user) before proc_init.
+ * proc_identity_init applies them in place of the GUEST_UID/GUEST_GID
+ * defaults, so the auxv AT_UID/AT_GID snapshot taken by build_linux_stack
+ * matches what getuid()/getgid() later report. The staged value is consumed
+ * by the next proc_identity_init, so it applies to a single bring-up only.
+ */
+void proc_set_initial_ids(uint32_t uid, uint32_t gid);
+
+/* Drop a staged --user value that no proc_identity_init consumed. A launch
+ * that fails between proc_set_initial_ids and proc_init would otherwise
+ * leave the value staged, and the next bring-up in the same host process
+ * would apply the failed launch's identity instead of the defaults.
+ */
+void proc_clear_initial_ids(void);
+
 /* Store the guest command line for /proc/self/cmdline emulation. argv is a
  * NULL-terminated array of strings.
  */

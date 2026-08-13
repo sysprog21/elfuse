@@ -1,5 +1,4 @@
-# Shared reporting helpers for standalone test scripts (the
-# tests/test-rosetta-*.sh suite).
+# Shared reporting helpers for standalone test scripts.
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0

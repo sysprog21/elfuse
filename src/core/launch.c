@@ -16,9 +16,11 @@
 
 #include <Hypervisor/Hypervisor.h>
 #include <Hypervisor/hv_vcpu.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "core/bootstrap.h"
@@ -29,6 +31,7 @@
 #include "runtime/futex.h"   /* futex_interrupt_request */
 #include "runtime/procemu.h" /* proc_pty_release_process_slaves */
 #include "runtime/thread.h"
+#include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/wakeup-pipe.h"
 
@@ -69,6 +72,28 @@ int elfuse_launch(const launch_args_t *args)
                                      ? args->guest_argv[0]
                                      : args->elf_path;
 
+    /* Fakeroot means the guest starts as uid/gid 0: proc_identity_init's
+     * defaults and the ELFUSE_FAKEROOT_EXEC transition both set root together
+     * with the flag, and uid_is_permitted() grants every setuid under fakeroot
+     * on that basis. A non-root identity request would keep that grant while
+     * reporting an unprivileged uid, so the guest could call setuid(0) at
+     * will. Enforced here, as with the Rosetta GDB check below.
+     */
+    if (proc_fakeroot_enabled() && args->has_creds &&
+        (args->uid != 0 || args->gid != 0)) {
+        log_error(
+            "--fakeroot runs the guest as uid/gid 0 and cannot be combined "
+            "with --user %u:%u",
+            args->uid, args->gid);
+        goto fail;
+    }
+
+    /* Stage --user before bring-up; proc.h states why it cannot be applied
+     * afterwards.
+     */
+    if (args->has_creds)
+        proc_set_initial_ids(args->uid, args->gid);
+
     if (guest_bootstrap_prepare(
             &g, args->elf_path, elf_host_temp, elf_guest_path, args->sysroot,
             args->guest_argc, args->guest_argv, envp_use, shim_bin,
@@ -106,6 +131,51 @@ int elfuse_launch(const launch_args_t *args)
             proc_set_sysroot_casefold(false);
     } else {
         proc_set_sysroot_casefold(false);
+    }
+
+    /* The guest cwd is the host process cwd, as in sys_chdir's real-directory
+     * branch; placed after the casefold probe so path_translate_at sees the
+     * sysroot's real case behavior.
+     */
+    if (args->cwd_guest && args->cwd_guest[0] != '\0') {
+        path_translation_t tx;
+        if (path_translate_at(LINUX_AT_FDCWD, args->cwd_guest, PATH_TR_NONE,
+                              &tx) < 0) {
+            log_error("failed to resolve working directory %s: %s",
+                      args->cwd_guest, strerror(errno));
+            goto fail;
+        }
+        /* proc_resolve_sysroot_path() hands back the host spelling for a path
+         * the sysroot does not hold, the overlay contract for guest syscalls,
+         * but that would start the guest in a same-named host directory
+         * outside the tree --workdir named. Demand containment against the
+         * canonical prefix from proc_sysroot_snapshot() instead.
+         */
+        if (args->sysroot) {
+            char sr[LINUX_PATH_MAX];
+            if (!proc_sysroot_snapshot(sr, sizeof(sr))) {
+                log_error("failed to read the sysroot prefix for --workdir %s",
+                          args->cwd_guest);
+                goto fail;
+            }
+            /* Same carve-out as path_dirent_dir_holds_escapes(): "--sysroot /"
+             * owns every host path, but path_prefix_match on a bare separator
+             * accepts "/" alone.
+             */
+            size_t srlen = strlen(sr);
+            if (srlen > 1 && !path_prefix_match(tx.host_path, sr, srlen)) {
+                log_error("--workdir %s does not resolve inside the sysroot",
+                          args->cwd_guest);
+                goto fail;
+            }
+        }
+        if (chdir(tx.host_path) < 0) {
+            log_error("failed to set working directory %s: %s", args->cwd_guest,
+                      strerror(errno));
+            goto fail;
+        }
+        if (proc_cwd_refresh() < 0)
+            proc_cwd_invalidate();
     }
 
     hv_vcpu_t vcpu;
@@ -203,7 +273,9 @@ int elfuse_launch(const launch_args_t *args)
 fail:
     /* Bring-up failed: unwind whatever exists so far, including the temp
      * unlink this side owns past the prepare call (contract in launch.h).
+     * Staged --user credentials are dropped too (proc.h).
      */
+    proc_clear_initial_ids();
     if (guest_initialized)
         guest_destroy(&g);
     if (elf_host_temp)

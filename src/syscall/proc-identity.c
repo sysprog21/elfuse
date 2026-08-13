@@ -33,6 +33,10 @@ static _Atomic int32_t guest_has_ctty = 1;
 
 static _Atomic bool fakeroot_enabled = false;
 
+static _Atomic bool initial_ids_staged = false;
+static _Atomic uint32_t initial_uid = GUEST_UID;
+static _Atomic uint32_t initial_gid = GUEST_GID;
+
 void proc_set_fakeroot_enabled(bool enabled)
 {
     atomic_store(&fakeroot_enabled, enabled);
@@ -64,6 +68,18 @@ const char *proc_fakeroot_exec_path(void)
     return fakeroot_exec_path[0] ? fakeroot_exec_path : NULL;
 }
 
+void proc_set_initial_ids(uint32_t uid, uint32_t gid)
+{
+    atomic_store(&initial_uid, uid);
+    atomic_store(&initial_gid, gid);
+    atomic_store(&initial_ids_staged, true);
+}
+
+void proc_clear_initial_ids(void)
+{
+    atomic_store(&initial_ids_staged, false);
+}
+
 void proc_identity_init(void)
 {
     guest_pid = 1;
@@ -76,6 +92,14 @@ void proc_identity_init(void)
     if (proc_fakeroot_enabled()) {
         uid = 0;
         gid = 0;
+    }
+
+    /* A staged --user wins over the defaults and over fakeroot; consumed
+     * here so it applies to one bring-up only (contract in proc.h).
+     */
+    if (atomic_exchange(&initial_ids_staged, false)) {
+        uid = atomic_load(&initial_uid);
+        gid = atomic_load(&initial_gid);
     }
 
     emu_uid = uid;

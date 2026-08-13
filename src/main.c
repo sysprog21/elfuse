@@ -201,7 +201,8 @@ static int host_dc_zva_assert(void)
 #define ELFUSE_USAGE_BODY(sep)                                     \
     "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]" sep \
     "[--create-sysroot PATH] [--no-rosetta] [--fakeroot]" sep      \
-    "[--gdb PORT] [--gdb-stop-on-entry] <elf-path> [args...]"
+    "[--gdb PORT] [--gdb-stop-on-entry]" sep                       \
+    "[--user UID[:GID]] [--workdir DIR] <elf-path> [args...]"
 
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
 #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
@@ -229,6 +230,9 @@ int main(int argc, char **argv)
     int gdb_port = 0;
     bool gdb_stop_on_entry = false;
     bool fakeroot = false;
+    bool has_creds = false;
+    uint32_t uid = 0, gid = 0;
+    char *workdir = NULL;
     int arg_start = 1;
     /* Everything the shared cleanup label reads is declared and initialized
      * here, above the option loop, so any later error path can `goto cleanup`:
@@ -296,6 +300,11 @@ int main(int argc, char **argv)
                 "Protocol on PORT\n"
                 "  --gdb-stop-on-entry     Halt before the first guest "
                 "instruction\n"
+                "  --user UID[:GID]        Run the guest as UID (and GID; "
+                "defaults to UID). Numeric; elfuse-oci resolves symbolic "
+                "names\n"
+                "  --workdir DIR           Guest-absolute initial working "
+                "directory (resolved under --sysroot)\n"
                 "\n"
                 "Environment:\n"
                 "  ELFUSE_NO_ROSETTA=1     Same as --no-rosetta\n"
@@ -368,6 +377,52 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[arg_start], "--gdb-stop-on-entry")) {
             gdb_stop_on_entry = true;
             arg_start++;
+        } else if (!strcmp(argv[arg_start], "--user") && arg_start + 1 < argc) {
+            const char *spec = argv[arg_start + 1];
+            char *end;
+            errno = 0;
+            unsigned long u = strtoul(spec, &end, 10);
+            if (errno || end == spec || u > UINT32_MAX) {
+                log_error("invalid --user UID: %s", spec);
+                goto cleanup;
+            }
+            unsigned long gg = u;
+            if (*end == ':') {
+                errno = 0;
+                char *end2;
+                gg = strtoul(end + 1, &end2, 10);
+                if (errno || end2 == end + 1 || *end2 != '\0' ||
+                    gg > UINT32_MAX) {
+                    log_error("invalid --user UID:GID: %s", spec);
+                    goto cleanup;
+                }
+            } else if (*end != '\0') {
+                log_error("invalid --user spec: %s", spec);
+                goto cleanup;
+            }
+            uid = (uint32_t) u;
+            gid = (uint32_t) gg;
+            has_creds = true;
+            arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--workdir") &&
+                   arg_start + 1 < argc) {
+            /* Reject relative paths up front: translation would resolve
+             * them against the host cwd, silently starting the guest outside
+             * the intended tree. strdup now because
+             * runtime_set_process_title clobbers the original argv block.
+             */
+            if (argv[arg_start + 1][0] != '/') {
+                log_error("--workdir requires a guest-absolute path, got %s",
+                          argv[arg_start + 1]);
+                goto cleanup;
+            }
+            free(workdir);
+            workdir = strdup(argv[arg_start + 1]);
+            if (!workdir) {
+                log_error("out of memory");
+                goto cleanup;
+            }
+            arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--")) {
             arg_start++;
             break;
@@ -616,7 +671,7 @@ int main(int argc, char **argv)
      * retains ownership of the original argv (proctitle above), the sysroot
      * mount (detached at the cleanup label after the guest exits so the
      * mount stays live for the whole run), host cwd, and the heap elf_path /
-     * sysroot_path / guest_argv copies.
+     * sysroot_path / guest_argv / workdir copies.
      */
     launch_args_t largs = {
         .elf_path = elf_host_path,
@@ -624,6 +679,10 @@ int main(int argc, char **argv)
         .sysroot = sysroot,
         .guest_argc = guest_argc,
         .guest_argv = guest_argv,
+        .has_creds = has_creds,
+        .uid = uid,
+        .gid = gid,
+        .cwd_guest = workdir,
         .gdb_port = gdb_port,
         .gdb_stop_on_entry = gdb_stop_on_entry,
         .timeout_sec = timeout_sec,
@@ -652,6 +711,7 @@ cleanup:
     free_guest_argv(guest_argv, guest_argc);
     free(elf_path);
     free(sysroot_path);
+    free(workdir);
     if (elf_host_temp)
         unlink(elf_host_path);
 

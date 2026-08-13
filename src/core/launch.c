@@ -54,7 +54,7 @@ _Static_assert(sizeof(shim_bin) <= INFRA_SHIM_SLOT,
 int elfuse_launch(const launch_args_t *args)
 {
     extern char **environ;
-    char **envp_use = environ;
+    char **envp_use = args->envp ? args->envp : environ;
 
     guest_t g;
     bool guest_initialized = false;

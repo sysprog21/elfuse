@@ -43,12 +43,16 @@ ifdef GUEST_TEST_BINARIES
   TEST_DIR  := $(GUEST_TEST_BINARIES)/bin
   TEST_DEPS :=
   TEST_HELLO_DEP :=
+  # A prebuilt tree predates test-env-dump, so the environment lanes of
+  # test-launch-flags.sh skip themselves rather than fail there.
+  TEST_ENV_DEPS :=
 else
   TEST_DIR  := $(BUILD_DIR)
   TEST_C_SRCS := $(filter-out $(NATIVE_TESTS) $(SPECIAL_TEST_SRCS) $(ROSETTA_X86_64_SRCS),$(wildcard tests/*.c))
   TEST_C_BINS := $(patsubst tests/%.c,$(BUILD_DIR)/%,$(TEST_C_SRCS))
   TEST_DEPS := $(BUILD_DIR)/test-hello $(TEST_C_BINS) $(SPECIAL_TEST_BINS)
   TEST_HELLO_DEP := $(BUILD_DIR)/test-hello
+  TEST_ENV_DEPS := $(BUILD_DIR)/test-env-dump $(BUILD_DIR)/test-cat
 endif
 
 # Colors (used by test output)

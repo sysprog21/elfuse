@@ -25,6 +25,8 @@ Supported user-facing options:
 | `--gdb-stop-on-entry` | Stop before the first guest instruction |
 | `--user UID[:GID]` | Run the guest as `UID`, and `GID` when given (defaults to `UID`). Numeric only |
 | `--workdir DIR` | Guest-absolute initial working directory, resolved under `--sysroot` |
+| `--env KEY=VALUE` | Set a guest environment variable. Repeatable; a bare `KEY` imports the host value |
+| `--clear-env` | Start from an empty environment; only `--env` entries apply |
 | `--` | End `elfuse` option parsing; remaining tokens are guest argv |
 
 `ELFUSE_FAKEROOT_EXEC` has no flag form. It names one executable, by absolute
@@ -48,13 +50,14 @@ only bounds a single `hv_vcpu_run()` iteration before the host regains control,
 which is what allows host-side timers and signals to be observed promptly.
 Setting `--timeout 0` disables this watchdog for long-running CPU-bound guests.
 
-## Guest Identity And Working Directory
+## Guest Identity, Working Directory, And Environment
 
-`--user` and `--workdir` select what the guest starts as and where it starts.
-A contradictory `--user` request is rejected before the VM is created, and
-`--workdir` is resolved during bring-up, before the first guest instruction,
-so a bad request fails with a diagnostic instead of launching a guest that
-runs as something other than what was asked for.
+`--user`, `--workdir`, `--env`, and `--clear-env` select what the guest starts as,
+where it starts, and what it sees in its environment. A contradictory `--user`
+or `--env` request is rejected before the VM is created, and `--workdir` is
+resolved during bring-up, before the first guest instruction, so a bad request
+fails with a diagnostic instead of launching a guest that runs as something
+other than what was asked for.
 
 `--user UID[:GID]` sets the identity the guest reports through `getuid` and
 `getgid`. It does not change the host process credentials: elfuse translates the
@@ -81,6 +84,14 @@ outside the requested tree, so the launch refuses it. FUSE-mounted,
 flag: a guest `chdir` into `/dev/shm` does two things this flag does not (it
 refuses a symlink leaf, and it keeps `getcwd` reporting the `/dev/shm`
 spelling rather than the backing location).
+
+`--env` follows `docker run -e`. It is repeatable: `KEY=VALUE` replaces that
+variable when it is already present and appends it otherwise, while a bare `KEY`
+imports the host's value for `KEY`. Unset and set-to-empty are distinct: a name
+the host does not set is skipped rather than imported as an empty value, while a
+host `KEY=` imports as `KEY=`. An empty variable name is rejected. Given neither
+`--env` nor `--clear-env`, the guest inherits the host environment unchanged.
+`--clear-env` starts from nothing, leaving only what `--env` puts back.
 
 ## Common Launch Patterns
 

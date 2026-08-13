@@ -8,14 +8,15 @@
  * reaches it through the CLI, including `elfuse-oci run`, which execs elfuse
  * with the flags that fill launch_args_t rather than linking against it.
  * Keeping bring-up behind one struct is what lets a front end select the
- * guest identity and cwd without a second bring-up path.
+ * guest identity, cwd, and environment without a second bring-up path.
  *
  * The function owns the guest_t, the vCPU, the GDB stub, the run loop, the
  * diagnostic dumps, and guest teardown; it does NOT own the elf_path /
- * sysroot / guest_argv heap copies or the sysroot_mount the host CLI may
- * have provisioned. Those stay with the caller so behaviors that need the
- * original CLI argv (proctitle rewriting, --create-sysroot detach on exit,
- * host cwd save+restore) stay coherent however the launch was kicked off.
+ * sysroot / guest_argv / envp / cwd_guest heap copies or the sysroot_mount
+ * the host CLI may have provisioned. Those stay with the caller so behaviors
+ * that need the original CLI argv (proctitle rewriting, --create-sysroot
+ * detach on exit, host cwd save+restore) stay coherent however the launch was
+ * kicked off.
  *
  * The caller owns every pointer in launch_args_t for the duration of the
  * call; elfuse_launch reads but never frees them. Per-field lifetime and
@@ -53,6 +54,12 @@ typedef struct {
      */
     int guest_argc;
     const char **guest_argv;
+
+    /* NULL-terminated guest environ. NULL means "use host environ". envp is
+     * char** (not const) to match the environ/guest_bootstrap_prepare
+     * convention: guest programs may mutate their environment.
+     */
+    char **envp;
 
     /* When true, stage uid/gid as the guest identity before bring-up so the
      * auxv AT_UID/AT_GID snapshot and getuid()/getgid() agree. When false,

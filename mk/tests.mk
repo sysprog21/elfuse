@@ -236,7 +236,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
 	$(call run-lane,test-case-collision-fallback,case collisions on a folding sysroot)
 	$(call run-lane,test-fuse-alpine,Alpine sysroot FUSE validation)
 	$(call run-lane,test-timeout-disable,timeout=0 validation)
-	$(call run-lane,test-launch-flags,launch flag rejection)
+	$(call run-lane,test-launch-flags,launch flags)
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 
@@ -1018,9 +1018,10 @@ test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@$(ELFUSE_BIN) --timeout 0 $(TEST_DIR)/test-hello > /dev/null
 
 ## Verify --user / --workdir / --fakeroot reject contradictory requests before
-## guest bring-up.
-test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
-	@bash tests/test-launch-flags.sh $(ELFUSE_BIN) $(TEST_DIR)/test-hello
+## guest bring-up, and that --env / --clear-env reach the guest's environ.
+test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP) $(TEST_ENV_DEPS)
+	@bash tests/test-launch-flags.sh $(ELFUSE_BIN) $(TEST_DIR)/test-hello \
+	    $(TEST_DIR)/test-env-dump $(TEST_DIR)/test-cat
 
 ## Check the --help and argument-error usage synopses against each other
 test-usage-synopsis: $(ELFUSE_BIN)

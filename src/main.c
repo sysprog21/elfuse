@@ -31,6 +31,7 @@
 #include "elfuse-limits.h"
 
 #include "core/bootstrap.h"
+#include "core/guest-env.h"
 #include "core/guest.h"
 #include "core/launch.h"
 #include "core/rosetta.h"
@@ -46,6 +47,8 @@
 
 #include "debug/log.h"
 #include "debug/syscall-hist.h"
+
+extern char **environ;
 
 static int parse_int_arg(const char *s, int min, int max, int *out)
 {
@@ -95,15 +98,6 @@ static int resolve_guest_elf_host_path(const char *elf_guest_path,
         return -1;
     }
     return 0;
-}
-
-static void free_guest_argv(const char **guest_argv, int guest_argc)
-{
-    if (!guest_argv)
-        return;
-    for (int i = 0; i < guest_argc; i++)
-        free((void *) guest_argv[i]);
-    free((void *) guest_argv);
 }
 
 /* The infra-reserve layout invariants documented in guest.h are derived from
@@ -198,11 +192,11 @@ static int host_dc_zva_assert(void)
  * which fits 80 columns. Sharing one body keeps the flag list from drifting
  * between them (one copy had already lost the --gdb flags).
  */
-#define ELFUSE_USAGE_BODY(sep)                                     \
-    "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]" sep \
-    "[--create-sysroot PATH] [--no-rosetta] [--fakeroot]" sep      \
-    "[--gdb PORT] [--gdb-stop-on-entry]" sep                       \
-    "[--user UID[:GID]] [--workdir DIR] <elf-path> [args...]"
+#define ELFUSE_USAGE_BODY(sep)                                             \
+    "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]" sep         \
+    "[--create-sysroot PATH] [--no-rosetta] [--fakeroot] [--gdb PORT]" sep \
+    "[--gdb-stop-on-entry] [--user UID[:GID]] [--workdir DIR]" sep         \
+    "[--env KEY=VALUE] [--clear-env] <elf-path> [args...]"
 
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
 #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
@@ -233,6 +227,9 @@ int main(int argc, char **argv)
     bool has_creds = false;
     uint32_t uid = 0, gid = 0;
     char *workdir = NULL;
+    char **env_overrides = NULL;
+    int n_env_overrides = 0;
+    bool clear_env = false;
     int arg_start = 1;
     /* Everything the shared cleanup label reads is declared and initialized
      * here, above the option loop, so any later error path can `goto cleanup`:
@@ -248,6 +245,8 @@ int main(int argc, char **argv)
     char elf_host_path[LINUX_PATH_MAX];
     bool elf_host_temp = false;
     bool have_host_cwd = (getcwd(host_cwd, sizeof(host_cwd)) != NULL);
+    char **envp = NULL;
+    int n_envp = 0;
     int exit_code = 1;
     memset(&sysroot_mount, 0, sizeof(sysroot_mount));
 
@@ -305,6 +304,11 @@ int main(int argc, char **argv)
                 "names\n"
                 "  --workdir DIR           Guest-absolute initial working "
                 "directory (resolved under --sysroot)\n"
+                "  --env KEY=VALUE         Set a guest environment variable; "
+                "repeatable. 'KEY' (no '=') inherits from the host environ\n"
+                "  --clear-env             Start the guest environment empty "
+                "(only --env entries apply); default inherits the host "
+                "environ\n"
                 "\n"
                 "Environment:\n"
                 "  ELFUSE_NO_ROSETTA=1     Same as --no-rosetta\n"
@@ -423,6 +427,23 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
             arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--env") && arg_start + 1 < argc) {
+            /* Tokens are borrowed from argv; guest_env_build strdups what it
+             * keeps (the ordering rationale sits at its call site). argc
+             * bounds the flag count, so one allocation needs no growth path.
+             */
+            if (!env_overrides) {
+                env_overrides = (char **) calloc((size_t) argc, sizeof(char *));
+                if (!env_overrides) {
+                    log_error("out of memory");
+                    goto cleanup;
+                }
+            }
+            env_overrides[n_env_overrides++] = argv[arg_start + 1];
+            arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--clear-env")) {
+            clear_env = true;
+            arg_start++;
         } else if (!strcmp(argv[arg_start], "--")) {
             arg_start++;
             break;
@@ -499,6 +520,17 @@ int main(int argc, char **argv)
     if (fork_child_fd >= 0)
         return fork_child_main(fork_child_fd, vfork_notify_fd, verbose,
                                timeout_sec);
+
+    /* Before runtime_set_process_title clobbers the argv block env_overrides
+     * borrows from, and before --create-sysroot would provision a
+     * sparsebundle for a launch a malformed --env is about to refuse.
+     */
+    if (guest_env_build(environ, env_overrides, n_env_overrides, clear_env,
+                        &envp, &n_envp) < 0) {
+        goto cleanup;
+    }
+    free(env_overrides);
+    env_overrides = NULL;
 
     if (arg_start >= argc) {
         log_error(ELFUSE_USAGE);
@@ -671,7 +703,7 @@ int main(int argc, char **argv)
      * retains ownership of the original argv (proctitle above), the sysroot
      * mount (detached at the cleanup label after the guest exits so the
      * mount stays live for the whole run), host cwd, and the heap elf_path /
-     * sysroot_path / guest_argv / workdir copies.
+     * sysroot_path / guest_argv / envp / workdir copies.
      */
     launch_args_t largs = {
         .elf_path = elf_host_path,
@@ -679,6 +711,7 @@ int main(int argc, char **argv)
         .sysroot = sysroot,
         .guest_argc = guest_argc,
         .guest_argv = guest_argv,
+        .envp = envp,
         .has_creds = has_creds,
         .uid = uid,
         .gid = gid,
@@ -708,10 +741,12 @@ cleanup:
     if (have_host_cwd && host_cwd[0] != '\0' && chdir(host_cwd) < 0)
         (void) chdir("/");
     sysroot_cleanup_mount(&sysroot_mount);
-    free_guest_argv(guest_argv, guest_argc);
+    strv_free(guest_argv, guest_argc);
     free(elf_path);
     free(sysroot_path);
     free(workdir);
+    free(env_overrides);
+    strv_free((const char **) envp, n_envp);
     if (elf_host_temp)
         unlink(elf_host_path);
 

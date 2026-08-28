@@ -590,6 +590,7 @@ $(BUILD_DIR)/probe: tests/fixtures/sharun/probe.c \
 endif
 
 include mk/tests.mk
+include mk/conformance.mk
 include mk/lint.mk
 include mk/verify.mk
 include mk/format.mk

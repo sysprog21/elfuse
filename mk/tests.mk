@@ -275,6 +275,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 	$(call run-lane,test-sharun,sharun launcher and probe)
+	$(call run-lane,test-conformance-harness,conformance harness selftests)
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "enabled": [
+    { "group": "basic", "scope": "pr" },
+    { "group": "slow", "scope": "full", "timeout_s": 1 },
+    { "group": "narrow", "scope": "full", "only": ["keep*"] },
+    { "group": "recorded", "scope": "full" },
+  ],
+  "declined": [
+    { "reason": "needs a kernel facility the host does not have",
+      "groups": ["kernel"] },
+  ],
+  "cases": {
+    "basic": {
+      "pass": "exit 0",
+      "fail": "exit 1",
+      "conf": "exit 32",
+      "warn": "exit 4",
+      "skipped": "exit 0",
+      "flaky": "flaky",
+    },
+    "slow": {
+      "timeout": "sleep 30",
+      "crash": "kill -SEGV $$",
+      "unresolved": "unresolved",
+    },
+    "recorded": {
+      "passes": "exit 0",
+    },
+    "narrow": {
+      "keep": "exit 0",
+      "drop": "exit 1",
+    },
+  },
+}

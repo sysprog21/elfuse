@@ -423,6 +423,8 @@ The repository contains several layers of validation:
 - shell integration suites such as BusyBox, coreutils, and dynamic-loader tests
 - debugger integration tests for the GDB stub
 - native macOS HVF checks such as multi-vCPU and RWX validation
+- conformance lanes that judge test suites against elfuse and a QEMU
+  reference; see `docs/conformance.md`
 
 The quick suite is driven by `tests/driver.sh`, which supports:
 

@@ -299,3 +299,62 @@ That has a few direct implications:
   work entirely inside the VM. Programs that link against `libfuse`
   (sshfs, ntfs-3g, AppImage runtimes) run without macFUSE, FUSE-T, or
   FSKit on the host.
+
+## Conformance testing
+
+`scripts/conformance` runs upstream suites on elfuse and a Linux reference in
+QEMU, then judges each case against checked-in expectations. See
+[conformance.md](conformance.md) for the data model and file formats.
+
+Prepare a checkout with:
+
+```sh
+make elfuse
+bash tests/fetch-fixtures.sh
+brew install qemu
+make conformance-payloads
+```
+
+Common runs are:
+
+```sh
+make test-conformance-harness
+make test-conformance
+make test-conformance BACKEND=qemu
+make test-conformance-full BACKEND=all
+make test-conformance TEST='<id> ...'
+```
+
+`BACKEND` accepts `elfuse` (default), `qemu`, or `all`; `host` is for the
+fake selftest suite. `CONF_JOBS` controls elfuse batch parallelism and
+`CONF_RESULTS` moves the results root. Each lane writes below
+`build/conformance/<suite>/<backend>/` and updates a `latest` symlink.
+
+The make targets wrap these CLI operations:
+
+```sh
+scripts/conformance <suite> list --scope pr
+scripts/conformance <suite> pr --dry-run
+scripts/conformance <suite> full -v --no-retry
+scripts/conformance gate <results-dir>
+scripts/conformance report build/conformance
+scripts/conformance <suite> pr --bootstrap
+scripts/conformance <suite> seed <results-dir> --reason '<why>' --write
+scripts/conformance lint
+scripts/conformance <suite> audit
+scripts/conformance <suite> verify
+scripts/conformance <suite> payload --force
+make update-pins UPDATE_CHECK=1
+make update-pins CONF_REF_<suite>=<ref>
+make clean-payloads
+```
+
+The CLI defaults to elfuse, one job, and `build/conformance`. The reference
+serializes cases. Exit codes are documented in
+[conformance.md](conformance.md#interface). Suites register through
+`mk/conformance.mk` and `tests/conformance/providers/`; if none register, the
+suite targets print `SKIP`.
+
+CI gates on `Conformance (make test-conformance)`. Nightly runs and dispatches
+with `scope=full` use the full selection; `update_check` reports pin drift
+without writing.

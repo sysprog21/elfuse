@@ -133,11 +133,13 @@ The build signs `build/elfuse` before use. Override the signing identity with
 ## Documentation
 
 - [docs/usage.md](docs/usage.md): command-line options, x86_64 via
-  Rosetta, dynamic linking via `--sysroot`, and attaching `gdb` /
-  `lldb` to the built-in stub.
+  Rosetta, dynamic linking via `--sysroot`, attaching `gdb` / `lldb` to
+  the built-in stub, and running the conformance suites.
 - [docs/testing.md](docs/testing.md): build prerequisites, the
   `make check` flow, the QEMU and Rosetta cross-check matrices, and
   fixture handling.
+- [docs/conformance.md](docs/conformance.md): the conformance harness,
+  expectations, payloads, and CI workflow.
 - [docs/filenames.md](docs/filenames.md): how a guest filename becomes a
   name on disk and back: case folding and normalization on the sysroot
   volume, the escape encoding, and the length limits both systems impose.
@@ -173,6 +175,9 @@ rules in [CONTRIBUTING.md](CONTRIBUTING.md). A missing local formatter warns
 rather than blocks, and a hook you already wrote is never replaced.
 `make uninstall-hooks` removes them, `make install-hooks` puts them back. They
 do not replace `make check`.
+
+`make test-conformance` judges each suite's pull-request subset against
+checked-in expectations. See [docs/usage.md](docs/usage.md#conformance-testing).
 
 ## Limitations
 

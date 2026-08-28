@@ -165,7 +165,11 @@ qemu_start()
     # a dedicated tmpfs, as any regular system has, so paths under /tmp map to a
     # resolvable st_dev. Guarded so a repeated qemu_start against a running VM
     # does not stack mounts.
-    _qemu_ssh_raw 'grep -q " /tmp tmpfs " /proc/mounts || mount -t tmpfs tmpfs /tmp'
+    if ! _qemu_ssh_raw 'grep -q " /tmp tmpfs " /proc/mounts || mount -t tmpfs tmpfs /tmp'; then
+        echo "qemu-runner: could not prepare /tmp in the guest" >&2
+        qemu_stop
+        return 1
+    fi
 }
 
 # Each call opens a fresh ssh connection. Avoids ControlMaster pitfalls (master
@@ -229,30 +233,63 @@ qemu_stop()
     _QR_CTL=""
 }
 
-# When sourced, register a cleanup trap that does not clobber the caller's
-# existing trap chain. When executed directly, the EXIT trap fires on script
-# exit.
-trap 'qemu_stop' EXIT
+qemu_write_state()
+{
+    printf 'port=%s\nkey=%s\npidfile=%s\n' \
+        "$QEMU_PORT" "$QEMU_SSH_KEY" "$_QR_PIDFILE" > "$1.tmp" && mv -f "$1.tmp" "$1"
+}
 
-# CLI driver: when run directly, support 'qemu-runner.sh start|exec|stop'.
+qemu_read_state()
+{
+    [ -s "$1" ] || {
+        echo "qemu-runner: no state file $1" >&2
+        return 1
+    }
+    QEMU_PORT="$(sed -n 's/^port=//p' "$1")"
+    QEMU_SSH_KEY="$(sed -n 's/^key=//p' "$1")"
+    _QR_PIDFILE="$(sed -n 's/^pidfile=//p' "$1")"
+
+    # Restrict cleanup to the directory shape created by mktemp.
+    case "$_QR_PIDFILE" in
+        */elfuse-qemu.*/qemu.pid) ;;
+        *)
+            echo "qemu-runner: $1 names no qemu-runner pidfile: $_QR_PIDFILE; remove the file once the VM is gone" >&2
+            return 1
+            ;;
+    esac
+}
+
 if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
     cmd="${1:-help}"
     shift || true
+    state_file=""
+    if [ "$cmd" != exec ] && [ "${1:-}" = "--state-file" ]; then
+        state_file="${2:?--state-file needs a path}"
+        shift 2
+    fi
     case "$cmd" in
         start)
-            qemu_start
+            trap 'qemu_stop' EXIT
+            qemu_start || exit 1
+            if [ -n "$state_file" ]; then
+                qemu_write_state "$state_file" || exit 1
+                trap - EXIT
+            fi
             echo "PORT=$QEMU_PORT KEY=$QEMU_SSH_KEY"
             ;;
         exec)
+            trap 'qemu_stop' EXIT
             qemu_start
             qemu_exec "$@"
             ;;
         stop)
+            [ -z "$state_file" ] || qemu_read_state "$state_file" || exit 1
             qemu_stop
+            [ -z "$state_file" ] || rm -f "$state_file"
             ;;
         *)
             cat << EOF
-Usage: $0 <start|exec ARGS...|stop>
+Usage: $0 <start [--state-file PATH]|exec ARGS...|stop [--state-file PATH]>
 
 Boots qemu-system-aarch64 with the test fixtures and exposes ssh.
 The host repo is shared into the VM at /mnt/host (read-only).

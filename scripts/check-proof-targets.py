@@ -25,6 +25,7 @@ Usage:
     check-proof-targets.py
 """
 
+import importlib.util
 import pathlib
 import re
 import subprocess
@@ -33,20 +34,16 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
-# scripts/ filenames are kebab-case per CLAUDE.md, which no plain "import"
-# statement can name, so the shared reader is loaded by path. The alternative
-# was an underscore in the filename, which the tree does not use anywhere.
-def _load_verify_mk():
-    import importlib.util
-
-    path = pathlib.Path(__file__).resolve().parent / "verify-mk.py"
-    spec = importlib.util.spec_from_file_location("verify_mk", path)
+# Kebab-case script names require path-based imports.
+def _load_sibling(name):
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_").replace(".py", ""),
+                                                  pathlib.Path(__file__).with_name(name))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-verify_mk = _load_verify_mk()
+verify_mk = _load_sibling("verify-mk.py")
 
 
 PROVED_DIR = ROOT / "src" / "proved"
@@ -145,71 +142,11 @@ def verdict_covers_every_prover_job():
     macOS job in the workflow does prover work, so each must be reachable from
     that job's needs, or the name goes green without it.
     """
-    # Regex rather than a YAML parser, matching what this file already does
-    # above and keeping the lint job free of a PyYAML dependency it does not
-    # otherwise need. The shapes read here are the ones this workflow uses:
-    # a two-space job key, and needs as either a scalar or a flow list.
-    #
-    # Split the "jobs:" section rather than the whole file, and accept any
-    # leading identifier character rather than a lower-case letter. A key class
-    # of [a-z] silently drops a job named "Verify-extra" or "_probe" from BOTH
-    # sides of the comparison below, so a macOS job the check name does not
-    # reach reads as no job at all -- the exact miss this function exists to
-    # make loud. Splitting the whole file also read the sub-keys of "on:",
-    # "concurrency:" and "permissions:" as jobs.
     text = (ROOT / ".github" / "workflows" / "verify.yml").read_text()
-    section = re.split(r"^jobs:[ \t]*$", text, maxsplit=1, flags=re.M)
-    if len(section) != 2:
-        print(
-            "  no top-level 'jobs:' key in .github/workflows/verify.yml",
-            file=sys.stderr,
-        )
-        return False
-    blocks = re.split(r"^  (?=[A-Za-z_])", section[1], flags=re.M)[1:]
-    jobs = {}
-    for block in blocks:
-        job = block.split(":", 1)[0]
-        needs = re.search(r"^    needs:\s*(.+)$", block, re.M)
-        jobs[job] = {
-            "name": (re.search(r"^    name:\s*(.+)$", block, re.M) or [None, ""])[1],
-            "runs-on": (re.search(r"^    runs-on:\s*(.+)$", block, re.M) or [None, ""])[
-                1
-            ],
-            "needs": re.findall(r"[A-Za-z][\w-]*", needs.group(1)) if needs else [],
-        }
-    verdict = [j for j, v in jobs.items() if v["name"].endswith("(make verify)")]
-    if len(verdict) != 1:
-        print(
-            "  expected exactly one job named '... (make verify)' in "
-            f".github/workflows/verify.yml, found {verdict}",
-            file=sys.stderr,
-        )
-        return False
-
-    seen, stack = set(), list(jobs[verdict[0]]["needs"])
-    while stack:
-        job = stack.pop()
-        if job in seen or job not in jobs:
-            continue
-        seen.add(job)
-        stack.extend(jobs[job]["needs"])
-    # Substring, case-folded, rather than a prefix on "macos". The hosted
-    # runner is "macos-15", but the self-hosted one build.yml already uses is
-    # the flow list "[self-hosted, macOS, arm64]", which a prefix test reads as
-    # a non-macOS job and stops enforcing on the day this workflow moves there.
-    # Over-matching only demands one more "needs" edge; under-matching drops a
-    # prover job out from under the required check with nothing said.
-    prover_jobs = {j for j, v in jobs.items() if "macos" in v["runs-on"].lower()}
-    missing = sorted(prover_jobs - seen)
-    if missing:
-        print(
-            f"  {missing} run on macOS but the '{jobs[verdict[0]]['name']}' check "
-            "does not reach them through needs, so requiring that check would "
-            "not enforce them",
-            file=sys.stderr,
-        )
-        return False
-    return True
+    problems = _load_sibling("workflow-jobs.py").check(text, "(make verify)")
+    for p in problems:
+        print("  .github/workflows/verify.yml: %s" % p, file=sys.stderr)
+    return not problems
 
 
 def main():

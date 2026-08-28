@@ -1,0 +1,123 @@
+name: Conformance
+
+on:
+  push:
+    branches: [main]
+  # Required checks must start; classify scope in job conditions.
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: pr subset or the full sweep
+        type: choice
+        options: [pr, full]
+        default: pr
+      update_check:
+        description: report which pins upstream has moved
+        type: boolean
+        default: false
+  merge_group:
+  schedule:
+    # Stagger the nightly run from common hour boundaries.
+    - cron: '17 3 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CONF_SCOPE: ${{ (github.event_name == 'schedule' || inputs.scope == 'full') && 'full' || 'pr' }}
+
+jobs:
+  # Build shares the Mac runner, while concurrency groups cancel instead of queue.
+  wait-for-runtime:
+    name: Wait for the runtime matrix
+    if: github.repository == 'sysprog21/elfuse'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Poll until Build is idle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live() {
+            for status in in_progress queued; do
+              curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/actions/workflows/build.yml/runs?status=$status&per_page=1" \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_count"])'
+            done | awk '{ n += $1 } END { print n + 0 }'
+          }
+          for _ in $(seq 1 110); do
+            n=$(live) || { echo "API error; retrying"; sleep 30; continue; }
+            echo "Build runs live: $n"
+            [ "$n" = 0 ] && exit 0
+            sleep 30
+          done
+          echo "::error::Build has held the Mac for 55 minutes; re-run when it is idle"
+          exit 1
+
+  harness:
+    name: Harness selftests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Gate consistency
+        run: |
+          python3 scripts/workflow-jobs.py --self-test
+          python3 scripts/workflow-jobs.py .github/workflows/conformance.yml "(make test-conformance)"
+
+      - name: Selftests
+        run: python3 scripts/conformance selftest
+
+  # Keep this required-check name independent of the lane graph.
+  conformance:
+    name: Conformance (make test-conformance)
+    needs: [wait-for-runtime, harness]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every dependency to have passed
+        run: |
+          set -euo pipefail
+          ok() {
+            [ "$1" = success ] || { [ "$1" = skipped ] && [ '${{ github.repository }}' != sysprog21/elfuse ]; }
+          }
+          ok '${{ needs.wait-for-runtime.result }}' || { echo "::error::the runtime wait did not pass"; exit 1; }
+          ok '${{ needs.harness.result }}' || { echo "::error::harness selftests did not pass"; exit 1; }
+          echo "every dependency accounted for"
+
+  update-check:
+    name: Pin drift
+    if: github.event_name == 'workflow_dispatch' && inputs.update_check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Report which pins upstream has moved
+        # Exit 3 reports drift without rewriting pins.
+        run: |
+          set -uo pipefail
+          out=$(python3 scripts/conformance update --check 2>&1); rc=$?
+          printf '%s\n' "$out"
+          { echo '## Pin drift'; echo; echo '```'; printf '%s\n' "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          case $rc in
+            0) ;;
+            3) echo "::warning title=conformance pins::upstream has moved; run make update-pins" ;;
+            *) exit "$rc" ;;
+          esac

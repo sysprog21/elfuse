@@ -1,0 +1,7 @@
+{
+  "actions": [
+    { "type": "quarantine",
+      "reason": "fails on the first attempt by construction; selftest fixture",
+      "matchers": ["fake:basic/flaky"] },
+  ],
+}

@@ -1,0 +1,18 @@
+// Host expectations used by selftests.
+{
+  "actions": [
+    { "include": "fake.jsonc" },
+    { "type": "expect_failure",
+      "reason": "the script exits 1 by design",
+      "matchers": ["fake:basic/fail"] },
+    { "type": "expect_failure",
+      "reason": "recorded as failing while the script exits 0; the unexpected_pass fixture",
+      "matchers": ["fake:recorded/passes"] },
+    { "type": "expect_conf",
+      "reason": "the script exits 32, LTP's TCONF",
+      "matchers": ["fake:basic/conf"] },
+    { "type": "skip",
+      "reason": "never launched; the filtered fixture",
+      "matchers": ["fake:basic/skipped"] },
+  ],
+}

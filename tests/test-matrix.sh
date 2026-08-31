@@ -291,6 +291,7 @@ QEMU_SKIP="
     test-ioctl-cloexec
     test-pty
     test-mprotect-mt
+    test-jit-icache
     test-clone3
     test-fork-synthetic-fd
     test-mmap-hint
@@ -341,6 +342,10 @@ QEMU_SKIP="
 #   elfuse's own vCPU/TLBI shootout timing; the qemu reference lane's nested
 #   virtualization has different scheduling latency and trips the same
 #   thresholds for real, unrelated races.
+# test-jit-icache: real Linux mprotect does not perform user-space instruction
+#   cache maintenance (Linux requires user-space JIT compilers to invoke
+#   sys_cacheflush / __builtin___clear_cache), whereas elfuse invalidates
+#   the host instruction cache automatically during sys_mprotect.
 # test-clone3: CLONE_NEWPID succeeds on a real kernel (PID namespaces) but
 #   elfuse has no namespace support and expects EINVAL; the mismatch derails
 #   the rest of the scenario into a hang instead of a clean FAIL.
@@ -841,6 +846,7 @@ run_unit_tests()
 
     printf "\nGuard page / mmap edge cases\n"
     test_check "$runner" "test-guard-page" "PASS" "$bindir/test-guard-page"
+    test_check "$runner" "test-jit-icache" "PASS" "$bindir/test-jit-icache"
     test_rc "$runner" "test-mmap-hint" 0 "$bindir/test-mmap-hint"
 
     test_rc "$runner" "test-mmap-sigbus-efault" 0 "$bindir/test-mmap-sigbus-efault"

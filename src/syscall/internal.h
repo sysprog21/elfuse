@@ -952,7 +952,7 @@ static inline fd_block_state_t fd_block_state_of(const fd_entry_t *e)
     return (fd_block_state_t) {
         .type = e->type,
         .generation = e->generation,
-        .seals = e->seals,
+        .seals = (unsigned int) e->seals,
         .can_block = e->can_block,
         .nonblock_owned = e->nonblock_owned,
         .guest_nonblock = (e->linux_flags & LINUX_O_NONBLOCK) != 0,

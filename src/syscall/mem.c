@@ -4523,8 +4523,16 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
             if (mprotect_same_prot_fast_path_safe(prot) &&
                 !g->regions_tracker_stale &&
                 guest_region_range_prot_uniform(g, addr, mprot_end, prot) &&
-                !guest_region_range_has_noreserve(g, addr, mprot_end))
+                !guest_region_range_has_noreserve(g, addr, mprot_end)) {
+                if (prot & LINUX_PROT_EXEC) {
+                    char *host_start = (char *) host_ptr_for_gpa(g, addr);
+                    if (host_start) {
+                        __builtin___clear_cache(host_start,
+                                                host_start + length);
+                    }
+                }
                 return 0;
+            }
 
             /* Do PTE work BEFORE updating the tracker. If page-table
              * maintenance fails, regions[] still reflects the old prot, so a
@@ -4540,6 +4548,12 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                     return -LINUX_ENOMEM;
             }
             guest_region_set_prot(g, addr, mprot_end, prot);
+            if (prot & LINUX_PROT_EXEC) {
+                char *host_start = (char *) host_ptr_for_gpa(g, addr);
+                if (host_start) {
+                    __builtin___clear_cache(host_start, host_start + length);
+                }
+            }
             return 0;
         }
         uint64_t mprot_off = addr - g->ipa_base;
@@ -4563,8 +4577,13 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                 !g->regions_tracker_stale &&
                 guest_region_range_prot_uniform(g, mprot_off, mprot_end,
                                                 prot) &&
-                !guest_region_range_has_noreserve(g, mprot_off, mprot_end))
+                !guest_region_range_has_noreserve(g, mprot_off, mprot_end)) {
+                if (prot & LINUX_PROT_EXEC) {
+                    char *host_start = (char *) g->host_base + mprot_off;
+                    __builtin___clear_cache(host_start, host_start + length);
+                }
                 return 0;
+            }
 
             if (prot != LINUX_PROT_NONE) {
                 int page_perms = prot_to_perms(prot);
@@ -4578,6 +4597,10 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                     return -LINUX_ENOMEM;
             }
             guest_region_set_prot(g, mprot_off, mprot_end, prot);
+            if (prot & LINUX_PROT_EXEC) {
+                char *host_start = (char *) g->host_base + mprot_off;
+                __builtin___clear_cache(host_start, host_start + length);
+            }
         }
     }
     return 0;

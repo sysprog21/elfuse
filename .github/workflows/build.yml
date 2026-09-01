@@ -51,6 +51,7 @@ on:
       - '.editorconfig'
       - '.clang-format'
       - 'frama-c-stubs/**'
+      - '.github/workflows/conformance.yml'
       - '.github/workflows/lint.yml'
       - '.github/workflows/static-analysis.yml'
       - '.github/workflows/verify.yml'

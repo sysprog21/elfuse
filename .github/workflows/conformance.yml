@@ -1,0 +1,122 @@
+name: Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      scope:
+        type: choice
+        options: [pr, full]
+        default: pr
+      update_check:
+        type: boolean
+        default: false
+
+concurrency:
+  # A schedule event resolves github.ref to the default branch, so without the
+  # event split the nightly full run and a main push share one group and a
+  # second push cancels the queued nightly.
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CONF_SCOPE: ${{ (github.event_name == 'schedule' || inputs.scope == 'full') && 'full' || 'pr' }}
+  CONF_REQUIRE: 1
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      suites: ${{ steps.suites.outputs.names }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: suites
+        run: |
+          names=$(python3 scripts/conformance suites --format json |
+            python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["suites"]))')
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+
+  harness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/conformance selftest
+
+  payload:
+    needs: discover
+    if: needs.discover.outputs.suites != '[]'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - run: make conformance-payloads
+      - run: tar -C externals -cf conformance-payloads.tar payloads
+      - uses: actions/upload-artifact@v7
+        with:
+          name: conformance-payloads
+          path: conformance-payloads.tar
+          if-no-files-found: error
+
+  qemu:
+    needs: [discover, payload]
+    if: needs.discover.outputs.suites != '[]'
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: conformance-payloads
+      - run: mkdir -p externals && tar -C externals -xf conformance-payloads.tar
+      - run: bash tests/fetch-fixtures.sh
+      - run: make test-conformance BACKEND=qemu
+
+  elfuse:
+    needs: [discover, payload, qemu]
+    if: needs.discover.outputs.suites != '[]'
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: conformance-payloads
+      - run: mkdir -p externals && tar -C externals -xf conformance-payloads.tar
+      - run: bash tests/fetch-fixtures.sh
+      - run: make elfuse
+      - run: make test-conformance BACKEND=elfuse
+
+  conformance:
+    name: Conformance (make test-conformance)
+    needs: [discover, harness, payload, qemu, elfuse]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          SUITES: ${{ needs.discover.outputs.suites }}
+          DISCOVER: ${{ needs.discover.result }}
+          HARNESS: ${{ needs.harness.result }}
+          PAYLOAD: ${{ needs.payload.result }}
+          QEMU: ${{ needs.qemu.result }}
+          ELFUSE: ${{ needs.elfuse.result }}
+        run: |
+          [ "$DISCOVER" = success ]
+          [ "$HARNESS" = success ]
+          if [ "$SUITES" = '[]' ]; then
+            [ "$PAYLOAD $QEMU $ELFUSE" = 'skipped skipped skipped' ]
+          else
+            [ "$PAYLOAD $QEMU $ELFUSE" = 'success success success' ]
+          fi
+
+  update-check:
+    if: github.event_name == 'workflow_dispatch' && inputs.update_check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/conformance pins check

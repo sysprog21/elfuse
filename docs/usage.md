@@ -299,3 +299,8 @@ That has a few direct implications:
   work entirely inside the VM. Programs that link against `libfuse`
   (sshfs, ntfs-3g, AppImage runtimes) run without macFUSE, FUSE-T, or
   FSKit on the host.
+
+## Conformance testing
+
+See [testing.md](testing.md#conformance-tests) for the command reference and
+[conformance.md](conformance.md) for the file and extension interfaces.

@@ -73,6 +73,8 @@ source "${REPO_ROOT}/tests/test-config.sh"
 TEST_LABEL_WIDTH=45
 # shellcheck source=tests/lib/test-runner.sh
 source "${REPO_ROOT}/tests/lib/test-runner.sh"
+# shellcheck source=tests/lib/qemu-ssh.sh
+source "${REPO_ROOT}/tests/lib/qemu-ssh.sh"
 
 # Globals (test-runner.sh seeds pass/fail/skip; test-matrix.sh resets them per
 # mode and tracks no extra counters).
@@ -192,15 +194,8 @@ run_qemu()
     if [ "${#args[@]}" -gt 0 ]; then
         printf -v quoted '%q ' "${args[@]}"
     fi
-    timeout 60 ssh \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        -o BatchMode=yes \
-        -o ConnectTimeout=10 \
-        -o ServerAliveInterval=15 \
-        -o ServerAliveCountMax=4 \
-        -i "$QEMU_SSH_KEY" -p "$QEMU_PORT" \
+    qemu_ssh_opts
+    timeout 60 ssh "${QEMU_SSH_OPTS[@]}" \
         root@127.0.0.1 "cd /mnt/host && ${quoted}" 2> /dev/null
 }
 

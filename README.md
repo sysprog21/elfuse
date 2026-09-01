@@ -141,8 +141,10 @@ The build signs `build/elfuse` before use. Override the signing identity with
   Rosetta, dynamic linking via `--sysroot`, and attaching `gdb` /
   `lldb` to the built-in stub.
 - [docs/testing.md](docs/testing.md): build prerequisites, the
-  `make check` flow, the QEMU and Rosetta cross-check matrices, and
-  fixture handling.
+  `make check` flow, the QEMU and Rosetta cross-check matrices,
+  fixture handling, and conformance commands.
+- [docs/conformance.md](docs/conformance.md): the conformance harness,
+  expectations, payloads, and CI workflow.
 - [docs/filenames.md](docs/filenames.md): how a guest filename becomes a
   name on disk and back: case folding and normalization on the sysroot
   volume, the escape encoding, and the length limits both systems impose.

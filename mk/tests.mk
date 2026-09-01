@@ -48,7 +48,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-pathmax test-sysroot-corpus \
         test-sysroot-name-soak check-soak \
         check-name-caseexact test-sysroot-path-matrix \
-        test-usage-synopsis \
+        test-usage-synopsis test-qemu-runner-stop \
         probe-volume-naming perf
 
 ## Build and run the assembly hello world test
@@ -305,6 +305,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 	$(call run-lane,test-sharun,sharun launcher and probe)
+	$(call run-lane,test-conformance-harness,conformance harness selftests)
+	$(call run-lane,test-qemu-runner-stop,qemu-runner stop identity check)
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
@@ -1103,6 +1105,10 @@ test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP) $(TEST_ENV_DEPS)
 ## Check the --help and argument-error usage synopses against each other
 test-usage-synopsis: $(ELFUSE_BIN)
 	@bash tests/test-usage-synopsis.sh $(ELFUSE_BIN)
+
+## Check qemu-runner.sh stop against a recycled pid and the run's own process
+test-qemu-runner-stop:
+	@bash tests/test-qemu-runner-stop.sh
 
 ## Run GDB stub integration tests (LLDB <-> elfuse gdbstub)
 test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello

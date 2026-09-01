@@ -423,6 +423,8 @@ The repository contains several layers of validation:
 - shell integration suites such as BusyBox, coreutils, and dynamic-loader tests
 - debugger integration tests for the GDB stub
 - native macOS HVF checks such as multi-vCPU and RWX validation
+- conformance lanes that judge test suites against elfuse and a QEMU
+  reference; see `docs/conformance.md`
 
 The quick suite is driven by `tests/driver.sh`, which supports:
 
@@ -435,6 +437,42 @@ Example:
 ```sh
 bash tests/driver.sh -f test-proc
 ```
+
+## Conformance Tests
+
+`scripts/conformance` runs registered suites on elfuse or QEMU. These are its
+public commands:
+
+| Command | Result |
+|---------|--------|
+| `scripts/conformance suites [--format text\|json]` | List registered suites |
+| `scripts/conformance list SUITE [--scope pr\|full] [--backend elfuse\|qemu\|all] [--format text\|json] [--require]` | List canonical case IDs; the default scope is `full` |
+| `scripts/conformance run SUITE [--scope pr\|full] [--case ID_OR_GLOB] [--backend elfuse\|qemu\|all] [--jobs N] [--results DIR] [--bootstrap] [--require] [--no-retry] [--dry-run] [-v]` | Run cases; the defaults are the `pr` scope, elfuse, one job, and `build/conformance` |
+| `scripts/conformance payload fingerprint SUITE` | Print the payload fingerprint |
+| `scripts/conformance payload build SUITE [--force]` | Build the payload |
+| `scripts/conformance payload verify SUITE [--fingerprint HASH]` | Verify the payload manifest and files |
+| `scripts/conformance selection check SUITE` | Compare selection with the pinned inventory |
+| `scripts/conformance selection update SUITE` | Rewrite generated selection |
+| `scripts/conformance expectations check [SUITE]` | Validate expectation files |
+| `scripts/conformance expectations seed SUITE RESULTS [--reason TEXT] [--write]` | Derive expectation actions from results |
+| `scripts/conformance pins check [SUITE] [--ref REF]` | Report pin drift without writing |
+| `scripts/conformance pins update SUITE [--ref REF]` | Update a pin |
+| `scripts/conformance report RESULTS [--format text\|markdown\|json]` | Read canonical results |
+| `scripts/conformance selftest` | Run harness selftests |
+
+Examples:
+
+```sh
+scripts/conformance run SUITE --scope full --backend all
+scripts/conformance run SUITE --case 'SUITE:GROUP/*' --backend qemu
+scripts/conformance report RESULTS --format markdown
+```
+
+The Make aliases are `test-conformance-harness`, `test-conformance`,
+`test-conformance-full`, `conformance-payloads`, `clean-payloads`, and
+`update-pins`. `BACKEND`, `CONF_SCOPE`, `TEST`, `CONF_JOBS`, and
+`CONF_RESULTS` configure the run targets. See [conformance.md](conformance.md)
+for result, expectation, payload, and suite interfaces.
 
 ## Validation Strategy By Change Type
 

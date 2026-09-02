@@ -325,8 +325,8 @@ Off by default, and useful when a guest misbehaves rather than in normal use:
 
 ## OCI Images
 
-`build/elfuse-oci` is separate from the C runtime. It pulls images into a local
-OCI image layout and does not unpack them.
+`build/elfuse-oci` is separate from the C runtime. It pulls images into an OCI
+image layout and unpacks their filesystems for `elfuse --sysroot`.
 
 ### Build
 
@@ -343,26 +343,35 @@ does not require Go.
 
 ```sh
 build/elfuse-oci pull debian:stable-slim
+build/elfuse-oci unpack debian:stable-slim --rootfs ~/debian-rootfs
+build/elfuse --sysroot ~/debian-rootfs /bin/sh
 ```
+
+A default APFS volume folds case, which a Linux rootfs does not expect. Provision
+the sysroot with `--create-sysroot` as described under
+[Dynamic Linking And Sysroots](#dynamic-linking-and-sysroots) when unpacking a
+distribution rootfs for real use.
 
 ### Commands
 
 | Command | Meaning |
 |---------|---------|
 | `pull <ref>` | Fetch one platform of an image into the store |
+| `unpack <ref>` | Apply a stored image to a rootfs directory |
 | `help`, `version` | Print help or the elfuse-oci version |
 
 An abbreviated reference receives the Docker Hub registry, the `library`
 repository when needed, and the `latest` tag when no tag is present. Digest
-references are accepted. Pull options may appear before or after `<ref>`.
+references are accepted. Options may appear before or after `<ref>`.
 
 ### Flags
 
 | Option | Commands | Meaning |
 |--------|----------|---------|
-| `--store DIR` | `pull` | Store directory; default `$ELFUSE_OCI_STORE`, then `~/.local/share/elfuse/oci` |
-| `--platform OS/ARCH[/VARIANT]` | `pull` | Target `linux/arm64` or `linux/amd64`; default `linux/arm64` |
+| `--store DIR` | `pull`, `unpack` | Store directory; default `$ELFUSE_OCI_STORE`, then `~/.local/share/elfuse/oci` |
+| `--platform OS/ARCH[/VARIANT]` | `pull`, `unpack` | Target `linux/arm64` or `linux/amd64`; default `linux/arm64` |
 | `--timeout DURATION` | `pull` | Bound the pull and lock wait; zero sets no deadline |
+| `--rootfs DIR` | `unpack` | Unpack into `DIR`; otherwise use the managed cache |
 
 ### Environment
 

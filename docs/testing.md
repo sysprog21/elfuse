@@ -559,5 +559,6 @@ make oci-test
 ELFUSE_OCI_NETTEST=1 make oci-test
 ```
 
-The default suite constructs image data in temporary stores and does not use a
-registry. `ELFUSE_OCI_NETTEST=1` adds a pull from Docker Hub.
+The default suite constructs image data in temporary stores and covers the
+CLI, store, and unpack without a registry. `ELFUSE_OCI_NETTEST=1` adds a pull
+from Docker Hub.

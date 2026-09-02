@@ -94,3 +94,12 @@ func (cf *commonFlags) openStore() (*store, ocispec.Platform, error) {
 	s, err := openStore(root)
 	return s, platform, err
 }
+
+func (cf *commonFlags) openStoreForRead() (*store, ocispec.Platform, error) {
+	root, platform, err := cf.values()
+	if err != nil {
+		return nil, ocispec.Platform{}, err
+	}
+	s, err := openStoreForRead(root)
+	return s, platform, err
+}

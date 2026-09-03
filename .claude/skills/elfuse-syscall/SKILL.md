@@ -222,6 +222,5 @@ so prefer them when the two disagree:
 ## Verifying
 
 `docs/testing.md`, section "Validation Strategy By Change Type", maps the area
-you touched to the minimum command set. Use it rather than a habit; see
-`elfuse-verify` for what the lanes mean and `elfuse-debug` for localizing a
-failure in one.
+you touched to the minimum command set; `elfuse-verify` says what a failure in
+each lane means. `elfuse-debug` localizes a failure inside one.

@@ -78,12 +78,12 @@ lanes are reachability paths.
 
 ## Preserve the boundaries
 
-- A helper that acquires a lock changes lock order at every caller. The lock
-  order comment in `src/syscall/internal.h` is the contract. A helper that
-  releases one, or drops and retakes it, is the same hazard read backwards, and
-  the name has to carry it: `_locked` already means "call me holding it", so a
-  helper that hands the lock back needs a different suffix and a comment saying
-  the caller must not touch that lock again.
+- A helper that acquires a lock changes lock order at every caller, against
+  the record `elfuse-syscall` reads. A helper that releases one, or drops and
+  retakes it, is the same hazard read backwards, and the name has to carry it:
+  `_locked` already means "call me holding it", so a helper that hands the
+  lock back needs a different suffix and a comment saying the caller must not
+  touch that lock again.
 - Moving an interruptible wait into a helper moves its restart classification.
   `scripts/check-eintr-contract.py` keys on the function that decides, not the
   syscall that returns, so the new helper takes the inventory entry and the

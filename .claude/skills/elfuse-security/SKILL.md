@@ -160,9 +160,10 @@ than a crash at the guilty line.
 A guest value read twice is two values. Copy the structure in once, validate
 the copy, then use only the copy; validating in place and passing the original
 address on is the double fetch, and shared memory makes it reachable without
-timing luck. A new file-scope lock goes into the ordering block at the top of
-`src/syscall/internal.h` in the same change. State the memory order at every
-shared access.
+timing luck. A new file-scope lock enters the ordering record in the same
+change, and the gate below fails one that is missing from it; `elfuse-syscall`
+says where that record lives and what it holds beyond the order. State the
+memory order at every shared access.
 
 Cost: a double fetch is not a race the guest has to win. It re-runs the syscall
 until the two reads differ, so the window is as wide as it needs to be.

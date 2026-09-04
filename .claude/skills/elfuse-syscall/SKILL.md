@@ -59,8 +59,8 @@ rules for handling one it chose badly are `elfuse-security`.
    3b. The `sys_` implementation goes in the domain file whose name says so:
    `ls src/syscall/` is the list, and read/write/ioctl in `io.c`,
    brk/mmap/mprotect in `mem.c`, sockets in the `net*.c` family are
-   representative. New code goes in the existing domain file; shared
-   declarations go in `internal.h`, not a new header.
+   representative. `elfuse-conventions` settles where a new file or a new
+   shared declaration may go, and the answer is almost never a new one.
 
    Two domains sit outside `src/syscall/` because they are runtime state
    rather than syscall surface: clone and fork in `src/runtime/forkipc.c`,
@@ -212,7 +212,6 @@ so prefer them when the two disagree:
 
 ## Verifying
 
-`docs/testing.md`, section "Validation Strategy By Change Type", maps the area
-you touched to the minimum command set. Use it rather than a habit; see
-`elfuse-verify` for what the lanes mean and `elfuse-debug` for localizing a
-failure in one.
+`elfuse-verify` maps the area you touched to the minimum command set, which is
+more specific than a habit, and says what a failure in each lane means.
+`elfuse-debug` localizes a failure inside one.

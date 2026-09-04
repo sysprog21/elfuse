@@ -233,9 +233,10 @@ a `bool`; a helper that forwards a page-table or syscall primitive's status
 should stay `int`.
 
 New code goes in the existing domain file, not a new one. New shared
-declarations go in the domain's `internal.h` or an existing header. A new lock
-is documented in the lock-order comment before it is used from a second
-module.
+declarations go in the domain's `internal.h` or an existing header, and a new
+lock reaches the ordering record; `elfuse-syscall` locates that record, says
+when a lock enters it, and names the three constraints in it that the
+ordering alone does not give.
 
 New C tests are `tests/test-<feature>.c` and use the shared harness macros
 rather than rolling their own reporting.

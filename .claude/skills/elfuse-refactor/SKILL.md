@@ -29,8 +29,9 @@ that both moves code and changes behavior cannot be reviewed as either.
 
 Measure it first. `references/measuring.md` carries the scans for function
 size, duplication, and nesting, and the traps in reading each. Report a number
-with the command that produced it and a judgment as a judgment; never quote a
-count from a document, this one included.
+with the command that produced it and a judgment as a judgment; `elfuse-verify`
+carries the rest of that rule, this file included among the documents a count
+must not be quoted from.
 
 Prefer deletion, an existing local helper, or a direct rewrite over a new
 abstraction. A parameter every caller gives the same value, a hook with one
@@ -71,12 +72,12 @@ lanes are reachability paths.
 
 ## Preserve the boundaries
 
-- A helper that acquires a lock changes lock order at every caller. The lock
-  order comment in `src/syscall/internal.h` is the contract. A helper that
-  releases one, or drops and retakes it, is the same hazard read backwards, and
-  the name has to carry it: `_locked` already means "call me holding it", so a
-  helper that hands the lock back needs a different suffix and a comment saying
-  the caller must not touch that lock again.
+- A helper that acquires a lock changes lock order at every caller, against
+  the record `elfuse-syscall` reads. A helper that releases one, or drops and
+  retakes it, is the same hazard read backwards, and the name has to carry it:
+  `_locked` already means "call me holding it", so a helper that hands the
+  lock back needs a different suffix and a comment saying the caller must not
+  touch that lock again.
 - Moving an interruptible wait into a helper moves its restart classification.
   `scripts/check-eintr-contract.py` keys on the function that decides, not the
   syscall that returns, so the new helper takes the inventory entry and the
@@ -97,10 +98,9 @@ is not enough: the two bodies must represent the same fact.
 
 ## Work in small, evidenced steps
 
-Read `docs/testing.md`, section "Validation Strategy By Change Type", and run
-the selected baseline before a multi-step cleanup. Keep inherited failures
-separate from the change. Stop when the baseline is red in the area being
-changed.
+Run the baseline `elfuse-verify` selects for the area touched before a
+multi-step cleanup. Keep inherited failures separate from the change. Stop
+when the baseline is red in the area being changed.
 
 A failure blamed on the environment earns one reproduction attempt under the
 condition blamed for it before it is written off. "Transient" and "the host was

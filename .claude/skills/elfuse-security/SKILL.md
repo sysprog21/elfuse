@@ -63,10 +63,9 @@ Cost: an out-of-bounds write that reproduces only at boundary values, which is
 the region hand-written tests skip. New arithmetic on a guest-chosen length
 belongs in `src/proved/` behind a contract, not inline.
 
-A contract there proves the arithmetic and not its callers: they sit outside
-`-wp-fct`, and for `proved/gva.h` they cannot be brought in at all, since
-Frama-C does not parse `src/core/guest.c`. `elfuse-verify` carries that limit,
-and it leaves the call site a review question rather than a proved one.
+A contract there proves the arithmetic and not its callers, so the call site
+stays a review question rather than a proved one. `elfuse-verify` carries the
+limit and what narrows it from the runtime side.
 
 ### Indexes
 
@@ -161,9 +160,9 @@ than a crash at the guilty line.
 A guest value read twice is two values. Copy the structure in once, validate
 the copy, then use only the copy; validating in place and passing the original
 address on is the double fetch, and shared memory makes it reachable without
-timing luck. A new file-scope lock goes into the ordering block at the top of
-`src/syscall/internal.h` in the same change. State the memory order at every
-shared access.
+timing luck. A new file-scope lock enters the ordering record in the same
+change, which the gate below fails for being missing. State the memory order
+at every shared access.
 
 Cost: a double fetch is not a race the guest has to win. It re-runs the syscall
 until the two reads differ, so the window is as wide as it needs to be.
@@ -206,11 +205,10 @@ Under `make check`:
   restart behavior is unstated.
 - `scripts/check-atomics.py` fails a C11 atomic operation written without the
   `_explicit` form, and bans the compiler builtins, so the order is written at
-  the site. Its docstring names what it deliberately leaves out: plain-operator
-  access to an `_Atomic` object, which needs per-translation-unit declarations
-  and which the tree already carries a large set of. That half is a review
-  question, so it is the one memory-order case to spend budget on rather than
-  skip.
+  the site. What its docstring leaves out is a review question rather than a
+  gap to skip, and it is the memory-order case worth the budget;
+  `elfuse-conventions` states which access it cannot see and why a regex
+  cannot close it.
 - `scripts/check-svc-tails.py` holds every return tail to the X7 ptrace test,
   bar the one exception its docstring names and allowlists.
 - `scripts/check-syscall-coverage.py` is a best-effort audit of `dispatch.tbl`

@@ -152,40 +152,27 @@ func replaceFile(ctx context.Context, dir, name string, content []byte, mode os.
 	if err != nil {
 		return err
 	}
-	cleanup := func() { _ = os.Remove(tmpPath) }
+	defer os.Remove(tmpPath)
+	defer f.Close()
 	if _, err := f.Write(content); err != nil {
-		f.Close()
-		cleanup()
 		return err
 	}
 	if err := ctx.Err(); err != nil {
-		f.Close()
-		cleanup()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		cleanup()
 		return err
 	}
 	if err := f.Close(); err != nil {
-		cleanup()
 		return err
 	}
 	if err := ctx.Err(); err != nil {
-		cleanup()
 		return err
 	}
 	if err := os.Rename(tmpPath, filepath.Join(dir, name)); err != nil {
-		cleanup()
 		return err
 	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return syncDirectory(dir)
 }
 
 func (s *store) rootIndex() (v1.IndexManifest, error) {

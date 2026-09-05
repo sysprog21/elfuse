@@ -391,6 +391,45 @@ VERIFY_FUTEXOP_SCAN := src/proved/futexop.h
 VERIFY_FUTEXOP_CLAIM := for ANY guest-supplied val3 word
 VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-covered
 
+VERIFY_FUTEXREQ_SRC  := src/proved/futexreq.h
+VERIFY_FUTEXREQ_FCTS := futex_requeue_counts_valid futex_requeue_budget
+VERIFY_FUTEXREQ_MIN_GOALS ?= 14
+# typed: two scalars in, one out, no buffer and no aliasing question.
+VERIFY_FUTEXREQ_MODEL := typed
+VERIFY_FUTEXREQ_SCAN := src/proved/futexreq.h
+VERIFY_FUTEXREQ_CLAIM := for ANY pair of guest-supplied requeue counts
+VERIFY_FUTEXREQ_UNPROVED := the bucket walk the budget bounds stays test-covered
+
+VERIFY_FUTEXWAKEOP_SRC  := src/proved/futexwakeop.h
+VERIFY_FUTEXWAKEOP_FCTS := futex_wake_op_supported futex_wake_cmp_supported \
+                           futex_wake_op_apply futex_wake_op_cmp
+VERIFY_FUTEXWAKEOP_MIN_GOALS ?= 92
+# typed: scalars in, one scalar out, no buffer and no aliasing question.
+VERIFY_FUTEXWAKEOP_MODEL := typed
+VERIFY_FUTEXWAKEOP_SCAN := src/proved/futexwakeop.h
+VERIFY_FUTEXWAKEOP_CLAIM := for ANY guest-supplied op and comparison selector
+VERIFY_FUTEXWAKEOP_UNPROVED := the wake walks the selectors gate stay test-covered
+
+VERIFY_FUTEXPI_SRC  := src/proved/futexpi.h
+VERIFY_FUTEXPI_FCTS := futex_pi_owner_tid futex_pi_unowned futex_pi_owner_died \
+                       futex_pi_has_waiters futex_pi_set_waiters \
+                       futex_pi_clear_waiters futex_pi_mark_owner_died
+VERIFY_FUTEXPI_MIN_GOALS ?= 38
+# typed: one scalar in, one scalar out, no buffer and no aliasing question.
+VERIFY_FUTEXPI_MODEL := typed
+VERIFY_FUTEXPI_SCAN := src/proved/futexpi.h
+VERIFY_FUTEXPI_CLAIM := for ANY bit pattern a guest can write to a PI lock word
+VERIFY_FUTEXPI_UNPROVED := the CAS loops around them stay test-covered
+
+VERIFY_FUTEXWAITV_SRC  := src/proved/futexwaitv.h
+VERIFY_FUTEXWAITV_FCTS := futex_bucket_insert
+VERIFY_FUTEXWAITV_MIN_GOALS ?= 36
+# typed: one flat array of unsigned, no aliasing question beside it.
+VERIFY_FUTEXWAITV_MODEL := typed
+VERIFY_FUTEXWAITV_SCAN := src/proved/futexwaitv.h
+VERIFY_FUTEXWAITV_CLAIM := for ANY set of guest-chosen futex addresses
+VERIFY_FUTEXWAITV_UNPROVED := the walk that calls it stays test-covered
+
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
 VERIFY_PATHDEPTH_MIN_GOALS ?= 24

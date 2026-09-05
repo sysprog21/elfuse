@@ -39,7 +39,7 @@
  * is measured.
  *
  * Run under ELFUSE_SHIM_STATS=1 to attribute the fast-path rows: the host
- * prints FUTEX_EAGAIN_HIT, FUTEX_EFAULT_HIT, FUTEX_SHAPE_BAIL and
+ * prints FUTEX_EAGAIN_HIT, FUTEX_FAULT_BAIL, FUTEX_SHAPE_BAIL and
  * FUTEX_MATCH_BAIL at exit. Those four sum to every SYS_futex that reached the
  * shape decoder; a call arriving with attention raised lands in ATTN_BAIL
  * instead, since the attention load runs after the decode. Each row runs iters

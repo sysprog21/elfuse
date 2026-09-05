@@ -81,11 +81,10 @@
  *                                     under mmap_lock only by
  *                                     exec_handoff_reset, and holds sig_lock
  *                                     beneath it through
- *                                     signal_restore_blocked. A requester drops
- *                                     mmap_lock before taking it: waiting for
- *                                     the slot under mmap_lock deadlocks
- *                                     against the leader, which needs that lock
- *                                     to run the request that frees the slot
+ *                                     signal_restore_blocked. sys_execve does
+ *                                     not acquire mmap_lock until the point of
+ *                                     no return, so a requester waiting for the
+ *                                     slot never holds it
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
@@ -162,6 +161,19 @@ typedef int host_fd_t;
 /* Cross-module locks. */
 extern pthread_mutex_t mmap_lock; /* Lock order: 1, mmap/brk + page tables */
 extern pthread_mutex_t fd_lock;   /* Lock order: 3, FD table */
+
+/* The only supported mmap_lock entry/exit API. Acquire drains the per-vCPU EL1
+ * mmap rings before any caller can inspect semantic region state.
+ */
+void mmap_lock_acquire(guest_t *g);
+void mmap_lock_release(void);
+void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond);
+
+/* Temporarily drop mmap_lock while retaining the host PT-gate reference, then
+ * reacquire without taking a second reference. Used only by lazy zeroing.
+ */
+void mmap_lock_drop_keep_gate(void);
+void mmap_lock_reacquire_with_gate(guest_t *g);
 
 /* FD table (defined in syscall/fdtable.c). */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];

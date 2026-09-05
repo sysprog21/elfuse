@@ -10,6 +10,7 @@
  */
 
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,7 @@
 
 #include "hvutil.h"
 #include "core/guest.h"
+#include "core/mmap-fastpath.h"
 #include "core/shim-globals.h"
 #include "core/vdso.h"
 #include "debug/log.h"
@@ -86,12 +88,12 @@ _Static_assert((SHIM_COUNTERS_OFF & 0xFFF) == 0xC8,
                "shim.S SHIM_COUNTERS_OFF_LO12 hard-coded to 0xC8");
 _Static_assert((SHIM_COUNTERS_OFF & ~0xFFF) == 0x1000,
                "shim.S SHIM_COUNTERS_OFF_HI hard-coded to 0x1000");
-_Static_assert(SHIM_IDENTITY_OFF_PGID == 0x1158,
-               "shim.S getpgid fast path hard-codes PGID off 0x1158");
-_Static_assert(SHIM_IDENTITY_OFF_SID == 0x1160,
-               "shim.S getsid fast path hard-codes SID off 0x1160");
-_Static_assert(SHIM_FUTEX_WAITERS_OFF == 0x1168,
-               "shim.S futex_wake_fast hard-codes the waiter array at 0x1168");
+_Static_assert(SHIM_IDENTITY_OFF_PGID == 0x1178,
+               "shim.S getpgid fast path hard-codes PGID off 0x1178");
+_Static_assert(SHIM_IDENTITY_OFF_SID == 0x1180,
+               "shim.S getsid fast path hard-codes SID off 0x1180");
+_Static_assert(SHIM_FUTEX_WAITERS_OFF == 0x1188,
+               "shim.S futex_wake_fast hard-codes the waiter array at 0x1188");
 _Static_assert(SHIM_IDENTITY_OFF_SID + 8 <= SHIM_FUTEX_WAITERS_OFF,
                "waiter array must not overlap the SID slot");
 _Static_assert(SHIM_GLOBALS_SIZE >= SHIM_IDENTITY_OFF_SID + 8,
@@ -101,6 +103,84 @@ _Static_assert(SHIM_GLOBALS_SIZE <= BLOCK_2MIB,
 _Static_assert(SHIM_COUNTERS_OFF + SHIM_COUNTERS_N * 8 <=
                    SHIM_IDENTITY_OFF_PGID,
                "counter array must not overlap the PGID slot");
+_Static_assert(SHIM_MMAP_CONTROL_BASE == 0x20000,
+               "EL1 mmap fast path hard-codes control base 0x20000");
+_Static_assert(SHIM_MMAP_CONTROL_STRIDE == 0x1000,
+               "EL1 mmap fast path hard-codes control stride 0x1000");
+_Static_assert(SHIM_MMAP_RING_SIZE == 32,
+               "EL1 mmap fast path hard-codes 32 ring entries");
+_Static_assert(offsetof(shim_mmap_control_t, generation) == 0,
+               "EL1 mmap generation offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, consumer_generation) == 4,
+               "EL1 mmap consumer-generation offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, flags) == 8,
+               "EL1 mmap flags offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, head) == 12,
+               "EL1 mmap head offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, tail) == 16,
+               "EL1 mmap tail offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, arena_base) == 24,
+               "EL1 mmap arena-base offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, arena_limit) == 32,
+               "EL1 mmap arena-limit offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, cursor) == 40,
+               "EL1 mmap cursor offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, next_arena_size) == 48,
+               "mmap next-arena-size offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, publication_seq) == 56,
+               "mmap publication-seq offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, ring) == 64,
+               "EL1 mmap ring offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, counters) == 0x340,
+               "EL1 mmap counter offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, materialized_generation) == 0x388,
+               "EL1 mmap materialized-generation offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, materialized_start) == 0x390 &&
+                   offsetof(shim_mmap_control_t, materialized_end) == 0x398,
+               "EL1 mmap materialized bounds offset drift");
+_Static_assert(offsetof(shim_mmap_control_t, retire) == 0x400,
+               "EL1 munmap retire offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, produced_bytes) == 8,
+               "EL1 munmap produced-byte offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, consumed_bytes) == 16,
+               "EL1 munmap consumed-byte offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, producer_active) == 24,
+               "EL1 munmap active offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, cleanup_requested) == 28,
+               "EL1 munmap cleanup-request offset drift");
+_Static_assert(offsetof(munmap_retire_ring_t, entries) == 32,
+               "EL1 munmap entries offset drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_RING_SIZE == 32 && MAX_THREADS == 64,
+               "EL1 munmap ring/arena scan constants drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_BYTES_SOFT == 0x10000000ULL,
+               "EL1 munmap byte advisory threshold drift");
+_Static_assert(SHIM_MUNMAP_RETIRE_F_ARENA_SLOT_MASK == 0x3f &&
+                   SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT == 6,
+               "EL1 munmap retire flag encoding drift");
+
+/* Host-only, so no EL1 offset depends on it; the assert pins it past every ring
+ * instead, which is what keeps adding it from moving the shared layout.
+ */
+_Static_assert(offsetof(shim_mmap_control_t, publication_window) >
+                   offsetof(shim_mmap_control_t, retire),
+               "publication window must not precede the EL1-visible rings");
+_Static_assert((MMAP_FAST_PUBLICATION_WINDOW &
+                (MMAP_FAST_PUBLICATION_WINDOW - 1)) == 0,
+               "publication window size must be a power of two");
+_Static_assert((MMAP_FAST_ARENA_MAX >> 12) <=
+                   (SHIM_MUNMAP_RETIRE_F_CHARGE_MASK >>
+                    SHIM_MUNMAP_RETIRE_F_CHARGE_SHIFT),
+               "munmap retire flags cannot encode maximum arena charge");
+_Static_assert(SHIM_MMAP_PT_GATE_OFF >= SHIM_GLOBALS_SIZE &&
+                   SHIM_MMAP_PT_GATE_OFF + sizeof(uint32_t) <=
+                       SHIM_MMAP_CONTROL_BASE,
+               "host PT gate overlaps shim globals or mmap controls");
+_Static_assert(sizeof(shim_mmap_control_t) <= SHIM_MMAP_CONTROL_STRIDE,
+               "per-vCPU mmap control exceeds its shim-data stride");
+_Static_assert(SHIM_MMAP_CONTROL_BASE +
+                       MAX_THREADS * SHIM_MMAP_CONTROL_STRIDE <=
+                   BLOCK_2MIB - MAX_THREADS * 4096,
+               "mmap controls overlap per-vCPU EL1 stacks");
 
 static uint8_t *cache_base(const guest_t *g)
 {
@@ -131,7 +211,13 @@ static void urandom_ring_unlock(_Atomic uint32_t *lock_p)
 
 void shim_globals_init(guest_t *g)
 {
-    memset(cache_base(g), 0, SHIM_GLOBALS_SIZE);
+    /* mmap controls occupy a separate low shim-data range. Init/exec/fork child
+     * all call this while no sibling can execute, so clearing the whole control
+     * array also prevents a recycled SP_EL1 slot from inheriting an arena
+     * published to its previous owner.
+     */
+    memset(cache_base(g), 0,
+           SHIM_MMAP_CONTROL_BASE + MAX_THREADS * SHIM_MMAP_CONTROL_STRIDE);
 }
 
 void shim_globals_publish_pid(guest_t *g, int64_t pid, int64_t ppid)
@@ -459,7 +545,7 @@ _Static_assert(SHIM_COUNTER_URANDOM_HIT * 8 == 72, "CB_URANDOM_HIT");
 _Static_assert(SHIM_COUNTER_GETRANDOM_HIT * 8 == 80, "CB_GETRANDOM_HIT");
 _Static_assert(SHIM_COUNTER_PGSID_HIT * 8 == 88, "CB_PGSID_HIT");
 _Static_assert(SHIM_COUNTER_FUTEX_EAGAIN_HIT * 8 == 96, "CB_FUTEX_EAGAIN_HIT");
-_Static_assert(SHIM_COUNTER_FUTEX_EFAULT_HIT * 8 == 104, "CB_FUTEX_EFAULT_HIT");
+_Static_assert(SHIM_COUNTER_FUTEX_FAULT_BAIL * 8 == 104, "CB_FUTEX_FAULT_BAIL");
 _Static_assert(SHIM_COUNTER_FUTEX_SHAPE_BAIL * 8 == 112, "CB_FUTEX_SHAPE_BAIL");
 _Static_assert(SHIM_COUNTER_FUTEX_MATCH_BAIL * 8 == 120, "CB_FUTEX_MATCH_BAIL");
 _Static_assert(SHIM_COUNTER_FUTEX_WAKE_HIT * 8 == 128, "CB_FUTEX_WAKE_HIT");
@@ -480,17 +566,15 @@ static const char *const counter_names[SHIM_COUNTERS_N] = {
     [SHIM_COUNTER_GETRANDOM_HIT] = "GETRANDOM_HIT",
     [SHIM_COUNTER_PGSID_HIT] = "PGSID_HIT",
     [SHIM_COUNTER_FUTEX_EAGAIN_HIT] = "FUTEX_EAGAIN_HIT",
-    [SHIM_COUNTER_FUTEX_EFAULT_HIT] = "FUTEX_EFAULT_HIT",
+    [SHIM_COUNTER_FUTEX_FAULT_BAIL] = "FUTEX_FAULT_BAIL",
     [SHIM_COUNTER_FUTEX_SHAPE_BAIL] = "FUTEX_SHAPE_BAIL",
     [SHIM_COUNTER_FUTEX_MATCH_BAIL] = "FUTEX_MATCH_BAIL",
     [SHIM_COUNTER_FUTEX_WAKE_HIT] = "FUTEX_WAKE_HIT",
     [SHIM_COUNTER_FUTEX_WAKE_WAITER_BAIL] = "FUTEX_WAKE_WAITER_BAIL",
-
-    /* Every slot of SHIM_COUNTERS_N == 18 is now named. The dump still prints
-     * "(reserved)" for an unnamed slot, which would flag an out-of-band
-     * increment; a future EL1 service needs the array grown rather than a free
-     * slot claimed.
-     */
+    [SHIM_COUNTER_FAULT_MATERIALIZE] = "FAULT_MATERIALIZE",
+    [SHIM_COUNTER_FAULT_TLBI_VAE] = "FAULT_TLBI_VAE",
+    [SHIM_COUNTER_FAULT_TLBI_RVAE] = "FAULT_TLBI_RVAE",
+    [SHIM_COUNTER_FAULT_TLBI_BCAST] = "FAULT_TLBI_BCAST",
 };
 
 uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot)
@@ -501,6 +585,16 @@ uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot)
     const _Atomic uint64_t *slot_p =
         (const _Atomic uint64_t *) (page + SHIM_COUNTERS_OFF) + slot;
     return atomic_load_explicit(slot_p, memory_order_relaxed);
+}
+
+void shim_globals_counter_inc(guest_t *g, unsigned slot)
+{
+    if (!shim_globals_stats_enabled() || slot >= SHIM_COUNTERS_N)
+        return;
+    uint8_t *page = (uint8_t *) g->host_base + g->shim_data_base;
+    _Atomic uint64_t *slot_p =
+        (_Atomic uint64_t *) (page + SHIM_COUNTERS_OFF) + slot;
+    atomic_fetch_add_explicit(slot_p, 1, memory_order_relaxed);
 }
 
 void shim_globals_counters_dump(const guest_t *g)
@@ -514,6 +608,67 @@ void shim_globals_counters_dump(const guest_t *g)
         fprintf(stderr, "  %-20s %llu\n", name ? name : "(reserved)",
                 (unsigned long long) v);
     }
+
+    static const char *const mmap_counter_names[SHIM_MMAP_COUNTERS_N] = {
+        [SHIM_MMAP_COUNTER_SHAPE_MISS] = "MMAP_SHAPE_MISS",
+        [SHIM_MMAP_COUNTER_CAPACITY_MISS] = "MMAP_CAPACITY_MISS",
+        [SHIM_MMAP_COUNTER_RING_FULL] = "MMAP_RING_FULL",
+        [SHIM_MMAP_COUNTER_GENERATION_STALE] = "MMAP_GENERATION_STALE",
+        [SHIM_MMAP_COUNTER_ATTENTION] = "MMAP_ATTENTION",
+        [SHIM_MMAP_COUNTER_HIT] = "MMAP_HIT",
+    };
+    uint64_t mmap_counters[SHIM_MMAP_COUNTERS_N] = {0};
+    uint64_t refill_count = 0, recycle_count = 0;
+    uint64_t current_max = 0, peak_max = 0;
+    uint64_t munmap_retire_near_full = 0;
+    const uint8_t *shim_data =
+        (const uint8_t *) g->host_base + g->shim_data_base;
+    for (int slot = 0; slot < MAX_THREADS; slot++) {
+        const shim_mmap_control_t *c =
+            (const shim_mmap_control_t *) (shim_data + SHIM_MMAP_CONTROL_BASE +
+                                           (uint64_t) slot *
+                                               SHIM_MMAP_CONTROL_STRIDE);
+        for (unsigned i = 0; i < SHIM_MMAP_COUNTERS_N; i++)
+            mmap_counters[i] +=
+                atomic_load_explicit(&c->counters[i], memory_order_relaxed);
+        refill_count += c->refill_count;
+        recycle_count += c->recycle_count;
+        if (c->next_arena_size > current_max)
+            current_max = c->next_arena_size;
+        if (c->peak_arena_size > peak_max)
+            peak_max = c->peak_arena_size;
+        munmap_retire_near_full += atomic_load_explicit(
+            &c->munmap_retire_near_full, memory_order_relaxed);
+    }
+    for (unsigned i = 0; i < SHIM_MMAP_COUNTERS_N; i++)
+        fprintf(stderr, "  %-20s %llu\n", mmap_counter_names[i],
+                (unsigned long long) mmap_counters[i]);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_REFILL",
+            (unsigned long long) refill_count);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_RECYCLE",
+            (unsigned long long) recycle_count);
+    fprintf(stderr, "  %-20s %llu\n", "MUNMAP_RETIRE_NEAR_FULL",
+            (unsigned long long) munmap_retire_near_full);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_CURRENT",
+            (unsigned long long) current_max);
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_ARENA_PEAK",
+            (unsigned long long) peak_max);
+    uint64_t high_water =
+        g->mmap_next > MMAP_BASE ? g->mmap_next - MMAP_BASE : 0;
+    fprintf(stderr, "  %-20s %llu\n", "MMAP_HIGH_WATER",
+            (unsigned long long) high_water);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_CLEAN_SKIP",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_CLEAN_SKIP]);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_DIRTY_MEMSET",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_DIRTY_MEMSET]);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_ALREADY_VALID",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_ALREADY_VALID]);
+    fprintf(stderr, "  %-20s %llu\n", "FAULT_WINDOW_BYTES",
+            (unsigned long long)
+                g->materialize_stats[GUEST_MATERIALIZE_WINDOW_BYTES]);
 }
 
 static pthread_once_t stats_once = PTHREAD_ONCE_INIT;

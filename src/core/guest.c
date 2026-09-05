@@ -41,13 +41,15 @@
 #include <unistd.h>
 
 #include "core/guest.h"
+#include "core/mmap-fastpath.h"
 #include "proved/gva.h"
 #include "core/startup-trace.h"
 #include "debug/log.h"
 #include "utils.h"
-#include "runtime/futex.h"  /* futex_interrupt_request */
-#include "runtime/thread.h" /* thread_destroy_all_vcpus */
-#include "syscall/proc.h"   /* proc_request_exit_group */
+#include "runtime/futex.h"    /* futex_interrupt_request */
+#include "runtime/thread.h"   /* thread_destroy_all_vcpus */
+#include "syscall/internal.h" /* mmap_lock (lazy fault-in) */
+#include "syscall/proc.h"     /* proc_request_exit_group */
 #include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
 
@@ -160,6 +162,7 @@ static const void *guest_host_memchr(const void *src,
 
 /* Forward declaration (defined in the page table section below) */
 static int desc_to_perms(uint64_t desc);
+static uint64_t *find_l2_entry(guest_t *g, uint64_t va);
 
 /* Page table pool allocator. */
 
@@ -356,6 +359,48 @@ static inline void pte_store_release(uint64_t *entry, uint64_t desc)
                           memory_order_release);
 }
 
+/* Low-VA TTBR0 occupancy index. All mutators run under mmap_lock (or during
+ * single-threaded bootstrap), so plain bitmap operations are sufficient. The
+ * page-table descriptors themselves remain release-published for lock-free
+ * guest walkers; this host-only index is never consulted by a vCPU.
+ */
+static inline bool guest_pte_present_index(uint64_t va, uint64_t *block_out)
+{
+    if (va >= GUEST_PTE_PRESENT_LIMIT)
+        return false;
+    *block_out = va / BLOCK_2MIB;
+    return true;
+}
+
+static inline void guest_pte_present_set(guest_t *g, uint64_t va)
+{
+    uint64_t block;
+    if (!guest_pte_present_index(va, &block))
+        return;
+    uint64_t word = block >> 6;
+    g->pte_present_blocks[word] |= 1ULL << (block & 63);
+    g->pte_present_summary[word >> 6] |= 1ULL << (word & 63);
+}
+
+static inline void guest_pte_present_clear(guest_t *g, uint64_t va)
+{
+    uint64_t block;
+    if (!guest_pte_present_index(va, &block))
+        return;
+    uint64_t word = block >> 6;
+    g->pte_present_blocks[word] &= ~(1ULL << (block & 63));
+    if (g->pte_present_blocks[word] == 0)
+        g->pte_present_summary[word >> 6] &= ~(1ULL << (word & 63));
+}
+
+static inline bool guest_pte_present_test(const guest_t *g, uint64_t va)
+{
+    uint64_t block;
+    if (!guest_pte_present_index(va, &block))
+        return false;
+    return (g->pte_present_blocks[block >> 6] & (1ULL << (block & 63))) != 0;
+}
+
 /* Public API */
 
 /* FEAT_TLBIRANGE probe -- runs exactly once via pthread_once. ARMv8.4
@@ -394,6 +439,24 @@ static void tlbi_range_probe_run(void)
         (sysctlbyname("hw.optional.arm.FEAT_LSE2", &lse2_raw, &lse2_len, NULL,
                       0) == 0) &&
         lse2_raw != 0;
+}
+
+static int guest_init_materialize_cond(guest_t *g)
+{
+    int rc = pthread_cond_init(&g->materialize_cond, NULL);
+    if (rc == 0)
+        return 0;
+    log_error("guest: materialize condition initialization failed: %s",
+              strerror(rc));
+    hv_vm_destroy();
+    munmap(g->host_base, g->guest_size);
+    g->host_base = NULL;
+    g->n_segments = 0;
+    if (g->shm_fd >= 0) {
+        close(g->shm_fd);
+        g->shm_fd = -1;
+    }
+    return -1;
 }
 
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
@@ -577,8 +640,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
      */
     g->segments[0] = (hvf_segment_t) {.ipa = GUEST_IPA_BASE, .len = size};
     g->n_segments = 1;
-
-    return 0;
+    return guest_init_materialize_cond(g);
 }
 
 int guest_init_from_shm(guest_t *g,
@@ -689,6 +751,8 @@ int guest_init_from_shm(guest_t *g,
      */
     g->segments[0] = (hvf_segment_t) {.ipa = GUEST_IPA_BASE, .len = size};
     g->n_segments = 1;
+    if (guest_init_materialize_cond(g) < 0)
+        return -1;
 
     log_debug(
         "guest: CoW fork: mapped %llu GiB from shm "
@@ -835,6 +899,7 @@ void guest_destroy(guest_t *g)
         close(g->shm_fd);
         g->shm_fd = -1;
     }
+    pthread_cond_destroy(&g->materialize_cond);
 }
 
 /* Check whether a candidate IPA range [gpa, gpa+size) overlaps the primary
@@ -1264,9 +1329,11 @@ int guest_map_va_range(guest_t *g,
              * guest_split_block instead. Skip silently to mirror upstream's
              * sys_mmap_high_va "reuse existing GPA" behavior.
              */
+            guest_pte_present_set(g, va);
             continue;
         }
         pte_store_release(&l2[l2_idx], make_block_desc(cur_gpa, perms));
+        guest_pte_present_set(g, va);
         if (!bcast) {
             if (va < changed_lo)
                 changed_lo = va;
@@ -1586,11 +1653,11 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
  * (MEM_PERM_R/W/X bitmask). The walk continues across adjacent L2/L3 entries
  * until a mapping, permission, or physical-contiguity break is found.
  */
-static void *gva_resolve_perm(const guest_t *g,
-                              uint64_t gva,
-                              uint64_t *avail,
-                              int required_perms,
-                              uint64_t avail_limit)
+static void *gva_resolve_perm_walk(const guest_t *g,
+                                   uint64_t gva,
+                                   uint64_t *avail,
+                                   int required_perms,
+                                   uint64_t avail_limit)
 {
     /* Always walk page tables to enforce permissions. The guest slab is
      * identity-mapped (GVA == GPA == offset), but L2 block descriptors carry
@@ -1651,14 +1718,116 @@ static void *gva_resolve_perm(const guest_t *g,
     return NULL;
 }
 
+/* Host-access fault-in for lazy (deferred-PTE) regions.
+ *
+ * A syscall may target guest memory the guest itself has never touched: a fresh
+ * calloc()-style arena handed straight to read(2), a futex word inside an
+ * untouched mapping, an iovec into a new heap chunk. The guest-fault path
+ * (guest_materialize_lazy via the EL1 shim) never runs for those, so the
+ * page-table walk in gva_resolve_perm_walk fails even though the access is
+ * legal. Materialize the touched blocks here, then let the caller re-walk.
+ *
+ * Locking: takes mmap_lock; callers of the resolve API that already hold
+ * mmap_lock must use the _nofault variants. Do not call while holding any lock
+ * that ranks after mmap_lock in the ordering (syscall/internal.h); callers that
+ * resolve under such locks (futex bucket paths) pre-fault at their lock-free
+ * entry points so the hook never engages there.
+ *
+ * TLBI: guest_materialize_lazy accumulates TLBI requests in the calling
+ * thread's per-vCPU slot. On a vCPU thread the syscall epilogue emits them. On
+ * non-vCPU threads the request is lost, which is self-healing: a vCPU that
+ * still holds a stale negative TLB entry re-faults, and the already-valid
+ * early-return in guest_materialize_lazy re-issues a page TLBI for it without
+ * re-zeroing.
+ *
+ * Returns 0 if at least one block in [gva, gva+len) is now materialized (or
+ * already was), -1 if the range intersects no materializable lazy region.
+ */
+int guest_lazy_faultin_locked(const guest_t *cg, uint64_t gva, uint64_t len)
+{
+    /* The lazy machinery mutates page tables; the const on the resolve API
+     * reflects the pure-walk fast path, not this slow path.
+     */
+    guest_t *g = (guest_t *) (uintptr_t) cg;
+
+    if (gva >= g->guest_size)
+        return -1; /* High-VA / non-identity ranges are never lazy. */
+    if (len == 0)
+        len = 1;
+    uint64_t end = (len > g->guest_size - gva) ? g->guest_size : gva + len;
+
+    int rc = -1;
+    for (uint64_t b = gva & ~(uint64_t) (BLOCK_2MIB - 1); b < end;
+         b += BLOCK_2MIB) {
+        uint64_t probe = (b > gva) ? b : gva;
+        if (guest_materialize_lazy(g, probe) == 0)
+            rc = 0;
+    }
+    return rc;
+}
+
+static int gva_lazy_faultin(const guest_t *cg,
+                            uint64_t gva,
+                            uint64_t len,
+                            int required_perms)
+{
+    (void) required_perms; /* Region prot gates the retry walk, not this. */
+
+    int rc;
+    mmap_lock_acquire((guest_t *) (uintptr_t) cg);
+    rc = guest_lazy_faultin_locked(cg, gva, len);
+    mmap_lock_release();
+    return rc;
+}
+
+int guest_lazy_faultin(const guest_t *g, uint64_t gva, uint64_t len)
+{
+    return gva_lazy_faultin(g, gva, len, MEM_PERM_R);
+}
+
+static void *gva_resolve_perm(const guest_t *g,
+                              uint64_t gva,
+                              uint64_t *avail,
+                              int required_perms,
+                              uint64_t avail_limit,
+                              bool allow_faultin)
+{
+    void *ptr =
+        gva_resolve_perm_walk(g, gva, avail, required_perms, avail_limit);
+    if (!allow_faultin)
+        return ptr;
+
+    /* Window the fault-in to what the caller actually needs. Length-less
+     * resolves (guest_ptr / guest_ptr_avail) materialize a single block; their
+     * callers iterate and re-enter here per chunk.
+     */
+    uint64_t want = (avail_limit == UINT64_MAX) ? 1 : avail_limit;
+    if (want == 0)
+        return ptr;
+    if (!ptr) {
+        if (gva_lazy_faultin(g, gva, want, required_perms) < 0)
+            return NULL;
+        return gva_resolve_perm_walk(g, gva, avail, required_perms,
+                                     avail_limit);
+    }
+    if (avail && *avail < want && gva <= UINT64_MAX - *avail &&
+        gva_lazy_faultin(g, gva + *avail, want - *avail, required_perms) == 0) {
+        void *again =
+            gva_resolve_perm_walk(g, gva, avail, required_perms, avail_limit);
+        if (again)
+            ptr = again;
+    }
+    return ptr;
+}
+
 void *guest_ptr(const guest_t *g, uint64_t gva)
 {
-    return gva_resolve_perm(g, gva, NULL, MEM_PERM_R, UINT64_MAX);
+    return gva_resolve_perm(g, gva, NULL, MEM_PERM_R, UINT64_MAX, true);
 }
 
 void *guest_ptr_w(const guest_t *g, uint64_t gva)
 {
-    return gva_resolve_perm(g, gva, NULL, MEM_PERM_W, UINT64_MAX);
+    return gva_resolve_perm(g, gva, NULL, MEM_PERM_W, UINT64_MAX, true);
 }
 
 void *guest_ptr_avail(const guest_t *g,
@@ -1666,7 +1835,19 @@ void *guest_ptr_avail(const guest_t *g,
                       uint64_t *avail,
                       int required_perms)
 {
-    return gva_resolve_perm(g, gva, avail, required_perms, UINT64_MAX);
+    return gva_resolve_perm(g, gva, avail, required_perms, UINT64_MAX, true);
+}
+
+/* Pure page-table walk without lazy fault-in. For callers that already hold
+ * mmap_lock or must avoid acquiring it (e.g. the stale-TLB re-walk in the EL0
+ * fault handler, which runs after guest_materialize_lazy has been consulted).
+ */
+void *guest_ptr_avail_nofault(const guest_t *g,
+                              uint64_t gva,
+                              uint64_t *avail,
+                              int required_perms)
+{
+    return gva_resolve_perm(g, gva, avail, required_perms, UINT64_MAX, false);
 }
 
 void *guest_ptr_bound(const guest_t *g,
@@ -1675,7 +1856,7 @@ void *guest_ptr_bound(const guest_t *g,
                       int required_perms,
                       uint64_t len_limit)
 {
-    return gva_resolve_perm(g, gva, avail, required_perms, len_limit);
+    return gva_resolve_perm(g, gva, avail, required_perms, len_limit, true);
 }
 
 static inline int guest_copy(const guest_t *g,
@@ -1683,7 +1864,8 @@ static inline int guest_copy(const guest_t *g,
                              void *dst,
                              const void *src,
                              size_t len,
-                             int required_perms)
+                             int required_perms,
+                             bool allow_faultin)
 {
     if (len == 0)
         return 0;
@@ -1697,7 +1879,7 @@ static inline int guest_copy(const guest_t *g,
     while (copied < len) {
         uint64_t avail;
         void *ptr = gva_resolve_perm(g, gva + copied, &avail, required_perms,
-                                     (uint64_t) (len - copied));
+                                     (uint64_t) (len - copied), allow_faultin);
         if (!ptr)
             return -1;
         size_t chunk = len - copied;
@@ -1717,7 +1899,7 @@ static inline int guest_copy(const guest_t *g,
 
 int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len)
 {
-    return guest_copy(g, gva, dst, NULL, len, MEM_PERM_R);
+    return guest_copy(g, gva, dst, NULL, len, MEM_PERM_R, true);
 }
 
 int guest_read_small(const guest_t *g, uint64_t gva, void *dst, size_t len)
@@ -1733,7 +1915,12 @@ int guest_read_small(const guest_t *g, uint64_t gva, void *dst, size_t len)
 
 int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len)
 {
-    return guest_copy(g, gva, NULL, src, len, MEM_PERM_W);
+    return guest_copy(g, gva, NULL, src, len, MEM_PERM_W, true);
+}
+
+int guest_write_nofault(guest_t *g, uint64_t gva, const void *src, size_t len)
+{
+    return guest_copy(g, gva, NULL, src, len, MEM_PERM_W, false);
 }
 
 size_t guest_write_partial(guest_t *g,
@@ -1745,7 +1932,7 @@ size_t guest_write_partial(guest_t *g,
     while (done < len) {
         uint64_t avail;
         void *dst = gva_resolve_perm(g, gva + done, &avail, MEM_PERM_W,
-                                     (uint64_t) (len - done));
+                                     (uint64_t) (len - done), true);
         if (!dst)
             return done;
 
@@ -1789,7 +1976,7 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max)
             break;
         uint64_t avail;
         void *ptr = gva_resolve_perm(g, gva + copied, &avail, MEM_PERM_R,
-                                     (uint64_t) (limit - copied));
+                                     (uint64_t) (limit - copied), true);
         if (!ptr)
             break;
 
@@ -1879,6 +2066,7 @@ void guest_reset(guest_t *g)
         if (gpa > g->guest_size || len > g->guest_size - gpa)
             continue; /* backing lies outside the primary slab */
         memset((uint8_t *) g->host_base + gpa, 0, len);
+        guest_dirty_clear_zeroed_range(g, gpa, gpa + len);
     }
 
     /* Zero page table pool (not tracked in region array) */
@@ -1915,6 +2103,8 @@ void guest_reset(guest_t *g)
     g->mmap_rw_gap_hint = 0;
     g->mmap_rx_gap_hint = 0;
     g->ttbr0 = 0;
+    memset(g->pte_present_blocks, 0, sizeof(g->pte_present_blocks));
+    memset(g->pte_present_summary, 0, sizeof(g->pte_present_summary));
     tlbi_request_clear();
     g->elf_load_min = ELF_DEFAULT_BASE;
 
@@ -2902,6 +3092,9 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
 {
     uint64_t base = g->ipa_base;
 
+    memset(g->pte_present_blocks, 0, sizeof(g->pte_present_blocks));
+    memset(g->pte_present_summary, 0, sizeof(g->pte_present_summary));
+
     /* Allocate L0 table */
     uint64_t l0_gpa = pt_alloc_page(g);
     if (!l0_gpa)
@@ -2998,6 +3191,8 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
              * to the primary-buffer GPA where the bytes actually are.
              */
             l2[l2_idx] = make_block_desc(output_ipa, block_perms);
+            if (lookup_addr >= base)
+                guest_pte_present_set(g, lookup_addr - base);
         }
     }
 
@@ -3010,6 +3205,11 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
      */
     if (!finalize_block_perms(g, regions, n))
         return 0;
+
+    for (int r = 0; r < n; r++) {
+        if (regions[r].perms & MEM_PERM_W)
+            guest_dirty_mark_range(g, regions[r].gpa_start, regions[r].gpa_end);
+    }
 
     guest_pt_gen_bump(g);
     return ttbr0;
@@ -3129,9 +3329,12 @@ int guest_extend_page_tables(guest_t *g,
          * an explicit PT_VALID test so the intent survives a future
          * descriptor-bit renumbering.
          */
-        if (l2[l2_idx] & PT_VALID)
+        if (l2[l2_idx] & PT_VALID) {
+            guest_pte_present_set(g, addr);
             continue;
+        }
         pte_store_release(&l2[l2_idx], make_block_desc(ipa, perms));
+        guest_pte_present_set(g, addr);
         if (!bcast) {
             if (addr < changed_lo)
                 changed_lo = addr;
@@ -3147,10 +3350,129 @@ int guest_extend_page_tables(guest_t *g,
     return 0;
 }
 
+static uint64_t guest_va_next_page_table_block(const guest_t *g,
+                                               uint64_t va,
+                                               uint64_t end)
+{
+    if (!g || !g->ttbr0)
+        return end;
+    uint64_t base = g->ipa_base;
+    uint64_t *l0 = pt_at(g, g->ttbr0 - base);
+    if (!l0)
+        return end;
+
+    va &= ~(uint64_t) (BLOCK_2MIB - 1);
+    while (va < end) {
+        uint64_t ipa = base + va;
+        unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GIB));
+        if (l0_idx >= 512)
+            return end;
+        if (!(l0[l0_idx] & PT_VALID)) {
+            uint64_t next_ipa = (uint64_t) (l0_idx + 1) * 512ULL * BLOCK_1GIB;
+            if (next_ipa <= ipa || next_ipa - base <= va)
+                return end; /* wrap guard */
+            va = next_ipa - base;
+            continue;
+        }
+        uint64_t *l1 = pt_at(g, (l0[l0_idx] & 0xFFFFFFFFF000ULL) - base);
+        if (!l1)
+            return end;
+        unsigned l1_idx =
+            (unsigned) ((ipa % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
+        if (!(l1[l1_idx] & PT_VALID)) {
+            uint64_t next_ipa = (ipa / BLOCK_1GIB + 1) * BLOCK_1GIB;
+            if (next_ipa <= ipa || next_ipa - base <= va)
+                return end;
+            va = next_ipa - base;
+            continue;
+        }
+        return va;
+    }
+    return end;
+}
+
+static uint64_t guest_va_next_indexed_block(const guest_t *g,
+                                            uint64_t va,
+                                            uint64_t end)
+{
+    if (va >= end || va >= GUEST_PTE_PRESENT_LIMIT)
+        return end;
+    if (end > GUEST_PTE_PRESENT_LIMIT)
+        end = GUEST_PTE_PRESENT_LIMIT;
+
+    uint64_t first_block = va / BLOCK_2MIB;
+    uint64_t last_block = (end - 1) / BLOCK_2MIB;
+    uint64_t first_word = first_block >> 6;
+    uint64_t last_word = last_block >> 6;
+    uint64_t bits =
+        g->pte_present_blocks[first_word] & (~0ULL << (first_block & 63));
+    if (first_word == last_word && (last_block & 63) != 63)
+        bits &= (1ULL << ((last_block & 63) + 1)) - 1;
+    if (bits)
+        return (first_word * 64 + (uint64_t) __builtin_ctzll(bits)) *
+               BLOCK_2MIB;
+
+    uint64_t word = first_word + 1;
+    while (word <= last_word) {
+        uint64_t summary_word = word >> 6;
+        uint64_t summary_last = last_word >> 6;
+        uint64_t summary =
+            g->pte_present_summary[summary_word] & (~0ULL << (word & 63));
+        if (summary_word == summary_last && (last_word & 63) != 63)
+            summary &= (1ULL << ((last_word & 63) + 1)) - 1;
+        if (summary) {
+            uint64_t present_word =
+                summary_word * 64 + (uint64_t) __builtin_ctzll(summary);
+            uint64_t present = g->pte_present_blocks[present_word];
+            if (present_word == last_word && (last_block & 63) != 63)
+                present &= (1ULL << ((last_block & 63) + 1)) - 1;
+            if (present)
+                return (present_word * 64 +
+                        (uint64_t) __builtin_ctzll(present)) *
+                       BLOCK_2MIB;
+        }
+        if (summary_word == summary_last)
+            break;
+        word = (summary_word + 1) * 64;
+    }
+    return end;
+}
+
+uint64_t guest_va_next_present_block(const guest_t *g,
+                                     uint64_t va,
+                                     uint64_t end)
+{
+    if (!g || va >= end)
+        return end;
+    if (va & (BLOCK_2MIB - 1)) {
+        if (va > UINT64_MAX - (BLOCK_2MIB - 1))
+            return end;
+        va = ALIGN_2MIB_UP(va);
+        if (va >= end)
+            return end;
+    }
+
+    if (va < GUEST_PTE_PRESENT_LIMIT) {
+        uint64_t low_end =
+            end < GUEST_PTE_PRESENT_LIMIT ? end : GUEST_PTE_PRESENT_LIMIT;
+        uint64_t next = guest_va_next_indexed_block(g, va, low_end);
+        if (next < low_end || end <= GUEST_PTE_PRESENT_LIMIT)
+            return next;
+        va = GUEST_PTE_PRESENT_LIMIT;
+    }
+
+    /* Non-identity/high-VA mappings live outside the compact low-VA index.
+     * Preserve the page-table walker for those uncommon ranges.
+     */
+    return guest_va_next_page_table_block(g, va, end);
+}
+
 bool guest_va_block_mapped(const guest_t *g, uint64_t va)
 {
     if (!g || !g->ttbr0 || (va & (BLOCK_2MIB - 1)))
         return false;
+    if (va < GUEST_PTE_PRESENT_LIMIT)
+        return guest_pte_present_test(g, va);
 
     uint64_t base = g->ipa_base;
     uint64_t *l0 = pt_at(g, g->ttbr0 - base);
@@ -3177,6 +3499,71 @@ bool guest_va_block_mapped(const guest_t *g, uint64_t va)
 
     unsigned l2_idx = (unsigned) ((va % BLOCK_1GIB) / BLOCK_2MIB);
     return (l2[l2_idx] & PT_VALID) != 0;
+}
+
+void guest_rebuild_pte_present(guest_t *g)
+{
+    if (!g)
+        return;
+    memset(g->pte_present_blocks, 0, sizeof(g->pte_present_blocks));
+    memset(g->pte_present_summary, 0, sizeof(g->pte_present_summary));
+    if (!g->ttbr0)
+        return;
+
+    uint64_t limit = g->guest_size;
+    if (limit > GUEST_PTE_PRESENT_LIMIT)
+        limit = GUEST_PTE_PRESENT_LIMIT;
+    for (uint64_t va = 0; va < limit; va += BLOCK_2MIB) {
+        uint64_t *l2_entry = find_l2_entry(g, va);
+        if (!l2_entry || !(*l2_entry & PT_VALID))
+            continue;
+        if ((*l2_entry & 3) == 1) {
+            guest_pte_present_set(g, va);
+            continue;
+        }
+        uint64_t l3_ipa = *l2_entry & 0xFFFFFFFFF000ULL;
+        uint64_t *l3 = pt_at(g, l3_ipa - g->ipa_base);
+        if (!l3)
+            continue;
+        for (unsigned i = 0; i < BLOCK_2MIB / PAGE_SIZE; i++) {
+            if (l3[i] & PT_VALID) {
+                guest_pte_present_set(g, va);
+                break;
+            }
+        }
+    }
+}
+
+void guest_retire_ptes_committed(guest_t *g, uint64_t start, uint64_t end)
+{
+    if (!g || end <= start)
+        return;
+    uint64_t block = ALIGN_2MIB_DOWN(start);
+    while (block < end) {
+        bool present = false;
+        uint64_t *l2_entry = find_l2_entry(g, block);
+        if (l2_entry && (*l2_entry & PT_VALID)) {
+            if ((*l2_entry & 3) == 1) {
+                present = true;
+            } else {
+                uint64_t l3_ipa = *l2_entry & 0xFFFFFFFFF000ULL;
+                uint64_t *l3 = pt_at(g, l3_ipa - g->ipa_base);
+                if (l3) {
+                    for (unsigned i = 0; i < BLOCK_2MIB / PAGE_SIZE; i++) {
+                        if (pte_load_acquire(&l3[i]) & PT_VALID) {
+                            present = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (present)
+            guest_pte_present_set(g, block);
+        else
+            guest_pte_present_clear(g, block);
+        block += BLOCK_2MIB;
+    }
 }
 
 /* L3 page table splitting. */
@@ -3335,6 +3722,7 @@ int guest_split_block(guest_t *g, uint64_t block_gpa)
 int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
 {
     uint64_t base = g->ipa_base;
+    bool any_changed = false;
 
     /* Page-align the range. The ALIGN_UP step on end could wrap to 0 for inputs
      * within PAGE_SIZE-1 of UINT64_MAX, silently turning the invalidation into
@@ -3349,10 +3737,21 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
         return 0;
 
     for (uint64_t addr = start; addr < end;) {
+        uint64_t indexed_block = ALIGN_2MIB_DOWN(addr);
+        if (indexed_block < GUEST_PTE_PRESENT_LIMIT &&
+            !guest_pte_present_test(g, indexed_block)) {
+            addr =
+                guest_va_next_present_block(g, indexed_block + BLOCK_2MIB, end);
+            continue;
+        }
         uint64_t *l2_entry = find_l2_entry(g, addr);
         if (!l2_entry) {
-            /* No L2 entry (already unmapped); skip this 2MiB block */
-            addr = ALIGN_2MIB_UP(addr + 1);
+            /* No L2 table: nothing to invalidate in this block. The low-VA
+             * occupancy index jumps directly to the next block containing a
+             * valid PTE; high VA retains the page-table hierarchy fallback.
+             */
+            guest_pte_present_clear(g, indexed_block);
+            addr = guest_va_next_present_block(g, ALIGN_2MIB_UP(addr + 1), end);
             continue;
         }
 
@@ -3361,6 +3760,7 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
 
         /* Not mapped at all: skip */
         if (!(*l2_entry & 1)) {
+            guest_pte_present_clear(g, block_start);
             addr = block_end;
             continue;
         }
@@ -3374,6 +3774,8 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
                  * broadcast.
                  */
                 pte_store_release(l2_entry, 0);
+                guest_pte_present_clear(g, block_start);
+                any_changed = true;
                 tlbi_request_range(base + block_start, base + block_end);
                 addr = block_end;
                 continue;
@@ -3399,12 +3801,14 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
         uint64_t page_end = (end < block_end) ? end : block_end;
         uint64_t changed_lo = UINT64_MAX, changed_hi = 0;
         bool bcast = tlbi_request_is_broadcast();
+        bool block_changed = false;
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx =
                 (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
             if (l3[l3_idx] != 0) {
                 pte_store_release(&l3[l3_idx], 0); /* Invalid descriptor */
+                block_changed = true;
                 if (!bcast) {
                     if (pa < changed_lo)
                         changed_lo = pa;
@@ -3416,10 +3820,27 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
 
         if (!bcast && changed_hi > changed_lo)
             tlbi_request_range(base + changed_lo, base + changed_hi);
+        if (block_changed)
+            any_changed = true;
+
+        bool block_present = false;
+        if (page_start > block_start || page_end < block_end) {
+            for (unsigned i = 0; i < BLOCK_2MIB / PAGE_SIZE; i++) {
+                if (l3[i] & PT_VALID) {
+                    block_present = true;
+                    break;
+                }
+            }
+        }
+        if (block_present)
+            guest_pte_present_set(g, block_start);
+        else
+            guest_pte_present_clear(g, block_start);
         addr = page_end;
     }
 
-    guest_pt_gen_bump(g);
+    if (any_changed)
+        guest_pt_gen_bump(g);
     return 0;
 }
 
@@ -3495,6 +3916,7 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
                     pte_store_release(l2_entry, make_block_desc(ipa, perms));
                     tlbi_request_range(base + block_start, base + block_end);
                 }
+                guest_pte_present_set(g, block_start);
                 addr = block_end;
                 continue;
             }
@@ -3569,9 +3991,15 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
 
         if (!bcast && changed_hi > changed_lo)
             tlbi_request_range(base + changed_lo, base + changed_hi);
+        guest_pte_present_set(g, block_start);
         addr = page_end;
     }
 
+    /* Writable PTEs allow guest stores without another host fault. Keep the
+     * block dirty even when materialization has just zeroed its backing.
+     */
+    if (perms & MEM_PERM_W)
+        guest_dirty_mark_range(g, start, end);
     guest_pt_gen_bump(g);
     return 0;
 }
@@ -3650,19 +4078,136 @@ int guest_install_va_pages(guest_t *g,
                     changed_hi = v + PAGE_SIZE;
             }
         }
+        guest_pte_present_set(g, v);
     }
 
     if (!bcast && changed_hi > changed_lo)
         tlbi_request_range(changed_lo, changed_hi);
+    if (perms & MEM_PERM_W)
+        guest_dirty_mark_range(g, gpa, gpa + length);
     guest_pt_gen_bump(g);
     return 0;
 }
 
-/* Lazy page materialization for MAP_NORESERVE. */
+/* Lazy page materialization for deferred-PTE (private anonymous /
+ * MAP_NORESERVE) regions.
+ */
 
-int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
+bool guest_block_may_be_dirty(const guest_t *g, uint64_t block_start)
 {
-    /* Find the noreserve region containing this offset */
+    if (!g || block_start >= g->guest_size)
+        return true;
+    uint64_t block = block_start / BLOCK_2MIB;
+    return (g->dirty_blocks[block >> 6] & (1ULL << (block & 63))) != 0;
+}
+
+void guest_dirty_mark_range(guest_t *g, uint64_t start, uint64_t end)
+{
+    if (!g || end <= start || start >= g->guest_size)
+        return;
+    if (end > g->guest_size)
+        end = g->guest_size;
+    uint64_t first = start / BLOCK_2MIB;
+    uint64_t last = (end - 1) / BLOCK_2MIB;
+    for (uint64_t block = first; block <= last; block++)
+        g->dirty_blocks[block >> 6] |= 1ULL << (block & 63);
+}
+
+void guest_dirty_clear_zeroed_range(guest_t *g, uint64_t start, uint64_t end)
+{
+    if (!g || end <= start || start >= g->guest_size)
+        return;
+    if (end > g->guest_size)
+        end = g->guest_size;
+    uint64_t first = ALIGN_2MIB_UP(start);
+    uint64_t last = ALIGN_2MIB_DOWN(end);
+    for (uint64_t addr = first; addr < last; addr += BLOCK_2MIB) {
+        uint64_t block = addr / BLOCK_2MIB;
+        g->dirty_blocks[block >> 6] &= ~(1ULL << (block & 63));
+    }
+}
+
+static bool materialize_claim_overlaps(const guest_materialize_claim_t *claim,
+                                       uint64_t start,
+                                       uint64_t end)
+{
+    return claim->active && start < claim->end && end > claim->start;
+}
+
+void guest_materialize_wait_range_locked(guest_t *g,
+                                         uint64_t start,
+                                         uint64_t end)
+{
+    if (!g || end <= start)
+        return;
+    for (;;) {
+        bool overlap = false;
+        for (int i = 0; i < GUEST_MATERIALIZE_CLAIMS; i++) {
+            if (materialize_claim_overlaps(&g->materialize_claims[i], start,
+                                           end)) {
+                overlap = true;
+                break;
+            }
+        }
+        if (!overlap)
+            return;
+        mmap_lock_cond_wait(g, &g->materialize_cond);
+    }
+}
+
+void guest_materialize_wait_all_locked(guest_t *g)
+{
+    guest_materialize_wait_range_locked(g, 0, UINT64_MAX);
+}
+
+static int materialize_claim_alloc_locked(guest_t *g,
+                                          uint64_t start,
+                                          uint64_t end)
+{
+    guest_materialize_wait_range_locked(g, start, end);
+    for (int i = 0; i < GUEST_MATERIALIZE_CLAIMS; i++) {
+        guest_materialize_claim_t *claim = &g->materialize_claims[i];
+        if (!claim->active) {
+            claim->start = start;
+            claim->end = end;
+            claim->active = true;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void materialize_claim_release_locked(guest_t *g, int slot)
+{
+    if (slot < 0)
+        return;
+    g->materialize_claims[slot].active = false;
+    pthread_cond_broadcast(&g->materialize_cond);
+}
+
+/* Whether the 4KiB page containing va has a valid stage-1 descriptor. Callers
+ * must hold mmap_lock; used to detect blocks a concurrent fault already
+ * materialized.
+ */
+bool guest_va_pte_valid(guest_t *g, uint64_t va)
+{
+    uint64_t *l2_entry = find_l2_entry(g, va);
+    if (!l2_entry || !(*l2_entry & PT_VALID))
+        return false;
+    if ((*l2_entry & 3) == 1)
+        return true; /* 2MiB block descriptor */
+    uint64_t *l3 = pt_at(g, (*l2_entry & 0xFFFFFFFFF000ULL) - g->ipa_base);
+    if (!l3)
+        return false;
+    unsigned l3_idx =
+        (unsigned) (((g->ipa_base + va) % BLOCK_2MIB) / PAGE_SIZE);
+    return (l3[l3_idx] & PT_VALID) != 0;
+}
+
+static int guest_materialize_lazy_one(guest_t *g, uint64_t fault_offset)
+{
+retry:;
+    /* Find the lazy region containing this offset */
     const guest_region_t *region = NULL;
     for (int i = 0; i < g->nregions; i++) {
         if (g->regions[i].start <= fault_offset &&
@@ -3673,7 +4218,36 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
     }
 
     if (!region)
-        return -1; /* Not a noreserve region */
+        return -1; /* Not a lazy region */
+
+    /* PROT_NONE is a reservation, not a mapping: a fault inside it is a genuine
+     * SIGSEGV, never a materialization request. Without this check a
+     * PROT_NONE|MAP_NORESERVE region would be silently granted read permission
+     * by the perms fallback below.
+     */
+    if (region->prot == LINUX_PROT_NONE)
+        return -1;
+
+    uint64_t block_start = fault_offset & ~(BLOCK_2MIB - 1);
+    uint64_t block_end = block_start + BLOCK_2MIB;
+    if (block_end > g->guest_size)
+        block_end = g->guest_size;
+
+    /* Already materialized: another thread (concurrent guest fault or a
+     * host-side fault-in on a syscall path) completed this block while this
+     * vCPU was queued on mmap_lock, and the guest may have written real data
+     * through the new PTEs since. Running the memset below again would wipe
+     * those writes. The fault that got us here is then either a stale negative
+     * TLB entry or an in-flight retry. Invalidate the whole materialization
+     * block so this path follows the same one-RVAE-per-block contract as a
+     * newly installed block.
+     */
+    if (guest_va_pte_valid(g, fault_offset)) {
+        mmap_fastpath_note_materialized_locked(g, block_start, block_end);
+        g->materialize_stats[GUEST_MATERIALIZE_ALREADY_VALID]++;
+        tlbi_request_range(g->ipa_base + block_start, g->ipa_base + block_end);
+        return 0;
+    }
 
     /* Materialize one 2MiB block containing the fault address. This is the
      * smallest granule that guest_extend_page_tables works with. For the common
@@ -3681,12 +4255,18 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
      * trade-off: it avoids over-committing the large reservation while keeping
      * the fault rate manageable.
      */
-    uint64_t block_start = fault_offset & ~(BLOCK_2MIB - 1);
-    uint64_t block_end = block_start + BLOCK_2MIB;
 
-    /* Clamp to guest size */
-    if (block_end > g->guest_size)
-        block_end = g->guest_size;
+    /* A sibling may be zeroing another window in this block without the lock.
+     * Wait before inspecting regions/PTEs, then restart because a mutator that
+     * was itself waiting may have changed the region layout first.
+     */
+    for (int i = 0; i < GUEST_MATERIALIZE_CLAIMS; i++) {
+        if (materialize_claim_overlaps(&g->materialize_claims[i], block_start,
+                                       block_end)) {
+            guest_materialize_wait_range_locked(g, block_start, block_end);
+            goto retry;
+        }
+    }
 
     uint64_t materialize_start =
         (block_start > region->start) ? block_start : region->start;
@@ -3707,18 +4287,70 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
     if (perms == 0)
         perms = MEM_PERM_R; /* At minimum readable */
 
+    /* Zero the window BEFORE any PTE becomes valid. The moment a descriptor is
+     * published, sibling vCPUs with no stale TLB entry can write through it
+     * without ever faulting; zeroing afterwards (the historical order) would
+     * wipe such a write. The slab is host memory, so zeroing needs no PTEs, and
+     * every writer that could touch the window first goes through mmap_lock
+     * (guest faults and host-side fault-in alike), so nothing can write between
+     * this memset and the descriptor stores below. Skip pages that are already
+     * valid: they belong to a previously materialized neighbor in the same
+     * block and may hold live data.
+     */
+    int claim_slot = -1;
+    bool dirty = guest_block_may_be_dirty(g, block_start);
+    if (dirty) {
+        uint64_t zero_pages[8] = {0};
+        bool any_valid = false;
+        for (uint64_t pg = materialize_start; pg < materialize_end;
+             pg += PAGE_SIZE) {
+            unsigned page = (unsigned) ((pg - block_start) / PAGE_SIZE);
+            if (guest_va_pte_valid(g, pg))
+                any_valid = true;
+            else
+                zero_pages[page >> 6] |= 1ULL << (page & 63);
+        }
+
+        claim_slot = materialize_claim_alloc_locked(g, block_start, block_end);
+        if (claim_slot >= 0)
+            mmap_lock_drop_keep_gate();
+        for (unsigned page = 0; page < 512;) {
+            if (!(zero_pages[page >> 6] & (1ULL << (page & 63)))) {
+                page++;
+                continue;
+            }
+            unsigned first = page;
+            do {
+                page++;
+            } while (page < 512 &&
+                     (zero_pages[page >> 6] & (1ULL << (page & 63))));
+            memset((uint8_t *) g->host_base + block_start +
+                       (uint64_t) first * PAGE_SIZE,
+                   0, (uint64_t) (page - first) * PAGE_SIZE);
+        }
+        if (claim_slot >= 0)
+            mmap_lock_reacquire_with_gate(g);
+        if (!(perms & MEM_PERM_W) && !any_valid &&
+            materialize_start == block_start && materialize_end == block_end)
+            guest_dirty_clear_zeroed_range(g, block_start, block_end);
+    }
+
     /* Create page table entries. guest_extend_page_tables creates L2 block
      * descriptors but skips existing table descriptors (L2->L3 splits).
      * guest_update_perms handles the L3 case: if guest_invalidate_ptes
      * previously split the block and invalidated the L3 entries, update_perms
      * recreates them with correct perms.
      */
-    if (guest_extend_page_tables(g, block_start, block_end, perms) < 0)
+    if (guest_extend_page_tables(g, block_start, block_end, perms) < 0) {
+        materialize_claim_release_locked(g, claim_slot);
         return -1;
+    }
 
     if (partial_block) {
-        if (guest_split_block(g, block_start) < 0)
+        if (guest_split_block(g, block_start) < 0) {
+            materialize_claim_release_locked(g, claim_slot);
             return -1;
+        }
 
         /* If this block had no page-table entry before the lazy fault,
          * guest_extend_page_tables() necessarily created a full 2MiB block.
@@ -3728,25 +4360,103 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
          */
         if (!had_mapping) {
             if (block_start < materialize_start &&
-                guest_invalidate_ptes(g, block_start, materialize_start) < 0)
+                guest_invalidate_ptes(g, block_start, materialize_start) < 0) {
+                materialize_claim_release_locked(g, claim_slot);
                 return -1;
+            }
             if (materialize_end < block_end &&
-                guest_invalidate_ptes(g, materialize_end, block_end) < 0)
+                guest_invalidate_ptes(g, materialize_end, block_end) < 0) {
+                materialize_claim_release_locked(g, claim_slot);
                 return -1;
+            }
         }
     }
 
     guest_update_perms(g, materialize_start, materialize_end, perms);
 
-    /* Zero the materialized memory. Only zero within the region boundaries to
-     * avoid clobbering adjacent data.
+    /* One 2MiB materialization gets one block-sized RVAE1IS. This is cheaper
+     * than per-page invalidation and covers every negative entry that may have
+     * been cached for the block while its descriptors were invalid.
      */
-    if (materialize_end > materialize_start)
-        memset((uint8_t *) g->host_base + materialize_start, 0,
-               materialize_end - materialize_start);
-
-    /* The page-table helpers above already requested the matching TLBI; no
-     * additional flush is needed here.
-     */
+    tlbi_request_range(g->ipa_base + block_start, g->ipa_base + block_end);
+    g->materialize_stats[dirty ? GUEST_MATERIALIZE_DIRTY_MEMSET
+                               : GUEST_MATERIALIZE_CLEAN_SKIP]++;
+    g->materialize_stats[GUEST_MATERIALIZE_WINDOW_BYTES] +=
+        materialize_end - materialize_start;
+    mmap_fastpath_note_materialized_locked(g, materialize_start,
+                                           materialize_end);
+    materialize_claim_release_locked(g, claim_slot);
     return 0;
+}
+
+int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
+{
+    return guest_materialize_lazy_one(g, fault_offset);
+}
+
+int guest_materialize_lazy_fault(guest_t *g, uint64_t fault_offset)
+{
+    typedef struct {
+        guest_t *guest;
+        uint64_t next_block;
+        unsigned streak;
+    } fault_around_state_t;
+    static _Thread_local fault_around_state_t state;
+
+    uint64_t block = ALIGN_2MIB_DOWN(fault_offset);
+    if (state.guest == g && block == state.next_block) {
+        if (state.streak < 4)
+            state.streak++;
+    } else {
+        state.guest = g;
+        state.streak = 0;
+    }
+
+    const guest_region_t *region = guest_region_find(g, fault_offset);
+    if (!region || !region->noreserve || region->prot == LINUX_PROT_NONE)
+        return -1;
+
+    unsigned blocks = 1U << state.streak;
+    if (blocks > 16)
+        blocks = 16;
+    uint64_t region_last = ALIGN_2MIB_UP(region->end);
+    if (region_last > g->guest_size)
+        region_last = g->guest_size;
+
+    for (unsigned i = 0; i < blocks; i++) {
+        uint64_t ahead = block + (uint64_t) i * BLOCK_2MIB;
+        if (ahead >= region_last)
+            break;
+        if (guest_block_may_be_dirty(g, ahead) && blocks > 4) {
+            blocks = 4;
+            break;
+        }
+    }
+
+    int result = -1;
+    uint64_t last = block;
+    for (unsigned i = 0; i < blocks; i++) {
+        uint64_t ahead = block + (uint64_t) i * BLOCK_2MIB;
+        if (ahead >= region_last)
+            break;
+
+        /* The current block must probe the actual FAR. A fast-path mmap can
+         * extend an already materialized region within the same 2MiB block;
+         * probing the region/block start would see an older valid page and
+         * return without installing the newly faulted page. Ahead blocks have
+         * no FAR, so use their first address inside the region.
+         */
+        uint64_t probe = (i == 0)
+                             ? fault_offset
+                             : (ahead < region->start ? region->start : ahead);
+        int rc = guest_materialize_lazy_one(g, probe);
+        if (i == 0)
+            result = rc;
+        if (rc < 0)
+            break;
+        last = ahead;
+    }
+    if (result == 0)
+        state.next_block = last + BLOCK_2MIB;
+    return result;
 }

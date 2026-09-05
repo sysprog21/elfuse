@@ -134,6 +134,10 @@ test-guard-page
 test-mmap-hint
 test-mmap-sigbus-efault
 
+[section] Lazy anonymous mmap tests
+test-mmap-lazy
+test-mmap-fastpath
+
 [section] mremap tests
 test-mremap
 test-mremap-infra

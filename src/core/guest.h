@@ -20,6 +20,7 @@
 #pragma once
 
 #include <Hypervisor/Hypervisor.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -264,7 +265,11 @@ typedef struct {
     uint64_t offset;   /* File offset (for /proc/self/maps display) */
     int backing_fd;    /* Duplicated host fd for file-backed mappings, or -1 */
     bool shared;       /* MAP_SHARED (writes should propagate) */
-    bool noreserve;    /* MAP_NORESERVE: PTEs deferred until fault */
+    bool noreserve;    /* Lazy region: PTEs and zeroing deferred until first
+                        * touch. Set for MAP_NORESERVE and for all private
+                        * anonymous mappings (sys_mmap folds the latter into
+                        * the tracked MAP_NORESERVE bit; not guest visible).
+                        */
     bool backing_ro;   /* MAP_SHARED region whose backing_fd was opened
                         * without write access, so its Linux max_prot is
                         * capped to PROT_READ. sys_mprotect must reject any
@@ -301,6 +306,8 @@ typedef struct {
  *   TLBI_BROADCAST -> X8 = 1  (TLBI VMALLE1IS, broadest)
  *   TLBI_RANGE     -> X8 = 3, X9 = start VA, X10 = page count
  *                     (TLBI VAE1IS loop preserves unrelated TLB entries)
+ *   TLBI_RANGE_LARGE -> X8 = 4, X9 = encoded range operand
+ *                       (single TLBI RVAE1IS)
  * X8 = 2 is reserved for the execve drop-frame marker the shim handles
  * separately; it is never produced by the accumulator.
  */
@@ -323,14 +330,12 @@ typedef enum {
  */
 #define TLBI_SELECTIVE_MAX_PAGES 16
 
-/* Cap single-shot TLBI RVAE1IS at this many 4 KiB pages. With SCALE=0 the
- * RVAE1IS operand encoding covers (NUM+1)*2 pages with NUM in [0..31], so a
- * single instruction reaches 64 pages == 256 KiB. Beyond that the host would
- * need SCALE=1 (NUM*64 step), which over-invalidates for the typical
- * dynamic-linker RELRO / glibc-bring-up storm sizes seen in practice; stay at
- * SCALE=0 for now and broadcast above 64 pages.
+/* Cap single-shot TLBI RVAE1IS at this many 4 KiB pages. SCALE=0 covers up to
+ * 64 pages, SCALE=1 up to 2048 pages, and SCALE=2 much larger ranges. 32768
+ * pages (128 MiB) covers the lazy fault-around window with one instruction
+ * while still fitting tlbi_request_t.pages in uint16_t.
  */
-#define TLBI_RVAE_MAX_PAGES 64
+#define TLBI_RVAE_MAX_PAGES 32768
 
 /* TLBI RVAE1IS operand bit-field constants. Per ARM ARM DDI 0487J.a D8.7.6 the
  * operand layout is:
@@ -346,28 +351,37 @@ typedef enum {
  */
 #define RVAE_OPERAND_BADDR_MASK ((1ULL << 37) - 1)
 #define RVAE_OPERAND_NUM_SHIFT 39
+#define RVAE_OPERAND_SCALE_SHIFT 44
 #define RVAE_OPERAND_TG_4KB (1ULL << 46)
 
 /* Pure encoder: build the TLBI RVAE1IS Xt operand from a 4 KiB-aligned VA and a
- * page count in the SCALE=0 range (1..TLBI_RVAE_MAX_PAGES). Lives in the header
- * as static inline so tlbi_request_emit_to_vcpu and any future caller
- * (host-side unit tests included) compile to the same expression. NUM =
- * ceil(pages / 2) - 1 over-invalidates odd page counts by exactly one page,
- * which is a perf-only side effect (the extra invalidation evicts a neighbour
- * TLB entry that the guest's next access reloads). pages < 2 is clamped to 2
- * because SCALE=0 NUM=0 means 2 pages -- the encoder cannot represent a single
- * page through RVAE1IS; single-page callers go through the per-page VAE1IS path
- * instead, but the clamp keeps the encoder total in any pathological input.
+ * page count in the supported SCALE=0..2 range. Lives in the header so the emit
+ * path and host unit tests use the same expression. Each NUM step covers
+ * 2^(5*SCALE+1) pages; the normalizer aligns and widens callers to that unit.
+ * pages < 2 is clamped to 2 because SCALE=0 NUM=0 is the smallest encodable
+ * range. Single-page callers normally use VAE1IS instead.
  */
+static inline uint64_t tlbi_rvae_unit_pages(uint64_t pages)
+{
+    if (pages <= 64)
+        return 2; /* SCALE=0 */
+    if (pages <= 2048)
+        return 64; /* SCALE=1 */
+    return 2048;   /* SCALE=2 */
+}
+
 static inline uint64_t tlbi_rvae1is_operand(uint64_t start_va, uint16_t pages)
 {
     if (pages < 2)
         pages = 2;
+    uint64_t scale = pages <= 64 ? 0 : (pages <= 2048 ? 1 : 2);
+    uint64_t unit_pages = 1ULL << (5 * scale + 1);
     uint64_t baddr = (start_va >> 12) & RVAE_OPERAND_BADDR_MASK;
-    uint64_t num = ((pages + 1) / 2) - 1;
+    uint64_t num = ((pages + unit_pages - 1) / unit_pages) - 1;
     if (num > 31)
         num = 31;
-    return baddr | (num << RVAE_OPERAND_NUM_SHIFT) | RVAE_OPERAND_TG_4KB;
+    return baddr | (num << RVAE_OPERAND_NUM_SHIFT) |
+           (scale << RVAE_OPERAND_SCALE_SHIFT) | RVAE_OPERAND_TG_4KB;
 }
 
 /* Runtime feature flag: TRUE when the host PE implements FEAT_TLBIRANGE
@@ -383,8 +397,8 @@ typedef struct {
                            *     after the TLBI sequence. 0 = data-only
                            *     change, skip the I-cache invalidation.
                            */
-    uint16_t pages;       /* Page count when kind == TLBI_RANGE (1..MAX) */
-    uint64_t start;       /* Page-aligned VA when kind == TLBI_RANGE */
+    uint16_t pages;       /* Page count for either range kind (1..MAX) */
+    uint64_t start;       /* Page-aligned VA for either range kind */
 } tlbi_request_t;
 
 /* Layout contract: 16 bytes (1+1+2+4 padding+8). Documents the padding and pins
@@ -436,6 +450,44 @@ typedef struct {
     uint64_t size;      /* Total bytes (always GUEST_OVERFLOW_SIZE today) */
     uint64_t next;      /* Bump offset; (next + BLOCK_2MIB) > size means full */
 } guest_overflow_t;
+
+/* One conservative "may contain nonzero bytes" bit per 2 MiB primary-slab
+ * block. The largest supported slab is 1 TiB, so this costs 64 KiB per guest.
+ * All access is serialized by mmap_lock.
+ */
+#define GUEST_DIRTY_BLOCKS_MAX ((1ULL << 40) / BLOCK_2MIB)
+#define GUEST_DIRTY_WORDS (GUEST_DIRTY_BLOCKS_MAX / 64)
+
+/* Host-side occupancy index for low-VA TTBR0 mappings. One bit per 2 MiB block
+ * records whether that block contains at least one valid L2/L3 PTE; a
+ * second-level bitmap records which occupancy words are non-zero. This lets
+ * huge lazy mmap/munmap ranges skip untouched address space without walking one
+ * page-table slot per GiB. The index is separate from dirty_blocks: a read-only
+ * mapping can have valid PTEs without dirty backing bytes.
+ */
+#define GUEST_PTE_PRESENT_BLOCKS_MAX GUEST_DIRTY_BLOCKS_MAX
+#define GUEST_PTE_PRESENT_WORDS (GUEST_PTE_PRESENT_BLOCKS_MAX / 64)
+#define GUEST_PTE_PRESENT_SUMMARY_WORDS (GUEST_PTE_PRESENT_WORDS / 64)
+#define GUEST_PTE_PRESENT_LIMIT (GUEST_PTE_PRESENT_BLOCKS_MAX * BLOCK_2MIB)
+
+enum {
+    GUEST_MATERIALIZE_CLEAN_SKIP = 0,
+    GUEST_MATERIALIZE_DIRTY_MEMSET,
+    GUEST_MATERIALIZE_ALREADY_VALID,
+    GUEST_MATERIALIZE_WINDOW_BYTES,
+    GUEST_MATERIALIZE_STATS_N,
+};
+
+/* Dirty-block zeroing claims. A claim makes its block's invalid PTE window
+ * stable while the expensive host memset runs without mmap_lock. Waiters use
+ * one guest-wide condition variable; the fixed table bounds host allocation and
+ * is ample for the vCPU limit.
+ */
+#define GUEST_MATERIALIZE_CLAIMS 64
+typedef struct {
+    uint64_t start, end;
+    bool active;
+} guest_materialize_claim_t;
 
 /* Guest state. */
 typedef struct {
@@ -564,6 +616,13 @@ typedef struct {
      */
     _Atomic uint64_t pt_gen;
 
+    uint64_t pte_present_blocks[GUEST_PTE_PRESENT_WORDS];
+    uint64_t pte_present_summary[GUEST_PTE_PRESENT_SUMMARY_WORDS];
+    uint64_t dirty_blocks[GUEST_DIRTY_WORDS];
+    uint64_t materialize_stats[GUEST_MATERIALIZE_STATS_N];
+    guest_materialize_claim_t materialize_claims[GUEST_MATERIALIZE_CLAIMS];
+    pthread_cond_t materialize_cond;
+
     /* Optional HVC 6 embedder extension hook.
      *
      * Native AArch64 guests reach this through HVC 6. When the build enables
@@ -685,8 +744,8 @@ static inline void tlbi_request_emit_to_vcpu(hv_vcpu_t vcpu)
         hv_vcpu_set_reg(vcpu, HV_REG_X11, cpu_tlbi_req.icache_flush ? 1 : 0);
         break;
     case TLBI_RANGE_LARGE: {
-        /* Single-shot TLBI RVAE1IS for ranges in (16..64] pages. The operand
-         * format and the SCALE=0 / TG=01 / ASID=0 assumptions are documented at
+        /* Single-shot TLBI RVAE1IS for ranges above the selective cap. The
+         * SCALE/NUM format and TG=01 assumption are documented at
          * tlbi_rvae1is_operand above. ASID stays 0 because the shim runs
          * single-ASID (TCR_EL1.A1=0, TTBR0 ASID=0; rosetta does not allocate a
          * separate ASID). If a future change introduces non-zero ASIDs, the
@@ -706,6 +765,31 @@ static inline void tlbi_request_emit_to_vcpu(hv_vcpu_t vcpu)
         break;
     }
     tlbi_request_clear();
+}
+
+/* RVAE1IS requires BaseADDR alignment to its SCALE granule. Widen a requested
+ * interval to that granule, repeating if widening crosses a SCALE threshold.
+ * Over-invalidation is architecturally harmless and preserves unrelated TLB
+ * entries far better than a VMALLE1IS broadcast.
+ */
+static inline bool tlbi_rvae_normalize(uint64_t *start, uint64_t *end)
+{
+    for (int pass = 0; pass < 3; pass++) {
+        uint64_t pages = (*end - *start) >> 12;
+        if (pages <= TLBI_SELECTIVE_MAX_PAGES)
+            return true;
+        uint64_t unit_pages = tlbi_rvae_unit_pages(pages);
+        uint64_t unit_bytes = unit_pages << 12;
+        uint64_t s = *start & ~(unit_bytes - 1);
+        if (*end > UINT64_MAX - (unit_bytes - 1))
+            return false;
+        uint64_t e = (*end + unit_bytes - 1) & ~(unit_bytes - 1);
+        *start = s;
+        *end = e;
+        if (((e - s) >> 12) <= unit_pages * 32)
+            return ((e - s) >> 12) <= TLBI_RVAE_MAX_PAGES;
+    }
+    return false;
 }
 
 static inline void tlbi_request_range(uint64_t start, uint64_t end)
@@ -737,6 +821,13 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
      */
     uint64_t large_cap =
         g_tlbi_range_supported ? TLBI_RVAE_MAX_PAGES : TLBI_SELECTIVE_MAX_PAGES;
+    if (g_tlbi_range_supported && n > TLBI_SELECTIVE_MAX_PAGES) {
+        if (!tlbi_rvae_normalize(&s, &e)) {
+            tlbi_request_broadcast();
+            return;
+        }
+        n = (e - s) >> 12;
+    }
     if (n > large_cap) {
         tlbi_request_broadcast();
         return;
@@ -768,6 +859,13 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
     uint64_t us = s < es ? s : es;
     uint64_t ue = e > ee ? e : ee;
     uint64_t un = (ue - us) >> 12;
+    if (g_tlbi_range_supported && un > TLBI_SELECTIVE_MAX_PAGES) {
+        if (!tlbi_rvae_normalize(&us, &ue)) {
+            tlbi_request_broadcast();
+            return;
+        }
+        un = (ue - us) >> 12;
+    }
     if (un > large_cap) {
         tlbi_request_broadcast();
         return;
@@ -1019,10 +1117,21 @@ int guest_install_va_pages(guest_t *g,
                            uint64_t gpa,
                            int perms);
 
-/* Query whether a 2 MiB TTBR0 VA block already has a leaf mapping.
- * Returns true only for a present L2 block descriptor.
+/* Query whether a 2 MiB TTBR0 VA block already has any L2 entry, either a block
+ * descriptor or an L3 table descriptor.
  */
 bool guest_va_block_mapped(const guest_t *g, uint64_t va);
+
+/* Rebuild the low-VA PTE occupancy index from TTBR0. Used after fork restores
+ * page-table pages into a freshly initialized guest_t.
+ */
+void guest_rebuild_pte_present(guest_t *g);
+
+/* Reconcile the host-only 2 MiB occupancy index after EL1 has invalidated
+ * descriptors in [start,end). This observes PTEs only; it never writes a
+ * descriptor or requests another TLBI. Caller holds mmap_lock.
+ */
+void guest_retire_ptes_committed(guest_t *g, uint64_t start, uint64_t end);
 
 /* Returns true when the VA range [va, va+size) overlaps the user-VA kbuf alias
  * window [KBUF_USER_VA, KBUF_USER_VA+KBUF_SIZE). Callers that install TTBR0
@@ -1050,6 +1159,39 @@ static inline bool guest_kbuf_user_va_overlap(uint64_t va, uint64_t size)
  * trusting it twice.
  */
 void *guest_ptr(const guest_t *g, uint64_t gva);
+
+/* Like guest_ptr_avail but never triggers lazy fault-in. For callers that
+ * already hold mmap_lock or must avoid acquiring it.
+ */
+void *guest_ptr_avail_nofault(const guest_t *g,
+                              uint64_t gva,
+                              uint64_t *avail,
+                              int required_perms);
+
+/* Materialize any lazy (deferred-PTE) blocks intersecting [gva, gva+len) so
+ * later resolves under locks that rank after mmap_lock (futex buckets) do not
+ * have to. Takes mmap_lock; call only from lock-free context.
+ *
+ * Returns 0 if anything was (or already is) materialized, -1 otherwise; callers
+ * that merely pre-fault can ignore the result.
+ */
+int guest_lazy_faultin(const guest_t *g, uint64_t gva, uint64_t len);
+
+/* Same as guest_lazy_faultin for callers that already hold mmap_lock (e.g.
+ * SC_LOCKED syscall handlers about to guest_read/guest_write a lazy range: the
+ * resolve-time hook would self-deadlock re-acquiring mmap_lock, so they must
+ * materialize up front through this variant).
+ */
+int guest_lazy_faultin_locked(const guest_t *g, uint64_t gva, uint64_t len);
+
+/* Smallest 2MiB-block-aligned va' in [va, end) containing at least one valid
+ * TTBR0 PTE, or end if none. Low VA uses the host-side hierarchical occupancy
+ * bitmap; non-identity/high VA falls back to the page-table hierarchy. Locking:
+ * callers MUST hold mmap_lock.
+ */
+uint64_t guest_va_next_present_block(const guest_t *g,
+                                     uint64_t va,
+                                     uint64_t end);
 
 /* Get a host pointer for a guest virtual address (write access).
  * Returns NULL if gva is out of bounds or not writable. Same validity window as
@@ -1110,6 +1252,12 @@ size_t guest_write_partial(guest_t *g,
                            uint64_t gva,
                            const void *src,
                            size_t len);
+
+/* Same copy without lazy materialization. Callers that already hold mmap_lock
+ * can use this after guest_lazy_faultin_locked(); an invalid destination then
+ * fails instead of recursively trying to acquire mmap_lock.
+ */
+int guest_write_nofault(guest_t *g, uint64_t gva, const void *src, size_t len);
 
 /* Optimized host-to-guest copy for small fixed-size outputs. Uses a direct
  * guest pointer when the full range is contiguous and writable, otherwise falls
@@ -1385,12 +1533,33 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
                                               uint64_t start,
                                               uint64_t end);
 
-/* Try to materialize a lazy (MAP_NORESERVE) page at the given offset. Called
- * from the data/instruction abort handler when the faulting address falls
- * within a noreserve region. Creates page table entries for one 2MiB block
- * containing the fault address, zeros the memory, and clears the noreserve flag
- * for the materialized sub-range.
+/* Try to materialize a lazy (deferred-PTE: private anonymous or MAP_NORESERVE)
+ * page at the given offset. Called from the data/instruction abort handler when
+ * the faulting address falls within a lazy region, and from the host-access
+ * fault-in path when a syscall targets a lazy range the guest has not touched
+ * yet. Creates page table entries for one 2MiB block containing the fault
+ * address. A slab block known to be clean skips zeroing; a possibly-dirty block
+ * zeros invalid pages before publishing them. A block that is already valid
+ * returns success without re-zeroing (concurrent-fault idempotence).
  * Returns 0 on success (caller should TLBI and retry), -1 if the offset is not
- * in a noreserve region.
+ * in a lazy region or the region is PROT_NONE. Locking: callers MUST hold
+ * mmap_lock.
  */
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset);
+
+/* Guest-fault variant with per-vCPU sequential fault-around. */
+int guest_materialize_lazy_fault(guest_t *g, uint64_t fault_offset);
+
+/* Dirty-map and in-flight-claim helpers. Callers hold mmap_lock. */
+bool guest_block_may_be_dirty(const guest_t *g, uint64_t block_start);
+void guest_dirty_mark_range(guest_t *g, uint64_t start, uint64_t end);
+void guest_dirty_clear_zeroed_range(guest_t *g, uint64_t start, uint64_t end);
+void guest_materialize_wait_range_locked(guest_t *g,
+                                         uint64_t start,
+                                         uint64_t end);
+void guest_materialize_wait_all_locked(guest_t *g);
+
+/* Whether the 4KiB page containing va has a valid stage-1 descriptor. Locking:
+ * callers MUST hold mmap_lock.
+ */
+bool guest_va_pte_valid(guest_t *g, uint64_t va);

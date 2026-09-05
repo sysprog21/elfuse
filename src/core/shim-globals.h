@@ -127,11 +127,12 @@
 
 /* Fast-path hit / miss counters.
  *
- * 18 uint64 slots after the ring lock, bumped by identity_class_fast,
+ * 22 uint64 slots after the ring lock, bumped by identity_class_fast,
  * urandom_read_fast, futex_wait_fast and futex_wake_fast at every hit and bail
  * so fast-path activity can be attributed rather than guessed. Slots 0-7 are
- * bail reasons, 8-11 identity and urandom hits, 12-13 futex wait hits, 14-15
- * futex wait bails, 16-17 the futex wake path's hit and its one bail.
+ * bail reasons, 8-11 identity and urandom hits, 12 the futex wait hit, 13-15
+ * futex wait bails, 16-17 the futex wake path's hit and its one bail, and 18-21
+ * lazy-fault materializations and the TLBI wire mode they emit.
  *
  * Increments are plain load-add-store, so concurrent bails on separate vCPUs
  * lose a few. These are diagnostic ratios, not accounting.
@@ -146,7 +147,7 @@
  * keep the two in sync.
  */
 #define SHIM_COUNTERS_OFF 0x10C8
-#define SHIM_COUNTERS_N 18
+#define SHIM_COUNTERS_N 22
 
 #define SHIM_COUNTER_ATTN_BAIL 0
 #define SHIM_COUNTER_URANDOM_FD_OOR 1
@@ -161,11 +162,15 @@
 #define SHIM_COUNTER_GETRANDOM_HIT 10
 #define SHIM_COUNTER_PGSID_HIT 11
 #define SHIM_COUNTER_FUTEX_EAGAIN_HIT 12
-#define SHIM_COUNTER_FUTEX_EFAULT_HIT 13
+#define SHIM_COUNTER_FUTEX_FAULT_BAIL 13
 #define SHIM_COUNTER_FUTEX_SHAPE_BAIL 14
 #define SHIM_COUNTER_FUTEX_MATCH_BAIL 15
 #define SHIM_COUNTER_FUTEX_WAKE_HIT 16
 #define SHIM_COUNTER_FUTEX_WAKE_WAITER_BAIL 17
+#define SHIM_COUNTER_FAULT_MATERIALIZE 18
+#define SHIM_COUNTER_FAULT_TLBI_VAE 19
+#define SHIM_COUNTER_FAULT_TLBI_RVAE 20
+#define SHIM_COUNTER_FAULT_TLBI_BCAST 21
 
 /* Extended identity slots: pgid and sid.
  *
@@ -174,8 +179,8 @@
  * matches. The host re-publishes after setpgid / setsid / exec / fork so the
  * slots match guest_pgid / guest_sid in proc-identity.c.
  */
-#define SHIM_IDENTITY_OFF_PGID 0x1158
-#define SHIM_IDENTITY_OFF_SID 0x1160
+#define SHIM_IDENTITY_OFF_PGID 0x1178
+#define SHIM_IDENTITY_OFF_SID 0x1180
 
 /* Per-bucket futex waiter counts, one uint32 per hash bucket of the table in
  * runtime/futex.c. The shim's wake fast path reads one of these to answer a
@@ -200,7 +205,7 @@
  * the table size are pinned by static asserts in runtime/futex.c.
  */
 #define SHIM_FUTEX_BUCKETS 1024u
-#define SHIM_FUTEX_WAITERS_OFF 0x1168
+#define SHIM_FUTEX_WAITERS_OFF 0x1188
 #define SHIM_FUTEX_WAITERS_BYTES (SHIM_FUTEX_BUCKETS * 4u)
 
 #define SHIM_GLOBALS_SIZE (SHIM_FUTEX_WAITERS_OFF + SHIM_FUTEX_WAITERS_BYTES)
@@ -374,6 +379,7 @@ void shim_globals_refill_urandom_ring(guest_t *g);
  * ELFUSE_SHIM_STATS.
  */
 uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot);
+void shim_globals_counter_inc(guest_t *g, unsigned slot);
 void shim_globals_counters_dump(const guest_t *g);
 
 /* ELFUSE_SHIM_STATS env-var gate (idempotent / cached). When enabled the exit

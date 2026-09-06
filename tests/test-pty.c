@@ -88,11 +88,24 @@
 int passes = 0, fails = 0;
 
 /* A master with no hangup support blocks these reads forever; the alarm turns
- * that into a visible failure instead of a wedged run.
+ * that into a visible failure instead of a wedged run. The message says why the
+ * run stopped: the log otherwise just ends after the last completed check, with
+ * nothing to tell a timeout apart from a crash.
+ *
+ * On stdout, not stderr: test-matrix.sh's run_elfuse discards stderr, so a
+ * message sent there would be missing from the one lane most likely to hit a
+ * timeout unattended. Writing the descriptor directly rather than through
+ * printf keeps the handler to async-signal-safe calls, and stdout is
+ * line-buffered (see main), so both guarded reads sit at a line boundary and
+ * the raw write cannot land inside a partly-built line.
  */
 static void hup_on_alarm(int sig)
 {
     (void) sig;
+    static const char msg[] =
+        "\ntest-pty: TIMEOUT waiting on a hung-up master read\n";
+    ssize_t ignored = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    (void) ignored;
     _exit(2);
 }
 
@@ -123,6 +136,13 @@ static int count_pts_entries(void)
 
 int main(void)
 {
+    /* Line-buffered so the results printed before a wedged read survive the
+     * alarm's _exit(2). CI reads this through a pipe, where the default block
+     * buffering would discard every line still in the buffer and leave nothing
+     * to say which check stopped making progress.
+     */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("test-pty: PTY ioctl + /dev/pts/N path support\n");
 
     /* Regression guard for the pty_keepalive_table BSS-zero collision: any
@@ -804,6 +824,17 @@ int main(void)
                 EXPECT_TRUE(hr > 0 && (hp.revents & POLLHUP),
                             "no POLLHUP after the last slave closed");
 
+                /* Guard both reads, as the readv case below does. The second
+                 * one is the wedge: on a tree without the support nothing ever
+                 * fails it -- elfuse's keepalive slave holds the host pty open,
+                 * so the host has no reason to -- and the run stalls where it
+                 * should report. The drain above reads the same hung-up master
+                 * with no deadline of its own, so it belongs in the same window
+                 * rather than in one of its own.
+                 */
+                signal(SIGALRM, hup_on_alarm);
+                alarm(10);
+
                 char hbuf[16];
                 ssize_t drained = put == (ssize_t) (sizeof(bye) - 1)
                                       ? read(hup_master, hbuf, sizeof(hbuf))
@@ -814,10 +845,13 @@ int main(void)
                             "pending slave output was lost");
 
                 errno = 0;
+                ssize_t hret = read(hup_master, hbuf, sizeof(hbuf));
+                int herr = errno;
+                alarm(0);
+
                 TEST("read reports EIO once drained");
-                EXPECT_TRUE(
-                    read(hup_master, hbuf, sizeof(hbuf)) < 0 && errno == EIO,
-                    "read did not report the hangup as EIO");
+                EXPECT_TRUE(hret < 0 && herr == EIO,
+                            "read did not report the hangup as EIO");
             }
             close(hup_master);
         }

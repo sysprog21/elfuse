@@ -55,7 +55,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-pathmax test-sysroot-corpus \
         test-sysroot-name-soak check-soak \
         check-name-caseexact test-sysroot-path-matrix \
-        test-usage-synopsis \
+        test-usage-synopsis test-qemu-runner \
         probe-volume-naming perf
 
 ## Build and run the assembly hello world test
@@ -344,6 +344,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 	$(call run-lane,test-sharun,sharun launcher and probe)
+	$(call run-lane,test-qemu-runner,qemu-runner start and stop checks)
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
@@ -1169,6 +1170,10 @@ test-usage-synopsis: $(ELFUSE_BIN)
 ## Run the buffered GDB session host regression
 test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host
 	$(BUILD_DIR)/test-gdbstub-host
+
+## Check qemu-runner.sh start reporting and stop identity, against stand-ins
+test-qemu-runner:
+	@bash tests/test-qemu-runner.sh
 
 ## Run GDB stub integration tests (LLDB <-> elfuse gdbstub)
 test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello $(BUILD_DIR)/test-gdbstub-host

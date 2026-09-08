@@ -1273,11 +1273,12 @@ run_suite()
             # shellcheck disable=SC1091
             . "${REPO_ROOT}/tests/qemu-runner.sh"
             printf "Booting qemu-system-aarch64 (Alpine minirootfs)\n"
+            _qemu_active=1
             qemu_start || {
+                _qemu_active=0
                 echo "qemu boot failed"
                 return 1
             }
-            _qemu_active=1
             runner="run_qemu"
             dyn_runner="run_qemu"
             ;;

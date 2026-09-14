@@ -1178,6 +1178,9 @@ Message](https://cbea.ms/git-commit/).
 6. Wrap the body at 72 characters.
 7. Use the body to explain what and why, not how.
 
+A body line may exceed 72 characters when everything past that column is part
+of one word containing a URL, since a URL cannot be wrapped.
+
 An example (derived from Chris' blog post) looks like the following:
 ```text
 Summarize changes in around 50 characters or less

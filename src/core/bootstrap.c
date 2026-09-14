@@ -37,6 +37,7 @@
 #include "syscall/signal.h"
 
 #include "debug/log.h"
+#include "core/mmap-fastpath.h"
 
 /* Worst case: 7 fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX, mmap
  * RW) plus up to ELF_MAX_SEGMENTS for both the executable and the interpreter.
@@ -136,6 +137,26 @@ static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[stack]");
     guest_invalidate_ptes(g, 0, 0x1000);
+}
+
+/* ELF/shim/stack bytes are populated directly in the slab before their page
+ * tables become live. Mark their semantic backing regardless of requested
+ * permissions: a read-only file segment is still nonzero and must be scrubbed
+ * if a later MAP_FIXED lazy-anonymous mapping reuses the same slab block.
+ * Synthetic page-table coverage for unallocated mmap space has no semantic
+ * region and therefore remains clean.
+ */
+static void mark_registered_backing_dirty(guest_t *g)
+{
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->end <= r->start)
+            continue;
+        uint64_t len = r->end - r->start;
+        if (r->gpa_base > g->guest_size || len > g->guest_size - r->gpa_base)
+            continue;
+        guest_dirty_mark_range(g, r->gpa_base, r->gpa_base + len);
+    }
 }
 
 int guest_bootstrap_probe_elf(const char *elf_path, elf_info_t *info)
@@ -302,7 +323,15 @@ static bool build_boot_regions(mem_region_t *regions,
      * to the vDSO page when splitting the block; otherwise vdso_build cannot
      * write into it through guest_ptr.
      */
-    if (!append_boot_region(regions, nregions, g->shim_base,
+
+    /* EL1 fast munmap walks and atomically clears the live TTBR0 tree. Give the
+     * page-table pool an identity VA visible only to EL1; EL0 remains unable to
+     * inspect or corrupt descriptors, and every guest syscall still rejects the
+     * encompassing infrastructure range.
+     */
+    if (!append_boot_region(regions, nregions, g->pt_pool_base, g->pt_pool_end,
+                            MEM_PERM_RW_EL1_ONLY) ||
+        !append_boot_region(regions, nregions, g->shim_base,
                             g->shim_base + shim_bin_len, MEM_PERM_RX) ||
 
         /* shim_data is EL1-only: the guest must not directly read or write the
@@ -568,6 +597,7 @@ int guest_bootstrap_prepare(guest_t *g,
     }
 
     register_runtime_regions(g, shim_bin_len);
+    mark_registered_backing_dirty(g);
     startup_trace_step("register_regions", t0);
 
     log_debug("TTBR0=0x%llx, IPA base=0x%llx", (unsigned long long) boot->ttbr0,
@@ -761,6 +791,13 @@ int guest_bootstrap_create_vcpu(guest_t *g,
      */
     shim_globals_set_singleton(g);
 
+    /* Publish the main vCPU's first arena only after shim_globals_init has
+     * cleared every recycled control slot. Verbose tracing keeps all shim
+     * syscall fast paths on HVC so the trace remains complete.
+     */
+    if (!verbose)
+        mmap_fastpath_prepare_vcpu(g, current_thread);
+
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTKCTL_EL1,
                                  CNTKCTL_EL1_EL0_TIMER_EN));
 
@@ -869,6 +906,7 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
                                  g->rosetta_guest_base - g->rosetta_va_base,
                                  ROSETTA_PATH);
     register_runtime_regions(g, shim_bin_len);
+    mark_registered_backing_dirty(g);
 
     int rosetta_argc = 0;
     const char **rosetta_argv = NULL;

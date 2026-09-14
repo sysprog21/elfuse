@@ -70,6 +70,7 @@ test-shim-urandom-wrap
 test-shim-futex-toctou
 test-ptrace-interrupt
 test-shim-cred-race
+test-mmap-fastpath
 test-mremap-infra
 test-mremap-fork-tracking
 test-dev-shm-paths

@@ -149,12 +149,19 @@ if [ -n "$body" ] && [ -n "$second" ]; then
     error "separate the subject from the body with a blank line"
 fi
 
-# Rule 6.
-wide=0
+# Rule 6, except where everything past column 72 is part of one word containing
+# a URL. Only the first 72 characters are searched for where that word begins,
+# because ##*[[:space:]] over the whole line is quadratic in its length.
 while IFS= read -r line; do
-    [ "${#line}" -le 72 ] || wide=1
+    [ "${#line}" -gt 72 ] || continue
+    head=${line:0:72}
+    case "${head##*[[:space:]]}${line:72}" in
+        *[[:space:]]*) ;;
+        *[[:alnum:]]://?*) continue ;;
+    esac
+    error "body lines must not exceed 72 characters"
+    break
 done <<< "$body"
-[ "$wide" -eq 0 ] || error "body lines must not exceed 72 characters"
 
 # Rule 7, in the one form that can be decided by looking: a body that opens a
 # section announcing it is about to describe the mechanism. A regex, where the

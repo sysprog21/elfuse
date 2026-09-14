@@ -146,6 +146,44 @@ expect_fail 'body over 72' 'Add a syscall
 
 This body line is quite deliberately wider than the seventy-two column limit.
 ' 'exceed 72'
+for scheme in http https ftp git s3; do
+    expect_ok "$scheme URL on a line of its own" "Add a syscall
+
+$scheme://www.kernel.org/doc/html/latest/process/submitting-patches.html#describe-your-changes
+"
+done
+expect_ok 'normal message with a URL reference' 'Add a syscall
+
+The guest calls it during startup and stops when it gets ENOSYS back,
+so every program built against a newer libc exits before reaching main.
+
+See https://www.kernel.org/doc/html/latest/process/submitting-patches.html#describe-your-changes
+'
+expect_ok 'URL in parentheses ending a wide line' 'Add a syscall
+
+See the thread (https://github.com/sysprog21/elfuse/issues/187#issuecomment-12345678).
+'
+expect_ok 'URL starting at column 73' 'Add a syscall
+
+12345678901234567890123456789012345678901234567890123456789012345678901 https://x.y/z
+'
+expect_fail 'prose through column 72 before a URL' 'Add a syscall
+
+123456789012345678901234567890123456789012345678901234567890123456789012 https://x.y/z
+' 'exceed 72'
+expect_fail 'prose after a wide URL' 'Add a syscall
+
+See https://github.com/sysprog21/elfuse/issues/187#issuecomment-1234567890 here
+' 'exceed 72'
+expect_fail 'wide prose after a URL line' 'Add a syscall
+
+https://www.kernel.org/doc/html/latest/process/submitting-patches.html#describe-your-changes
+This body line is quite deliberately wider than the seventy-two column limit.
+' 'exceed 72'
+expect_fail 'wide path without a scheme' 'Add a syscall
+
+www.kernel.org/doc/html/latest/process/submitting-patches.html#describe-your-changes
+' 'exceed 72'
 expect_fail 'body describes how' 'Add a syscall
 
 How: it calls into the dispatch table.

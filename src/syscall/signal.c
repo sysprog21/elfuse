@@ -32,7 +32,10 @@
  *
  * rt_sigreturn always has a frame to drop, having entered through one.
  * deliver_signal_locked and signal_rt_sigreturn each say why at the point they
- * write the marker. sys_execve is a fourth rebuilder, in exec.c, and takes
+ * write the marker. The marker occupies X8, and the tail that consumes it
+ * restores no register, so the guest's own X8 has to reach EL0 another way:
+ * shim_publish_frame_x8 puts it in the shim frame's X8 slot, and the shim
+ * reloads it from there. sys_execve is a fourth rebuilder, in exec.c, and takes
  * neither shape: it re-enters through the shim's MMU-off _start with the GPRs
  * zeroed, so there is no frame to drop and no marker to write.
  *
@@ -2203,6 +2206,121 @@ static void build_sigcontext_reserved(uint8_t *reserved,
     memset(reserved + off, 0, 8);
 }
 
+/* The EL1 shim's exception frame: 256 bytes, saved X8 at byte 64. SAVE_GPRS in
+ * src/core/shim.S lays it out and exec_drop_frame reloads X8 from that slot;
+ * scripts/check-svc-tails.py holds the two sides to the same number.
+ */
+#define SHIM_FRAME_BYTES 256
+#define SHIM_FRAME_OFF_X8 64
+
+/* The guest's own X8 while the host borrows the register, handed from the
+ * rt_sigreturn that borrowed it to a signal delivered later in the same host
+ * epilogue.
+ *
+ * The shim is told to drop its saved exception frame by a marker the host puts
+ * in X8, and the tail that consumes the marker restores no register, so X8 is
+ * the one register that cannot hold guest state across that return. Publishing
+ * the value into the frame slot covers the return itself. It does not cover a
+ * signal delivered before the vCPU is resumed: that delivery snapshots the live
+ * registers, and the live X8 is still the marker, so the frame it builds would
+ * record the marker as the guest's X8 and its rt_sigreturn would hand that
+ * back.
+ *
+ * What makes substituting this safe is that it cannot outlive that window.
+ * signal_forget_sigreturn_x8 drops the record at every vCPU resume, so the only
+ * reader that can ever see one is a delivery between the rt_sigreturn that
+ * wrote it and the guest running again, which is exactly the stretch where the
+ * live register is not the guest's. Consumption drops it too, so a second
+ * delivery in the same epilogue reads the register.
+ *
+ * The ELR it was parked for is kept and compared, the way syscall_restart_arm
+ * recognizes its own rewind, but it is an identity check and not the bound: one
+ * thing moves the guest inside an epilogue and it re-keys the record as it
+ * does, so a delivery that still finds a different ELR is on a path this did
+ * not anticipate and reads the register instead.
+ *
+ * One path moves the guest inside the epilogue: a ptrace stop consumed on this
+ * same tail, where the tracer writes a new PC before the epilogue delivers a
+ * signal. ELR_EL1 is then the tracer's PC, and the comparison would miss the
+ * one delivery this record is genuinely for, leaving it to read the marker out
+ * of the register. signal_repark_sigreturn_x8 re-keys the record on the PC the
+ * stop left behind instead of widening the comparison away, because only the
+ * address moved: the guest, its epilogue and the X8 owed to it are the same,
+ * and every delivery that did not come through that stop still has to match.
+ * What the stop hands the tracer through PTRACE_GETREGSET, and what the shim
+ * does with an X8 the tracer writes back, are pre-existing and out of this
+ * record's reach; docs/internals.md measures both.
+ *
+ * Per-vCPU: TLS, like cpu_tlbi_req and cpu_restart_req.
+ */
+static _Thread_local struct {
+    bool valid;
+    uint64_t elr; /* ELR_EL1 the value belongs to */
+    uint64_t x8;  /* what the guest had in X8 at that ELR */
+} sigreturn_x8;
+
+void signal_forget_sigreturn_x8(void)
+{
+    sigreturn_x8.valid = false;
+}
+
+void signal_repark_sigreturn_x8(hv_vcpu_t vcpu)
+{
+    if (!sigreturn_x8.valid)
+        return;
+    sigreturn_x8.elr = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+}
+
+/* Hand the shim the X8 that EL0 must see when it drops the frame it is holding,
+ * by writing it into the frame's own X8 slot.
+ *
+ * That slot cannot collide with the marker the way a second register would: it
+ * is EL1-only memory on this vCPU's exception stack, unreachable from EL0 and
+ * unshared with any other vCPU, it holds nothing live once the frame is being
+ * dropped, and the shim's pop retires it. A drop that reaches the tail without
+ * a value published here gets the X8 the exception was taken with, which is
+ * guest state rather than a wire value.
+ *
+ * Only rt_sigreturn publishes, and only because it is the one rebuilder whose
+ * X8 differs from the one the frame was entered with. It is also the only
+ * caller that can promise the frame is live: it always arrives through HVC #5,
+ * where the vector entry has saved the frame and SP_EL1 still points at it.
+ *
+ * The bound is the EL1 stack region, not the shim data block that contains it.
+ * The block holds the shim-globals cache at the bottom -- identity slots,
+ * urandom ring, attention bitmask -- and only the slots thread_alloc_sp_el1
+ * carves from the top are stack. An SP_EL1 that is wrong but still inside the
+ * block would otherwise pass, and the write would land in that cache: silent
+ * corruption of live shim state where the whole point of the check is to
+ * report. thread_sp_el1_region derives the slots from the constants the
+ * allocator hands them out with.
+ */
+static void shim_publish_frame_x8(hv_vcpu_t vcpu,
+                                  const guest_t *g,
+                                  uint64_t x8_for_el0)
+{
+    uint64_t sp_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
+    uint64_t lo, hi;
+
+    thread_sp_el1_region(g, &lo, &hi);
+
+    if (sp_el1 < lo || sp_el1 > hi - SHIM_FRAME_BYTES) {
+        /* Nothing that took an exception through the shim can be here. Report
+         * it rather than write; the shim then hands EL0 the X8 the frame was
+         * entered with.
+         */
+        log_error(
+            "rt_sigreturn: SP_EL1 0x%llx is outside the EL1 stack region "
+            "[0x%llx, 0x%llx)",
+            (unsigned long long) sp_el1, (unsigned long long) lo,
+            (unsigned long long) hi);
+        return;
+    }
+
+    uint8_t *frame = (uint8_t *) g->host_base + sp_el1;
+    memcpy(frame + SHIM_FRAME_OFF_X8, &x8_for_el0, sizeof(x8_for_el0));
+}
+
 /* Build and install the rt_sigframe for `signum` on the current thread, with
  * sig_lock held on entry and released on every return path. Shared by
  * signal_deliver() (signal selected from the process-wide pending set) and
@@ -2302,6 +2420,20 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     } else {
         saved_pc = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
         saved_pstate = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    }
+
+    /* X8 is not the guest's while the drop-frame marker occupies it, and an
+     * rt_sigreturn earlier in this same epilogue leaves the marker live with
+     * ELR_EL1 on the instruction the guest is about to resume, which can be an
+     * SVC it has not executed yet. Snapshotting the register there would record
+     * the marker as the guest's X8, and the handler's own rt_sigreturn would
+     * hand it back, so that SVC would run as syscall 2. Take what rt_sigreturn
+     * parked instead. A record exists only inside the epilogue that wrote it,
+     * so there is no later delivery for this to reach; see sigreturn_x8.
+     */
+    if (!el0_preempt && sigreturn_x8.valid && sigreturn_x8.elr == saved_pc) {
+        saved_regs[8] = sigreturn_x8.x8;
+        sigreturn_x8.valid = false;
     }
 
     /* 1b. rseq abort: if the thread is in a restartable sequence critical
@@ -2527,6 +2659,12 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * consume it. The EL0-preemption path resumes straight into the handler at
      * EL0 with no shim frame to drop, so the marker is neither needed nor
      * consulted.
+     *
+     * The marker is all this writes. What EL0 sees in X8 on that drop is
+     * whatever stands in the frame's X8 slot: the value the exception was taken
+     * with, or the one an rt_sigreturn published earlier in this same epilogue.
+     * Neither is the marker, which is the whole point; shim_publish_frame_x8
+     * says why the slot and not a register.
      */
     if (!el0_preempt)
         hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
@@ -2828,7 +2966,20 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
      * restored the complete guest register state here; letting the shim restore
      * X1-X30 from the rt_sigreturn syscall entry would corrupt the interrupted
      * context.
+     *
+     * X8 is restored above with the other 30 GPRs and then handed over again,
+     * because the marker is written into the same register. Without that second
+     * hand-off the marker is what the ERET delivers, and a frame whose saved PC
+     * sits on an SVC issues it as syscall 2. The same value is parked for a
+     * signal delivered later in this epilogue, which snapshots the register
+     * itself and would otherwise write the marker into the frame it builds. The
+     * park dies at the next vCPU resume whether or not anything took it.
      */
+    uint64_t restored_x8 = frame.uc.uc_mcontext.regs[8];
+    shim_publish_frame_x8(vcpu, g, restored_x8);
+    sigreturn_x8.valid = true;
+    sigreturn_x8.elr = restored_pc;
+    sigreturn_x8.x8 = restored_x8;
     hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
 
     /* Return SYSCALL_EXEC_HAPPENED to skip the normal X0 writeback, since

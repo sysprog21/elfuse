@@ -301,8 +301,8 @@ typedef struct {
  *   TLBI_BROADCAST -> X8 = 1  (TLBI VMALLE1IS, broadest)
  *   TLBI_RANGE     -> X8 = 3, X9 = start VA, X10 = page count
  *                     (TLBI VAE1IS loop preserves unrelated TLB entries)
- * X8 = 2 is reserved for the execve drop-frame marker the shim handles
- * separately; it is never produced by the accumulator.
+ * X8 = 2 is reserved for the drop-frame marker the shim handles separately; it
+ * is never produced by the accumulator.
  */
 typedef enum {
     TLBI_NONE = 0,

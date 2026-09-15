@@ -63,21 +63,25 @@ the block size the shim assumes.
 |----|------|-------------|
 | 0 | TLBI_NONE | skip flush |
 | 1 | TLBI_BROADCAST | TLBI VMALLE1IS + DSB ISH + ISB |
-| 2 | drop-frame | host rebuilt EL0 state; discard saved frame on ERET |
+| 2 | drop-frame | host rebuilt EL0 state; discard saved frame on ERET, restoring no register except X8, reloaded from the frame's own X8 slot (`[sp, #64]`) |
 | 3 | TLBI_RANGE | loop TLBI VAE1IS, X9=VA, X10=page count |
 | 4 | TLBI_RANGE_LARGE | single RVAE1IS, encoded operand in X9 |
 
 X11=1 is the icache-flush hint: set when a page transitions to executable, and
 the shim then issues an IC invalidate alongside whichever TLBI it picked. The
-shim restores X11 from the saved frame before ERET, so EL0 never observes it.
+restoring tails reload X11 from the saved frame before ERET, so EL0 never
+observes it. The X8 = 2 tail restores nothing but X8, so a delivery that follows
+a page-table-modifying syscall in the same epilogue hands X9 through X11 out to
+EL0 in place of the guest's.
 
 X7 is the ptrace-stop request on the same return, and it obeys a rule the TLBI
 codes do not. The shim reads it only after restoring the saved frame, so the
 tracer snapshots the guest's architectural registers rather than shim scratch;
 non-zero means take HVC #13 before the ERET. That makes X7 unusable on the one
-tail that never restores the frame, X8 = 2, where the live registers already
-are the final EL0 state and a host write to X7 would land in EL0 as guest
-state. The host takes that stop inline in the epilogue instead and leaves X7
+tail that never restores the frame, X8 = 2, where the live registers are the
+final EL0 state with one exception -- X8 holds the marker, which is why that
+tail reloads it from the frame -- and a host write to X7 would land in EL0 as
+guest state. The host takes that stop inline in the epilogue instead and leaves X7
 alone, and an `execve` re-entry, which has no tail at all, leaves the stop owed
 for the new image.
 
@@ -123,7 +127,13 @@ your path goes through the dispatch epilogue at all:
 - Inside the epilogue, set X8=2. The shim reads it as the drop-frame marker
   and discards the saved GPR frame. Signal delivery on the syscall-return path
   works this way. It does not need the marker when EL0 was preempted rather
-  than returning from a syscall, because there is no shim frame to drop.
+  than returning from a syscall, because there is no shim frame to drop. If
+  the X8 you want EL0 to see differs from the one the frame was entered with,
+  publish it into the frame's X8 slot with the marker: the marker occupies the
+  register, and the tail reloads X8 from that slot alone. Bound that write at
+  the EL1 stack region (`thread_sp_el1_region`), not at the shim data block:
+  the block's low end is the shim-globals cache, and only its top
+  `MAX_THREADS` slots are stack.
 - Bypass the epilogue by returning `SYSCALL_EXEC_HAPPENED`. The epilogue
   returns early, before it writes X0 or X8. `sys_execve` works this way, and
   the normal X0 writeback is exactly what it needs to avoid. It must also skip

@@ -1915,9 +1915,10 @@ int64_t sys_ptrace(guest_t *g,
          * whatever the tracer writes back, since the shim restores its own
          * frame over it. The HVC #5 epilogue consumes the flag and then either
          * stops right there, on the tails whose live registers are already the
-         * final EL0 set, or asks the shim through X7 to restore the frame and
-         * come back at HVC #13. The canceled-exit handler consumes it once it
-         * has established the vCPU is at EL0.
+         * final EL0 set bar the X8 the tail reloads from the frame, or asks the
+         * shim through X7 to restore the frame and come back at HVC #13. The
+         * canceled-exit handler consumes it once it has established the vCPU is
+         * at EL0.
          *
          * Attention goes up before the kick, the same order
          * shim_globals_raise_attention uses and for the same reason: a fast
@@ -4029,6 +4030,13 @@ static bool ptrace_take_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
     if (cont_sig > 0)
         signal_queue(cont_sig);
 
+    /* The stop above returns with whatever registers the tracer wrote, PC among
+     * them. An X8 parked by an rt_sigreturn earlier in this same epilogue is
+     * still the X8 the guest is owed at the PC it now resumes from, so the
+     * record follows it before the delivery below reads it.
+     */
+    signal_repark_sigreturn_x8(vcpu);
+
     /* One delivery covers both the injected resume signal and anything that
      * arrived while the tracee was stopped, so neither caller repeats it.
      */
@@ -4074,7 +4082,8 @@ static bool syscall_return_epilogue(guest_t *g,
      * host-only. The vector entry clobbers no GPR below X9, so the live set at
      * HVC #5 is still the guest's, and only that restore puts a host write to
      * X7 back. Two tails skip it: X8 == 2, where the host has rebuilt EL0 state
-     * and the live registers are already final, and an execve re-entry, which
+     * and the live registers are already final bar X8, which carries the marker
+     * and is reloaded from the frame by the tail, and an execve re-entry, which
      * goes through the MMU-off _start with no tail at all.
      *
      * Only the exec-happened return has to ask the vCPU which of those it is.
@@ -4099,7 +4108,11 @@ static bool syscall_return_epilogue(guest_t *g,
         ptrace_consume_owed_stop(g)) {
         if (regs_final) {
             /* Live registers are already the architectural EL0 set, which is
-             * what the detour exists to produce. Stop here instead.
+             * what the detour exists to produce. Stop here instead. One
+             * register is not the guest's: X8 still holds the drop-frame
+             * marker, which the tail reloads from the frame after this stop, so
+             * PTRACE_GETREGSET here reports 2 where the guest's X8 belongs.
+             * Pre-existing and unchanged; docs/internals.md measures it.
              */
             running = ptrace_take_stop(g, vcpu, exit_code);
             stop_taken = true;
@@ -4675,8 +4688,8 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
          * so it is the only thread that can survive one. Running it at the top
          * of the loop puts the rebuilt EL0 state in place before the vCPU is
          * resumed, whether this thread was preempted in guest code or is
-         * returning from its own syscall (sys_execve sets the X8=2 frame-drop
-         * marker either way).
+         * returning from its own syscall (sys_execve writes no frame-drop
+         * marker either way: its MMU-off _start re-entry never pops a frame).
          */
         if (thread_current_is_leader() && thread_leader_work_pending())
             exec_run_handoff(vcpu, g, verbose);
@@ -4707,6 +4720,12 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         if (is_main)
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 1,
                                   memory_order_relaxed);
+
+        /* The guest owns X8 again from here, so the X8 an rt_sigreturn parked
+         * for a delivery in its own epilogue must not survive into the next
+         * exception. See signal_forget_sigreturn_x8 in syscall/signal.h.
+         */
+        signal_forget_sigreturn_x8();
 
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 

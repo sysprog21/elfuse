@@ -15,7 +15,7 @@ func TestUsageAndErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("missing command must fail")
 	}
-	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull")
+	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull", "unpack")
 	if stderr != "" {
 		t.Fatalf("parse error wrote to stderr: %q", stderr)
 	}
@@ -24,7 +24,7 @@ func TestUsageAndErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unexpected argument bogus") {
 		t.Fatalf("unknown command error = %v", err)
 	}
-	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull")
+	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull", "unpack")
 	if stderr != "" {
 		t.Fatalf("unknown command wrote to stderr: %q", stderr)
 	}
@@ -76,5 +76,17 @@ func TestParserWritesToConfiguredStreams(t *testing.T) {
 	}
 	if stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("parse wrote stdout %q stderr %q", stdout.String(), stderr.String())
+	}
+}
+
+func TestUnpackUsage(t *testing.T) {
+	var err error
+	stdout, stderr := captureOutput(t, func() { err = run([]string{"unpack", "--nope", "x"}) })
+	if err == nil || !strings.Contains(err.Error(), "unknown flag --nope") {
+		t.Fatalf("unknown flag error = %v", err)
+	}
+	mustContain(t, stdout, "Usage: elfuse-oci unpack", "--platform", "--store", "--rootfs")
+	if stderr != "" {
+		t.Fatalf("unknown flag wrote to stderr: %q", stderr)
 	}
 }

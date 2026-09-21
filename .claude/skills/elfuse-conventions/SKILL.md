@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions outside CONTRIBUTING.md. Use when adding, reviewing, or reducing prose in source comments, docstrings, README.md, or docs/*.md; drafting a commit message, PR description, or review reply; adding a file or type; touching an atomic or lock-free access; handling untracked working docs; or wiring the build to a tool absent from a fresh clone.
+description: elfuse conventions outside CONTRIBUTING.md. Use when adding, reviewing, or reducing prose in source comments, docstrings, README.md, or docs/*.md; drafting a commit message, PR description, or PR or issue comment; adding a file or type; touching an atomic or lock-free access; handling untracked working docs; or wiring the build to a tool absent from a fresh clone.
 ---
 
 # elfuse conventions
@@ -379,6 +379,12 @@ the feature. Combined, neither half is reviewable. The one-time `commentflow`
 reflow is the precedent.
 
 ## Pull requests
+
+Remove all mannered prose. This binds every comment posted on a PR or
+issue, by a person or an agent. A reply is a few plain sentences, no
+longer than the comment it answers unless it carries a measurement or a
+reproduction. Use a list only when the reply answers several separate
+review points.
 
 A PR thread is human collaboration, and agent-shaped artifacts are rejected
 on sight: no pasted walkthroughs or summaries ("We are humans. Don't copy

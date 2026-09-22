@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -95,6 +96,44 @@ func TestRootIndexNamesNestedIndex(t *testing.T) {
 	}
 	if len(nested.Manifests) != 1 || nested.Manifests[0].Digest.String() != digest || !samePlatform(nested.Manifests[0].Platform, defaultPlatform) {
 		t.Fatalf("nested index = %+v", nested)
+	}
+}
+
+func TestDigestForErrorKinds(t *testing.T) {
+	s := tempStore(t)
+	_, err := s.digestFor("absent:1", defaultPlatform)
+	if !errors.Is(err, errNotPulled) || !strings.Contains(err.Error(), "elfuse-oci pull") {
+		t.Fatalf("missing image error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, "index.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.digestFor("absent:1", defaultPlatform); err == nil || errors.Is(err, errNotPulled) {
+		t.Fatalf("corrupt index error = %v", err)
+	}
+}
+
+func TestManifestRoundTrip(t *testing.T) {
+	s, digest := storeWithImage(t, "fix:1", testImage{})
+	manifest, err := s.manifestFor(context.Background(), digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Layers) != 1 || manifest.Config.MediaType != ocispec.MediaTypeImageConfig {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+}
+
+func TestManifestForRejectsInvalidManifest(t *testing.T) {
+	s := tempStore(t)
+	for _, body := range [][]byte{
+		[]byte(`{}`),
+		[]byte(`{"schemaVersion":1,"config":{"digest":"sha256:` + strings.Repeat("0", 64) + `"}}`),
+	} {
+		desc := pushBlob(t, s, types.OCIManifestSchema1, body)
+		if _, err := s.manifestFor(context.Background(), desc.Digest.String()); err == nil {
+			t.Fatalf("manifest %s must fail validation", body)
+		}
 	}
 }
 
@@ -328,5 +367,96 @@ func TestWithLockRefusesExpiredContext(t *testing.T) {
 	err := s.withLock(ctx, func() error { ran = true; return nil })
 	if !errors.Is(err, context.Canceled) || ran {
 		t.Fatalf("error = %v, ran = %v", err, ran)
+	}
+}
+
+func TestCacheDirRejectsSymlinkedParent(t *testing.T) {
+	good := "sha256:" + strings.Repeat("a", 64)
+	for _, rel := range []string{cacheRootfs, filepath.Join(cacheRootfs, "sha256")} {
+		s := tempStore(t)
+		p := filepath.Join(s.root, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.Symlink(t.TempDir(), p); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.cacheDir(cacheRootfs, good)
+		if err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("%s: err = %v, want a symlink refusal", rel, err)
+		}
+	}
+}
+
+func TestCacheDirRejectsOddDigests(t *testing.T) {
+	s := tempStore(t)
+	for _, bad := range []string{"sha512:" + strings.Repeat("a", 128), "sha256:short", "zzz",
+		"sha256:" + strings.Repeat("g", 64)} {
+		if _, err := s.cacheDir(cacheRootfs, bad); err == nil {
+			t.Errorf("digest %q must be rejected as a cache key", bad)
+		}
+	}
+}
+
+func TestRefuseRootfsInStore(t *testing.T) {
+	s := tempStore(t)
+	for _, rootfs := range []string{s.root, filepath.Join(s.root, "rootfs", "x")} {
+		if err := refuseRootfsInStore(s.root, rootfs); err == nil ||
+			!strings.Contains(err.Error(), "inside the store") {
+			t.Errorf("%s: err = %v, want a refusal", rootfs, err)
+		}
+	}
+	if err := refuseRootfsInStore(s.root, filepath.Dir(s.root)); err == nil ||
+		!strings.Contains(err.Error(), "contains the store") {
+		t.Errorf("store parent: err = %v, want a refusal", err)
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, rootfs := range []string{"", t.TempDir(), filepath.Join(file, "child")} {
+		if err := refuseRootfsInStore(s.root, rootfs); err != nil {
+			t.Errorf("%q: err = %v, want acceptance", rootfs, err)
+		}
+	}
+}
+
+// A store that pull would refuse is refused for reading, and a mistyped path
+// is not created.
+func TestOpenStoreForReadRefusals(t *testing.T) {
+	legacy := t.TempDir()
+	if err := os.WriteFile(filepath.Join(legacy, "refs.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openStoreForRead(legacy); err == nil || !strings.Contains(err.Error(), "legacy refs.json") {
+		t.Errorf("legacy store: err = %v, want the legacy refusal", err)
+	}
+
+	bare := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bare, "index.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openStoreForRead(bare); err == nil || !strings.Contains(err.Error(), "not an elfuse OCI store") {
+		t.Errorf("marker-less store: err = %v, want a format refusal", err)
+	}
+
+	s := tempStore(t)
+	if err := os.WriteFile(filepath.Join(s.root, "oci-layout"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openStoreForRead(s.root); err == nil || !strings.Contains(err.Error(), "corrupt oci-layout") {
+		t.Errorf("malformed oci-layout: err = %v, want a format refusal", err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, markerName), []byte("2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openStoreForRead(s.root); err == nil || !strings.Contains(err.Error(), "unsupported format marker") {
+		t.Errorf("newer marker: err = %v, want a format refusal", err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "absent")
+	if _, err := openStoreForRead(missing); err == nil {
+		t.Fatal("a missing store must fail")
+	}
+	if _, err := os.Lstat(missing); !os.IsNotExist(err) {
+		t.Error("opening for read must not create the store directory")
 	}
 }

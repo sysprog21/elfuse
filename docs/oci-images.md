@@ -8,8 +8,8 @@ requiring a registry or a container daemon. This is separate from the OCI
 runtime specification, which describes how a container is started.
 
 `elfuse-oci` is a separate Go command that pulls images into such a local
-layout. At this point in the stack it does not unpack or run them, and it does
-not add namespaces, cgroups, or other container isolation. Command syntax is in
+layout and unpacks their filesystems. It does not run images or add namespaces,
+cgroups, or other container isolation. Command syntax is in
 [usage.md](usage.md#oci-images).
 
 ## Store
@@ -23,6 +23,7 @@ The store is an [OCI image layout](https://github.com/opencontainers/image-spec/
   oci-layout
   index.json
   blobs/<algorithm>/<digest>
+  rootfs/sha256/<hex>
 ```
 
 The marker records the elfuse store format. `oci-layout`, `index.json`, and
@@ -48,8 +49,10 @@ The store and blob directories use mode 0700. Metadata and the lock use 0600,
 and immutable blobs use 0400, so another local user cannot read a private
 image through default permissions.
 
-The store is a cache. A directory containing `refs.json` has an incompatible
-format and is rejected; remove it and pull the image again.
+The store is a cache. A directory that carries no format marker but does hold
+`refs.json` has an incompatible format and is rejected; remove it and pull the
+image again. `unpack` applies the same format checks as `pull` but never
+creates or repairs the store.
 
 A failed pull can leave unreferenced blobs, and pulling a moved tag can leave
 the old blobs unreferenced. This version has no pruning command. To reclaim
@@ -72,11 +75,41 @@ pinned as baseline `amd64`.
 The pull timeout covers the registry request, store publication, and the wait
 for another writer. The default value, zero, does not set a deadline.
 
+## Unpack
+
+Without `--rootfs`, `unpack` caches the rootfs under the store by manifest
+digest. It extracts into a sibling temporary directory and renames the
+completed tree into place, so concurrent unpacks may duplicate work but only a
+completed tree is published. The cache takes the store's 0700 mode, a symlink
+at a cache path is rejected, and the next unpack that extracts into the cache
+removes staging trees older than a day. A cached tree is reused as is; remove
+it to unpack again.
+
+`--rootfs DIR` applies the image to `DIR`, following a symlink to it. An
+existing directory is updated in place; an absent one is staged and renamed,
+and losing that rename is an error. A destination inside the store, or one
+containing it, is rejected.
+
+Layers are applied in manifest order by `moby/go-archive`, which handles
+whiteouts, hardlinks, path containment, file metadata, and decompression.
+Ownership is not applied, and unsupported extended attributes do not fail
+extraction. elfuse rewrites each entry before go-archive sees it:
+
+- Device and FIFO entries, and hardlinks to them, become whiteouts, so no
+  lower-layer file survives at their paths.
+- Absolute symlink targets are rewritten relative to the link's on-disk
+  parent, the rewrite `symlinkat` applies inside a sysroot
+  ([filenames.md](filenames.md#symlink-targets)); a hardlink to such a
+  symlink is rebased at its own location.
+- Directory modes are restored after all layers are applied, so a read-only
+  directory still receives later entries.
+- Setuid, setgid, and sticky bits are cleared.
+
 ## Validation
 
 The offline tests create manifests and layers in temporary stores. They cover
 reference normalization, exact platform selection, index structure, blob
 validation, credential-helper resolution, concurrent pulls, stale temporary
 files, private permissions, legacy-store refusal, lock cancellation, CLI
-parsing, and the race detector. Set `ELFUSE_OCI_NETTEST=1` to add a Docker Hub
-round trip.
+parsing, layer application, cache publication, and the race detector. Set
+`ELFUSE_OCI_NETTEST=1` to add a Docker Hub round trip.

@@ -242,8 +242,7 @@ func syncDirectory(path string) error {
 	return err
 }
 
-func (s *store) writeBlob(ctx context.Context, desc v1.Descriptor, r io.ReadCloser) error {
-	defer r.Close()
+func (s *store) writeBlob(ctx context.Context, desc v1.Descriptor, openReader func() (io.ReadCloser, error)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -277,6 +276,11 @@ func (s *store) writeBlob(ctx context.Context, desc v1.Descriptor, r io.ReadClos
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	r, err := openReader()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
 	tmp, err := os.CreateTemp(dir, ".blob-*")
 	if err != nil {
 		return err
@@ -333,7 +337,9 @@ func (s *store) writeBlobBytes(ctx context.Context, media types.MediaType, b []b
 		return v1.Descriptor{}, err
 	}
 	desc := v1.Descriptor{MediaType: media, Digest: hash, Size: size}
-	return desc, s.writeBlob(ctx, desc, io.NopCloser(bytes.NewReader(b)))
+	return desc, s.writeBlob(ctx, desc, func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(b)), nil
+	})
 }
 
 func (s *store) publishImage(ctx context.Context, img v1.Image, platform ocispec.Platform) (v1.Descriptor, error) {
@@ -360,11 +366,7 @@ func (s *store) publishImage(ctx context.Context, img v1.Image, platform ocispec
 		if err != nil {
 			return v1.Descriptor{}, err
 		}
-		r, err := layer.Compressed()
-		if err != nil {
-			return v1.Descriptor{}, err
-		}
-		if err := s.writeBlob(ctx, v1.Descriptor{MediaType: media, Digest: digest, Size: size}, r); err != nil {
+		if err := s.writeBlob(ctx, v1.Descriptor{MediaType: media, Digest: digest, Size: size}, layer.Compressed); err != nil {
 			return v1.Descriptor{}, err
 		}
 	}
@@ -376,7 +378,9 @@ func (s *store) publishImage(ctx context.Context, img v1.Image, platform ocispec
 	if err != nil {
 		return v1.Descriptor{}, err
 	}
-	if err := s.writeBlob(ctx, v1.Descriptor{MediaType: types.OCIConfigJSON, Digest: configHash, Size: int64(len(config))}, io.NopCloser(bytes.NewReader(config))); err != nil {
+	if err := s.writeBlob(ctx, v1.Descriptor{MediaType: types.OCIConfigJSON, Digest: configHash, Size: int64(len(config))}, func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(config)), nil
+	}); err != nil {
 		return v1.Descriptor{}, err
 	}
 	manifest, err := img.RawManifest()
@@ -392,7 +396,9 @@ func (s *store) publishImage(ctx context.Context, img v1.Image, platform ocispec
 		return v1.Descriptor{}, err
 	}
 	desc := v1.Descriptor{MediaType: media, Digest: digest, Size: int64(len(manifest)), Platform: toV1Platform(platform)}
-	if err := s.writeBlob(ctx, desc, io.NopCloser(bytes.NewReader(manifest))); err != nil {
+	if err := s.writeBlob(ctx, desc, func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(manifest)), nil
+	}); err != nil {
 		return v1.Descriptor{}, err
 	}
 	return desc, nil

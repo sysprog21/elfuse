@@ -155,6 +155,10 @@ func TestPullReusesCachedConfig(t *testing.T) {
 
 func TestPullCachedConfigPlatformChecks(t *testing.T) {
 	for _, mode := range []string{"image", "declared-index", "platformless-index"} {
+		wantError := "image platform is"
+		if mode == "platformless-index" {
+			wantError = "no image for platform"
+		}
 		for _, actual := range []v1.Platform{
 			{OS: "windows", Architecture: "arm64"},
 			{OS: "linux", Architecture: "amd64"},
@@ -166,8 +170,8 @@ func TestPullCachedConfigPlatformChecks(t *testing.T) {
 				pushBlob(t, s, r.desc.MediaType, r.body)
 				r.blocked.Store(true)
 				err := r.pull(t, s)
-				if err == nil || (!strings.Contains(err.Error(), "image platform") && !strings.Contains(err.Error(), "no image for platform")) {
-					t.Errorf("cached platform mismatch error = %v", err)
+				if err == nil || !strings.Contains(err.Error(), wantError) {
+					t.Errorf("cached platform mismatch error = %v, want %q", err, wantError)
 				}
 				if got := r.gets.Load(); got != 0 {
 					t.Errorf("cached platform check config GETs = %d, want 0", got)
@@ -213,12 +217,16 @@ func TestPullCachedConfigIntegrity(t *testing.T) {
 
 func TestPullConfigMismatchLeavesCacheEmpty(t *testing.T) {
 	for _, mode := range []string{"image", "declared-index", "platformless-index"} {
+		wantError := "image platform is"
+		if mode == "platformless-index" {
+			wantError = "no image for platform"
+		}
 		t.Run(mode, func(t *testing.T) {
 			r := newConfigRegistry(t, v1.Platform{OS: "linux", Architecture: "amd64"}, mode, 0)
 			s := tempStore(t)
 			err := r.pull(t, s)
-			if err == nil || (!strings.Contains(err.Error(), "image platform") && !strings.Contains(err.Error(), "no image for platform")) {
-				t.Fatalf("cold platform mismatch error = %v", err)
+			if err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("cold platform mismatch error = %v, want %q", err, wantError)
 			}
 			if got := r.gets.Load(); got != 1 {
 				t.Errorf("cold platform check config GETs = %d, want 1", got)

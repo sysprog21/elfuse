@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -35,6 +37,53 @@ func (r *cancelReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *cancelReadCloser) Close() error { return nil }
+
+type countedLayer struct {
+	v1.Layer
+	opens   int
+	openErr error
+}
+
+func (l *countedLayer) Compressed() (io.ReadCloser, error) {
+	l.opens++
+	if l.openErr != nil {
+		return nil, l.openErr
+	}
+	return l.Layer.Compressed()
+}
+
+func TestPublishImageReusesCachedLayers(t *testing.T) {
+	s := tempStore(t)
+	layer := &countedLayer{Layer: static.NewLayer(
+		buildLayerTar(t, []tarEntry{{Name: "hello", Body: "world"}}),
+		types.OCIUncompressedLayer,
+	)}
+	img, err := mutate.AppendLayers(platformImage(t, *toV1Platform(defaultPlatform)), layer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.publishImage(context.Background(), img, defaultPlatform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layer.opens != 1 {
+		t.Fatalf("initial layer opens = %d, want 1", layer.opens)
+	}
+	layer.openErr = errors.New("layer source unavailable")
+	second, err := s.publishImage(context.Background(), img, defaultPlatform)
+	if err != nil {
+		t.Fatalf("publish cached image: %v", err)
+	}
+	if second.Digest != first.Digest || layer.opens != 1 {
+		t.Fatalf("cached digest = %s, want %s; layer opens = %d, want 1", second.Digest, first.Digest, layer.opens)
+	}
+	if _, err := tempStore(t).publishImage(context.Background(), img, defaultPlatform); !errors.Is(err, layer.openErr) {
+		t.Fatalf("uncached image error = %v, want %v", err, layer.openErr)
+	}
+	if layer.opens != 2 {
+		t.Fatalf("uncached layer opens = %d, want 2", layer.opens)
+	}
+}
 
 func TestPinsPerPlatform(t *testing.T) {
 	s := tempStore(t)
@@ -162,7 +211,9 @@ func TestWriteBlobStopsOnCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	err = s.writeBlob(ctx, v1.Descriptor{MediaType: types.OCIConfigJSON, Digest: hash, Size: size}, &cancelReadCloser{cancel: cancel})
+	err = s.writeBlob(ctx, v1.Descriptor{MediaType: types.OCIConfigJSON, Digest: hash, Size: size}, func() (io.ReadCloser, error) {
+		return &cancelReadCloser{cancel: cancel}, nil
+	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("write error = %v", err)
 	}

@@ -272,8 +272,8 @@ mappings and register state, and the ways it breaks are mapping-shaped.
 - For dynamic x86_64 guests the host deliberately does not load segments or
   the interpreter. The translator reads PT_INTERP itself and mmaps the loader
   out of `--sysroot` through ordinary guest syscalls.
-- The GDB stub is rejected for x86_64 because it would serve the translated
-  aarch64 view rather than the state the guest believes it has.
+- The GDB stub is rejected for x86_64. `elfuse-debug` carries the reason,
+  beside the invocation it refuses.
 
 `docs/internals.md` section "x86_64-via-Apple-Rosetta" has the mechanism, and
 `docs/testing.md` has the per-host baselines the x86_64 lane compares against.

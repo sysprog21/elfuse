@@ -100,7 +100,9 @@ static void *spin_waiter(void *arg)
             /* Print the first one. This phase used to count these and say
              * nothing else, and the counter alone cannot tell a wrong errno
              * from an SVC that re-executed as a different syscall, which is
-             * what the open Tier A item about X8=2 turns out to be.
+             * what the Tier A item about X8=2 turned out to be
+             * (sysprog21/elfuse#379, now closed; tests/test-shim-sigreturn-x8
+             * reaches the same window without a race).
              */
             if (spin_other == 0)
                 fprintf(stderr, "FAIL: unexpected spin rc %ld (round %d)\n", rc,

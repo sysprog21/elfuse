@@ -518,6 +518,41 @@ int signal_deliver_fault(hv_vcpu_t vcpu,
  */
 int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g);
 
+/* Drop the guest X8 that rt_sigreturn parked for a signal delivered later in
+ * the same host epilogue.
+ *
+ * The drop-frame marker occupies X8, so a delivery that follows an rt_sigreturn
+ * before the guest runs again cannot read the guest's X8 out of the register;
+ * signal_rt_sigreturn parks it and that delivery takes the parked value. The
+ * park is only ever correct for that stretch. Once the vCPU is resumed the
+ * guest owns X8 again, and a record left behind would be handed to some later
+ * delivery that merely resumes at the same PC -- a fault on an instruction the
+ * guest returned to, say, whose ELR_EL1 is the faulting PC and whose X8 is
+ * live.
+ *
+ * The vCPU run loop therefore calls this immediately before every resume, and
+ * scripts/check-svc-tails.py holds every hv_vcpu_run() call site to it.
+ */
+void signal_forget_sigreturn_x8(void);
+
+/* Re-key that record on the PC a ptrace stop left the guest at.
+ *
+ * Nothing moves the guest between the rt_sigreturn that parks an X8 and the
+ * resume that ends the record's life, with one exception: a PTRACE_INTERRUPT
+ * stop is taken inline on that same tail, and the tracer can write a new PC
+ * before it resumes the tracee with an injected signal. The delivery that
+ * follows then lands on an ELR_EL1 the record was not parked for, so the ELR
+ * check that keeps a stale record from being read misses the one delivery the
+ * record is genuinely for, and the frame it builds records the drop-frame
+ * marker as the guest's X8.
+ *
+ * Called with the vCPU still inside that epilogue, where the guest is the same
+ * guest with the same X8 owed to it and only the address it resumes from has
+ * moved. Nothing to do when no value is parked, which is every stop taken
+ * anywhere else.
+ */
+void signal_repark_sigreturn_x8(hv_vcpu_t vcpu);
+
 /* Handle rt_sigaction (SYS 134). */
 int64_t signal_rt_sigaction(guest_t *g,
                             int signum,

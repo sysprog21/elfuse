@@ -518,10 +518,10 @@ uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t)
         int slot = bit_ctz64(free_mask);
 
         /* Main thread's SP_EL1 sits at the top of the shim data block. Each
-         * subsequent thread is 4KiB below.
+         * subsequent thread is one slot below.
          */
         uint64_t top = sp_el1_top(g);
-        sp = top - (uint64_t) slot * 4096;
+        sp = top - (uint64_t) slot * SP_EL1_SLOT_BYTES;
         sp_el1_allocated |= BIT64(slot);
         t->sp_el1 = sp;
         t->sp_el1_slot = slot;
@@ -530,6 +530,19 @@ uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t)
     pthread_mutex_unlock(&thread_lock);
 
     return sp;
+}
+
+void thread_sp_el1_region(const guest_t *g, uint64_t *lo, uint64_t *hi)
+{
+    /* Derived from what thread_alloc_sp_el1 above hands out, not from the block
+     * it hands it out of: slot 0 starts at the top and slot MAX_THREADS - 1 is
+     * the last one, so the region is the top MAX_THREADS slots and everything
+     * under it belongs to the shim-globals cache.
+     */
+    uint64_t top = sp_el1_top(g);
+
+    *hi = top;
+    *lo = top - (uint64_t) MAX_THREADS * SP_EL1_SLOT_BYTES;
 }
 
 void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx)

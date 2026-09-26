@@ -35,9 +35,13 @@
  * X8 on return from #5, the post-syscall request:
  *   0  no flush
  *   1  broadcast TLBI VMALLE1IS
- *   2  host replaced the EL0 register state (execve, rt_sigreturn, signal
- *      delivery on the syscall-return path): full flush, drop the saved frame,
- *      ERET without restoring GPRs
+ *   2  host replaced the EL0 register state (rt_sigreturn, signal delivery on
+ *      the syscall-return path): full flush, drop the saved frame, ERET
+ *      without restoring GPRs, with one exception. X8 is the register the
+ *      marker itself arrives in, so it cannot also carry the guest value the
+ *      host wants EL0 to see. The host leaves that value in the frame's own X8
+ *      slot and exec_drop_frame reloads X8 from there; see the note on that
+ *      label.
  *   3  TLBI VAE1IS over X10 pages from the page-aligned VA in X9
  *   4  single-shot TLBI RVAE1IS (FEAT_TLBIRANGE), operand pre-encoded in X9 as
  *      baddr | NUM<<39 | SCALE<<44 | TTL<<37 | ASID<<48 (SCALE, TTL and ASID
@@ -48,15 +52,20 @@
  * take HVC #13 after the restore, so the tracer sees the architectural GPR set
  * rather than shim scratch. The host leaves X7 alone on the X8 == 2 tail, which
  * never restores the frame and would carry the flag into EL0 as guest state; it
- * takes that stop itself, where the live registers are already final. A tail
+ * takes that stop itself, where the live registers are already final bar X8,
+ * which holds the marker and is reloaded from the frame by the tail. A tail
  * that skips the X7 test drops a stop the host has already consumed, so new
  * exits from the dispatch below go through svc_hvc_restore_eret, never straight
  * to svc_restore_eret.
  *
  * X11 is the I-cache hint, read for X8 in {1, 3, 4}: 1 issues IC IALLU after
  * the TLBI because the change made new content executable, 0 skips it. X8 == 2
- * always flushes, since execve loads new code. The shim restores X11 from the
- * saved frame before ERET, so EL0 never sees the hint.
+ * flushes unconditionally, IC IALLU included, because the host has rebuilt the
+ * EL0 state and the shim cannot tell what changed. The restoring tails reload
+ * X11 from the saved frame before ERET, so EL0 never sees the hint. The X8 == 2
+ * tail restores nothing but X8, so a delivery that follows a page-table
+ * modifying syscall in the same epilogue hands X9 through X11 out to EL0 in
+ * place of the guest's; see the note on exec_drop_frame.
  *
  * Two constraints on everything below. macOS 'as' treats ';' on AArch64 as a
  * comment, not a statement separator, so every instruction needs its own line.
@@ -1669,7 +1678,7 @@ restore_and_bad:
 /* handle_brk: BRK instruction from EL0 (EC=0x3C)
  *
  * JIT translators use BRK instructions as patching trampolines and debug hooks.
- * The guest registers a SIGTRAP handler via rt_sigaction. The shim restores all
+ * The guest registers a SIGTRAP handler via rt_sigaction. The shim loads all
  * GPRs and forwards to the host via HVC #10 for signal delivery.
  *
  * Host reads ESR_EL1 (BRK immediate), ELR_EL1 (BRK PC), and current GPRs from
@@ -1678,15 +1687,27 @@ restore_and_bad:
  * SIGTRAP action (terminate).
  */
 handle_brk:
-    /* Restore all GPRs from stack frame (host needs current state) */
-    RESTORE_GPRS
+    /* Load the EL0 GPRs from the saved frame WITHOUT popping it, the shape
+     * handle_el0_fault uses and for the same reason: the host needs the guest's
+     * register state, and the frame has to outlive the HVC so the tail below
+     * can read out of it.
+     */
+    LOAD_GPRS
 
     /* Forward to host for SIGTRAP delivery */
     hvc #10
 
     /* Host has set up signal frame (if handler registered) or flagged for
-     * termination. Either way, ERET to new PC.
+     * termination. A delivery leaves the drop-frame marker in X8, which is
+     * guest state on this path: the SIGTRAP handler would enter with 2 in place
+     * of whatever the guest was carrying, and a JIT translator using BRK as a
+     * trampoline is the caller most likely to read that register. Reload it
+     * from the frame's own X8 slot before the pop, the way exec_drop_frame
+     * does; nothing publishes there on this path, so the value is the one the
+     * BRK was taken with. Then drop the frame and ERET to the new PC.
      */
+    ldr x8, [sp, #64]
+    add sp, sp, #256
     eret
 
 /* handle_svc_0: Linux syscall forwarding
@@ -1710,7 +1731,9 @@ handle_svc_0:
      *   4. Set X8 to indicate the post-syscall request:
      *        0 = no TLB flush
      *        1 = broadcast TLBI VMALLE1IS
-     *        2 = execve replaced register state (drop frame + flush)
+     *        2 = host replaced register state (rt_sigreturn, signal
+     *            delivery): drop frame + flush, and reload X8 from the
+     *            frame's own slot; see exec_drop_frame
      *        3 = selective TLBI VAE1IS over X10 pages starting at X9
      *   5. Resume vCPU (execution continues below)
      */
@@ -1844,6 +1867,48 @@ svc_hvc_restore_eret:
     eret
 
 exec_drop_frame:
+    /* This tail restores nothing from the frame because the host has written
+     * the EL0 state it wants straight into the vCPU. X8 is the one register
+     * that cannot arrive that way: it carries the drop-frame marker in, so the
+     * value the host wants EL0 to see has to travel out of band.
+     *
+     * It travels in the frame's own X8 slot, [sp+64] per SAVE_GPRS, filled by
+     * the host before it writes the marker. That slot cannot collide with the
+     * marker the way a second register would: it is EL1-only memory on this
+     * vCPU's exception stack, unreachable from EL0 and unshared with any other
+     * vCPU, and the pop below retires it. Putting it back here is what keeps a
+     * frame whose saved PC sits on an SVC from issuing that SVC as syscall 2.
+     *
+     * Three tails branch here and only the HVC #5 one has a publisher. The two
+     * W^X permission faults reach it when the host answers the flip request
+     * with the marker, which it does when the region never had the permission
+     * and the fault is a real SIGSEGV. Nothing publishes on that route, so the
+     * reload hands EL0 the X8 the exception was taken with, which is the
+     * guest's own and is what the handler then enters with. Before this reload
+     * existed those two entered their handler with the marker. handle_brk has
+     * the same problem and does not branch here, since it has its own flush to
+     * skip and no X8 dispatch to run; it carries its own copy of the reload.
+     *
+     * The ordinary syscall-return tail above is not covered, and this reload
+     * does not reach it. A signal delivered in the epilogue of a page-table
+     * syscall snapshots the live registers there, where X8 is the TLBI kind and
+     * X9 through X11 are its operands and the icache hint, so the frame that
+     * delivery builds records the wire values as the guest's and its own
+     * rt_sigreturn hands them back. The saved PC being past the SVC does not
+     * make that free: the instruction after an SVC can be another SVC, and the
+     * guest then issues the wire value as a syscall number. Measured with two
+     * adjacent SVCs under a 200us itimer over 60000 rounds, the first of them
+     * mprotect: all 707 deliveries left the second running as syscall 0 or 3
+     * rather than the 226 the guest held. It is pre-existing and not the
+     * register this tail moves. The same probe on afdcfce, interleaved so both
+     * binaries met the same machine, read 703 of its 704 as syscall 2, the
+     * marker rather than the wire value. syscall/proc.h names the same
+     * shadowing on the frame a handler returns through.
+     *
+     * It survives the change that closes #379, so it is tracked as its own
+     * issue rather than living only here: #384.
+     */
+    ldr x8, [sp, #64]
     tlbi vmalle1is
     dsb ish
     isb

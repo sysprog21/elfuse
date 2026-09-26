@@ -29,6 +29,13 @@
 
 /* Maximum number of concurrent guest threads in one VM. */
 #define MAX_THREADS 64
+
+/* One EL1 exception stack per thread. Named because the region these slots
+ * occupy is a bound as well as an allocation: the host writes into a live shim
+ * frame on that stack, and anything below the lowest slot is the shim-globals
+ * cache rather than stack.
+ */
+#define SP_EL1_SLOT_BYTES 4096
 #define MAX_DEFERRED_STACK_UNMAPS 8
 
 /* Per-thread state. One entry per guest thread (main + workers). Tagged (struct
@@ -353,14 +360,27 @@ uint64_t thread_pending_union(void);
 int thread_is_single_active(void);
 
 /* Allocate a per-thread SP_EL1 stack and record both the IPA and the slot index
- * into t. Thread N gets the Nth 4KiB slot counting down from the top of the
- * shim data block (g->shim_data_base + 2MiB). The shim block lives at high IPA
- * computed by guest_init, so callers must pass g; the slot index is stored in
- * t->sp_el1_slot so the free path (which is reached from teardown contexts that
- * lack g) can clear the bitmask directly.
+ * into t. Thread N gets the Nth SP_EL1_SLOT_BYTES slot counting down from the
+ * top of the shim data block (g->shim_data_base + 2MiB). The shim block lives
+ * at high IPA computed by guest_init, so callers must pass g; the slot index is
+ * stored in t->sp_el1_slot so the free path (which is reached from teardown
+ * contexts that lack g) can clear the bitmask directly.
  * Returns the SP_EL1 IPA, or 0 on slot exhaustion.
  */
 uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t);
+
+/* The IPA range the slots above are carved from: *lo is the bottom of the
+ * lowest slot, *hi one past the top of the highest, so a live SP_EL1 is in
+ * [*lo, *hi).
+ *
+ * The shim data block holds two unrelated things. These slots sit at the top of
+ * it, and the shim-globals cache -- identity slots, urandom ring, attention
+ * bitmask -- starts at the bottom. A host that validates an SP_EL1 against the
+ * whole block therefore accepts addresses that name cache and not stack, and
+ * writing a shim frame at one of those corrupts the cache instead of reporting
+ * the bad SP_EL1. Callers that write through an SP_EL1 bound it with this.
+ */
+void thread_sp_el1_region(const guest_t *g, uint64_t *lo, uint64_t *hi);
 
 /* Iterate over all active threads, calling fn(entry, ctx) for each. Holds the
  * thread table lock during iteration.

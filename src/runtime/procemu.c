@@ -1737,7 +1737,7 @@ static int proc_build_maps_entries(const guest_t *g,
     int result = -1;
     int saved_errno = 0;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire_raw();
 
     /* Convert regions[] to maps entries. regions[] is already sorted by start
      * address. The MAP_SHARED/MAP_ANONYMOUS/MAP_NORESERVE bits are preserved in
@@ -1792,7 +1792,7 @@ static int proc_build_maps_entries(const guest_t *g,
 
 out_unlock:
     saved_errno = errno;
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release_raw();
     if (result < 0) {
         maps_entries_destroy(&entries);
         errno = saved_errno;

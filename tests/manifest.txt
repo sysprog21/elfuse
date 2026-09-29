@@ -135,6 +135,10 @@ test-mmap-hint
 test-mmap-sigbus-efault
 test-brk-stack
 
+[section] Lazy anonymous mmap tests
+test-mmap-lazy
+test-mmap-fastpath
+
 [section] mremap tests
 test-mremap
 test-mremap-infra

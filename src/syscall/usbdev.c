@@ -3340,6 +3340,22 @@ static unsigned usbdev_fmode(int linux_flags)
     return (unsigned) (((linux_flags & LINUX_O_ACCMODE) + 1) & 3);
 }
 
+static void usbdev_prefault_read_locked(usbdev_t *u,
+                                        guest_t *g,
+                                        uint64_t buf_gva,
+                                        uint64_t count)
+{
+    uint64_t len = count < u->blob_len ? count : u->blob_len;
+    if (!len)
+        return;
+
+    /* The acquire reference survives close; recheck the blob after relocking.
+     */
+    pthread_mutex_unlock(&u->lock);
+    (void) guest_lazy_faultin(g, buf_gva, len);
+    pthread_mutex_lock(&u->lock);
+}
+
 int64_t usbdev_read(int fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 {
     fd_entry_t snap;
@@ -3352,16 +3368,19 @@ int64_t usbdev_read(int fd, guest_t *g, uint64_t buf_gva, uint64_t count)
      */
     if (usbdev_fd_disconnected(fd))
         return -LINUX_ENODEV;
-    usbdev_t *u = usbdev_acquire(fd);
+    usbdev_t *u = usbdev_acquire_snap(fd, &snap);
     if (!u)
         return -LINUX_EBADF;
+    usbdev_prefault_read_locked(u, g, buf_gva, count);
     int64_t ret;
-    if ((uint64_t) u->pos >= u->blob_len || count == 0) {
+    if (!u->blob) {
+        ret = -LINUX_EBADF;
+    } else if ((uint64_t) u->pos >= u->blob_len || count == 0) {
         ret = 0;
     } else {
         size_t avail = u->blob_len - (size_t) u->pos;
         size_t n = count < avail ? (size_t) count : avail;
-        if (guest_write(g, buf_gva, u->blob + u->pos, n) < 0) {
+        if (guest_write_nofault(g, buf_gva, u->blob + u->pos, n) < 0) {
             ret = -LINUX_EFAULT;
         } else {
             u->pos += (off_t) n;
@@ -3393,16 +3412,19 @@ int64_t usbdev_pread(int fd,
     /* Same -ENODEV gate as usbdev_read: no read path serves a gone device. */
     if (usbdev_fd_disconnected(fd))
         return -LINUX_ENODEV;
-    usbdev_t *u = usbdev_acquire(fd);
+    usbdev_t *u = usbdev_acquire_snap(fd, &snap);
     if (!u)
         return -LINUX_EBADF;
+    usbdev_prefault_read_locked(u, g, buf_gva, count);
     int64_t ret;
-    if ((uint64_t) offset >= u->blob_len || count == 0) {
+    if (!u->blob) {
+        ret = -LINUX_EBADF;
+    } else if ((uint64_t) offset >= u->blob_len || count == 0) {
         ret = 0;
     } else {
         size_t avail = u->blob_len - (size_t) offset;
         size_t n = count < avail ? (size_t) count : avail;
-        if (guest_write(g, buf_gva, u->blob + offset, n) < 0)
+        if (guest_write_nofault(g, buf_gva, u->blob + offset, n) < 0)
             ret = -LINUX_EFAULT;
         else
             ret = (int64_t) n;
@@ -3493,12 +3515,10 @@ int64_t usbdev_fstat(int fd, struct stat *st)
 
 /* ioctl handlers (entry lock held unless noted) */
 
-static int64_t usbdev_do_control(usbdev_t *u, guest_t *g, uint64_t arg)
+static int64_t usbdev_do_control(usbdev_t *u,
+                                 guest_t *g,
+                                 linux_usbdevfs_ctrltransfer_t ct)
 {
-    linux_usbdevfs_ctrltransfer_t ct;
-    if (guest_read_small(g, arg, &ct, sizeof(ct)) < 0)
-        return -LINUX_EFAULT;
-
     /* check_ctrlrecip (devio.c:878-935) runs before the wLength cap
      * (devio.c:1177-1183): a request naming an interface or endpoint the device
      * does not have is -ENOENT however long it is. Capping first answered
@@ -3546,7 +3566,7 @@ static int64_t usbdev_do_control(usbdev_t *u, guest_t *g, uint64_t arg)
         }
     }
     if (ret >= 0 && !in && ct.wLength > 0 &&
-        guest_read(g, ct.data, buf, ct.wLength) < 0)
+        guest_read_nofault(g, ct.data, buf, ct.wLength) < 0)
         ret = -LINUX_EFAULT;
     if (ret >= 0) {
         IOUSBDevRequestTO req = {
@@ -3577,7 +3597,8 @@ static int64_t usbdev_do_control(usbdev_t *u, guest_t *g, uint64_t arg)
         } else {
             int64_t actlen = req.wLenDone;
             ret = in && actlen > 0 &&
-                          guest_write(g, ct.data, buf, (size_t) actlen) < 0
+                          guest_write_nofault(g, ct.data, buf,
+                                              (size_t) actlen) < 0
                       ? -LINUX_EFAULT
                       : actlen;
         }
@@ -3587,12 +3608,10 @@ static int64_t usbdev_do_control(usbdev_t *u, guest_t *g, uint64_t arg)
     return ret;
 }
 
-static int64_t usbdev_do_bulk(usbdev_t *u, guest_t *g, uint64_t arg)
+static int64_t usbdev_do_bulk(usbdev_t *u,
+                              guest_t *g,
+                              linux_usbdevfs_bulktransfer_t bt)
 {
-    linux_usbdevfs_bulktransfer_t bt;
-    if (guest_read_small(g, arg, &bt, sizeof(bt)) < 0)
-        return -LINUX_EFAULT;
-
     /* do_proc_bulk resolves and claims the endpoint's interface before it looks
      * at the length (devio.c:1289-1298), so an absent endpoint is -ENOENT
      * whatever the length says. Checking the length first answered -ENOMEM and
@@ -3650,12 +3669,12 @@ static int64_t usbdev_do_bulk(usbdev_t *u, guest_t *g, uint64_t arg)
         int64_t err = usbdev_ioret_op(u, r);
         if (err < 0) {
             ret = err; /* partial data not copied on error, as Linux */
-        } else if (size > 0 && guest_write(g, bt.data, buf, size) < 0) {
+        } else if (size > 0 && guest_write_nofault(g, bt.data, buf, size) < 0) {
             ret = -LINUX_EFAULT;
         } else {
             ret = size;
         }
-    } else if (bt.len > 0 && guest_read(g, bt.data, buf, bt.len) < 0) {
+    } else if (bt.len > 0 && guest_read_nofault(g, bt.data, buf, bt.len) < 0) {
         ret = -LINUX_EFAULT;
     } else {
         IOReturn r = (*fi->intf)->WritePipeTO(fi->intf, pipe, buf, bt.len,
@@ -3702,7 +3721,7 @@ static bool usbdev_iface_claimed_elsewhere(const usbdev_t *u, unsigned ifnum)
 static int64_t usbdev_do_getdriver(usbdev_t *u, guest_t *g, uint64_t arg)
 {
     linux_usbdevfs_getdriver_t gd;
-    if (guest_read_small(g, arg, &gd, sizeof(gd)) < 0)
+    if (guest_read_nofault(g, arg, &gd, sizeof(gd)) < 0)
         return -LINUX_EFAULT;
 
     /* Ahead of everything below: an interface question about a device that is
@@ -3735,7 +3754,7 @@ static int64_t usbdev_do_getdriver(usbdev_t *u, guest_t *g, uint64_t arg)
         if (!bound)
             return -LINUX_ENODATA;
     }
-    if (guest_write_small(g, arg, &gd, sizeof(gd)) < 0)
+    if (guest_write_nofault(g, arg, &gd, sizeof(gd)) < 0)
         return -LINUX_EFAULT;
     return 0;
 }
@@ -3743,7 +3762,7 @@ static int64_t usbdev_do_getdriver(usbdev_t *u, guest_t *g, uint64_t arg)
 static int64_t usbdev_do_setinterface(usbdev_t *u, guest_t *g, uint64_t arg)
 {
     linux_usbdevfs_setinterface_t si;
-    if (guest_read_small(g, arg, &si, sizeof(si)) < 0)
+    if (guest_read_nofault(g, arg, &si, sizeof(si)) < 0)
         return -LINUX_EFAULT;
     int64_t rc = usbdev_claim_locked(u, si.interface); /* implicit claim */
     if (rc < 0)
@@ -3812,7 +3831,7 @@ static bool usbdev_claimed_elsewhere(usbdev_t *u)
 static int64_t usbdev_do_setconfiguration(usbdev_t *u, guest_t *g, uint64_t arg)
 {
     uint32_t cfg;
-    if (guest_read_small(g, arg, &cfg, sizeof(cfg)) < 0)
+    if (guest_read_nofault(g, arg, &cfg, sizeof(cfg)) < 0)
         return -LINUX_EFAULT;
     /* -1/0 -> unconfigure (message.c:2064); SetConfiguration(0) does that. */
     if (cfg == 0xffffffffu)
@@ -3881,7 +3900,7 @@ static int64_t usbdev_do_setconfiguration(usbdev_t *u, guest_t *g, uint64_t arg)
 static int64_t usbdev_do_clear_halt(usbdev_t *u, guest_t *g, uint64_t arg)
 {
     uint32_t ep;
-    if (guest_read_small(g, arg, &ep, sizeof(ep)) < 0)
+    if (guest_read_nofault(g, arg, &ep, sizeof(ep)) < 0)
         return -LINUX_EFAULT;
     usbdev_iface_t *fi;
     uint8_t pipe;
@@ -3919,7 +3938,7 @@ static int64_t usbdev_do_resetep(usbdev_t *u, guest_t *g, uint64_t arg)
 static int64_t usbdev_do_disconnect_claim(usbdev_t *u, guest_t *g, uint64_t arg)
 {
     linux_usbdevfs_disconnect_claim_t dc;
-    if (guest_read_small(g, arg, &dc, sizeof(dc)) < 0)
+    if (guest_read_nofault(g, arg, &dc, sizeof(dc)) < 0)
         return -LINUX_EFAULT;
 
     /* Ahead of the interface-number check, not merely ahead of the interface
@@ -3974,7 +3993,7 @@ static int64_t usbdev_do_disconnect_claim(usbdev_t *u, guest_t *g, uint64_t arg)
 static int64_t usbdev_do_driver_ioctl(usbdev_t *u, guest_t *g, uint64_t arg)
 {
     linux_usbdevfs_ioctl_t ic;
-    if (guest_read_small(g, arg, &ic, sizeof(ic)) < 0)
+    if (guest_read_nofault(g, arg, &ic, sizeof(ic)) < 0)
         return -LINUX_EFAULT;
 
     /* Ahead of the interface-number check, for the reason
@@ -4038,12 +4057,11 @@ static int64_t usbdev_do_driver_ioctl(usbdev_t *u, guest_t *g, uint64_t arg)
 /* async URB ioctls */
 
 /* SUBMITURB (proc_do_submiturb, doc A section A3). Entry lock held. */
-static int64_t usbdev_do_submiturb(usbdev_t *u, guest_t *g, uint64_t arg)
+static int64_t usbdev_do_submiturb(usbdev_t *u,
+                                   guest_t *g,
+                                   uint64_t arg,
+                                   linux_usbdevfs_urb_t uu)
 {
-    linux_usbdevfs_urb_t uu;
-    if (guest_read_small(g, arg, &uu, sizeof(uu)) < 0)
-        return -LINUX_EFAULT;
-
     /* The flags mask, USBFS_XFER_MAX and the null buffer, in the kernel's order
      * (usbdev-urb.h). A negative buffer_length is covered by the unsigned
      * compare, exactly as it is in devio.c:1647.
@@ -4109,7 +4127,7 @@ static int64_t usbdev_do_submiturb(usbdev_t *u, guest_t *g, uint64_t arg)
         uint8_t setup[8];
         if (uu.buffer_length < 8)
             return -LINUX_EINVAL;
-        if (guest_read_small(g, uu.buffer, setup, sizeof(setup)) < 0)
+        if (guest_read_nofault(g, uu.buffer, setup, sizeof(setup)) < 0)
             return -LINUX_EFAULT;
         uint16_t wLength = (uint16_t) (setup[6] | (setup[7] << 8));
         if ((uint32_t) uu.buffer_length - 8 < wLength)
@@ -4198,7 +4216,8 @@ static int64_t usbdev_do_submiturb(usbdev_t *u, guest_t *g, uint64_t arg)
         usbdev_memory_refund(charge);
         return -LINUX_ENOMEM;
     }
-    if (!is_in && data_len > 0 && guest_read(g, data_gva, buf, data_len) < 0) {
+    if (!is_in && data_len > 0 &&
+        guest_read_nofault(g, data_gva, buf, data_len) < 0) {
         free(buf);
         free(rec);
         pthread_mutex_lock(&u->async_lock);
@@ -4420,29 +4439,31 @@ static int64_t usbdev_do_discardurb(usbdev_t *u, uint64_t arg)
 
 /* Copy one completion back to the guest (vCPU thread): IN data into the urb's
  * buffer, then status/actual_length/error_count into the guest urb, then the
- * userurb pointer into *arg (processcompl, devio.c:2043-2079).
+ * userurb pointer into *arg (processcompl, devio.c:2043-2079). Runs under the
+ * entry lock, so nothing here faults: SUBMITURB faulted in the urb and its
+ * buffer, and usbdev_do_reap faults in the slot arg names.
  */
 static int64_t usbdev_reap_copyout(guest_t *g, usbdev_urb_t *rec, uint64_t arg)
 {
     if (rec->is_in && rec->actual > 0 &&
-        guest_write(g, rec->data_gva, rec->buf,
-                    rec->actual < rec->data_len ? rec->actual : rec->data_len) <
-            0)
+        guest_write_nofault(
+            g, rec->data_gva, rec->buf,
+            rec->actual < rec->data_len ? rec->actual : rec->data_len) < 0)
         return -LINUX_EFAULT;
     int32_t st = rec->status;
     int32_t act = (int32_t) rec->actual;
     int32_t ec = 0;
-    if (guest_write_small(g,
-                          rec->userurb + offsetof(linux_usbdevfs_urb_t, status),
-                          &st, sizeof(st)) < 0 ||
-        guest_write_small(
+    if (guest_write_nofault(
+            g, rec->userurb + offsetof(linux_usbdevfs_urb_t, status), &st,
+            sizeof(st)) < 0 ||
+        guest_write_nofault(
             g, rec->userurb + offsetof(linux_usbdevfs_urb_t, actual_length),
             &act, sizeof(act)) < 0 ||
-        guest_write_small(
+        guest_write_nofault(
             g, rec->userurb + offsetof(linux_usbdevfs_urb_t, error_count), &ec,
             sizeof(ec)) < 0)
         return -LINUX_EFAULT;
-    if (guest_write_small(g, arg, &rec->userurb, sizeof(rec->userurb)) < 0)
+    if (guest_write_nofault(g, arg, &rec->userurb, sizeof(rec->userurb)) < 0)
         return -LINUX_EFAULT;
     return 0;
 }
@@ -4469,6 +4490,7 @@ static void usbdev_reap_window_delay(void)
  */
 static int64_t usbdev_do_reap(guest_t *g, int fd, uint64_t arg, bool block)
 {
+    (void) guest_lazy_faultin(g, arg, sizeof(uint64_t));
     for (;;) {
         /* The slot's record and the descriptor behind it, out of ONE fd_lock
          * window. They are two facts about one open file description: the
@@ -4802,6 +4824,33 @@ static bool usbdev_vfs_answers_first(uint32_t request)
     }
 }
 
+static size_t usbdev_ioctl_arg_size(uint32_t request)
+{
+    switch (request) {
+    case USBDEVFS_CLAIMINTERFACE:
+    case USBDEVFS_RELEASEINTERFACE:
+    case USBDEVFS_SETCONFIGURATION:
+    case USBDEVFS_CLEAR_HALT:
+    case USBDEVFS_RESETEP:
+    case USBDEVFS_GET_CAPABILITIES:
+        return sizeof(uint32_t);
+    case USBDEVFS_SETINTERFACE:
+        return sizeof(linux_usbdevfs_setinterface_t);
+    case USBDEVFS_GETDRIVER:
+        return sizeof(linux_usbdevfs_getdriver_t);
+    case USBDEVFS_CONNECTINFO:
+        return sizeof(linux_usbdevfs_connectinfo_t);
+    case USBDEVFS_DISCONNECT_CLAIM:
+        return sizeof(linux_usbdevfs_disconnect_claim_t);
+    case USBDEVFS_IOCTL:
+        return sizeof(linux_usbdevfs_ioctl_t);
+    case USBDEVFS_DISCSIGNAL:
+        return sizeof(linux_usbdevfs_disconnectsignal_t);
+    default:
+        return 0;
+    }
+}
+
 int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 {
     fd_entry_t snap;
@@ -4835,7 +4884,36 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         return usbdev_do_reap(g, fd, arg,
                               (uint32_t) request == USBDEVFS_REAPURB);
 
-    usbdev_t *u = usbdev_acquire(fd);
+    linux_usbdevfs_ctrltransfer_t ct = {0};
+    linux_usbdevfs_bulktransfer_t bt = {0};
+    linux_usbdevfs_urb_t uu = {0};
+    int copy_rc = 0;
+    if ((uint32_t) request == USBDEVFS_CONTROL) {
+        copy_rc = guest_read(g, arg, &ct, sizeof(ct));
+        if (copy_rc == 0 && ct.wLength && ct.wLength <= USBDEV_CTRL_MAX)
+            (void) guest_lazy_faultin(g, ct.data, ct.wLength);
+    } else if ((uint32_t) request == USBDEVFS_BULK) {
+        copy_rc = guest_read(g, arg, &bt, sizeof(bt));
+        if (copy_rc == 0 && bt.len &&
+            bt.len <= USBDEV_MEMORY_MAX - USBDEV_URB_OVERHEAD)
+            (void) guest_lazy_faultin(g, bt.data, bt.len);
+    } else if ((uint32_t) request == USBDEVFS_SUBMITURB) {
+        /* The reap writes the status and data back under the entry lock, so it
+         * relies on this fault-in too.
+         */
+        copy_rc = guest_read(g, arg, &uu, sizeof(uu));
+        if (copy_rc == 0 && uu.buffer_length > 0 &&
+            (uint32_t) uu.buffer_length <=
+                USBDEV_MEMORY_MAX - sizeof(usbdev_urb_t))
+            (void) guest_lazy_faultin(g, uu.buffer,
+                                      (uint32_t) uu.buffer_length);
+    } else {
+        size_t len = usbdev_ioctl_arg_size((uint32_t) request);
+        if (len)
+            (void) guest_lazy_faultin(g, arg, len);
+    }
+
+    usbdev_t *u = usbdev_acquire_snap(fd, &snap);
     if (!u)
         return -LINUX_EBADF;
 
@@ -4875,14 +4953,14 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     switch ((uint32_t) request) {
     case USBDEVFS_CLAIMINTERFACE: {
         uint32_t ifnum;
-        ret = guest_read_small(g, arg, &ifnum, sizeof(ifnum)) < 0
+        ret = guest_read_nofault(g, arg, &ifnum, sizeof(ifnum)) < 0
                   ? -LINUX_EFAULT
                   : usbdev_claim_ioctl(u, ifnum);
         break;
     }
     case USBDEVFS_RELEASEINTERFACE: {
         uint32_t ifnum;
-        ret = guest_read_small(g, arg, &ifnum, sizeof(ifnum)) < 0
+        ret = guest_read_nofault(g, arg, &ifnum, sizeof(ifnum)) < 0
                   ? -LINUX_EFAULT
                   : usbdev_release_ioctl(u, ifnum);
         break;
@@ -4904,8 +4982,9 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         break;
     case USBDEVFS_GET_CAPABILITIES: {
         uint32_t caps = USBDEV_CAPS;
-        ret = guest_write_small(g, arg, &caps, sizeof(caps)) < 0 ? -LINUX_EFAULT
-                                                                 : 0;
+        ret = guest_write_nofault(g, arg, &caps, sizeof(caps)) < 0
+                  ? -LINUX_EFAULT
+                  : 0;
         break;
     }
     case USBDEVFS_GET_SPEED:
@@ -4916,15 +4995,15 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             .devnum = (uint32_t) u->devnum,
             .slow = u->speed_code == 0,
         };
-        ret =
-            guest_write_small(g, arg, &ci, sizeof(ci)) < 0 ? -LINUX_EFAULT : 0;
+        ret = guest_write_nofault(g, arg, &ci, sizeof(ci)) < 0 ? -LINUX_EFAULT
+                                                               : 0;
         break;
     }
     case USBDEVFS_CONTROL:
-        ret = usbdev_do_control(u, g, arg);
+        ret = copy_rc < 0 ? -LINUX_EFAULT : usbdev_do_control(u, g, ct);
         break;
     case USBDEVFS_BULK:
-        ret = usbdev_do_bulk(u, g, arg);
+        ret = copy_rc < 0 ? -LINUX_EFAULT : usbdev_do_bulk(u, g, bt);
         break;
     case USBDEVFS_RESET: {
         /* Stage-2 deviation (see file header): clear stalls on every claimed
@@ -5002,7 +5081,7 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         ret = usbdev_do_driver_ioctl(u, g, arg);
         break;
     case USBDEVFS_SUBMITURB:
-        ret = usbdev_do_submiturb(u, g, arg);
+        ret = copy_rc < 0 ? -LINUX_EFAULT : usbdev_do_submiturb(u, g, arg, uu);
         break;
     case USBDEVFS_DISCARDURB:
         ret = usbdev_do_discardurb(u, arg);
@@ -5012,7 +5091,7 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
          * async guest-signal injection from the event thread.
          */
         linux_usbdevfs_disconnectsignal_t ds;
-        if (guest_read_small(g, arg, &ds, sizeof(ds)) < 0) {
+        if (guest_read_nofault(g, arg, &ds, sizeof(ds)) < 0) {
             ret = -LINUX_EFAULT;
         } else {
             u->discsig_signr = ds.signr;

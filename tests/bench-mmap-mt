@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Measure concurrent mmap and munmap fast paths in fresh elfuse processes.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib/bench-mmap.sh
+. "$ROOT_DIR/tests/lib/bench-mmap.sh"
+
+ELFUSE="${ELFUSE:-${ROOT_DIR}/build/elfuse}"
+BENCH="${BENCH_MMAP_BIN:-${ROOT_DIR}/build/bench-mmap}"
+SAMPLES="${BENCH_MMAP_MT_SAMPLES:-7}"
+
+SIZES=(4096 2097152)
+THREAD_COUNTS=(1 2 4 8)
+
+if [ ! -x "$ELFUSE" ] || [ ! -x "$BENCH" ]; then
+    echo "build build/elfuse and build/bench-mmap first" >&2
+    exit 2
+fi
+if ! [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BENCH_MMAP_MT_SAMPLES must be a positive integer" >&2
+    exit 2
+fi
+
+printf 'Multi-threaded mmap/munmap fast paths\n'
+printf 'Each row is the median of %s fresh elfuse processes.\n' "$SAMPLES"
+printf 'ns is mean per-thread time; Mops/s is aggregate throughput.\n'
+printf '%-10s %8s %8s %12s %12s %12s %12s\n' \
+    size threads ops/thr 'mmap ns' 'mmap Mops/s' 'munmap ns' 'munmap Mops/s'
+
+for size in "${SIZES[@]}"; do
+    for threads in "${THREAD_COUNTS[@]}"; do
+        mmap_ns_samples=()
+        mmap_mops_samples=()
+        munmap_ns_samples=()
+        munmap_mops_samples=()
+        ops_per_thread=-
+        failed=0
+        for ((sample = 0; sample < SAMPLES; sample++)); do
+            if ! out="$("$ELFUSE" "$BENCH" mt-one "$size" "$threads" 2>&1)"; then
+                printf 'benchmark failed for size=%s threads=%s:\n%s\n' \
+                    "$size" "$threads" "$out" >&2
+                failed=1
+                break
+            fi
+            if ! ops_per_thread="$(field "$out" ops_per_thread)" \
+                || ! mmap_ns="$(field "$out" mmap_ns)" \
+                || ! mmap_mops="$(field "$out" mmap_mops)" \
+                || ! munmap_ns="$(field "$out" munmap_ns)" \
+                || ! munmap_mops="$(field "$out" munmap_mops)"; then
+                failed=1
+                break
+            fi
+            mmap_ns_samples+=("$mmap_ns")
+            mmap_mops_samples+=("$mmap_mops")
+            munmap_ns_samples+=("$munmap_ns")
+            munmap_mops_samples+=("$munmap_mops")
+        done
+        if [ "$failed" -ne 0 ]; then
+            printf '%-10s %8s %8s %12s\n' "$(human "$size")" "$threads" - FAILED
+            continue
+        fi
+        mmap_ns="$(numeric_median "${mmap_ns_samples[@]}")"
+        mmap_mops="$(numeric_median "${mmap_mops_samples[@]}")"
+        munmap_ns="$(numeric_median "${munmap_ns_samples[@]}")"
+        munmap_mops="$(numeric_median "${munmap_mops_samples[@]}")"
+        printf '%-10s %8s %8s %12.1f %12.3f %12.1f %12.3f\n' \
+            "$(human "$size")" "$threads" "$ops_per_thread" "$mmap_ns" \
+            "$mmap_mops" "$munmap_ns" "$munmap_mops"
+    done
+done

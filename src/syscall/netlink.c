@@ -814,7 +814,7 @@ static int64_t nl_timeout_store(guest_t *g,
         return -LINUX_EINVAL;
 
     nl_timeval_t tv;
-    if (guest_read_small(g, optval_gva, &tv, sizeof(tv)) < 0)
+    if (guest_read_nofault(g, optval_gva, &tv, sizeof(tv)) < 0)
         return -LINUX_EFAULT;
 
     if (tv.tv_usec < 0 || tv.tv_usec >= 1000000)
@@ -1048,6 +1048,9 @@ int64_t netlink_setsockopt(guest_t *g,
     if (level != LINUX_SOL_SOCKET)
         return -LINUX_ENOPROTOOPT;
 
+    uint32_t need = nl_optlen_min(optname);
+    if (optlen >= sizeof(int32_t))
+        (void) guest_lazy_faultin(g, optval_gva, optlen < need ? optlen : need);
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find(guest_fd);
     if (!ns) {
@@ -1066,7 +1069,7 @@ int64_t netlink_setsockopt(guest_t *g,
         return -LINUX_EINVAL;
     }
     int32_t value = 0;
-    if (guest_read_small(g, optval_gva, &value, sizeof(value)) < 0) {
+    if (guest_read_nofault(g, optval_gva, &value, sizeof(value)) < 0) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EFAULT;
     }
@@ -1111,7 +1114,7 @@ int64_t netlink_setsockopt(guest_t *g,
         break;
     case LINUX_SO_LINGER: {
         int32_t ling[2] = {0, 0};
-        if (guest_read_small(g, optval_gva, ling, sizeof(ling)) < 0) {
+        if (guest_read_nofault(g, optval_gva, ling, sizeof(ling)) < 0) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -1480,6 +1483,19 @@ static int64_t nl_msg_iovcnt(const linux_msghdr_t *mhdr, int *iovcnt)
     return 0;
 }
 
+static void nl_prefault_iov(guest_t *g,
+                            const linux_iovec_t *iov,
+                            int iovcnt,
+                            uint64_t limit)
+{
+    for (int i = 0; i < iovcnt && limit; i++) {
+        uint64_t len = iov[i].iov_len < limit ? iov[i].iov_len : limit;
+        if (len)
+            (void) guest_lazy_faultin(g, iov[i].iov_base, len);
+        limit -= len;
+    }
+}
+
 /* The send half of sendmsg(2), sendto(2), write(2) and writev(2) on a netlink
  * socket.
  *
@@ -1494,6 +1510,7 @@ static int64_t netlink_send_iov(int guest_fd,
                                 const linux_iovec_t *iov,
                                 int iovcnt)
 {
+    nl_prefault_iov(g, iov, iovcnt, NETLINK_REQ_MAX);
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find(guest_fd);
     if (!ns) {
@@ -1557,8 +1574,8 @@ static int64_t netlink_send_iov(int guest_fd,
     uint8_t req[NETLINK_REQ_MAX] = {0};
     size_t rlen = 0;
     for (int i = 0; i < iovcnt; i++) {
-        if (guest_read(g, iov[i].iov_base, req + rlen,
-                       (size_t) iov[i].iov_len) < 0) {
+        if (guest_read_nofault(g, iov[i].iov_base, req + rlen,
+                               (size_t) iov[i].iov_len) < 0) {
             result = -LINUX_EFAULT;
             goto out;
         }
@@ -1865,6 +1882,7 @@ static int64_t netlink_recv_iov(int guest_fd,
                                 int flags)
 {
     bool nonblock = (flags & LINUX_MSG_DONTWAIT) || fd_guest_nonblock(guest_fd);
+    nl_prefault_iov(g, iov, iovcnt, NETLINK_BUF_SIZE);
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find(guest_fd);
     if (!ns) {
@@ -1906,8 +1924,8 @@ static int64_t netlink_recv_iov(int guest_fd,
          * chunk by chunk and a chunk that faults still places the bytes ahead
          * of it, which is what copy_to_iter() counts.
          */
-        size_t moved = guest_write_partial(g, iov[i].iov_base,
-                                           ns->buf + ns->buf_pos, chunk);
+        size_t moved = guest_write_partial_nofault(
+            g, iov[i].iov_base, ns->buf + ns->buf_pos, chunk);
         ns->buf_pos += moved;
         done += moved;
         if (moved < chunk) {

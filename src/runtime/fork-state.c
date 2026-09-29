@@ -191,7 +191,7 @@ int fork_ipc_recv_fds(int sock, int *fds, int max_count, int *out_count)
     return 0;
 }
 
-int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm)
+int fork_ipc_send_memory_regions(int ipc_sock, guest_t *g, bool use_shm)
 {
     if (use_shm) {
         uint32_t zero_regions = 0;
@@ -202,9 +202,9 @@ int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm)
 #define MAX_USED_REGIONS 16
     used_region_t used[MAX_USED_REGIONS];
     unsigned int shim_sz = proc_get_shim_size();
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire(g);
     int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 
     uint32_t num_regions = (uint32_t) nregions;
     if (fork_ipc_write_all(ipc_sock, &num_regions, sizeof(num_regions)) < 0)
@@ -802,6 +802,7 @@ int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
                                 bool regions_tracker_stale_snapshot,
+                                const uint64_t *dirty_blocks_snapshot,
                                 const guest_region_t *preannounced_snapshot,
                                 uint32_t num_preannounced)
 {
@@ -853,6 +854,9 @@ int fork_ipc_send_process_state(int ipc_sock,
     if (num_guest_regions > 0 &&
         fork_ipc_write_all(ipc_sock, regions_snapshot,
                            num_guest_regions * sizeof(guest_region_t)) < 0)
+        return -1;
+    if (fork_ipc_write_all(ipc_sock, dirty_blocks_snapshot,
+                           GUEST_DIRTY_WORDS * sizeof(uint64_t)) < 0)
         return -1;
 
     if (fork_ipc_write_all(ipc_sock, &num_preannounced,
@@ -1076,6 +1080,12 @@ int fork_ipc_recv_process_state(int ipc_fd,
     guest_reseed_next_vma_id(g);
     g->regions_tracker_stale =
         (regions_tracker_stale != 0) || (num_guest_regions > recv_regions);
+
+    if (fork_ipc_read_all(ipc_fd, g->dirty_blocks,
+                          GUEST_DIRTY_WORDS * sizeof(uint64_t)) < 0) {
+        log_error("fork-child: failed to read dirty block bitmap");
+        return -1;
+    }
 
     uint32_t num_preannounced = 0;
     if (fork_ipc_read_all(ipc_fd, &num_preannounced, sizeof(num_preannounced)) <

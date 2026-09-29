@@ -21,7 +21,8 @@ func main() {
 }
 
 type cli struct {
-	Pull pullCommand `cmd:"" help:"Pull an image into the local store"`
+	Pull   pullCommand   `cmd:"" help:"Pull an image into the local store"`
+	Unpack unpackCommand `cmd:"" help:"Unpack a stored image into a rootfs"`
 }
 
 func newParser(stdout, stderr io.Writer, target *cli) (*kong.Kong, error) {

@@ -15,7 +15,7 @@ func TestUsageAndErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("missing command must fail")
 	}
-	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull")
+	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull", "unpack")
 	if stderr != "" {
 		t.Fatalf("parse error wrote to stderr: %q", stderr)
 	}
@@ -24,18 +24,20 @@ func TestUsageAndErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unexpected argument bogus") {
 		t.Fatalf("unknown command error = %v", err)
 	}
-	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull")
+	mustContain(t, stdout, "Usage: elfuse-oci <command>", "pull", "unpack")
 	if stderr != "" {
 		t.Fatalf("unknown command wrote to stderr: %q", stderr)
 	}
 
-	stdout, stderr = captureOutput(t, func() { err = run([]string{"pull", "--nope", "x"}) })
-	if err == nil || !strings.Contains(err.Error(), "unknown flag --nope") {
-		t.Fatalf("unknown flag error = %v", err)
-	}
-	mustContain(t, stdout, "Usage: elfuse-oci pull", "--platform", "--store", "--timeout")
-	if stderr != "" {
-		t.Fatalf("unknown flag wrote to stderr: %q", stderr)
+	for cmd, flag := range map[string]string{"pull": "--timeout", "unpack": "--rootfs"} {
+		stdout, stderr = captureOutput(t, func() { err = run([]string{cmd, "--nope", "x"}) })
+		if err == nil || !strings.Contains(err.Error(), "unknown flag --nope") {
+			t.Fatalf("%s: unknown flag error = %v", cmd, err)
+		}
+		mustContain(t, stdout, "Usage: elfuse-oci "+cmd, "--platform", "--store", flag)
+		if stderr != "" {
+			t.Fatalf("%s: unknown flag wrote to stderr: %q", cmd, stderr)
+		}
 	}
 }
 

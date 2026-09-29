@@ -10,10 +10,12 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -21,8 +23,13 @@ import (
 )
 
 type tarEntry struct {
-	Name string
-	Body string
+	Name    string
+	Body    string
+	Link    string
+	Mode    int64
+	Type    byte
+	Major   int64
+	ModTime time.Time
 }
 
 func buildLayerTar(t *testing.T, entries []tarEntry) []byte {
@@ -30,7 +37,32 @@ func buildLayerTar(t *testing.T, entries []tarEntry) []byte {
 	var b bytes.Buffer
 	tw := tar.NewWriter(&b)
 	for _, e := range entries {
-		hdr := &tar.Header{Name: e.Name, Mode: 0o644, Size: int64(len(e.Body)), Typeflag: tar.TypeReg}
+		hdr := &tar.Header{Name: e.Name, Mode: e.Mode, Size: int64(len(e.Body)), Typeflag: tar.TypeReg, ModTime: e.ModTime}
+		if hdr.Mode == 0 {
+			hdr.Mode = 0o644
+		}
+		// tar.Writer rounds ModTime to whole seconds unless Format is set, and
+		// only PAX keeps the fraction.
+		if e.ModTime.Nanosecond() != 0 {
+			hdr.Format = tar.FormatPAX
+		}
+		switch {
+		case e.Type != 0:
+			hdr.Typeflag = e.Type
+			hdr.Size = 0
+			hdr.Linkname = e.Link
+			hdr.Devmajor = e.Major
+		case e.Link != "":
+			hdr.Typeflag = tar.TypeSymlink
+			hdr.Linkname = e.Link
+			hdr.Size = 0
+		case e.Name[len(e.Name)-1] == '/':
+			hdr.Typeflag = tar.TypeDir
+			if e.Mode == 0 {
+				hdr.Mode = 0o755
+			}
+			hdr.Size = 0
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatal(err)
 		}
@@ -47,7 +79,10 @@ func buildLayerTar(t *testing.T, entries []tarEntry) []byte {
 func gzipBytes(t *testing.T, b []byte) []byte {
 	t.Helper()
 	var z bytes.Buffer
-	zw := gzip.NewWriter(&z)
+	zw, err := gzip.NewWriterLevel(&z, gzip.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := zw.Write(b); err != nil {
 		t.Fatal(err)
 	}
@@ -219,4 +254,46 @@ func mustContain(t *testing.T, got string, wants ...string) {
 			t.Fatalf("output missing %q:\n%s", want, got)
 		}
 	}
+}
+
+func manifestOf(t *testing.T, s *store, digest string) ocispec.Manifest {
+	t.Helper()
+	manifest, err := s.manifestFor(context.Background(), digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
+func runCaptured(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	var err error
+	_, stderr := captureOutput(t, func() { err = run(args) })
+	return stderr, err
+}
+
+func unpackFresh(t *testing.T, s *store, digest string) string {
+	t.Helper()
+	dest := filepath.Join(t.TempDir(), "rootfs")
+	if err := unpackFreshTo(t, s, digest, dest, false); err != nil {
+		t.Fatal(err)
+	}
+	return dest
+}
+
+func unpackFreshTo(t *testing.T, s *store, digest, dest string, cached bool) (err error) {
+	t.Helper()
+	t.Cleanup(func() { _ = removeRootfsTree(dest) })
+	captureOutput(t, func() {
+		err = unpackImageFresh(context.Background(), s, manifestOf(t, s, digest), dest, cached)
+	})
+	return err
+}
+
+// incompressibleBody returns seeded random bytes, which gzip cannot shrink.
+func incompressibleBody(seed, n int) string {
+	r := rand.New(rand.NewSource(int64(seed)))
+	b := make([]byte, n)
+	r.Read(b)
+	return string(b)
 }

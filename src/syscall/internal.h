@@ -185,8 +185,11 @@ typedef int guest_fd_t;
 typedef int host_fd_t;
 
 /* Cross-module locks. */
-extern pthread_mutex_t mmap_lock; /* Lock order: 1, mmap/brk + page tables */
-extern pthread_mutex_t fd_lock;   /* Lock order: 3, FD table */
+extern pthread_mutex_t fd_lock; /* Lock order: 3, FD table */
+
+/* mmap_lock (Lock order: 1, mmap/brk + page tables) is not recursive. */
+void mmap_lock_acquire(void);
+void mmap_lock_release(void);
 
 /* FD table (defined in syscall/fdtable.c). */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];

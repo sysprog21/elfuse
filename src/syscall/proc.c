@@ -3634,7 +3634,7 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
     /* Hold mmap_lock for page table modifications AND region lookups to prevent
      * races with concurrent mmap/mprotect/munmap from other vCPU threads.
      */
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
 
     /* Check if this is a genuine permission violation (not a W^X toggle). If
      * the guest region lacks the required permission, deliver SIGSEGV instead
@@ -3646,7 +3646,7 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
         const guest_region_t *reg = guest_region_find(g, off);
         int required = (type == 1) ? LINUX_PROT_WRITE : LINUX_PROT_EXEC;
         if (reg && !(reg->prot & required)) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             uint64_t esr;
             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
             signal_set_fault_info(LINUX_SEGV_ACCERR, far, esr);
@@ -3672,7 +3672,7 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
     uint64_t block_start = far & ~(BLOCK_2MIB - 1);
     int sr = guest_split_block(g, block_start);
     int ur = guest_update_perms(g, page_start, page_end, new_perms);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     if (verbose && (sr < 0 || ur < 0))
         log_warn(
             "%s: W^X toggle FAILED "
@@ -3910,9 +3910,9 @@ static bool vcpu_handle_el0_fault(guest_t *g,
     uint32_t fsc_type = (fsc >> 2) & 0xF;
     if (fsc_type == 0x01) {
         uint64_t fault_off = far_addr - g->ipa_base;
-        pthread_mutex_lock(&mmap_lock);
+        mmap_lock_acquire();
         int mat = guest_materialize_lazy(g, fault_off);
-        pthread_mutex_unlock(&mmap_lock);
+        mmap_lock_release();
         if (mat == 0) {
             /* Page materialized; the helpers inside guest_materialize_lazy
              * populated the per-vCPU TLBI accumulator with the range just
@@ -3969,9 +3969,9 @@ static bool vcpu_handle_el0_fault(guest_t *g,
     uint64_t live_avail = 0;
     void *live_pt = NULL;
     if (stale_plausible) {
-        pthread_mutex_lock(&mmap_lock);
+        mmap_lock_acquire();
         live_pt = guest_ptr_avail(g, far_addr, &live_avail, want_perm);
-        pthread_mutex_unlock(&mmap_lock);
+        mmap_lock_release();
     }
     if (live_pt) {
         /* Bound per vCPU and per (page, faulting PC). A genuinely stuck entry

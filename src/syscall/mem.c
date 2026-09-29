@@ -8,6 +8,7 @@
  * Guest memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise, msync
  */
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +37,24 @@
  * may call mmap/brk concurrently; without this lock they could get overlapping
  * allocations or corrupt page table structures.
  */
-pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
+static pthread_mutex_t mmap_lock =
+    PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
+
+static _Thread_local bool mmap_lock_owned;
+
+void mmap_lock_acquire(void)
+{
+    assert(!mmap_lock_owned);
+    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_owned = true;
+}
+
+void mmap_lock_release(void)
+{
+    assert(mmap_lock_owned);
+    mmap_lock_owned = false;
+    pthread_mutex_unlock(&mmap_lock);
+}
 
 /* Host kernel page size (16 KiB on Apple Silicon, typically 4 KiB on Intel
  * macOS). MAP_FIXED requires addr/length/offset multiples of this, so an
@@ -4473,7 +4491,7 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t)
     if (nranges <= 0)
         return;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     for (int i = 0; i < nranges; i++) {
         int rc = munmap_guest_range(g, starts[i], ends[i]);
         if (rc < 0) {
@@ -4486,7 +4504,7 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t)
         }
         thread_drop_deferred_stack_unmap(t, starts[i], ends[i]);
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 }
 
 /* sys_munmap. */
@@ -4896,12 +4914,12 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
     int *fsync_fds = NULL;
     int fsync_count = 0;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     uint64_t cursor = off;
     while (cursor < end) {
         const guest_region_t *r = guest_region_find(g, cursor);
         if (!r || r->start > cursor) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             return -LINUX_ENOMEM;
         }
         cursor = r->end < end ? r->end : end;
@@ -4910,7 +4928,7 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
     if (flags & LINUX_MS_SYNC) {
         fsync_fds = calloc((size_t) g->nregions, sizeof(*fsync_fds));
         if (!fsync_fds) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             return -LINUX_ENOMEM;
         }
     }
@@ -5007,7 +5025,7 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
         if (ret < 0)
             break;
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 
     /* Every queued fd is fsynced unconditionally, even if a later region's
      * diff/refresh failed and broke the locked loop early: the original code
@@ -5059,7 +5077,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
     if (!txn)
         return -LINUX_ENOMEM;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
 
     size_t hps = host_page_size_cached();
 
@@ -5204,7 +5222,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             *txn_out = txn;
             return -LINUX_ENOMEM;
         }
@@ -5217,7 +5235,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             *txn_out = txn;
             return nsnaps;
         }
@@ -5257,7 +5275,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         close(fd);
     }
 
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     *txn_out = txn;
     return 0;
 }
@@ -5276,7 +5294,7 @@ int mmap_fork_abort_anon_shared(guest_t *g,
     mmap_fork_anon_shared_txn_t *txn = *txn_ptr;
     int rc = 0;
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
 
     for (int i = txn->noverlays - 1; i >= 0; i--) {
         const fork_overlay_snapshot_t *ovl = &txn->overlays[i];
@@ -5346,7 +5364,7 @@ int mmap_fork_abort_anon_shared(guest_t *g,
         }
     }
 
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     mmap_fork_dispose_anon_shared_txn(txn_ptr);
     return rc;
 }
@@ -5360,7 +5378,7 @@ int mmap_fork_restore_overlays(guest_t *g,
                                const uint64_t *parent_ovl_start,
                                const uint64_t *parent_ovl_end)
 {
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int rc = 0;
 
     for (int i = 0; i < g->nregions; i++) {
@@ -5449,6 +5467,6 @@ int mmap_fork_restore_overlays(guest_t *g,
         }
     }
 
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     return rc;
 }

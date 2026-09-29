@@ -632,7 +632,7 @@ static void resolve_clone_stack_range(const guest_t *g,
      * soon as a sibling allocates while another thread clones. Neither caller
      * holds a lock here, and mmap_lock is order 1, so taking it is safe.
      */
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     const guest_region_t *r = guest_region_find(g, sp_off - 1);
     if (r) {
         if (start_out)
@@ -640,7 +640,7 @@ static void resolve_clone_stack_range(const guest_t *g,
         if (end_out)
             *end_out = r->end;
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 }
 
 /* Forward declaration: worker entry runs after sys_clone_thread */

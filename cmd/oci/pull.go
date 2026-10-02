@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -43,8 +44,19 @@ func normalizeRef(ref string) (name.Reference, error) {
 	return name.ParseReference(ref, name.WeakValidation)
 }
 
-func imagePlatform(img v1.Image) (v1.Platform, error) {
-	config, err := img.ConfigFile()
+func imagePlatform(ctx context.Context, s *store, img v1.Image) (v1.Platform, error) {
+	manifest, err := img.Manifest()
+	if err != nil {
+		return v1.Platform{}, err
+	}
+	raw, err := s.verifiedBlobBytes(ctx, manifest.Config)
+	if os.IsNotExist(err) {
+		raw, err = img.RawConfigFile()
+	}
+	if err != nil {
+		return v1.Platform{}, err
+	}
+	config, err := v1.ParseConfigFile(bytes.NewReader(raw))
 	if err != nil {
 		return v1.Platform{}, err
 	}
@@ -55,7 +67,7 @@ func imagePlatform(img v1.Image) (v1.Platform, error) {
 	}, nil
 }
 
-func indexChildImage(index v1.ImageIndex, child v1.Descriptor) (v1.Image, v1.Platform, error) {
+func indexChildImage(ctx context.Context, s *store, index v1.ImageIndex, child v1.Descriptor) (v1.Image, v1.Platform, error) {
 	if !child.MediaType.IsImage() {
 		return nil, v1.Platform{}, fmt.Errorf("unexpected index child media type %s", child.MediaType)
 	}
@@ -63,7 +75,7 @@ func indexChildImage(index v1.ImageIndex, child v1.Descriptor) (v1.Image, v1.Pla
 	if err != nil {
 		return nil, v1.Platform{}, err
 	}
-	actual, err := imagePlatform(img)
+	actual, err := imagePlatform(ctx, s, img)
 	return img, actual, err
 }
 
@@ -82,7 +94,7 @@ func imagePlatformMatches(actual, requested v1.Platform) bool {
 		actual.Variant == requested.Variant
 }
 
-func selectIndexImage(index v1.ImageIndex, platform v1.Platform) (v1.Image, error) {
+func selectIndexImage(ctx context.Context, s *store, index v1.ImageIndex, platform v1.Platform) (v1.Image, error) {
 	manifest, err := index.IndexManifest()
 	if err != nil {
 		return nil, err
@@ -91,7 +103,7 @@ func selectIndexImage(index v1.ImageIndex, platform v1.Platform) (v1.Image, erro
 		if child.Platform == nil || !imagePlatformMatches(*child.Platform, platform) {
 			continue
 		}
-		img, actual, err := indexChildImage(index, child)
+		img, actual, err := indexChildImage(ctx, s, index, child)
 		if err != nil {
 			return nil, err
 		}
@@ -104,7 +116,7 @@ func selectIndexImage(index v1.ImageIndex, platform v1.Platform) (v1.Image, erro
 		if child.Platform != nil {
 			continue
 		}
-		img, actual, err := indexChildImage(index, child)
+		img, actual, err := indexChildImage(ctx, s, index, child)
 		if err != nil {
 			return nil, err
 		}
@@ -115,13 +127,13 @@ func selectIndexImage(index v1.ImageIndex, platform v1.Platform) (v1.Image, erro
 	return nil, fmt.Errorf("no image for platform %s", platform)
 }
 
-func selectImage(desc *remote.Descriptor, platform v1.Platform) (v1.Image, error) {
+func selectImage(ctx context.Context, s *store, desc *remote.Descriptor, platform v1.Platform) (v1.Image, error) {
 	if desc.MediaType.IsIndex() {
 		index, err := desc.ImageIndex()
 		if err != nil {
 			return nil, err
 		}
-		return selectIndexImage(index, platform)
+		return selectIndexImage(ctx, s, index, platform)
 	}
 	if !desc.MediaType.IsImage() {
 		return nil, fmt.Errorf("unexpected media type %s", desc.MediaType)
@@ -130,7 +142,7 @@ func selectImage(desc *remote.Descriptor, platform v1.Platform) (v1.Image, error
 	if err != nil {
 		return nil, err
 	}
-	actual, err := imagePlatform(img)
+	actual, err := imagePlatform(ctx, s, img)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +154,7 @@ func selectImage(desc *remote.Descriptor, platform v1.Platform) (v1.Image, error
 
 type imageFetcher func(context.Context, name.Reference, v1.Platform) (v1.Image, error)
 
-func fetchRemoteImage(ctx context.Context, ref name.Reference, platform v1.Platform) (v1.Image, error) {
+func fetchRemoteImage(ctx context.Context, s *store, ref name.Reference, platform v1.Platform) (v1.Image, error) {
 	desc, err := remote.Get(ref,
 		remote.WithContext(ctx),
 		remote.WithAuthFromKeychain(authn.DefaultKeychain),
@@ -151,11 +163,13 @@ func fetchRemoteImage(ctx context.Context, ref name.Reference, platform v1.Platf
 	if err != nil {
 		return nil, err
 	}
-	return selectImage(desc, platform)
+	return selectImage(ctx, s, desc, platform)
 }
 
 func pullImage(ctx context.Context, s *store, ref string, platform ocispec.Platform) error {
-	return pullImageWithFetcher(ctx, s, ref, platform, fetchRemoteImage)
+	return pullImageWithFetcher(ctx, s, ref, platform, func(ctx context.Context, ref name.Reference, platform v1.Platform) (v1.Image, error) {
+		return fetchRemoteImage(ctx, s, ref, platform)
+	})
 }
 
 func pullImageWithFetcher(ctx context.Context, s *store, ref string, platform ocispec.Platform, fetch imageFetcher) error {

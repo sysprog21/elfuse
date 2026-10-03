@@ -48,6 +48,10 @@ The shape the tree already uses, and the reason for it:
   of them closes with the tracked sources that win when the two disagree.
 - Numbers are recomputed rather than carried. A count quoted from a document
   reads as verified.
+- A fact has one owning skill. The others name that skill and stop, because a
+  second copy is the one that drifts. `scripts/check-skill-refs.py` catches a
+  verbatim run of 20 words or more outside fences and the sources section; a
+  shorter copy or a paraphrase only a reader catches.
 - Material that only one branch reaches goes in a `references/` file beside the
   `SKILL.md`, reached by a pointer sharp enough to fire on its own. The gate
   checks those files too. Material every branch needs stays inline; splitting

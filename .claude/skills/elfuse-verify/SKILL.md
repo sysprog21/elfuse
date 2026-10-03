@@ -313,7 +313,8 @@ math. The shape that has worked every time is a self-contained codec or walk
 over a guest-chosen blob: pure arithmetic, libc-only includes, an explicit
 output-buffer bound, and no syscalls. A file whose header comment already says
 it treats its input as untrusted and is free of project dependencies is
-telling you it was written to be proved.
+telling you it was written to be proved. Which inputs count as attacker-facing
+is the boundary list in `elfuse-security`, not a judgment made per file.
 
 Two things that look like candidates and are not. A file whose length
 arithmetic is all delegated to an already-proved header adds nothing but a
@@ -411,6 +412,17 @@ make check-ubsan           # undefined behavior
 make check-tsan            # data races, worth it for anything multi-vCPU
 make infer-uninit          # uninitialized reads
 ```
+
+A clean sanitizer lane is narrower than `make check`. The three sanitizer
+targets run `check-sanitizer`, which runs only the `SANITIZER_SECTIONS`
+subset in `mk/tests.mk` plus the shared lanes, `CHECK_HOST_UNIT_BINS` among
+them. A parser reached by neither is not exercised under instrumentation at
+all. The USB descriptor, ELF header and abstract socket name parsers are
+reached through their host unit tests. Ancillary messages are only partly
+inside: a few selected tests pass SCM_RIGHTS in passing, but the dedicated
+cmsg suites and netlink parsing are outside. The sanitizer
+targets instrument host C only: `src/core/shim.S` is assembled by its own rule
+and stays outside, so a clean run says nothing about the shim fast paths.
 
 ## What done means
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when a skill file points at something that no longer exists.
+"""Fail when a skill file has drifted from the tree or from another skill.
 
 The files under .claude/skills/ are documentation, so nothing else in the
 tree checks them, and a rotted pointer does not read as stale, it reads as
@@ -20,16 +20,20 @@ What is checked, per file:
   4. A quoted section name attached to the word "section" exists as a
      heading in the docs file nearest it.
   5. A named sibling skill exists.
+  6. No two skill files share a verbatim passage of DUP_RUN words or more.
+     A second copy is the one that goes stale, and nothing else in the tree
+     notices it diverge.
 
 Only typeset references count: a path in backticks, a make command in
 backticks or in a fenced block. Guessing which words in running prose are
 meant to be paths costs more than it catches.
 
-Two things stay unchecked on purpose: whether the prose is true, since only
-the mechanical half rots silently, and a bare markdown name at the repo
-root, which may be a per-developer working doc (see unverifiable()). The
-"fd.c/h" shorthand for a file pair is rejected rather than ignored, since
-allowing it would leave a reference that looks checked and is not.
+Some things stay unchecked on purpose: paraphrase, which no word match
+sees; whether the prose is true, since only the mechanical half rots
+silently; and a bare markdown name at the repo root, which may be a
+per-developer working doc (see unverifiable()). The "fd.c/h" shorthand for
+a file pair is rejected rather than ignored, since allowing it would leave a
+reference that looks checked and is not.
 
 A missing .claude/skills/ exits 0 with a note, so a build can call this
 without depending on files a clone may not carry.
@@ -90,7 +94,7 @@ PATH_RE = re.compile(
 # one list deeper.
 MAKE_RE = re.compile(r"`make ([a-z][a-z0-9-]*)")
 MAKE_FENCED_RE = re.compile(r"^[ \t]*make ([a-z][a-z0-9-]*)", re.M)
-FENCE_RE = re.compile(r"^[ \t]*```.*?^[ \t]*```", re.M | re.S)
+FENCE_RE = re.compile(r"^[ \t]*(?:```.*?^[ \t]*```|~~~.*?^[ \t]*~~~)", re.M | re.S)
 
 # Fenced paths carry no backticks, so PATH_RE cannot see them. Requiring both a
 # directory component and a known extension keeps this off ordinary words and
@@ -358,6 +362,46 @@ def check_skill_refs(text, skills):
     return messages
 
 
+# Shorter shared runs are mostly ordinary phrasing; 20 words is a sentence
+# copied, not two writers choosing the same words.
+DUP_RUN = 20
+
+# The closing section every skill carries by convention (elfuse-skills) is the
+# one place meant to repeat, so it is dropped by heading, whatever its wording.
+SOURCES_RE = re.compile(
+    r"^##[ \t]+Authoritative sources[ \t]*\n.*?(?=^#|\Z)", re.M | re.S
+)
+
+
+def shingles(raw):
+    """Every DUP_RUN-word window of prose, in order, fences and sources dropped.
+
+    Each stretch between dropped blocks is windowed on its own, so the words
+    either side of a fence never join into a passage neither file contains.
+    """
+    windows = {}
+    for segment in SOURCES_RE.sub("\0", FENCE_RE.sub("\0", raw)).split("\0"):
+        words = segment.split()
+        for i in range(len(words) - DUP_RUN + 1):
+            windows.setdefault(" ".join(words[i : i + DUP_RUN]))
+    return windows
+
+
+def check_duplicates(named_texts):
+    """Report each pair of files sharing a DUP_RUN-word passage, once."""
+    sets = [(name, shingles(raw)) for name, raw in named_texts]
+    found = []
+    for i, (a, sa) in enumerate(sets):
+        for b, sb in sets[i + 1 :]:
+            first = next((w for w in sa if w in sb), None)
+            if first:
+                found.append(
+                    f"{a}: repeats a passage of {b}; keep one copy and point "
+                    f"at it: \"{' '.join(first.split()[:10])} ...\""
+                )
+    return found
+
+
 def check_file(path, paths, targets, skills, errors):
     """Run every pass over one file, prefixing each finding with its path."""
     raw = path.read_text(errors="replace")
@@ -382,6 +426,7 @@ def check_file(path, paths, targets, skills, errors):
         + check_skill_refs(text, skills)
     )
     errors.extend(f"{rel}: {message}" for message in messages)
+    return str(rel), raw
 
 
 # Each case is (what it exercises, body, substring of the expected error or
@@ -420,6 +465,7 @@ SELF_TEST_CASES = [
         "does not exist",
     ),
     ("path in a fenced block", "```sh\npython3 scripts/nope.py\n```", "does not exist"),
+    ("path in a tilde fence", "~~~sh\npython3 scripts/nope.py\n~~~", "does not exist"),
     (
         "path in a fenced block inside a numbered step",
         "1. Run it:\n\n   ```sh\n   python3 scripts/nope.py\n   ```",
@@ -489,7 +535,7 @@ def self_test():
     then protects nothing.
     """
     paths, targets, skills = tree_paths(), make_targets(), {"elfuse-syscall"}
-    failures = []
+    failures, adhoc = [], 0
 
     with tempfile.TemporaryDirectory() as tmp:
         skill_dir = pathlib.Path(tmp) / "elfuse-syscall"
@@ -509,6 +555,7 @@ def self_test():
             elif expect is not None and expect not in found:
                 failures.append(f"{label}: expected {expect!r}, got: {found or 'none'}")
 
+        adhoc += 1
         # A reference file cites siblings from one directory deeper, so it
         # needs a fixture that sits there.
         sibling = skill_dir / "references" / "sibling.md"
@@ -518,6 +565,7 @@ def self_test():
         if errors:
             failures.append(f"reference sibling: expected no error, got: {errors}")
 
+        adhoc += 1
         # Frontmatter drift needs its own directory, since the name is checked
         # against the one the file sits in.
         other = pathlib.Path(tmp) / "elfuse-other"
@@ -529,7 +577,26 @@ def self_test():
         if not any("frontmatter name" in e for e in errors):
             failures.append("frontmatter drift: expected a name mismatch, got none")
 
-    total = len(SELF_TEST_CASES) + 2
+        adhoc += 1
+        # The duplicate pass compares files, so it runs on text pairs.
+        copied = " ".join(f"w{i}" for i in range(DUP_RUN))
+        if not check_duplicates([("a", f"x {copied} y"), ("b", f"z {copied}")]):
+            failures.append("duplicate passage: expected a report, got none")
+        adhoc += 1
+        footer = f"## Authoritative sources  \n\n- {copied}\n"
+        if check_duplicates([("a", "one\n" + footer), ("b", "two\n" + footer)]):
+            failures.append("shared footer: expected no report, got one")
+        adhoc += 1
+        tilde = f"~~~\n{copied}\n~~~\n"
+        if check_duplicates([("a", tilde), ("b", tilde)]):
+            failures.append("tilde-fenced code: expected no report, got one")
+        adhoc += 1
+        half = copied.split()
+        joined = " ".join(half[:10]) + "\n```\ncode\n```\n" + " ".join(half[10:])
+        if check_duplicates([("a", joined), ("b", copied)]):
+            failures.append("passage split by a fence: expected no report, got one")
+
+    total = len(SELF_TEST_CASES) + adhoc
     if failures:
         print(
             f"  {len(failures)} of {total} self-test case(s) failed:", file=sys.stderr
@@ -567,13 +634,19 @@ def main():
             return 1
         files.insert(0, path)
 
+    # One file named two ways is still one file.
+    files = list(dict.fromkeys(path.resolve() for path in files))
+
     if not files:
         print("  no .claude/skills/ in this clone; nothing to check")
         return 0
 
-    paths, targets, errors = tree_paths(), make_targets(), []
+    paths, targets, errors, skill_texts = tree_paths(), make_targets(), [], []
     for path in files:
-        check_file(path, paths, targets, skills, errors)
+        named = check_file(path, paths, targets, skills, errors)
+        if SKILL_DIR in path.parents:
+            skill_texts.append(named)
+    errors += check_duplicates(skill_texts)
 
     # A file may name the same missing thing twice; report each once.
     errors = list(dict.fromkeys(errors))
@@ -585,7 +658,7 @@ def main():
 
     print(
         f"  {len(files)} file(s), every path, target, section, and "
-        "cross-reference resolves"
+        "cross-reference resolves, no passage repeats"
     )
     return 0
 

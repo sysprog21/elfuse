@@ -183,9 +183,9 @@ typedef int64_t (*syscall_handler_t)(guest_t *g,
     {                                                                         \
         (void) g; (void) x0; (void) x1; (void) x2;                            \
         (void) x3; (void) x4; (void) x5; (void) verbose;                      \
-        pthread_mutex_lock(&mmap_lock);                                       \
+        mmap_lock_acquire();                                                  \
         int64_t r = (body);                                                   \
-        pthread_mutex_unlock(&mmap_lock);                                     \
+        mmap_lock_release();                                                  \
         return r;                                                             \
     }
 
@@ -502,16 +502,16 @@ static void sc_sync_regions_inline(guest_t *g)
      * position) cannot make us skip an entry permanently.
      */
     for (int i = 0;; i++) {
-        pthread_mutex_lock(&mmap_lock);
+        mmap_lock_acquire();
         if (i >= g->nregions) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             break;
         }
         const guest_region_t *r = &g->regions[i];
         int duped = -1;
         if (r->shared && r->backing_fd >= 0)
             duped = dup(r->backing_fd);
-        pthread_mutex_unlock(&mmap_lock);
+        mmap_lock_release();
         if (duped < 0)
             continue;
         (void) fsync(duped);
@@ -542,7 +542,7 @@ static int64_t sc_sync_impl(guest_t *g)
     }
     pthread_mutex_unlock(&fd_lock);
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     for (int i = 0; i < g->nregions && n < (int) cap; i++) {
         const guest_region_t *r = &g->regions[i];
         if (!r->shared || r->backing_fd < 0)
@@ -552,7 +552,7 @@ static int64_t sc_sync_impl(guest_t *g)
             continue;
         hosts[n++] = duped;
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 
     /* fsync each dup outside both locks so a slow disk does not stall
      * concurrent FD or memory operations on other threads.
@@ -738,7 +738,7 @@ static int64_t sc_mincore(guest_t *g,
      * never early-returns on a hole.
      */
     uint8_t chunk[512];
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int ri = guest_region_first_end_above(g, addr);
     for (uint64_t done = 0; done < npages;) {
         uint64_t batch = npages - done;
@@ -754,12 +754,12 @@ static int64_t sc_mincore(guest_t *g,
                 has_hole = true;
         }
         if (guest_write(g, vec + done, chunk, batch) < 0) {
-            pthread_mutex_unlock(&mmap_lock);
+            mmap_lock_release();
             return -LINUX_EFAULT;
         }
         done += batch;
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 
     return has_hole ? -LINUX_ENOMEM : 0;
 }
@@ -985,9 +985,9 @@ static int64_t sc_mmap(guest_t *g,
                        uint64_t x5,
                        bool verbose)
 {
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int64_t r = sys_mmap(g, x0, x1, (int) x2, (int) x3, (int) x4, (int64_t) x5);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     log_debug("  mmap(0x%llx, 0x%llx) \xe2\x86\x92 0x%llx",
               (unsigned long long) x0, (unsigned long long) x1,
               (unsigned long long) (uint64_t) r);
@@ -1004,9 +1004,9 @@ static int64_t sc_mremap(guest_t *g,
                          bool verbose)
 {
     (void) x5;
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int64_t r = sys_mremap(g, x0, x1, x2, (int) x3, x4);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     log_debug("  mremap(0x%llx, 0x%llx, 0x%llx, 0x%x) \xe2\x86\x92 0x%llx",
               (unsigned long long) x0, (unsigned long long) x1,
               (unsigned long long) x2, (int) x3,
@@ -2191,9 +2191,9 @@ static int64_t sc_execve(guest_t *g,
     (void) x3;
     (void) x4;
     (void) x5;
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int64_t r = sys_execve(current_thread->vcpu, g, x0, x1, x2, verbose, NULL);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     return r;
 }
 
@@ -2274,7 +2274,7 @@ static int64_t sc_execveat(guest_t *g,
         need_resolve = true;
     }
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int64_t r;
     if (need_resolve) {
         /* Use the host-resolved path directly so execveat does not copy a host
@@ -2284,7 +2284,7 @@ static int64_t sc_execveat(guest_t *g,
     } else {
         r = sys_execve(vcpu, g, path_gva, x2, x3, verbose, NULL);
     }
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     return r;
 }
 

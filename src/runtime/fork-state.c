@@ -202,9 +202,9 @@ int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm)
 #define MAX_USED_REGIONS 16
     used_region_t used[MAX_USED_REGIONS];
     unsigned int shim_sz = proc_get_shim_size();
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 
     uint32_t num_regions = (uint32_t) nregions;
     if (fork_ipc_write_all(ipc_sock, &num_regions, sizeof(num_regions)) < 0)

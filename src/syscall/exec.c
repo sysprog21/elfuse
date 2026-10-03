@@ -849,7 +849,7 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
      * under its own mmap_lock rather than here. Re-taken on every return path
      * so the wrapper's unlock stays balanced.
      */
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 
     pthread_mutex_lock(&exec_handoff_lock);
 
@@ -858,7 +858,7 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
      */
     if (!exec_handoff_wait_for(HANDOFF_EMPTY)) {
         pthread_mutex_unlock(&exec_handoff_lock);
-        pthread_mutex_lock(&mmap_lock);
+        mmap_lock_acquire();
         return -LINUX_EINTR;
     }
 
@@ -877,7 +877,7 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
         exec_handoff_set_state(HANDOFF_EMPTY);
         pthread_cond_broadcast(&exec_handoff_cond);
         pthread_mutex_unlock(&exec_handoff_lock);
-        pthread_mutex_lock(&mmap_lock);
+        mmap_lock_acquire();
         return -LINUX_ENAMETOOLONG;
     }
     exec_handoff.blocked_mask =
@@ -906,7 +906,7 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
     }
     pthread_mutex_unlock(&exec_handoff_lock);
 
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     return result;
 }
 
@@ -971,10 +971,10 @@ int64_t exec_run_handoff(hv_vcpu_t vcpu, guest_t *g, bool verbose)
      * path its sc_execve wrapper takes. This path comes from the run loop, so
      * take it here instead.
      */
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
     int64_t rc =
         sys_execve(vcpu, g, path_gva, argv_gva, envp_gva, verbose, host_path);
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
 
     pthread_mutex_lock(&exec_handoff_lock);
     if (rc == SYSCALL_EXEC_HAPPENED) {
@@ -1783,19 +1783,19 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * executing the old image's code, winds down against the memory and fd
      * table its guest still expects. Both callers hold mmap_lock (order 1)
      * across the whole syscall, and the teardown must not run under it: a
-     * sibling blocked in pthread_mutex_lock(&mmap_lock) inside sc_brk, sc_mmap,
-     * sc_munmap, sc_mprotect, or its own deferred stack unmap is reachable by
-     * none of the teardown wakes, so it can never reach a stop check and the
-     * join below would always time out. Measured before this release: four
-     * siblings looping on mmap/munmap took the fatal path every time.
+     * sibling blocked acquiring mmap_lock inside sc_brk, sc_mmap, sc_munmap,
+     * sc_mprotect, or its own deferred stack unmap is reachable by none of the
+     * teardown wakes, so it can never reach a stop check and the join below
+     * would always time out. Measured before this release: four siblings
+     * looping on mmap/munmap took the fatal path every time.
      *
      * Dropping it here is safe because nothing in the teardown touches guest
      * memory or the region table, and re-acquiring cannot contend: by the time
      * it returns 0 no other guest thread is left to hold it.
      */
-    pthread_mutex_unlock(&mmap_lock);
+    mmap_lock_release();
     int survivors = thread_exec_de_thread();
-    pthread_mutex_lock(&mmap_lock);
+    mmap_lock_acquire();
 
     /* The refusal above is a snapshot: a sibling could have created a CLONE_VM
      * child in the window between it and here. de_thread neither reaps nor

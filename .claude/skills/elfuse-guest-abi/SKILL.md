@@ -238,6 +238,11 @@ guest-readable host cache:
   urandom write ranges (a racing EL0 munmap/mprotect) and returns EFAULT.
 - `/proc/self/maps` reports the span as PROT_NONE.
 
+Weakening one of the first three is a security regression, not only an ABI
+one; the fourth is reporting, and a change to it is judged by what it lets
+the guest do. `elfuse-security` carries the threat model and how to write
+either up.
+
 Publishing into the cache is bracketed rather than ordered by luck:
 `shim_globals_attn_or` raises the attention bit before the mutator's stores
 with `atomic_fetch_or_explicit(..., memory_order_seq_cst)`, so a

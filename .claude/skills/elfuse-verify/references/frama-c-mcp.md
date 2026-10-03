@@ -7,17 +7,9 @@ land: that is `make verify` plus `make verify-mutants`, from the Makefile.
 
 ## Using the server
 
-`make verify-<name>` is a batch run: it either discharges or it does not, and
-a failure tells you little about which obligation is stuck. If the `frama-c`
-MCP server is connected, it drives the same Frama-C interactively, which turns
-contract writing into a loop instead of a guess. Start with `self_check`,
-because the optional pieces degrade independently, then reload the target's
-sources plus `FRAMAC_STUB_DIR`, run WP one function at a time, and use
-`get_wp_goals` and `context` to find which obligation is unproved rather than
-rewriting a contract on suspicion. Retrying the unproved goals distinguishes
-"not proved" from "not proved yet", so check that before rewriting a contract
-that only needed a longer timeout. `create_sandbox` is the honest way to try a
-strengthening without touching the real source.
+The loop itself is in the `elfuse-verify` body. One step it leaves out:
+retrying the unproved goals distinguishes "not proved" from "not proved yet",
+so check that before rewriting a contract that only needed a longer timeout.
 
 Three of the server's behaviors are worth knowing before you read a result
 from it:
@@ -110,7 +102,7 @@ from `make print-verify-profiles` carries both, and `nostdinc` must be stated
 for a profile to be proof evidence at all. When you load by hand instead, pass
 `nostdinc` and `isystem_paths` yourself, or you are measuring another program.
 
-Two rules about what any of that proves:
+What any of that proves, and what it does not:
 
 - The MCP's default WP model is not what every target uses. A goal that
   discharges under defaults says nothing about whether `make verify-<name>`
@@ -145,11 +137,6 @@ Two rules about what any of that proves:
   source tree. A behavior described here that the running server does not show
   means the installed binary predates it, not that the description is wrong;
   `self_check` reports the server version.
-- The MCP is an accelerator, never the gate. A change lands on `make verify`
-  plus `make verify-mutants`, run from the Makefile, because that is what CI
-  runs and what a contributor without the server can reproduce. Never report a
-  proof as done on MCP evidence alone, and never add a workflow step, script,
-  or CI job that depends on the server being connected.
 
 It also answers the coverage question rather than just the green/red one,
 which is how you find a target that passes because it is proving less than you

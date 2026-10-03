@@ -1885,10 +1885,10 @@ exec_drop_frame:
      * with the marker, which it does when the region never had the permission
      * and the fault is a real SIGSEGV. Nothing publishes on that route, so the
      * reload hands EL0 the X8 the exception was taken with, which is the
-     * guest's own and is what the handler then enters with. Before this reload
-     * existed those two entered their handler with the marker. handle_brk has
-     * the same problem and does not branch here, since it has its own flush to
-     * skip and no X8 dispatch to run; it carries its own copy of the reload.
+     * guest's own and is what the handler then enters with; without it the
+     * handler would enter with the marker. handle_brk has the same problem and
+     * does not branch here, since it has its own flush to skip and no X8
+     * dispatch to run; it carries its own copy of the reload.
      *
      * The ordinary syscall-return tail above is not covered, and this reload
      * does not reach it. A signal delivered in the epilogue of a page-table
@@ -1897,17 +1897,8 @@ exec_drop_frame:
      * delivery builds records the wire values as the guest's and its own
      * rt_sigreturn hands them back. The saved PC being past the SVC does not
      * make that free: the instruction after an SVC can be another SVC, and the
-     * guest then issues the wire value as a syscall number. Measured with two
-     * adjacent SVCs under a 200us itimer over 60000 rounds, the first of them
-     * mprotect: all 707 deliveries left the second running as syscall 0 or 3
-     * rather than the 226 the guest held. It is pre-existing and not the
-     * register this tail moves. The same probe on afdcfce, interleaved so both
-     * binaries met the same machine, read 703 of its 704 as syscall 2, the
-     * marker rather than the wire value. syscall/proc.h names the same
-     * shadowing on the frame a handler returns through.
-     *
-     * It survives the change that closes #379, so it is tracked as its own
-     * issue rather than living only here: #384.
+     * guest then issues the wire value as a syscall number. syscall/proc.h
+     * names the same shadowing on the frame a handler returns through.
      */
     ldr x8, [sp, #64]
     tlbi vmalle1is

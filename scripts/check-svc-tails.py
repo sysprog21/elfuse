@@ -30,9 +30,8 @@ so whatever is in a register when it runs reaches EL0. X8 is where the marker
 that selected the tail arrived, so the host publishes the guest's X8 in the
 frame's own X8 slot and exec_drop_frame reloads it from there before the pop.
 Deleting that one load is invisible in review and turns an SVC the guest has
-not executed yet into syscall 2 (sysprog21/elfuse#379), so the offset is
-checked here against the C side that writes it rather than left to match by
-eye.
+not executed yet into syscall 2, so the offset is checked here against the C
+side that writes it rather than left to match by eye.
 
 handle_brk is held to the same rule and checked the same way. It is not an
 HVC #5 tail, but it ends the same: the host delivers a signal out of HVC #10

@@ -371,10 +371,10 @@ const char *proc_resolve_sysroot_create_path(const char *path,
  * saved frame. A rewound PC makes rt_sigreturn re-execute that SVC as the call
  * the wire value names. Leaving the PC past the SVC narrows that rather than
  * closing it, because the instruction after an SVC can be another SVC; that
- * residue is pre-existing, measured beside exec_drop_frame in core/shim.S, and
- * out of reach of this cancel. The drop-frame marker is the other value that
- * displaces the guest's X8, and signal.c keeps that one out of both the frame
- * and the ERET on its own.
+ * residue is described beside exec_drop_frame in core/shim.S, and out of reach
+ * of this cancel. The drop-frame marker is the other value that displaces the
+ * guest's X8, and signal.c keeps that one out of both the frame and the ERET on
+ * its own.
  *
  * Cancel is a no-op unless ELR_EL1 still holds the value the arm wrote, so a
  * later delivery on an unrelated path cannot disturb a guest that has moved on.

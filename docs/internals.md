@@ -331,10 +331,10 @@ W^X tails branch to `exec_drop_frame` on the marker; `handle_brk`
 (`HVC #10`) drops its frame on every return.
 
 Linux preserves `X1`-`X30` across `SVC #0`, so the marker must not reach
-EL0: a resumed `SVC` that has not executed yet would run as syscall 2
-(sysprog21/elfuse#379). Those tails therefore reload `X8` from the
-frame's `X8` slot before the pop. The slot holds the `X8` the exception
-was taken with unless the host published another there:
+EL0: a resumed `SVC` that has not executed yet would run as syscall 2.
+Those tails therefore reload `X8` from the frame's `X8` slot before the
+pop. The slot holds the `X8` the exception was taken with unless the
+host published another there:
 `signal_rt_sigreturn` publishes the one it restored, and the `BRK`
 ptrace stop the one its tracer left. `signal_rt_sigreturn` also parks
 that value for a signal delivered later in the same epilogue, which
@@ -342,7 +342,7 @@ would otherwise snapshot the marker as the guest's `X8`; the run loop
 drops the record before every `hv_vcpu_run()`, and an inline ptrace
 stop that moves the PC re-keys it. The TLBI kinds on the ordinary
 syscall-return tail are not covered: a signal delivered there still
-records the wire values as `X8`-`X11` (sysprog21/elfuse#384).
+records the wire values as `X8`-`X11`.
 
 Important: `signal_rt_sigreturn` returns `SYSCALL_EXEC_HAPPENED` to
 bypass the normal syscall dispatch epilogue, as `sys_execve` does.

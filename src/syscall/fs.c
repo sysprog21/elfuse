@@ -2374,6 +2374,8 @@ static void dir_backing_drain(dir_stream_t *ds, const char *guest_path, int fd)
     ds->backing_count = count;
 }
 
+#define GETDENTS_PREFAULT_MAX (64 * 1024)
+
 /* getdents64: read directory entries from a guest directory fd. Uses the
  * persistent DIR* stored in fd_table (created by openat).
  */
@@ -2401,6 +2403,10 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (!ds)
         return -LINUX_ENOTDIR;
 
+    uint64_t prefault_len =
+        count < GETDENTS_PREFAULT_MAX ? count : GETDENTS_PREFAULT_MAX;
+    (void) guest_lazy_faultin(g, buf_gva, prefault_len, MEM_PERM_W);
+
     /* Serialize the walk against a concurrent getdents64 pinning the same
      * stream -- see the lock field in dir_stream_t.
      */
@@ -2408,7 +2414,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 
     int64_t ret;
 
-    if (!guest_ptr(g, buf_gva)) {
+    if (!guest_ptr_avail_nofault(g, buf_gva, NULL, MEM_PERM_R)) {
         ret = -LINUX_EFAULT;
         goto out;
     }
@@ -2625,14 +2631,15 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         lde.d_type = entry_type;
 
         /* Serialize entry into temp buffer, then copy to guest via
-         * guest_write() which handles 2MiB block boundary crossings.
+         * guest_write_nofault() which handles 2MiB block boundary crossings.
          */
         memcpy(entry_buf, &lde, sizeof(lde));
         memcpy(entry_buf + DIRENT64_HDR_BYTES, guest_name, name_len + 1);
         if (pad_start < reclen)
             memset(entry_buf + pad_start, 0, reclen - pad_start);
 
-        if (guest_write(g, buf_gva + guest_pos, entry_buf, reclen) < 0) {
+        if (guest_write_nofault(g, buf_gva + guest_pos, entry_buf, reclen) <
+            0) {
             /* readdir has already handed this entry over, so leaving now
              * without putting it back resumes the next call past it: the guest
              * gets a listing one name short that still ends at 0, which is the

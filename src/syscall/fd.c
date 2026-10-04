@@ -239,7 +239,10 @@ int64_t sys_timerfd_settime(guest_t *g,
                             uint64_t old_value_gva)
 {
     int64_t ret = 0;
+    uint64_t miss_gva = 0;
+    int miss_perms = 0;
 
+retry:
     pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(fd);
     if (slot < 0) {
@@ -248,7 +251,12 @@ int64_t sys_timerfd_settime(guest_t *g,
     }
 
     linux_itimerspec_t its;
-    if (guest_read_small(g, new_value_gva, &its, sizeof(its)) < 0) {
+    int rc = guest_read_nofault(g, new_value_gva, &its, sizeof(its));
+    if (rc < 0) {
+        if (rc == -1) {
+            miss_gva = new_value_gva;
+            miss_perms = MEM_PERM_R;
+        }
         ret = -LINUX_EFAULT;
         goto unlock;
     }
@@ -282,7 +290,12 @@ int64_t sys_timerfd_settime(guest_t *g,
                 old.it_value_nsec = remaining % NS_PER_SEC;
             }
         }
-        if (guest_write_small(g, old_value_gva, &old, sizeof(old)) < 0) {
+        rc = guest_write_nofault(g, old_value_gva, &old, sizeof(old));
+        if (rc < 0) {
+            if (rc == -1) {
+                miss_gva = old_value_gva;
+                miss_perms = MEM_PERM_W;
+            }
             ret = -LINUX_EFAULT;
             goto unlock;
         }
@@ -363,6 +376,13 @@ int64_t sys_timerfd_settime(guest_t *g,
 
 unlock:
     pthread_mutex_unlock(&sfd_lock);
+    if (miss_perms &&
+        guest_lazy_faultin(g, miss_gva, sizeof(linux_itimerspec_t),
+                           miss_perms) == 0) {
+        miss_perms = 0;
+        ret = 0;
+        goto retry;
+    }
     return ret;
 }
 

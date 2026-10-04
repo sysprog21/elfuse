@@ -1150,6 +1150,27 @@ size_t guest_write_partial(guest_t *g,
  */
 int guest_write_small(guest_t *g, uint64_t gva, const void *src, size_t len);
 
+int guest_lazy_faultin(const guest_t *g,
+                       uint64_t gva,
+                       uint64_t len,
+                       int required_perms);
+
+int guest_lazy_faultin_locked(const guest_t *g,
+                              uint64_t gva,
+                              uint64_t len,
+                              int required_perms);
+
+void *guest_ptr_avail_nofault(const guest_t *g,
+                              uint64_t gva,
+                              uint64_t *avail,
+                              int required_perms);
+int guest_read_nofault(const guest_t *g, uint64_t gva, void *dst, size_t len);
+int guest_write_nofault(guest_t *g, uint64_t gva, const void *src, size_t len);
+size_t guest_write_partial_nofault(guest_t *g,
+                                   uint64_t gva,
+                                   const void *src,
+                                   size_t len);
+
 /* Read a null-terminated string from guest memory. Copies up to max-1 bytes +
  * NUL into dst.
  *

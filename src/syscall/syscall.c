@@ -730,12 +730,13 @@ static int64_t sc_mincore(guest_t *g,
      * + regions) instead of a binary search per page.
      *
      * mmap_lock (order 1) is held across the whole sweep so a sibling vCPU's
-     * munmap cannot memmove regions[] out from under the cursor. guest_write
-     * takes no locks, so nesting the vec flush inside the lock introduces no
-     * inversion. Flush in bounded chunks so a huge length never triggers a
-     * large host allocation. EFAULT (bad vec) takes precedence over ENOMEM
-     * (hole), matching the kernel's upfront access_ok() check, so the sweep
-     * never early-returns on a hole.
+     * munmap cannot memmove regions[] out from under the cursor. mmap_lock is
+     * not recursive, so a lazy vec page is faulted in through the locked entry
+     * point, which leaves regions[] alone, and the copy itself takes no locks.
+     * Flush in bounded chunks so a huge length never triggers a large host
+     * allocation. EFAULT (bad vec) takes precedence over ENOMEM (hole),
+     * matching the kernel's upfront access_ok() check, so the sweep never
+     * early-returns on a hole.
      */
     uint8_t chunk[512];
     mmap_lock_acquire();
@@ -753,7 +754,8 @@ static int64_t sc_mincore(guest_t *g,
             if (!mapped)
                 has_hole = true;
         }
-        if (guest_write(g, vec + done, chunk, batch) < 0) {
+        if (guest_lazy_faultin_locked(g, vec + done, batch, MEM_PERM_W) < 0 ||
+            guest_write_nofault(g, vec + done, chunk, batch) < 0) {
             mmap_lock_release();
             return -LINUX_EFAULT;
         }

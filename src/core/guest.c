@@ -30,6 +30,7 @@
  *                           permissions within a 2MiB block (W^X)
  */
 
+#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,7 @@
 #include "runtime/futex.h"  /* futex_interrupt_request */
 #include "runtime/thread.h" /* thread_destroy_all_vcpus */
 #include "syscall/proc.h"   /* proc_request_exit_group */
+#include "syscall/internal.h"
 #include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
 
@@ -1746,10 +1748,10 @@ static inline int guest_copy(const guest_t *g,
             chunk = avail;
         if (required_perms == MEM_PERM_R) {
             if (guest_host_memcpy((uint8_t *) dst + copied, ptr, chunk) < 0)
-                return -1;
+                return -2;
         } else if (guest_host_memcpy(ptr, (const uint8_t *) src + copied,
                                      chunk) < 0) {
-            return -1;
+            return -2;
         }
         copied += chunk;
     }
@@ -1758,7 +1760,7 @@ static inline int guest_copy(const guest_t *g,
 
 int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len)
 {
-    return guest_copy(g, gva, dst, NULL, len, MEM_PERM_R);
+    return guest_copy(g, gva, dst, NULL, len, MEM_PERM_R) < 0 ? -1 : 0;
 }
 
 int guest_read_small(const guest_t *g, uint64_t gva, void *dst, size_t len)
@@ -1774,7 +1776,7 @@ int guest_read_small(const guest_t *g, uint64_t gva, void *dst, size_t len)
 
 int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len)
 {
-    return guest_copy(g, gva, NULL, src, len, MEM_PERM_W);
+    return guest_copy(g, gva, NULL, src, len, MEM_PERM_W) < 0 ? -1 : 0;
 }
 
 size_t guest_write_partial(guest_t *g,
@@ -1811,6 +1813,81 @@ int guest_write_small(guest_t *g, uint64_t gva, const void *src, size_t len)
     }
 
     return guest_write(g, gva, src, len);
+}
+
+void *guest_ptr_avail_nofault(const guest_t *g,
+                              uint64_t gva,
+                              uint64_t *avail,
+                              int required_perms)
+{
+    return gva_resolve_perm(g, gva, avail, required_perms, UINT64_MAX);
+}
+
+int guest_read_nofault(const guest_t *g, uint64_t gva, void *dst, size_t len)
+{
+    return guest_copy(g, gva, dst, NULL, len, MEM_PERM_R);
+}
+
+int guest_write_nofault(guest_t *g, uint64_t gva, const void *src, size_t len)
+{
+    return guest_copy(g, gva, NULL, src, len, MEM_PERM_W);
+}
+
+size_t guest_write_partial_nofault(guest_t *g,
+                                   uint64_t gva,
+                                   const void *src,
+                                   size_t len)
+{
+    return guest_write_partial(g, gva, src, len);
+}
+
+int guest_lazy_faultin_locked(const guest_t *cg,
+                              uint64_t gva,
+                              uint64_t len,
+                              int required_perms)
+{
+    assert(mmap_lock_held());
+    if (len == 0)
+        return 0;
+    if (!gva_span_ok(gva, len))
+        return -1;
+
+    /* Materializing edits the page tables; the const on the access API covers
+     * only the walk.
+     */
+    guest_t *g = (guest_t *) (uintptr_t) cg;
+    uint64_t end = gva + len;
+    while (gva < end) {
+        uint64_t avail = 0;
+        if (!gva_resolve_perm(g, gva, &avail, required_perms, end - gva)) {
+            if (gva < g->ipa_base ||
+                guest_materialize_lazy(g, gva - g->ipa_base) < 0 ||
+                !gva_resolve_perm(g, gva, &avail, required_perms, end - gva))
+                return -1;
+        }
+        if (avail == 0)
+            return -1;
+        gva += avail;
+    }
+    return 0;
+}
+
+int guest_lazy_faultin(const guest_t *g,
+                       uint64_t gva,
+                       uint64_t len,
+                       int required_perms)
+{
+    /* The resolved case is the common one and needs no lock. */
+    uint64_t avail = 0;
+    if (len == 0 ||
+        (gva_span_ok(gva, len) &&
+         gva_resolve_perm(g, gva, &avail, required_perms, len) && avail >= len))
+        return 0;
+
+    mmap_lock_acquire();
+    int rc = guest_lazy_faultin_locked(g, gva, len, required_perms);
+    mmap_lock_release();
+    return rc;
 }
 
 int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max)

@@ -413,6 +413,41 @@ static bool futex_word_load(const uint32_t *word, uint32_t *out)
     return !faulted;
 }
 
+/* Bucket locks nest below mmap_lock, so the futex word is reached under them
+ * only through the nofault walk.
+ */
+static uint32_t *futex_word_nofault(const guest_t *g,
+                                    uint64_t uaddr,
+                                    int required_perms)
+{
+    return guest_ptr_avail_nofault(g, uaddr, NULL, required_perms);
+}
+
+#define FUTEX_WORD_UNMAPPED 1
+
+static int64_t futex_word_faultin(const guest_t *g,
+                                  uint64_t uaddr,
+                                  int64_t block,
+                                  int required_perms)
+{
+    if (block != FUTEX_WORD_UNMAPPED)
+        return block;
+    if (guest_lazy_faultin(g, uaddr, sizeof(uint32_t), required_perms) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
+static uint32_t *futex_word_prefault(const guest_t *g,
+                                     uint64_t uaddr,
+                                     int required_perms)
+{
+    uint32_t *word = futex_word_nofault(g, uaddr, required_perms);
+    if (!word &&
+        guest_lazy_faultin(g, uaddr, sizeof(uint32_t), required_perms) == 0)
+        word = futex_word_nofault(g, uaddr, required_perms);
+    return word;
+}
+
 /* The compare every waiting futex operation makes before it commits to
  * blocking. The guest reads the word, decides it should sleep, and calls futex
  * with the value it saw; between those two the value may have moved and a wake
@@ -421,9 +456,9 @@ static bool futex_word_load(const uint32_t *word, uint32_t *out)
  * into a wait nothing will ever satisfy.
  *
  * Returns 0 when the caller should block, -LINUX_EAGAIN when the word moved,
- * -LINUX_EFAULT when uaddr does not resolve or the load faults. word_out, when
- * non-NULL, receives the resolved host pointer; only futex_os_sync_wait needs
- * it, to hand to the kernel address-wait.
+ * FUTEX_WORD_UNMAPPED when uaddr does not resolve, -LINUX_EFAULT when the load
+ * faults. word_out, when non-NULL, receives the resolved host pointer; only
+ * futex_os_sync_wait needs it, to hand to the kernel address-wait.
  *
  * Four callers share this: futex_os_sync_wait, futex_wait, futex_requeue's
  * CMP_REQUEUE, and futex_waitv. What differs between them is which bucket locks
@@ -433,16 +468,18 @@ static bool futex_word_load(const uint32_t *word, uint32_t *out)
  * futex_wait_fast in core/shim.S is a fifth implementation, in EL1 assembly,
  * answering the -LINUX_EAGAIN case without the HVC round trip. It bails to the
  * host for every input this function would answer differently, so a change to
- * the outcomes or their order here needs the same change there.
+ * the outcomes or their order here needs the same change there. One input does
+ * not bail yet: a word on a lazy page faults its load, and it answers that with
+ * EFAULT where the callers here fault the page in.
  */
 static int64_t futex_should_block(const guest_t *g,
                                   uint64_t uaddr,
                                   uint32_t expected,
                                   uint32_t **word_out)
 {
-    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
+    uint32_t *word = futex_word_nofault(g, uaddr, MEM_PERM_R);
     if (!word)
-        return -LINUX_EFAULT;
+        return FUTEX_WORD_UNMAPPED;
     if (word_out)
         *word_out = word;
 
@@ -880,9 +917,15 @@ static int64_t futex_os_sync_wait(guest_t *g,
     }
 
     uint32_t *host_addr;
-    int64_t block = futex_should_block(g, uaddr, expected, &host_addr);
-    if (block != 0)
+    int64_t block;
+retry:
+    block = futex_should_block(g, uaddr, expected, &host_addr);
+    if (block != 0) {
+        block = futex_word_faultin(g, uaddr, block, MEM_PERM_R);
+        if (block == 0)
+            goto retry;
         return block;
+    }
 
     /* Bound consecutive EFAULT retries. Apple documents EFAULT as transient
      * (kernel copyin failure under memory pressure), so a few retries are fine;
@@ -1124,6 +1167,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
             return -LINUX_EAGAIN;
     }
 
+retry:
     pthread_mutex_lock(&b->lock);
 
     /* Read the futex word while holding the bucket lock, so the enqueue below
@@ -1133,6 +1177,9 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
     int64_t block = futex_should_block(g, uaddr, expected, NULL);
     if (block != 0) {
         pthread_mutex_unlock(&b->lock);
+        block = futex_word_faultin(g, uaddr, block, MEM_PERM_R);
+        if (block == 0)
+            goto retry;
         return block;
     }
 
@@ -1478,6 +1525,7 @@ static int64_t futex_requeue(guest_t *g,
     futex_bucket_t *b_dst = &buckets[idx_dst];
 
     /* Lock both buckets in consistent order (lower index first) */
+retry:
     if (idx_src == idx_dst) {
         pthread_mutex_lock(&b_src->lock);
     } else if (idx_src < idx_dst) {
@@ -1495,6 +1543,9 @@ static int64_t futex_requeue(guest_t *g,
             if (idx_src != idx_dst)
                 pthread_mutex_unlock(&b_dst->lock);
             pthread_mutex_unlock(&b_src->lock);
+            block = futex_word_faultin(g, uaddr, block, MEM_PERM_R);
+            if (block == 0)
+                goto retry;
             return block;
         }
     }
@@ -1663,6 +1714,7 @@ static int64_t futex_wake_op(guest_t *g,
     futex_bucket_t *b2 = &buckets[idx2];
 
     /* Lock ordering */
+retry:
     if (idx1 == idx2) {
         pthread_mutex_lock(&b1->lock);
     } else if (idx1 < idx2) {
@@ -1674,11 +1726,13 @@ static int64_t futex_wake_op(guest_t *g,
     }
 
     /* Atomically modify *uaddr2 */
-    uint32_t *word2 = (uint32_t *) guest_ptr_w(g, uaddr2);
+    uint32_t *word2 = futex_word_nofault(g, uaddr2, MEM_PERM_W);
     if (!word2) {
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
+        if (guest_lazy_faultin(g, uaddr2, sizeof(uint32_t), MEM_PERM_W) == 0)
+            goto retry;
         return -LINUX_EFAULT;
     }
 
@@ -1813,7 +1867,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
-    uint32_t *word = (uint32_t *) guest_ptr_w(g, uaddr);
+    uint32_t *word = futex_word_prefault(g, uaddr, MEM_PERM_W);
     if (!word)
         return -LINUX_EFAULT;
 
@@ -2451,6 +2505,8 @@ int64_t sys_futex_waitv(guest_t *g,
     }
 
     waitv_shared_t shared;
+    uint64_t miss_uaddr = 0;
+retry:
     pthread_mutex_init(&shared.lock, NULL);
     pthread_cond_init(&shared.cond, NULL);
 
@@ -2484,17 +2540,25 @@ int64_t sys_futex_waitv(guest_t *g,
     for (int i = 0; i < nbuckets; i++)
         pthread_mutex_lock(&buckets[bucket_ids[i]].lock);
 
+    /* Every word is checked before any waiter is enqueued. unlock_early drops
+     * the bucket locks before it unlinks, so a waiter enqueued ahead of a
+     * failed check could be taken by a wake in between, and the retry below
+     * would then park past a wake already counted as delivered.
+     */
     for (uint32_t i = 0; i < nr_futexes; i++) {
-        uint64_t uaddr = elts[i].uaddr;
-        uint32_t expected = (uint32_t) elts[i].val;
-        unsigned idx = entry_bucket[i];
-        futex_bucket_t *b = &buckets[idx];
-
-        int64_t block = futex_should_block(g, uaddr, expected, NULL);
+        int64_t block =
+            futex_should_block(g, elts[i].uaddr, (uint32_t) elts[i].val, NULL);
         if (block != 0) {
             result_err = block;
+            miss_uaddr = elts[i].uaddr;
             goto unlock_early;
         }
+    }
+
+    for (uint32_t i = 0; i < nr_futexes; i++) {
+        uint64_t uaddr = elts[i].uaddr;
+        unsigned idx = entry_bucket[i];
+        futex_bucket_t *b = &buckets[idx];
 
         futex_waiter_t *w = &waiters[i];
         w->uaddr = uaddr;
@@ -2608,6 +2672,12 @@ unlock_early:
             g, (int) i < enqueued ? waiters[i].pub_bucket : entry_bucket[i],
             -1);
 
+    /* Everything above is undone, so a word the walk missed can be faulted in
+     * and the whole set checked again.
+     */
+    result_err = futex_word_faultin(g, miss_uaddr, result_err, MEM_PERM_R);
+    if (result_err == 0)
+        goto retry;
     return result_err;
 }
 

@@ -905,6 +905,9 @@ run_unit_tests()
     printf "\nmadvise MADV_DONTNEED\n"
     test_rc "$runner" "test-madvise" 0 "$bindir/test-madvise"
 
+    printf "\nSyscalls on untouched MAP_NORESERVE memory\n"
+    test_rc "$runner" "test-lazy-host-access" 0 "$bindir/test-lazy-host-access"
+
     printf "\nScatter-gather I/O\n"
     test_check "$runner" "test-readv-writev" "PASS" "$bindir/test-readv-writev"
 

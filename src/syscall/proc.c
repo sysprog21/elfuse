@@ -2831,6 +2831,7 @@ int64_t sys_waitid(guest_t *g,
      * WNOHANG in the inner loop and retry with timedwait if the caller
      * requested blocking.
      */
+retry:
     pthread_mutex_lock(&pid_lock);
     for (;;) {
         bool found_any = false;
@@ -2941,8 +2942,13 @@ int64_t sys_waitid(guest_t *g,
                 memcpy(si + SIGINFO_OFF_UID, &uid, 4);
                 memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
 
-                if (guest_write_small(g, infop_gva, si, SIGINFO_SIZE) < 0) {
+                int rc = guest_write_nofault(g, infop_gva, si, SIGINFO_SIZE);
+                if (rc < 0) {
                     pthread_mutex_unlock(&pid_lock);
+                    if (rc == -1 &&
+                        guest_lazy_faultin(g, infop_gva, SIGINFO_SIZE,
+                                           MEM_PERM_W) == 0)
+                        goto retry;
                     return -LINUX_EFAULT;
                 }
             }

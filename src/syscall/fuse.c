@@ -2490,6 +2490,7 @@ int64_t fuse_dev_read(int guest_fd,
         return -LINUX_EBADF;
     }
 
+retry:
     pthread_mutex_lock(&session->lock);
     while (!session->closed && !session->queue_head) {
         if (dev_st.guest_nonblock) {
@@ -2544,8 +2545,12 @@ int64_t fuse_dev_read(int guest_fd,
         host_fd_ref_close(&notify_ref);
         return -LINUX_EINVAL;
     }
-    if (guest_write(g, buf_gva, req->frame, frame_len) < 0) {
+    int rc = guest_write_nofault(g, buf_gva, req->frame, frame_len);
+    if (rc < 0) {
         pthread_mutex_unlock(&session->lock);
+        if (rc == -1 &&
+            guest_lazy_faultin(g, buf_gva, frame_len, MEM_PERM_W) == 0)
+            goto retry;
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);

@@ -788,6 +788,13 @@ fd_lifetime_t *fd_mark_closed_unlocked(int fd);
  */
 void fd_retire_published(int fd, int host_fd);
 
+/* fd_retire_published for a caller that kept the generation its allocation
+ * returned: the slot is retired only while it still carries @gen, so a slot a
+ * sibling closed and reallocated is left alone even when the replacement holds
+ * the same host fd number.
+ */
+void fd_retire_published_gen(int fd, int host_fd, uint64_t gen);
+
 /* Atomically snapshot an fd entry and mark it closed.
  *
  * Returns true if the slot was open (snapshot written to *out), false if

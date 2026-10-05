@@ -1150,11 +1150,12 @@ fd_lifetime_t *fd_lifetime_pin_locked(int fd)
  * host_fd narrows which slot this retires but does not identify it: if the
  * sibling's replacement happens to reuse the same number, the check passes and
  * this retires the replacement. Distinguishing that needs the allocation
- * generation, which the plain fd_alloc does not hand back. The residue is a
- * guest operating on an fd number it was never given, which linux-wire.h
- * already calls a guest-level bug.
+ * generation, which the plain fd_alloc does not hand back; a caller that holds
+ * it passes it as @gen, and 0 leaves the generation unchecked. The residue for
+ * the unchecked form is a guest operating on an fd number it was never given,
+ * which linux-wire.h already calls a guest-level bug.
  */
-void fd_retire_published(int fd, int host_fd)
+static void fd_retire_slot(int fd, int host_fd, uint64_t gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
         if (host_fd >= 0)
@@ -1166,8 +1167,9 @@ void fd_retire_published(int fd, int host_fd)
      * directory types); retiring one still has to clear the slot.
      */
     pthread_mutex_lock(&fd_lock);
-    bool still_ours =
-        fd_table[fd].type != FD_CLOSED && fd_table[fd].host_fd == host_fd;
+    bool still_ours = fd_table[fd].type != FD_CLOSED &&
+                      fd_table[fd].host_fd == host_fd &&
+                      (gen == 0 || fd_table[fd].generation == gen);
     fd_lifetime_t *lifetime = still_ours ? fd_mark_closed_unlocked(fd) : NULL;
     pthread_mutex_unlock(&fd_lock);
 
@@ -1175,6 +1177,16 @@ void fd_retire_published(int fd, int host_fd)
         fd_lifetime_release(lifetime);
     else if (still_ours && host_fd >= 0)
         close(host_fd);
+}
+
+void fd_retire_published(int fd, int host_fd)
+{
+    fd_retire_slot(fd, host_fd, 0);
+}
+
+void fd_retire_published_gen(int fd, int host_fd, uint64_t gen)
+{
+    fd_retire_slot(fd, host_fd, gen);
 }
 
 /* Snapshot an fd entry under fd_lock.

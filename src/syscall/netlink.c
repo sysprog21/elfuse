@@ -133,20 +133,15 @@ typedef struct {
 typedef struct {
     bool in_use;
     int guest_fd; /* Guest fd number */
-    /* Allocation order, unique and increasing. A guest fd number outlives the
-     * socket that had it: fd_cleanup_entry() runs netlink_close() after the
-     * number is already back in the fd table's free pool, so a socket() on
-     * another thread can be handed the same number while the previous slot is
-     * still in_use. Two slots can therefore carry one guest_fd, and the
-     * generation is what tells them apart -- nl_find() answers with the newest
-     * (the only one the guest can still reach) and netlink_close() retires the
-     * oldest.
-     *
-     * That pairing is exact rather than approximate. A number is only reissued
-     * after the previous holder's close was issued, so the pending closes for a
-     * number are always the oldest slots holding it, whatever order the threads
-     * running them arrive in; retiring oldest-first therefore never takes down
-     * the live socket, and every slot is retired exactly once.
+    /* The fd generation fd_alloc stamped on guest_fd, unique and increasing. A
+     * guest fd number outlives the socket that had it: fd_cleanup_entry() runs
+     * netlink_close() after the number is already back in the fd table's free
+     * pool, so a socket() on another thread can be handed the same number while
+     * the previous slot is still in_use. Two slots can therefore carry one
+     * guest_fd, and the generation tells them apart: nl_find() answers with the
+     * newest (the only one the guest can still reach) and netlink_close()
+     * retires the slot stamped with the generation of the fd being closed. A
+     * dup carries netlink_close and no slot, so its close retires nothing.
      */
     uint64_t gen;
     uint8_t buf[NETLINK_BUF_SIZE]; /* Response buffer */
@@ -295,7 +290,6 @@ static inline uint32_t nl_group_mask(void)
 
 static netlink_state_t nl_state[MAX_NETLINK_FDS];
 static pthread_mutex_t nl_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t nl_gen_next = 1;
 
 #define NL_FOR_EACH(s) \
     for (netlink_state_t *s = nl_state; s < nl_state + MAX_NETLINK_FDS; s++)
@@ -319,15 +313,15 @@ static netlink_state_t *nl_find(int guest_fd)
     return best;
 }
 
-/* The counterpart for teardown: the oldest slot holding the number. */
-static netlink_state_t *nl_find_oldest(int guest_fd)
+/* The counterpart for teardown: the slot stamped with a closing fd's
+ * generation, or NULL.
+ */
+static netlink_state_t *nl_find_gen(uint64_t gen)
 {
-    netlink_state_t *best = NULL;
     NL_FOR_EACH (s)
-        if (s->in_use && s->guest_fd == guest_fd &&
-            (!best || s->gen < best->gen))
-            best = s;
-    return best;
+        if (s->in_use && s->gen == gen)
+            return s;
+    return NULL;
 }
 
 /* Claim a slot and publish it fully initialized. proto and sock_type are set
@@ -337,6 +331,7 @@ static netlink_state_t *nl_find_oldest(int guest_fd)
  * concurrent send can read as NETLINK_ROUTE on a uevent fd.
  */
 static netlink_state_t *nl_alloc(int guest_fd,
+                                 uint64_t gen,
                                  int protocol,
                                  int sock_type,
                                  int pipe_rd,
@@ -352,7 +347,7 @@ static netlink_state_t *nl_alloc(int guest_fd,
         s->proto = protocol;
         s->sock_type = sock_type;
         s->pid = (uint32_t) getpid();
-        s->gen = nl_gen_next++;
+        s->gen = gen;
 
         /* Last, and after every field the finder reads: in_use is what makes
          * this slot visible to nl_find.
@@ -684,7 +679,8 @@ int64_t netlink_socket(int protocol, int type)
         return -LINUX_EMFILE;
     }
 
-    int gfd = fd_alloc(FD_NETLINK, pipefd[0], netlink_close);
+    uint64_t gen = 0;
+    int gfd = fd_alloc_from(0, FD_NETLINK, pipefd[0], netlink_close, &gen);
     if (gfd < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
@@ -700,12 +696,21 @@ int64_t netlink_socket(int protocol, int type)
      */
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns =
-        nl_alloc(gfd, protocol, base_type, pipefd[0], pipefd[1]);
+        nl_alloc(gfd, gen, protocol, base_type, pipefd[0], pipefd[1]);
     pthread_mutex_unlock(&nl_lock);
     if (!ns) {
-        fd_retire_published(gfd, pipefd[0]);
+        fd_retire_published_gen(gfd, pipefd[0], gen);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
+    }
+
+    /* A close that arrived before the slot was registered found nothing to tear
+     * down. The number no longer carries this generation then, and the slot is
+     * retired here.
+     */
+    if (fd_current_generation(gfd) != gen) {
+        netlink_close(gfd, gen);
+        return gfd;
     }
 
     /* Linux opens a netlink socket O_RDWR; carry SOCK_NONBLOCK into linux_flags
@@ -2031,9 +2036,9 @@ int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
 static void netlink_close(int guest_fd, uint64_t generation)
 {
-    (void) generation;
+    (void) guest_fd;
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find_oldest(guest_fd);
+    netlink_state_t *ns = nl_find_gen(generation);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return;

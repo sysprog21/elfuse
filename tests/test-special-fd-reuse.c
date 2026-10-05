@@ -1,6 +1,6 @@
 /*
- * Test that closing a timerfd, signalfd or inotify fd leaves a newer fd of the
- * same kind on the same fd number alone
+ * Test that closing a timerfd, signalfd, inotify or netlink fd leaves a newer
+ * fd of the same kind on the same fd number alone
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -14,12 +14,16 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 
 #include <sys/inotify.h>
 #include <sys/signalfd.h>
+#include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <linux/netlink.h>
 
 #include "test-harness.h"
 
@@ -76,6 +80,37 @@ static int inotify_probe(int fd)
     return wd < 0 ? -1 : inotify_rm_watch(fd, wd);
 }
 
+/* Every netlink socket answers getsockname with AF_NETLINK, so the family alone
+ * would pass on the state of another socket that held this fd number. Each
+ * socket is bound to a port id of its own, clear of the ids the kernel assigns
+ * (the pid, then values counting down from -4097).
+ */
+static atomic_uint netlink_next_pid = 0x40000000;
+static _Thread_local uint32_t netlink_pid;
+
+static int netlink_open(void)
+{
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (fd < 0)
+        return -1;
+    netlink_pid = atomic_fetch_add(&netlink_next_pid, 1);
+    struct sockaddr_nl addr = {.nl_family = AF_NETLINK, .nl_pid = netlink_pid};
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int netlink_probe(int fd)
+{
+    struct sockaddr_nl addr = {0};
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *) &addr, &len) != 0)
+        return -1;
+    return addr.nl_family == AF_NETLINK && addr.nl_pid == netlink_pid ? 0 : -1;
+}
+
 typedef struct {
     const char *name;
     int (*open)(void);
@@ -86,6 +121,7 @@ static const kind_t kinds[] = {
     {"timerfd", timerfd_open, timerfd_probe},
     {"signalfd", signalfd_open, signalfd_probe},
     {"inotify", inotify_open, inotify_probe},
+    {"netlink", netlink_open, netlink_probe},
 };
 
 typedef struct {

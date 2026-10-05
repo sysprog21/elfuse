@@ -61,6 +61,13 @@ int64_t net_wait_or_interrupted(const fd_block_state_t *st,
     return io_wait_fd_or_interrupted(host_fd, events);
 }
 
+/* fd_alloc cleanup for a socket, which may own an abstract name. */
+static void absock_fd_cleanup(int guest_fd, uint64_t generation)
+{
+    (void) generation;
+    absock_unregister_fd(guest_fd);
+}
+
 /* Is there anything for a zero-length receive to return, asked without
  * consuming it?
  *
@@ -415,7 +422,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
             return linux_errno();
         }
 
-        int gfd = fd_alloc(FD_SOCKET, fd, absock_unregister_fd);
+        int gfd = fd_alloc(FD_SOCKET, fd, absock_fd_cleanup);
         if (gfd < 0) {
             close(fd);
             return -LINUX_EMFILE;
@@ -440,7 +447,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 
-    int gfd = fd_alloc(FD_SOCKET, fd, absock_unregister_fd);
+    int gfd = fd_alloc(FD_SOCKET, fd, absock_fd_cleanup);
     if (gfd < 0) {
         close(fd);
         return -LINUX_EMFILE;
@@ -484,13 +491,13 @@ int64_t sys_socketpair(guest_t *g,
         setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
     }
 
-    int gfd0 = fd_alloc(FD_SOCKET, fds[0], absock_unregister_fd);
+    int gfd0 = fd_alloc(FD_SOCKET, fds[0], absock_fd_cleanup);
     if (gfd0 < 0) {
         close(fds[0]);
         close(fds[1]);
         return -LINUX_EMFILE;
     }
-    int gfd1 = fd_alloc(FD_SOCKET, fds[1], absock_unregister_fd);
+    int gfd1 = fd_alloc(FD_SOCKET, fds[1], absock_fd_cleanup);
     if (gfd1 < 0) {
         fd_retire_published(gfd0, fds[0]);
         close(fds[1]);
@@ -679,7 +686,7 @@ static int64_t do_accept(guest_t *g,
     int one = 1;
     setsockopt(new_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 
-    int gfd = fd_alloc(FD_SOCKET, new_fd, absock_unregister_fd);
+    int gfd = fd_alloc(FD_SOCKET, new_fd, absock_fd_cleanup);
     if (gfd < 0) {
         close(new_fd);
         return -LINUX_EMFILE;
@@ -855,7 +862,7 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
             spec = fd_alias_of(-1, &snap);
         int alloc_rc =
             fd_alloc_alias_at(have_snap ? &spec : NULL, fd, FD_SOCKET, pair[0],
-                              absock_unregister_fd, NULL);
+                              absock_fd_cleanup, NULL);
         if (alloc_rc < 0) {
             close(pair[0]);
             close(pair[1]);

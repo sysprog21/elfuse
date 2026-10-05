@@ -54,7 +54,7 @@
 #include "utils.h"
 #include <poll.h>
 
-static void netlink_close(int guest_fd);
+static void netlink_close(int guest_fd, uint64_t generation);
 
 /* Linux netlink message structures. These structures are defined manually to
  * match the Linux ABI exactly, since macOS has no <linux/netlink.h>. The two
@@ -2029,8 +2029,9 @@ int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     return netlink_recv_iov(guest_fd, g, &one, 1, 0);
 }
 
-static void netlink_close(int guest_fd)
+static void netlink_close(int guest_fd, uint64_t generation)
 {
+    (void) generation;
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find_oldest(guest_fd);
     if (!ns) {

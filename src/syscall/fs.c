@@ -646,7 +646,7 @@ static int fd_alloc_opened_host(int host_fd,
                                 int type,
                                 int linux_flags,
                                 int min_guest_fd,
-                                void (*cleanup)(int),
+                                void (*cleanup)(int, uint64_t),
                                 const char *virtual_path,
                                 const fd_alias_spec_t *spec)
 {
@@ -1378,7 +1378,7 @@ static int duplicate_guest_fd(int src_fd,
     proc_pty_unlock_for_dup();
 
     int new_type = (src_snap.type == FD_STDIO) ? FD_REGULAR : src_snap.type;
-    void (*cleanup)(int) = fd_cleanup_for_type(new_type);
+    void (*cleanup)(int, uint64_t) = fd_cleanup_for_type(new_type);
     uint64_t alloc_gen = 0;
 
     /* The new slot aliases src_snap's description, whatever type it ends up

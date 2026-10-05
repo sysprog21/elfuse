@@ -209,7 +209,7 @@ void fdtable_init(void);
  * Returns -1 if table is full. cleanup is set atomically under fd_lock (pass
  * NULL for plain fds).
  */
-int fd_alloc(int type, int host_fd, void (*cleanup)(int));
+int fd_alloc(int type, int host_fd, void (*cleanup)(int, uint64_t));
 
 /* The status bits that belong to the open file description rather than to the
  * fd slot naming it, so a dup carries them to the alias and an alias sweep may
@@ -354,26 +354,26 @@ static inline fd_alias_spec_t fd_alias_carried(bool foreign, bool owned)
 int fd_alloc_alias(const fd_alias_spec_t *spec,
                    int type,
                    int host_fd,
-                   void (*cleanup)(int));
+                   void (*cleanup)(int, uint64_t));
 int fd_alloc_alias_at(const fd_alias_spec_t *spec,
                       int fd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       uint64_t *out_gen);
 int fd_alloc_alias_relaxed(const fd_alias_spec_t *spec,
                            int fixed_fd,
                            int minfd,
                            int type,
                            int host_fd,
-                           void (*cleanup)(int),
+                           void (*cleanup)(int, uint64_t),
                            uint64_t *out_gen);
 int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
                        int fixed_fd,
                        int minfd,
                        int type,
                        int host_fd,
-                       void (*cleanup)(int),
+                       void (*cleanup)(int, uint64_t),
                        void *dir,
                        int linux_flags,
                        uint64_t *out_gen);
@@ -388,7 +388,7 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
  */
 int fd_alloc_dir(int type,
                  int host_fd,
-                 void (*cleanup)(int),
+                 void (*cleanup)(int, uint64_t),
                  void *dir,
                  int linux_flags);
 
@@ -399,14 +399,14 @@ int fd_alloc_dir(int type,
 int fd_alloc_dir_from(int minfd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       void *dir,
                       int linux_flags,
                       uint64_t *out_gen);
 int fd_alloc_dir_at(int fd,
                     int type,
                     int host_fd,
-                    void (*cleanup)(int),
+                    void (*cleanup)(int, uint64_t),
                     void *dir,
                     int linux_flags,
                     uint64_t *out_gen);
@@ -422,7 +422,7 @@ int fd_alloc_dir_at(int fd,
 int fd_alloc_from(int minfd,
                   int type,
                   int host_fd,
-                  void (*cleanup)(int),
+                  void (*cleanup)(int, uint64_t),
                   uint64_t *out_gen);
 
 /* Allocate the lowest available FD >= minfd with a single-thread fast path.
@@ -431,7 +431,7 @@ int fd_alloc_from(int minfd,
 int fd_alloc_from_relaxed(int minfd,
                           int type,
                           int host_fd,
-                          void (*cleanup)(int),
+                          void (*cleanup)(int, uint64_t),
                           uint64_t *out_gen);
 
 /* Allocate a specific FD slot.
@@ -441,7 +441,7 @@ int fd_alloc_from_relaxed(int minfd,
 int fd_alloc_at(int fd,
                 int type,
                 int host_fd,
-                void (*cleanup)(int),
+                void (*cleanup)(int, uint64_t),
                 uint64_t *out_gen);
 
 /* Allocate a specific FD slot with a single-thread fast path. Falls back to
@@ -450,7 +450,7 @@ int fd_alloc_at(int fd,
 int fd_alloc_at_relaxed(int fd,
                         int type,
                         int host_fd,
-                        void (*cleanup)(int),
+                        void (*cleanup)(int, uint64_t),
                         uint64_t *out_gen);
 
 /* Report whether a guest FD slot >= minfd will be free after execve's CLOEXEC
@@ -624,8 +624,8 @@ void fd_refresh_urandom_bitmap(int fd);
  * type so the binding stays consistent without each path re-deriving the
  * dispatch table.
  */
-void fd_register_cleanup(int type, void (*cleanup)(int));
-void (*fd_cleanup_for_type(int type))(int);
+void fd_register_cleanup(int type, void (*cleanup)(int, uint64_t));
+void (*fd_cleanup_for_type(int type))(int, uint64_t);
 
 /* True for fd types whose host backing (kqueue for timerfd/inotify, pipe halves
  * for eventfd/signalfd/netlink/pidfd, epoll instance) cannot be meaningfully

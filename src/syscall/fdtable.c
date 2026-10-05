@@ -277,7 +277,7 @@ static fd_host_probe_t fd_probe_host(int type, int host_fd)
 static inline void fd_init_entry(int fd,
                                  int type,
                                  int host_fd,
-                                 void (*cleanup)(int),
+                                 void (*cleanup)(int, uint64_t),
                                  const fd_host_probe_t *probe)
 {
     fd_bitmap_set_used(fd);
@@ -519,7 +519,7 @@ void fdtable_init(void)
 static int fd_alloc_locked(int minfd,
                            int type,
                            int host_fd,
-                           void (*cleanup)(int),
+                           void (*cleanup)(int, uint64_t),
                            const fd_host_probe_t *probe)
 {
     int fd = fd_bitmap_find_free(minfd);
@@ -545,7 +545,7 @@ static int fd_alloc_locked(int minfd,
  * Returns -1 if table is full or RLIMIT_NOFILE would be exceeded (sets errno to
  * EMFILE).
  */
-int fd_alloc(int type, int host_fd, void (*cleanup)(int))
+int fd_alloc(int type, int host_fd, void (*cleanup)(int, uint64_t))
 {
     fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
@@ -556,7 +556,7 @@ int fd_alloc(int type, int host_fd, void (*cleanup)(int))
 
 int fd_alloc_dir(int type,
                  int host_fd,
-                 void (*cleanup)(int),
+                 void (*cleanup)(int, uint64_t),
                  void *dir,
                  int linux_flags)
 {
@@ -581,7 +581,7 @@ int fd_alloc_dir(int type,
 int fd_alloc_dir_from(int minfd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       void *dir,
                       int linux_flags,
                       uint64_t *out_gen)
@@ -607,7 +607,7 @@ int fd_alloc_dir_from(int minfd,
 int fd_alloc_dir_at(int fd,
                     int type,
                     int host_fd,
-                    void (*cleanup)(int),
+                    void (*cleanup)(int, uint64_t),
                     void *dir,
                     int linux_flags,
                     uint64_t *out_gen)
@@ -645,7 +645,7 @@ int fd_alloc_dir_at(int fd,
 int fd_alloc_from(int minfd,
                   int type,
                   int host_fd,
-                  void (*cleanup)(int),
+                  void (*cleanup)(int, uint64_t),
                   uint64_t *out_gen)
 {
     fd_host_probe_t probe = fd_probe_host(type, host_fd);
@@ -670,7 +670,7 @@ int fd_alloc_from(int minfd,
 int fd_alloc_alias(const fd_alias_spec_t *spec,
                    int type,
                    int host_fd,
-                   void (*cleanup)(int))
+                   void (*cleanup)(int, uint64_t))
 {
     fd_alias_begin(spec);
     return fd_alias_end(fd_alloc(type, host_fd, cleanup));
@@ -680,7 +680,7 @@ int fd_alloc_alias_at(const fd_alias_spec_t *spec,
                       int fd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       uint64_t *out_gen)
 {
     fd_alias_begin(spec);
@@ -692,7 +692,7 @@ int fd_alloc_alias_relaxed(const fd_alias_spec_t *spec,
                            int minfd,
                            int type,
                            int host_fd,
-                           void (*cleanup)(int),
+                           void (*cleanup)(int, uint64_t),
                            uint64_t *out_gen)
 {
     fd_alias_begin(spec);
@@ -708,7 +708,7 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
                        int minfd,
                        int type,
                        int host_fd,
-                       void (*cleanup)(int),
+                       void (*cleanup)(int, uint64_t),
                        void *dir,
                        int linux_flags,
                        uint64_t *out_gen)
@@ -724,7 +724,7 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
 int fd_alloc_from_relaxed(int minfd,
                           int type,
                           int host_fd,
-                          void (*cleanup)(int),
+                          void (*cleanup)(int, uint64_t),
                           uint64_t *out_gen)
 {
     if (!thread_is_single_active())
@@ -782,7 +782,7 @@ bool fd_reexec_slot_available(int minfd)
 int fd_alloc_at(int fd,
                 int type,
                 int host_fd,
-                void (*cleanup)(int),
+                void (*cleanup)(int, uint64_t),
                 uint64_t *out_gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -822,7 +822,7 @@ int fd_alloc_at(int fd,
 int fd_alloc_at_relaxed(int fd,
                         int type,
                         int host_fd,
-                        void (*cleanup)(int),
+                        void (*cleanup)(int, uint64_t),
                         uint64_t *out_gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -1379,16 +1379,16 @@ void fd_publish_linux_flags(int guest_fd, int linux_flags)
  * back the binding via fd_cleanup_for_type().
  */
 #define FD_TYPE_REGISTRY_SIZE 32
-static void (*fd_type_cleanup[FD_TYPE_REGISTRY_SIZE])(int);
+static void (*fd_type_cleanup[FD_TYPE_REGISTRY_SIZE])(int, uint64_t);
 
-void fd_register_cleanup(int type, void (*cleanup)(int))
+void fd_register_cleanup(int type, void (*cleanup)(int, uint64_t))
 {
     if (type < 0 || type >= FD_TYPE_REGISTRY_SIZE)
         return;
     fd_type_cleanup[type] = cleanup;
 }
 
-void (*fd_cleanup_for_type(int type))(int)
+void (*fd_cleanup_for_type(int type))(int, uint64_t)
 {
     if (type < 0 || type >= FD_TYPE_REGISTRY_SIZE)
         return NULL;
@@ -1448,7 +1448,7 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
 
     /* Type-specific teardown via vtable (replaces per-type switch) */
     if (snap->cleanup)
-        snap->cleanup(guest_fd);
+        snap->cleanup(guest_fd, snap->generation);
 
     /* Drop this host fd from both pty side tables. Must happen before
      * close(snap->host_fd): both are keyed by the still-live host fd. The

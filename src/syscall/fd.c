@@ -43,9 +43,9 @@
  */
 static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void timerfd_close(int guest_fd);
-static void eventfd_close(int guest_fd);
-static void signalfd_close(int guest_fd);
+static void timerfd_close(int guest_fd, uint64_t generation);
+static void eventfd_close(int guest_fd, uint64_t generation);
+static void signalfd_close(int guest_fd, uint64_t generation);
 
 #define NS_PER_SEC 1000000000LL
 
@@ -521,8 +521,9 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 /* Clean up timerfd state when guest closes the fd. Must hold sfd_lock to
  * prevent racing with concurrent timerfd_read.
  */
-static void timerfd_close(int guest_fd)
+static void timerfd_close(int guest_fd, uint64_t generation)
 {
+    (void) generation;
     pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(guest_fd);
     if (slot >= 0) {
@@ -684,8 +685,9 @@ int64_t sys_eventfd2(unsigned int initval, int flags)
 /* Clean up eventfd state when guest closes the fd. Must hold sfd_lock to
  * prevent racing with concurrent eventfd_write/eventfd_read.
  */
-static void eventfd_close(int guest_fd)
+static void eventfd_close(int guest_fd, uint64_t generation)
 {
+    (void) generation;
     pthread_mutex_lock(&sfd_lock);
     int slot = eventfd_find(guest_fd);
     if (slot >= 0) {
@@ -1058,8 +1060,9 @@ static int signalfd_slot_alloc(void)
 /* Clean up signalfd state when guest closes the fd. Must hold sfd_lock to
  * prevent racing with concurrent signalfd_notify.
  */
-static void signalfd_close(int guest_fd)
+static void signalfd_close(int guest_fd, uint64_t generation)
 {
+    (void) generation;
     pthread_mutex_lock(&sfd_lock);
     int slot = signalfd_find(guest_fd);
     if (slot >= 0) {

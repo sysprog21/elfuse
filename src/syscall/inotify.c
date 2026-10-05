@@ -45,7 +45,7 @@
 #include "syscall/path.h"
 #include "syscall/proc.h" /* proc_exit_group_requested */
 
-static void inotify_close(int guest_fd);
+static void inotify_close(int guest_fd, uint64_t generation);
 
 /* Linux inotify constants (from linux/inotify.h). Only the bits emulation
  * actually emits or recognizes are listed; the remaining inotify events
@@ -1022,8 +1022,9 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     return (int64_t) copied;
 }
 
-static void inotify_close(int guest_fd)
+static void inotify_close(int guest_fd, uint64_t generation)
 {
+    (void) generation;
     pthread_mutex_lock(&inotify_lock);
 
     int slot = inotify_find(guest_fd);

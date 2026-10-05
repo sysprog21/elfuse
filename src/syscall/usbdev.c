@@ -2836,8 +2836,10 @@ static void usbdev_teardown_locked(usbdev_t *u)
     devkey_retire(u);
 }
 
-static void usbdev_fd_cleanup(int guest_fd)
+static void usbdev_fd_cleanup(int guest_fd, uint64_t generation)
 {
+    (void) generation;
+
     /* The fd-table slot is already closed and free when this runs
      * (fd_cleanup_entry is called outside fd_lock), so a sibling thread's
      * open() can have won the same fd number and bound a second entry here

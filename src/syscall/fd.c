@@ -76,6 +76,56 @@ static int sfd_alloc_slot(const void *state, size_t count, size_t stride)
     return sfd_find_slot(state, count, stride, -1);
 }
 
+/* What a timerfd or signalfd slot starts with: the guest fd and the generation
+ * fd_alloc stamped on it.
+ */
+typedef struct {
+    int guest_fd;
+    uint64_t gen;
+} sfd_key_t;
+
+/* The live slot behind a guest fd. fd_cleanup_entry runs the type's close after
+ * the number is free again, so a sibling's create can hold it while the closed
+ * fd's slot is still registered; of the slots holding the number, the one with
+ * the newest fd generation is the one the guest can reach.
+ */
+static int sfd_find_newest(const void *state,
+                           size_t count,
+                           size_t stride,
+                           int guest_fd)
+{
+    const uint8_t *base = state;
+    int best = -1;
+    uint64_t best_gen = 0;
+    for (size_t i = 0; i < count; i++) {
+        sfd_key_t key;
+        memcpy(&key, base + i * stride, sizeof(key));
+        if (key.guest_fd == guest_fd && (best < 0 || key.gen > best_gen)) {
+            best = (int) i;
+            best_gen = key.gen;
+        }
+    }
+    return best;
+}
+
+/* The slot a closing fd owned, or -1: a dup carries the type's close and no
+ * slot.
+ */
+static int sfd_find_gen(const void *state,
+                        size_t count,
+                        size_t stride,
+                        uint64_t gen)
+{
+    const uint8_t *base = state;
+    for (size_t i = 0; i < count; i++) {
+        sfd_key_t key;
+        memcpy(&key, base + i * stride, sizeof(key));
+        if (key.guest_fd >= 0 && key.gen == gen)
+            return (int) i;
+    }
+    return -1;
+}
+
 /* timerfd emulation via kqueue EVFILT_TIMER
  *
  * Each timerfd_create() creates a kqueue + timer registration. Reads from the
@@ -102,7 +152,7 @@ typedef struct {
  */
 #define LINUX_CLOCK_BOOTTIME 7
 
-static struct {
+static struct timerfd_slot {
     int guest_fd;         /* Guest fd (-1 if unused) */
     uint64_t gen;         /* fd generation fd_alloc stamped on guest_fd */
     int kq_fd;            /* kqueue fd for this timer */
@@ -114,6 +164,9 @@ static struct {
     bool armed;  /* True if timer is running */
 } timerfd_state[TIMERFD_MAX];
 
+_Static_assert(offsetof(struct timerfd_slot, gen) == offsetof(sfd_key_t, gen),
+               "a timerfd slot must start with sfd_key_t's fields");
+
 void timerfd_init(void)
 {
     for (int i = 0; i < TIMERFD_MAX; i++)
@@ -121,31 +174,16 @@ void timerfd_init(void)
     fd_register_cleanup(FD_TIMERFD, timerfd_close);
 }
 
-/* The live slot behind a guest fd. fd_cleanup_entry runs timerfd_close after
- * the number is free again, so a sibling's timerfd_create can hold it while the
- * closed fd's slot is still registered; of the slots holding the number, the
- * one with the newest fd generation is the one the guest can reach.
- */
 static int timerfd_find(int guest_fd)
 {
-    int best = -1;
-    for (int i = 0; i < TIMERFD_MAX; i++) {
-        if (timerfd_state[i].guest_fd == guest_fd &&
-            (best < 0 || timerfd_state[i].gen > timerfd_state[best].gen))
-            best = i;
-    }
-    return best;
+    return sfd_find_newest(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]),
+                           guest_fd);
 }
 
-/* The slot a closing fd owned, or -1: a dup carries timerfd_close and no slot.
- */
 static int timerfd_find_gen(uint64_t gen)
 {
-    for (int i = 0; i < TIMERFD_MAX; i++) {
-        if (timerfd_state[i].guest_fd >= 0 && timerfd_state[i].gen == gen)
-            return i;
-    }
-    return -1;
+    return sfd_find_gen(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]),
+                        gen);
 }
 
 static int timerfd_alloc(void)
@@ -1064,13 +1102,16 @@ _Static_assert(sizeof(linux_signalfd_siginfo_t) == 128,
 
 /* Per-signalfd state */
 #define SIGNALFD_MAX 16
-static struct {
+static struct signalfd_slot {
     int guest_fd;  /* Guest fd (-1 if unused) */
     uint64_t gen;  /* fd generation fd_alloc stamped on guest_fd */
     int pipe_rd;   /* Read end for poll/epoll readiness */
     int pipe_wr;   /* Write end for signaling */
     uint64_t mask; /* Signal mask (bitmask of signals to accept) */
 } signalfd_state[SIGNALFD_MAX];
+
+_Static_assert(offsetof(struct signalfd_slot, gen) == offsetof(sfd_key_t, gen),
+               "a signalfd slot must start with sfd_key_t's fields");
 
 void signalfd_init(void)
 {
@@ -1079,29 +1120,16 @@ void signalfd_init(void)
     fd_register_cleanup(FD_SIGNALFD, signalfd_close);
 }
 
-/* The live slot behind a guest fd: the newest generation holding the number, as
- * timerfd_find explains.
- */
 static int signalfd_find(int guest_fd)
 {
-    int best = -1;
-    for (int i = 0; i < SIGNALFD_MAX; i++) {
-        if (signalfd_state[i].guest_fd == guest_fd &&
-            (best < 0 || signalfd_state[i].gen > signalfd_state[best].gen))
-            best = i;
-    }
-    return best;
+    return sfd_find_newest(signalfd_state, SIGNALFD_MAX,
+                           sizeof(signalfd_state[0]), guest_fd);
 }
 
-/* The slot a closing fd owned, or -1: a dup carries signalfd_close and no slot.
- */
 static int signalfd_find_gen(uint64_t gen)
 {
-    for (int i = 0; i < SIGNALFD_MAX; i++) {
-        if (signalfd_state[i].guest_fd >= 0 && signalfd_state[i].gen == gen)
-            return i;
-    }
-    return -1;
+    return sfd_find_gen(signalfd_state, SIGNALFD_MAX, sizeof(signalfd_state[0]),
+                        gen);
 }
 
 static int signalfd_slot_alloc(void)

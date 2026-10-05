@@ -23,16 +23,33 @@
 
 #define PIDFD_TABLE_SIZE 32
 
+/* One entry per pidfd_open. A dup shares the entry of the pidfd it copies, as
+ * the two share one open file description on Linux, so an alias takes no entry
+ * and no host descriptor of its own.
+ */
 typedef struct {
     bool active;
     int64_t guest_pid;
     int write_end;
-    uint64_t gen; /* fd-table generation fd_alloc stamped on this open; a guest
-                   * fd number is reused, a generation is not
-                   */
+    uint64_t open_gen; /* fd-table generation of the pidfd_open; names the entry
+                        * to its monitor after that fd is closed
+                        */
+    int refs; /* guest fds mapped to the entry, and a dup between pidfd_dup_ref
+               * and pidfd_dup_bind
+               */
 } pidfd_entry_t;
 
 static pidfd_entry_t pidfd_table[PIDFD_TABLE_SIZE];
+
+/* The entry each guest fd number maps to, with the fd-table generation the
+ * number carried when it was mapped: a guest fd number is reused, a generation
+ * is not. gen 0 is no mapping.
+ */
+static struct {
+    uint64_t gen;
+    pidfd_entry_t *entry;
+} pidfd_owner[FD_TABLE_SIZE];
+
 static pthread_mutex_t pidfd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pidfd_entry_t *pidfd_find_free_entry(void)
@@ -44,16 +61,48 @@ static pidfd_entry_t *pidfd_find_free_entry(void)
     return NULL;
 }
 
-/* The entry of the open that fd_alloc stamped with @gen. Caller holds
- * pidfd_lock.
+/* The entry @guest_fd maps to while the number carries @gen, or NULL. Caller
+ * holds pidfd_lock.
  */
-static pidfd_entry_t *pidfd_find_entry(uint64_t gen)
+static pidfd_entry_t *pidfd_owner_entry(int guest_fd, uint64_t gen)
 {
-    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
-        if (pidfd_table[i].active && pidfd_table[i].gen == gen)
-            return &pidfd_table[i];
+    if (gen == 0 || !RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE) ||
+        pidfd_owner[guest_fd].gen != gen)
+        return NULL;
+    return pidfd_owner[guest_fd].entry;
+}
+
+/* Drop one reference; the last one closes the write end and frees the entry.
+ * Caller holds pidfd_lock.
+ */
+static void pidfd_unref(pidfd_entry_t *entry)
+{
+    if (--entry->refs > 0)
+        return;
+    if (entry->write_end >= 0)
+        close(entry->write_end);
+    entry->write_end = -1;
+    entry->active = false;
+}
+
+/* Map @guest_fd, stamped @gen, to @entry, and hand the mapping the caller's
+ * reference. fd_cleanup_entry runs pidfd_cleanup after the number is free, so
+ * the number can still hold the mapping of a closed fd, or already hold that of
+ * a newer one. Generations only increase: an older mapping belongs to a closed
+ * fd and gives up its reference here, and a newer one means this fd was closed
+ * before it was mapped, so the caller's reference is dropped in its place.
+ * Caller holds pidfd_lock.
+ */
+static void pidfd_map(int guest_fd, uint64_t gen, pidfd_entry_t *entry)
+{
+    if (pidfd_owner[guest_fd].gen > gen) {
+        pidfd_unref(entry);
+        return;
     }
-    return NULL;
+    if (pidfd_owner[guest_fd].gen != 0)
+        pidfd_unref(pidfd_owner[guest_fd].entry);
+    pidfd_owner[guest_fd].gen = gen;
+    pidfd_owner[guest_fd].entry = entry;
 }
 
 static void pidfd_cleanup(int guest_fd, uint64_t generation);
@@ -69,13 +118,16 @@ static void pidfd_complete_entry(pidfd_entry_t *entry)
     entry->write_end = -1;
 }
 
-/* Complete one pidfd without touching others that watch the same target. */
-static void pidfd_complete_one(uint64_t gen)
+/* Complete one pidfd_open's entry, which its dups share, without touching other
+ * opens that watch the same target.
+ */
+static void pidfd_complete_one(uint64_t open_gen)
 {
     pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_entry(gen);
-    if (entry)
-        pidfd_complete_entry(entry);
+    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
+        if (pidfd_table[i].active && pidfd_table[i].open_gen == open_gen)
+            pidfd_complete_entry(&pidfd_table[i]);
+    }
     pthread_mutex_unlock(&pidfd_lock);
 }
 
@@ -87,18 +139,16 @@ void pidfd_init(void)
 static void pidfd_cleanup(int guest_fd, uint64_t generation)
 {
     /* The fd number is free by the time fd_cleanup_entry calls this, and a
-     * sibling's pidfd_open can have registered an entry under it. A dup of a
-     * pidfd has no entry of its own, so only the generation tells whether there
-     * is one to tear down.
+     * sibling's pidfd can hold it. That pidfd's pidfd_map has then replaced the
+     * closed fd's mapping and dropped its reference, so only a mapping still
+     * carrying the closed fd's generation is torn down here.
      */
-    (void) guest_fd;
     pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_entry(generation);
+    pidfd_entry_t *entry = pidfd_owner_entry(guest_fd, generation);
     if (entry) {
-        if (entry->write_end >= 0)
-            close(entry->write_end);
-        entry->write_end = -1;
-        entry->active = false;
+        pidfd_owner[guest_fd].gen = 0;
+        pidfd_owner[guest_fd].entry = NULL;
+        pidfd_unref(entry);
     }
     pthread_mutex_unlock(&pidfd_lock);
 }
@@ -190,7 +240,9 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     entry->active = true;
     entry->guest_pid = target_pid;
     entry->write_end = pfd[1];
-    entry->gen = gen;
+    entry->open_gen = gen;
+    entry->refs = 1;
+    pidfd_map(gfd, gen, entry);
     pthread_mutex_unlock(&pidfd_lock);
 
     /* A close that arrived before the entry was registered found nothing to
@@ -247,6 +299,34 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     return gfd;
 }
 
+int pidfd_dup_ref(int src_fd, uint64_t src_gen)
+{
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_entry_t *entry = pidfd_owner_entry(src_fd, src_gen);
+    if (entry)
+        entry->refs++;
+    pthread_mutex_unlock(&pidfd_lock);
+    return entry ? (int) (entry - pidfd_table) : -1;
+}
+
+void pidfd_dup_bind(int ref, int guest_fd, uint64_t gen)
+{
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_map(guest_fd, gen, &pidfd_table[ref]);
+    pthread_mutex_unlock(&pidfd_lock);
+
+    /* Same window as pidfd_create: a close before the fd was mapped. */
+    if (fd_current_generation(guest_fd) != gen)
+        pidfd_cleanup(guest_fd, gen);
+}
+
+void pidfd_dup_unref(int ref)
+{
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_unref(&pidfd_table[ref]);
+    pthread_mutex_unlock(&pidfd_lock);
+}
+
 void proc_pidfd_notify_exit(int64_t exited_pid)
 {
     pthread_mutex_lock(&pidfd_lock);
@@ -266,7 +346,7 @@ int64_t proc_pidfd_lookup_pid(int guest_fd)
 
     int64_t pid = -1;
     pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_entry(gen);
+    pidfd_entry_t *entry = pidfd_owner_entry(guest_fd, gen);
     if (entry)
         pid = entry->guest_pid;
     pthread_mutex_unlock(&pidfd_lock);

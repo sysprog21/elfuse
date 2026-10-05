@@ -54,6 +54,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "syscall/usbdev.h"
 #include "syscall/poll.h" /* epoll_dup_fd */
 #include "syscall/proc.h"
+#include "syscall/proc-pidfd.h" /* pidfd_dup_bind */
 
 /* Linux dirent64 layout. */
 typedef struct {
@@ -1381,6 +1382,21 @@ static int duplicate_guest_fd(int src_fd,
     void (*cleanup)(int, uint64_t) = fd_cleanup_for_type(new_type);
     uint64_t alloc_gen = 0;
 
+    /* A pidfd keeps its target in a side table the allocator knows nothing of,
+     * and the alias shares the source's entry there. The reference is taken
+     * before the alias is allocated: it is the one step that can fail, and a
+     * dup2 that fails has to leave its target open.
+     */
+    int pidfd_ref = -1;
+    if (new_type == FD_PIDFD) {
+        pidfd_ref = pidfd_dup_ref(src_fd, src_snap.generation);
+        if (pidfd_ref < 0) {
+            close(new_host_fd);
+            errno = EBADF;
+            return -1;
+        }
+    }
+
     /* The new slot aliases src_snap's description, whatever type it ends up
      * with, so the allocator inherits its status-flag answers instead of
      * probing a description it does not own. The dup's own bits ride along with
@@ -1418,6 +1434,8 @@ static int duplicate_guest_fd(int src_fd,
          * its last slave go.
          */
         int saved_errno = errno;
+        if (pidfd_ref >= 0)
+            pidfd_dup_unref(pidfd_ref);
         if (shared_dir) {
             /* The descriptor is the source's and stays open with it; only this
              * side's reference on the shared stream is given back.
@@ -1430,6 +1448,9 @@ static int duplicate_guest_fd(int src_fd,
         errno = saved_errno;
         return -1;
     }
+
+    if (pidfd_ref >= 0)
+        pidfd_dup_bind(pidfd_ref, guest_fd, alloc_gen);
 
     /* A false return means a sibling reallocated the slot while the metadata
      * install was pending. Nothing to unwind: that sibling's close path already

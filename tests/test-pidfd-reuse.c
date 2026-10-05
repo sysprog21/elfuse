@@ -53,8 +53,8 @@ static void *churn(void *arg)
             continue;
         }
 
-        /* An alias has no pidfd state of its own, so closing it must leave
-         * whichever pidfd holds the number next alone.
+        /* Closing an alias must leave alone both the pidfd it aliased and
+         * whichever pidfd holds its number next.
          */
         int alias = dup((int) pfd);
         if (alias < 0)

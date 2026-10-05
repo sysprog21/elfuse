@@ -25,14 +25,14 @@
 
 typedef struct {
     bool active;
-    int guest_fd;
     int64_t guest_pid;
     int write_end;
-    uint64_t gen; /* names this open across guest fd number reuse */
+    uint64_t gen; /* fd-table generation fd_alloc stamped on this open; a guest
+                   * fd number is reused, a generation is not
+                   */
 } pidfd_entry_t;
 
 static pidfd_entry_t pidfd_table[PIDFD_TABLE_SIZE];
-static uint64_t pidfd_next_gen;
 static pthread_mutex_t pidfd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pidfd_entry_t *pidfd_find_free_entry(void)
@@ -44,10 +44,13 @@ static pidfd_entry_t *pidfd_find_free_entry(void)
     return NULL;
 }
 
-static pidfd_entry_t *pidfd_find_guest_fd_entry(int guest_fd)
+/* The entry of the open that fd_alloc stamped with @gen. Caller holds
+ * pidfd_lock.
+ */
+static pidfd_entry_t *pidfd_find_entry(uint64_t gen)
 {
     for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
-        if (pidfd_table[i].active && pidfd_table[i].guest_fd == guest_fd)
+        if (pidfd_table[i].active && pidfd_table[i].gen == gen)
             return &pidfd_table[i];
     }
     return NULL;
@@ -70,12 +73,9 @@ static void pidfd_complete_entry(pidfd_entry_t *entry)
 static void pidfd_complete_one(uint64_t gen)
 {
     pthread_mutex_lock(&pidfd_lock);
-    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
-        if (pidfd_table[i].active && pidfd_table[i].gen == gen) {
-            pidfd_complete_entry(&pidfd_table[i]);
-            break;
-        }
-    }
+    pidfd_entry_t *entry = pidfd_find_entry(gen);
+    if (entry)
+        pidfd_complete_entry(entry);
     pthread_mutex_unlock(&pidfd_lock);
 }
 
@@ -86,9 +86,14 @@ void pidfd_init(void)
 
 static void pidfd_cleanup(int guest_fd, uint64_t generation)
 {
-    (void) generation;
+    /* The fd number is free by the time fd_cleanup_entry calls this, and a
+     * sibling's pidfd_open can have registered an entry under it. A dup of a
+     * pidfd has no entry of its own, so only the generation tells whether there
+     * is one to tear down.
+     */
+    (void) guest_fd;
     pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_guest_fd_entry(guest_fd);
+    pidfd_entry_t *entry = pidfd_find_entry(generation);
     if (entry) {
         if (entry->write_end >= 0)
             close(entry->write_end);
@@ -160,7 +165,11 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
         return linux_errno();
     }
 
-    int gfd = fd_alloc(FD_PIDFD, pfd[0], pidfd_cleanup);
+    /* The generation comes from the allocating call: a sibling can close and
+     * reuse the number as soon as the slot is published.
+     */
+    uint64_t gen = 0;
+    int gfd = fd_alloc_from(0, FD_PIDFD, pfd[0], pidfd_cleanup, &gen);
     if (gfd < 0) {
         close(pfd[0]);
         close(pfd[1]);
@@ -179,12 +188,19 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     }
 
     entry->active = true;
-    entry->guest_fd = gfd;
     entry->guest_pid = target_pid;
     entry->write_end = pfd[1];
-    entry->gen = ++pidfd_next_gen;
-    uint64_t gen = entry->gen;
+    entry->gen = gen;
     pthread_mutex_unlock(&pidfd_lock);
+
+    /* A close that arrived before the entry was registered found nothing to
+     * tear down. The number no longer carries this generation then, and the
+     * entry is retired here, as usbdev's open does.
+     */
+    if (fd_current_generation(gfd) != gen) {
+        pidfd_cleanup(gfd, gen);
+        return gfd;
+    }
 
     /* host_pid <= 0 means the target lives inside this host process -- the
      * caller itself, or a CLONE_VM child, which holds a guest tid but no host
@@ -243,15 +259,18 @@ void proc_pidfd_notify_exit(int64_t exited_pid)
 
 int64_t proc_pidfd_lookup_pid(int guest_fd)
 {
+    /* Read before pidfd_lock, which is a leaf. */
+    uint64_t gen = fd_current_generation(guest_fd);
+    if (gen == 0)
+        return -1;
+
+    int64_t pid = -1;
     pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_guest_fd_entry(guest_fd);
-    if (entry) {
-        int64_t pid = entry->guest_pid;
-        pthread_mutex_unlock(&pidfd_lock);
-        return pid;
-    }
+    pidfd_entry_t *entry = pidfd_find_entry(gen);
+    if (entry)
+        pid = entry->guest_pid;
     pthread_mutex_unlock(&pidfd_lock);
-    return -1;
+    return pid;
 }
 
 int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags)

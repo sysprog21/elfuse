@@ -98,6 +98,7 @@ typedef struct {
 
 typedef struct {
     int guest_fd;   /* -1 if slot is unused */
+    uint64_t gen;   /* fd generation fd_alloc stamped on guest_fd */
     int kq_fd;      /* kqueue fd */
     int pipe_rd;    /* Self-pipe read end (poll/epoll) */
     int pipe_wr;    /* Self-pipe write end */
@@ -124,11 +125,32 @@ void inotify_init(void)
     fd_register_cleanup(FD_INOTIFY, inotify_close);
 }
 
+/* The live instance behind a guest fd. fd_cleanup_entry runs inotify_close
+ * after the number is free again, so a sibling's inotify_init1 can hold it
+ * while the closed fd's instance is still registered; of the instances holding
+ * the number, the one with the newest fd generation is the one the guest can
+ * reach.
+ */
 static int inotify_find(int guest_fd)
 {
-    for (int i = 0; i < INOTIFY_MAX; i++)
-        if (inotify_state[i].guest_fd == guest_fd)
+    int best = -1;
+    for (int i = 0; i < INOTIFY_MAX; i++) {
+        if (inotify_state[i].guest_fd == guest_fd &&
+            (best < 0 || inotify_state[i].gen > inotify_state[best].gen))
+            best = i;
+    }
+    return best;
+}
+
+/* The instance a closing fd owned, or -1: a dup carries inotify_close and no
+ * instance.
+ */
+static int inotify_find_gen(uint64_t gen)
+{
+    for (int i = 0; i < INOTIFY_MAX; i++) {
+        if (inotify_state[i].guest_fd >= 0 && inotify_state[i].gen == gen)
             return i;
+    }
     return -1;
 }
 
@@ -618,7 +640,8 @@ int64_t sys_inotify_init1(int flags)
     }
 
     /* Allocate guest fd; pipe read end is the host_fd so poll/epoll works */
-    int gfd = fd_alloc(FD_INOTIFY, pipefd[0], inotify_close);
+    uint64_t gen = 0;
+    int gfd = fd_alloc_from(0, FD_INOTIFY, pipefd[0], inotify_close, &gen);
     if (gfd < 0) {
         close(kq);
         close(pipefd[0]);
@@ -630,7 +653,7 @@ int64_t sys_inotify_init1(int flags)
     int slot = inotify_slot_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
-        fd_retire_published(gfd, pipefd[0]);
+        fd_retire_published_gen(gfd, pipefd[0], gen);
         close(kq);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
@@ -638,6 +661,7 @@ int64_t sys_inotify_init1(int flags)
 
     inotify_instance_t *inst = &inotify_state[slot];
     inst->guest_fd = gfd;
+    inst->gen = gen;
     inst->kq_fd = kq;
     inst->pipe_rd = pipefd[0];
     inst->pipe_wr = pipefd[1];
@@ -645,6 +669,15 @@ int64_t sys_inotify_init1(int flags)
     inst->event_used = 0;
     memset(inst->watches, 0, sizeof(inst->watches));
     pthread_mutex_unlock(&inotify_lock);
+
+    /* A close that arrived before the instance was registered found nothing to
+     * tear down. The number no longer carries this generation then, and the
+     * instance is retired here.
+     */
+    if (fd_current_generation(gfd) != gen) {
+        inotify_close(gfd, gen);
+        return gfd;
+    }
 
     /* Linux opens the inotify inode O_RDONLY (anon_inode_getfd in
      * fs/notify/inotify/inotify_user.c), and O_NONBLOCK goes to the shadow
@@ -1024,10 +1057,10 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
 static void inotify_close(int guest_fd, uint64_t generation)
 {
-    (void) generation;
+    (void) guest_fd;
     pthread_mutex_lock(&inotify_lock);
 
-    int slot = inotify_find(guest_fd);
+    int slot = inotify_find_gen(generation);
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
         return;

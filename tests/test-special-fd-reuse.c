@@ -1,6 +1,6 @@
 /*
- * Test that closing a timerfd or signalfd leaves a newer fd of the same kind on
- * the same fd number alone
+ * Test that closing a timerfd, signalfd or inotify fd leaves a newer fd of the
+ * same kind on the same fd number alone
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include <sys/inotify.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 
@@ -26,6 +27,8 @@ int passes = 0, fails = 0;
 
 #define THREADS 4
 #define ROUNDS 1000
+
+static const char *watch_path;
 
 static int timerfd_open(void)
 {
@@ -62,6 +65,17 @@ static int signalfd_probe(int fd)
     return signalfd(fd, &mask, 0) == fd ? 0 : -1;
 }
 
+static int inotify_open(void)
+{
+    return inotify_init1(0);
+}
+
+static int inotify_probe(int fd)
+{
+    int wd = inotify_add_watch(fd, watch_path, IN_ATTRIB);
+    return wd < 0 ? -1 : inotify_rm_watch(fd, wd);
+}
+
 typedef struct {
     const char *name;
     int (*open)(void);
@@ -71,6 +85,7 @@ typedef struct {
 static const kind_t kinds[] = {
     {"timerfd", timerfd_open, timerfd_probe},
     {"signalfd", signalfd_open, signalfd_probe},
+    {"inotify", inotify_open, inotify_probe},
 };
 
 typedef struct {
@@ -142,8 +157,11 @@ static void run_kind(const kind_t *kind)
     EXPECT_EQ(sum.probe_failed, 0, "a sibling's close reached this fd");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void) argc;
+    watch_path = argv[0];
+
     printf("test-special-fd-reuse: close under fd number reuse\n");
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++)
         run_kind(&kinds[i]);

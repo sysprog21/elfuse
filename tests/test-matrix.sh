@@ -905,6 +905,10 @@ run_unit_tests()
     printf "\nmadvise MADV_DONTNEED\n"
     test_rc "$runner" "test-madvise" 0 "$bindir/test-madvise"
 
+    printf "\nMAP_NORESERVE first touch\n"
+    test_rc "$runner" "test-noreserve-materialize" 0 \
+        "$bindir/test-noreserve-materialize"
+
     printf "\nScatter-gather I/O\n"
     test_check "$runner" "test-readv-writev" "PASS" "$bindir/test-readv-writev"
 

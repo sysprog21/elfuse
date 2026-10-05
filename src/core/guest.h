@@ -1420,10 +1420,10 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
 
 /* Try to materialize a lazy (MAP_NORESERVE) page at the given offset. Called
  * from the data/instruction abort handler when the faulting address falls
- * within a noreserve region. Creates page table entries for one 2MiB block
- * containing the fault address, zeros the memory, and clears the noreserve flag
- * for the materialized sub-range.
+ * within a noreserve region. Creates page table entries for the part of the
+ * region inside the 2MiB block containing the fault address, zeroing the pages
+ * that had none. Pages already mapped keep their contents.
  * Returns 0 on success (caller should TLBI and retry), -1 if the offset is not
- * in a noreserve region.
+ * in a noreserve region or the region is PROT_NONE.
  */
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset);

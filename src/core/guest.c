@@ -3063,6 +3063,57 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
     return ttbr0;
 }
 
+/* Return the L2 slot covering ipa, allocating the L1 and L2 tables on the way
+ * if they do not exist yet.
+ *
+ * Returns NULL when ipa is out of range or the page table pool is exhausted.
+ */
+static uint64_t *l2_slot_alloc(guest_t *g, uint64_t ipa)
+{
+    uint64_t base = g->ipa_base;
+    uint64_t *l0 = pt_at(g, g->ttbr0 - base);
+
+    /* L0 index: which 512GiB slot (>512GiB addresses need L0[1]+) */
+    unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GIB));
+    if (l0_idx >= 512) {
+        log_error("guest: IPA 0x%llx out of L0 range in extend",
+                  (unsigned long long) ipa);
+        return NULL;
+    }
+
+    /* Allocate L1 table on first access to each L0 slot */
+    if (!(l0[l0_idx] & PT_VALID)) {
+        uint64_t l1_gpa = pt_alloc_page(g);
+        if (!l1_gpa)
+            return NULL;
+        pte_store_release(&l0[l0_idx], (base + l1_gpa) | PT_VALID | PT_TABLE);
+    }
+
+    uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t *l1 = pt_at(g, l1_ipa - base);
+
+    unsigned l1_idx = (unsigned) ((ipa % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
+    if (l1_idx >= 512) {
+        log_error("guest: IPA 0x%llx out of L1 range in extend",
+                  (unsigned long long) ipa);
+        return NULL;
+    }
+
+    /* Ensure L1 entry points to an L2 table */
+    if (!(l1[l1_idx] & PT_VALID)) {
+        uint64_t l2_gpa = pt_alloc_page(g);
+        if (!l2_gpa)
+            return NULL;
+        pte_store_release(&l1[l1_idx], (base + l2_gpa) | PT_VALID | PT_TABLE);
+    }
+
+    uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t *l2 = pt_at(g, l2_ipa - base);
+
+    unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GIB) / BLOCK_2MIB);
+    return &l2[l2_idx];
+}
+
 /* Extend page tables to cover [start, end) with 2MiB block descriptors. Walks
  * the existing L0->L1 structure (from g->ttbr0) and allocates new L2 tables as
  * needed. This is safe to call while the vCPU is paused (during HVC #5
@@ -3103,10 +3154,6 @@ int guest_extend_page_tables(guest_t *g,
 
     uint64_t base = g->ipa_base;
 
-    /* Navigate to L0 table */
-    uint64_t l0_gpa_off = g->ttbr0 - base;
-    uint64_t *l0 = pt_at(g, l0_gpa_off);
-
     /* Walk 2MiB blocks in [start, end). Track the smallest sub-range whose L2
      * entry actually transitioned from unmapped to mapped; blocks that were
      * already valid get no new descriptor and need no TLBI (false-positive
@@ -3121,49 +3168,9 @@ int guest_extend_page_tables(guest_t *g,
 
     for (uint64_t addr = addr_start; addr < addr_end; addr += BLOCK_2MIB) {
         uint64_t ipa = base + addr;
-
-        /* L0 index: which 512GiB slot (>512GiB addresses need L0[1]+) */
-        unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GIB));
-        if (l0_idx >= 512) {
-            log_error("guest: IPA 0x%llx out of L0 range in extend",
-                      (unsigned long long) ipa);
+        uint64_t *l2_entry = l2_slot_alloc(g, ipa);
+        if (!l2_entry)
             return -1;
-        }
-
-        /* Allocate L1 table on first access to each L0 slot */
-        if (!(l0[l0_idx] & PT_VALID)) {
-            uint64_t l1_gpa = pt_alloc_page(g);
-            if (!l1_gpa)
-                return -1;
-            pte_store_release(&l0[l0_idx],
-                              (base + l1_gpa) | PT_VALID | PT_TABLE);
-        }
-
-        uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
-        uint64_t *l1 = pt_at(g, l1_ipa - base);
-
-        unsigned l1_idx =
-            (unsigned) ((ipa % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
-        if (l1_idx >= 512) {
-            log_error("guest: IPA 0x%llx out of L1 range in extend",
-                      (unsigned long long) ipa);
-            return -1;
-        }
-
-        /* Ensure L1 entry points to an L2 table */
-        if (!(l1[l1_idx] & PT_VALID)) {
-            uint64_t l2_gpa = pt_alloc_page(g);
-            if (!l2_gpa)
-                return -1;
-            pte_store_release(&l1[l1_idx],
-                              (base + l2_gpa) | PT_VALID | PT_TABLE);
-        }
-
-        /* Navigate to L2 table */
-        uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
-        uint64_t *l2 = pt_at(g, l2_ipa - base);
-
-        unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GIB) / BLOCK_2MIB);
 
         /* Only map if not already mapped. A negative TLB entry from a prior
          * translation fault is possible only for VAs that were unmapped at the
@@ -3177,9 +3184,9 @@ int guest_extend_page_tables(guest_t *g,
          * an explicit PT_VALID test so the intent survives a future
          * descriptor-bit renumbering.
          */
-        if (l2[l2_idx] & PT_VALID)
+        if (*l2_entry & PT_VALID)
             continue;
-        pte_store_release(&l2[l2_idx], make_block_desc(ipa, perms));
+        pte_store_release(l2_entry, make_block_desc(ipa, perms));
         if (!bcast) {
             if (addr < changed_lo)
                 changed_lo = addr;
@@ -3708,6 +3715,38 @@ int guest_install_va_pages(guest_t *g,
 
 /* Lazy page materialization for MAP_NORESERVE. */
 
+/* Map [start, end) inside the empty 2MiB slot at block_start with 4KiB pages
+ * and leave the rest of the block unmapped. The L3 table is complete before the
+ * release store publishes it, so no vCPU ever sees a page outside [start, end).
+ */
+static int materialize_partial_block(guest_t *g,
+                                     uint64_t block_start,
+                                     uint64_t start,
+                                     uint64_t end,
+                                     int perms)
+{
+    uint64_t base = g->ipa_base;
+    uint64_t *l2_entry = l2_slot_alloc(g, base + block_start);
+    if (!l2_entry)
+        return -1;
+
+    uint64_t l3_gpa = pt_alloc_page(g);
+    if (!l3_gpa)
+        return -1;
+    uint64_t *l3 = pt_at(g, l3_gpa);
+    for (uint64_t pa = start; pa < end; pa += PAGE_SIZE) {
+        unsigned l3_idx = (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
+        l3[l3_idx] = make_page_desc(base + pa, perms);
+    }
+
+    if (perms & MEM_PERM_X)
+        tlbi_request_mark_icache();
+    pte_store_release(l2_entry, (base + l3_gpa) | PT_VALID | PT_TABLE);
+    tlbi_request_range(base + start, base + end);
+    guest_pt_gen_bump(g);
+    return 0;
+}
+
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
 {
     /* Find the noreserve region containing this offset */
@@ -3722,6 +3761,26 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
 
     if (!region)
         return -1; /* Not a noreserve region */
+
+    /* PROT_NONE reserves the range; an access to it is a real fault, not a
+     * request for memory.
+     */
+    if (!(region->prot &
+          (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC)))
+        return -1;
+
+    /* Another vCPU materialized this page while this one waited for mmap_lock,
+     * and the guest may have written to it since. All that is left is the stale
+     * translation the fault came from.
+     */
+    uint64_t fault_page = fault_offset & ~(PAGE_SIZE - 1);
+    if (gva_resolve_perm(g, g->ipa_base + fault_page, NULL, 0, UINT64_MAX)) {
+        if (region->prot & LINUX_PROT_EXEC)
+            tlbi_request_mark_icache();
+        tlbi_request_range(g->ipa_base + fault_page,
+                           g->ipa_base + fault_page + PAGE_SIZE);
+        return 0;
+    }
 
     /* Materialize one 2MiB block containing the fault address. This is the
      * smallest granule that guest_extend_page_tables works with. For the common
@@ -3752,46 +3811,51 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
         perms |= MEM_PERM_W;
     if (region->prot & LINUX_PROT_EXEC)
         perms |= MEM_PERM_X;
-    if (perms == 0)
-        perms = MEM_PERM_R; /* At minimum readable */
+
+    /* Zero before any descriptor is published: once one is, a sibling vCPU can
+     * write through it without faulting, and zeroing afterwards would wipe that
+     * write. Nothing writes an unmapped page in between, since every path that
+     * maps one holds mmap_lock. A page that is already mapped belongs to an
+     * adjacent mapping merged into this region and holds the guest's data, so
+     * it is left alone.
+     */
+    for (uint64_t pg = materialize_start; pg < materialize_end;) {
+        if (gva_resolve_perm(g, g->ipa_base + pg, NULL, 0, UINT64_MAX)) {
+            pg += PAGE_SIZE;
+            continue;
+        }
+        uint64_t run = pg;
+        do {
+            pg += PAGE_SIZE;
+        } while (pg < materialize_end &&
+                 !gva_resolve_perm(g, g->ipa_base + pg, NULL, 0, UINT64_MAX));
+        memset((uint8_t *) g->host_base + run, 0, pg - run);
+    }
+
+    /* A block with no descriptor yet that the region only partly covers gets an
+     * L3 table holding just the region's pages, filled before the L2 slot
+     * points at it. Publishing a whole 2MiB block first and trimming it after
+     * would let a sibling vCPU reach a guard or hole in the same block during
+     * the trim.
+     */
+    if (partial_block && !had_mapping)
+        return materialize_partial_block(g, block_start, materialize_start,
+                                         materialize_end, perms);
 
     /* Create page table entries. guest_extend_page_tables creates L2 block
      * descriptors but skips existing table descriptors (L2->L3 splits).
      * guest_update_perms handles the L3 case: if guest_invalidate_ptes
      * previously split the block and invalidated the L3 entries, update_perms
-     * recreates them with correct perms.
+     * recreates them with correct perms. An existing split block already
+     * encodes the neighboring mappings, so it is left as is.
      */
     if (guest_extend_page_tables(g, block_start, block_end, perms) < 0)
         return -1;
 
-    if (partial_block) {
-        if (guest_split_block(g, block_start) < 0)
-            return -1;
-
-        /* If this block had no page-table entry before the lazy fault,
-         * guest_extend_page_tables() necessarily created a full 2MiB block.
-         * Split it and remove pages outside this noreserve region so holes and
-         * guards in the same 2MiB block remain faults. Existing split blocks
-         * already encode neighboring mappings, so leave them intact.
-         */
-        if (!had_mapping) {
-            if (block_start < materialize_start &&
-                guest_invalidate_ptes(g, block_start, materialize_start) < 0)
-                return -1;
-            if (materialize_end < block_end &&
-                guest_invalidate_ptes(g, materialize_end, block_end) < 0)
-                return -1;
-        }
-    }
+    if (partial_block && guest_split_block(g, block_start) < 0)
+        return -1;
 
     guest_update_perms(g, materialize_start, materialize_end, perms);
-
-    /* Zero the materialized memory. Only zero within the region boundaries to
-     * avoid clobbering adjacent data.
-     */
-    if (materialize_end > materialize_start)
-        memset((uint8_t *) g->host_base + materialize_start, 0,
-               materialize_end - materialize_start);
 
     /* The page-table helpers above already requested the matching TLBI; no
      * additional flush is needed here.

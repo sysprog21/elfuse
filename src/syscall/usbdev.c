@@ -2838,32 +2838,22 @@ static void usbdev_teardown_locked(usbdev_t *u)
 
 static void usbdev_fd_cleanup(int guest_fd, uint64_t generation)
 {
-    (void) generation;
-
     /* The fd-table slot is already closed and free when this runs
      * (fd_cleanup_entry is called outside fd_lock), so a sibling thread's
      * open() can have won the same fd number and bound a second entry here
-     * before this call arrives, and both entries then answer to it. Matching on
-     * the number alone tore down whichever sat at the lower index -- about half
-     * the time the NEW one, whose guest fd was still open and which then
-     * reported EBADF on every use. The lane below drives 8000 open/read/close
-     * rounds across four threads: with the tiebreak removed it loses fds on
-     * every run (281, 313 and 371 over three), and none with it. The count is a
-     * race and varies; that it is never zero without the tiebreak is the point.
-     *
-     * fd_alloc stamps a globally monotonic generation, so among entries that
-     * answer to one fd number the closing one is always the one with the
-     * smaller generation. The cleanup vtable is void(*)(int) and hands over no
-     * snapshot, so that ordering is what identifies the entry.
+     * before this call arrives, and both entries then answer to it. The
+     * generation of the slot being closed names the one to tear down; a number
+     * alone would name whichever sat at the lower index.
      */
     pthread_mutex_lock(&usbdev_table_lock);
     usbdev_t *u = NULL;
     for (int i = 0; i < USBDEV_MAX_FDS; i++) {
         usbdev_t *o = &usbdev_fds[i];
-        if (!o->used || o->dead || o->guest_fd != guest_fd)
-            continue;
-        if (!u || o->generation < u->generation)
+        if (o->used && !o->dead && o->guest_fd == guest_fd &&
+            o->generation == generation) {
             u = o;
+            break;
+        }
     }
     if (!u) {
         pthread_mutex_unlock(&usbdev_table_lock);
@@ -3025,8 +3015,8 @@ static void usbdev_retire_window_delay(void)
  * "not dead": used and alive, this fd number, this generation. Testing !dead
  * alone marked the sibling's entry dead, freed its blob and closed its pipe,
  * and the sibling's still-open fd answered EBADF on every read and ioctl -- the
- * failure usbdev_fd_cleanup's generation tiebreak exists to avoid, reintroduced
- * on the other side of the same window.
+ * failure usbdev_fd_cleanup's generation match exists to avoid, reintroduced on
+ * the other side of the same window.
  */
 static void usbdev_retire_unpublished(usbdev_t *u, int guest_fd, uint64_t gen)
 {

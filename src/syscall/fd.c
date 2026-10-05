@@ -84,32 +84,12 @@ typedef struct {
     uint64_t gen;
 } sfd_key_t;
 
-/* The live slot behind a guest fd. fd_cleanup_entry runs the type's close after
- * the number is free again, so a sibling's create can hold it while the closed
- * fd's slot is still registered; of the slots holding the number, the one with
- * the newest fd generation is the one the guest can reach.
- */
-static int sfd_find_newest(const void *state,
-                           size_t count,
-                           size_t stride,
-                           int guest_fd)
-{
-    const uint8_t *base = state;
-    int best = -1;
-    uint64_t best_gen = 0;
-    for (size_t i = 0; i < count; i++) {
-        sfd_key_t key;
-        memcpy(&key, base + i * stride, sizeof(key));
-        if (key.guest_fd == guest_fd && (best < 0 || key.gen > best_gen)) {
-            best = (int) i;
-            best_gen = key.gen;
-        }
-    }
-    return best;
-}
-
-/* The slot a closing fd owned, or -1: a dup carries the type's close and no
- * slot.
+/* The slot of the fd that carries @gen, or -1: a dup carries the type's close
+ * and no slot. A lookup by fd number could answer with the slot of a closed fd,
+ * since fd_cleanup_entry runs the type's close after the number is free and
+ * another fd can hold it by then. A caller other than the type's close takes
+ * @gen from the fd table before sfd_lock, which orders after fd_lock. A read
+ * takes it and O_NONBLOCK from one fd_block_state, so the two describe one fd.
  */
 static int sfd_find_gen(const void *state,
                         size_t count,
@@ -172,12 +152,6 @@ void timerfd_init(void)
     for (int i = 0; i < TIMERFD_MAX; i++)
         timerfd_state[i].guest_fd = -1;
     fd_register_cleanup(FD_TIMERFD, timerfd_close);
-}
-
-static int timerfd_find(int guest_fd)
-{
-    return sfd_find_newest(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]),
-                           guest_fd);
 }
 
 static int timerfd_find_gen(uint64_t gen)
@@ -309,8 +283,9 @@ int64_t sys_timerfd_settime(guest_t *g,
 {
     int64_t ret = 0;
 
+    uint64_t gen = fd_current_generation(fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         ret = -LINUX_EBADF;
         goto unlock;
@@ -437,8 +412,9 @@ unlock:
 
 int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva)
 {
+    uint64_t gen = fd_current_generation(fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return -LINUX_EBADF;
@@ -479,10 +455,12 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     if (count < 8)
         return -LINUX_EINVAL;
 
-    bool nonblock = fd_guest_nonblock(guest_fd);
+    fd_block_state_t st = fd_block_state(guest_fd);
+    bool nonblock = st.guest_nonblock;
+    uint64_t gen = st.generation;
 
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(guest_fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return -LINUX_EBADF;
@@ -533,7 +511,7 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             int nev = kevent(kq, NULL, 0, &kev, 1, &collect);
             pthread_mutex_lock(&sfd_lock);
             /* Re-validate: slot may have been freed by timerfd_close() */
-            if (timerfd_state[slot].guest_fd != guest_fd) {
+            if (timerfd_find_gen(gen) != slot) {
                 pthread_mutex_unlock(&sfd_lock);
                 return -LINUX_EBADF;
             }
@@ -1118,12 +1096,6 @@ void signalfd_init(void)
     fd_register_cleanup(FD_SIGNALFD, signalfd_close);
 }
 
-static int signalfd_find(int guest_fd)
-{
-    return sfd_find_newest(signalfd_state, SIGNALFD_MAX,
-                           sizeof(signalfd_state[0]), guest_fd);
-}
-
 static int signalfd_find_gen(uint64_t gen)
 {
     return sfd_find_gen(signalfd_state, SIGNALFD_MAX, sizeof(signalfd_state[0]),
@@ -1171,8 +1143,9 @@ int64_t sys_signalfd4(guest_t *g,
 
     /* If fd >= 0, update existing signalfd mask */
     if (fd >= 0) {
+        uint64_t gen = fd_current_generation(fd);
         pthread_mutex_lock(&sfd_lock);
-        int slot = signalfd_find(fd);
+        int slot = signalfd_find_gen(gen);
         if (slot < 0) {
             pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EINVAL;
@@ -1260,6 +1233,7 @@ int64_t signalfd_read(int guest_fd,
                       uint64_t count)
 {
     int nonblock;
+    fd_block_state_t st;
 retry:
     /* Capture slot state under sfd_lock, then release BEFORE calling
      * signal_get_state() which acquires sig_lock(4). Holding sfd_lock(5a) while
@@ -1268,10 +1242,12 @@ retry:
      * Re-read per attempt: a sibling can change the flag while this one is
      * parked, and the block-or-report decision below is made fresh each round.
      */
-    nonblock = fd_guest_nonblock(guest_fd);
+    st = fd_block_state(guest_fd);
+    nonblock = st.guest_nonblock;
+    uint64_t gen = st.generation;
 
     pthread_mutex_lock(&sfd_lock);
-    int slot = signalfd_find(guest_fd);
+    int slot = signalfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return -LINUX_EBADF;
@@ -1360,7 +1336,7 @@ retry:
 
         /* Re-validate: slot may have been freed by signalfd_close() */
         pthread_mutex_lock(&sfd_lock);
-        int still_valid = (signalfd_state[slot].guest_fd == guest_fd);
+        int still_valid = (signalfd_find_gen(gen) == slot);
         pthread_mutex_unlock(&sfd_lock);
         if (!still_valid) {
             free(heap);
@@ -1505,8 +1481,9 @@ bool eventfd_fdinfo_snapshot(int guest_fd, uint64_t *count_out)
 
 bool signalfd_fdinfo_snapshot(int guest_fd, uint64_t *mask_out)
 {
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = signalfd_find(guest_fd);
+    int slot = signalfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return false;
@@ -1522,8 +1499,9 @@ bool timerfd_fdinfo_snapshot(int guest_fd,
                              int64_t *value_ns_out,
                              int64_t *interval_ns_out)
 {
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(guest_fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return false;

@@ -138,8 +138,8 @@ typedef struct {
      * netlink_close() after the number is already back in the fd table's free
      * pool, so a socket() on another thread can be handed the same number while
      * the previous slot is still in_use. Two slots can therefore carry one
-     * guest_fd, and the generation tells them apart: nl_find() answers with the
-     * newest (the only one the guest can still reach) and netlink_close()
+     * guest_fd, and the generation tells them apart: a lookup takes the
+     * generation the fd table carries for the number now, and netlink_close()
      * retires the slot stamped with the generation of the fd being closed. A
      * dup carries netlink_close and no slot, so its close retires nothing.
      */
@@ -299,22 +299,11 @@ static pthread_mutex_t nl_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Both helpers walk nl_state and must be called with nl_lock held: the table is
  * shared by every guest thread, and a socket() racing another socket() would
  * otherwise scan for a free slot, find the same one, and hand two callers the
- * same state. The live socket behind a guest fd: the newest slot holding that
- * number. An older one, if any, is a socket the guest has already closed and
- * whose teardown has not run yet -- see the generation comment above.
- */
-static netlink_state_t *nl_find(int guest_fd)
-{
-    netlink_state_t *best = NULL;
-    NL_FOR_EACH (s)
-        if (s->in_use && s->guest_fd == guest_fd &&
-            (!best || s->gen > best->gen))
-            best = s;
-    return best;
-}
-
-/* The counterpart for teardown: the slot stamped with a closing fd's
- * generation, or NULL.
+ * same state. The slot of the fd that carries @gen, or NULL. A caller other
+ * than netlink_close takes @gen from fd_current_generation before nl_lock: a
+ * lookup by fd number could answer with the slot of a socket the guest has
+ * closed and whose teardown has not run yet -- see the generation comment
+ * above.
  */
 static netlink_state_t *nl_find_gen(uint64_t gen)
 {
@@ -350,7 +339,7 @@ static netlink_state_t *nl_alloc(int guest_fd,
         s->gen = gen;
 
         /* Last, and after every field the finder reads: in_use is what makes
-         * this slot visible to nl_find.
+         * this slot visible to nl_find_gen.
          */
         s->in_use = true;
         return s;
@@ -739,8 +728,9 @@ int64_t netlink_bind(int guest_fd,
     bool have_addr = addr_gva && addrlen >= sizeof(sockaddr_nl_t) &&
                      guest_read_small(g, addr_gva, &snl, sizeof(snl)) == 0;
 
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
@@ -942,8 +932,9 @@ static int64_t nl_setsockopt_netlink(guest_t *g,
     /* The socket is looked up before the optname is judged, as every other
      * option path here does: a closed fd is EBADF whatever it was asked for.
      */
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
@@ -1000,8 +991,9 @@ static int64_t nl_getsockopt_netlink(guest_t *g,
     if (guest_optlen < 0)
         return -LINUX_EINVAL;
 
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
@@ -1051,8 +1043,9 @@ int64_t netlink_setsockopt(guest_t *g,
     if (level != LINUX_SOL_SOCKET)
         return -LINUX_ENOPROTOOPT;
 
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
@@ -1183,8 +1176,9 @@ int64_t netlink_getsockopt(guest_t *g,
     if (level != LINUX_SOL_SOCKET)
         return -LINUX_ENOPROTOOPT;
 
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
@@ -1497,8 +1491,9 @@ static int64_t netlink_send_iov(int guest_fd,
                                 const linux_iovec_t *iov,
                                 int iovcnt)
 {
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
@@ -1692,6 +1687,7 @@ static int64_t nl_wait_readable_locked(netlink_state_t *ns,
      * even on a socket the guest never marked nonblocking.
      */
     bool no_wait = nonblock || ns->opt_rcvtimeo_ms < 0;
+    uint64_t gen = ns->gen;
 
     /* The SO_RCVTIMEO deadline is taken once, here, and not refreshed by the
      * waits below. That is skb_recv_datagram()'s shape: sock_rcvtimeo() is read
@@ -1775,8 +1771,7 @@ static int64_t nl_wait_readable_locked(netlink_state_t *ns,
         }
 
         pthread_mutex_lock(&nl_lock);
-        netlink_state_t *current_ns = nl_find(guest_fd);
-        if (!current_ns || current_ns != ns) {
+        if (nl_find_gen(gen) != ns) {
             pthread_mutex_unlock(&nl_lock);
             return -LINUX_EBADF;
         }
@@ -1867,9 +1862,14 @@ static int64_t netlink_recv_iov(int guest_fd,
                                 int iovcnt,
                                 int flags)
 {
-    bool nonblock = (flags & LINUX_MSG_DONTWAIT) || fd_guest_nonblock(guest_fd);
+    /* O_NONBLOCK and the generation from one fd-table snapshot, so the two
+     * describe one fd.
+     */
+    fd_block_state_t st = fd_block_state(guest_fd);
+    bool nonblock = (flags & LINUX_MSG_DONTWAIT) || st.guest_nonblock;
+    uint64_t gen = st.generation;
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
@@ -1954,8 +1954,9 @@ int64_t netlink_getsockname(int guest_fd,
                             uint64_t addr_gva,
                             uint64_t addrlen_gva)
 {
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
+    netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;

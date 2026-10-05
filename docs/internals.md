@@ -513,11 +513,12 @@ Netlink socket state is keyed by guest fd number, and a guest fd number
 outlives its socket: `fd_cleanup_entry()` runs the netlink teardown after
 the number is already back in the fd table's free pool, so a concurrent
 `socket()` can be handed it while the previous slot is still live. Slots
-therefore carry the fd generation `fd_alloc` stamped on their number: lookups
-answer with the newest slot for a number, and teardown retires the slot
-stamped with the generation of the fd being closed, which a `dup` of the
-socket never is. The timerfd, signalfd and inotify tables pair a close with
-its slot the same way.
+therefore carry the fd generation `fd_alloc` stamped on their number: a
+lookup matches the generation the fd table carries for the number at the
+time of the call, so a number that has passed to another fd finds no slot,
+and teardown retires the slot stamped with the generation of the fd being
+closed, which a `dup` of the socket never is. The timerfd, signalfd and
+inotify tables look up and pair a close with its slot the same way.
 
 ### Stack Alignment
 

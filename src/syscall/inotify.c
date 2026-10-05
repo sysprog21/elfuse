@@ -125,25 +125,12 @@ void inotify_init(void)
     fd_register_cleanup(FD_INOTIFY, inotify_close);
 }
 
-/* The live instance behind a guest fd. fd_cleanup_entry runs inotify_close
- * after the number is free again, so a sibling's inotify_init1 can hold it
- * while the closed fd's instance is still registered; of the instances holding
- * the number, the one with the newest fd generation is the one the guest can
- * reach.
- */
-static int inotify_find(int guest_fd)
-{
-    int best = -1;
-    for (int i = 0; i < INOTIFY_MAX; i++) {
-        if (inotify_state[i].guest_fd == guest_fd &&
-            (best < 0 || inotify_state[i].gen > inotify_state[best].gen))
-            best = i;
-    }
-    return best;
-}
-
-/* The instance a closing fd owned, or -1: a dup carries inotify_close and no
- * instance.
+/* The instance of the fd that carries @gen, or -1: a dup carries inotify_close
+ * and no instance. A lookup by fd number could answer with the instance of a
+ * closed fd, since fd_cleanup_entry runs inotify_close after the number is free
+ * and another fd can hold it by then. A caller other than inotify_close takes
+ * @gen from fd_current_generation before inotify_lock, which orders after
+ * fd_lock.
  */
 static int inotify_find_gen(uint64_t gen)
 {
@@ -451,13 +438,13 @@ static bool snapshot_contains(char *const *entries, int n, const char *name)
  *
  * Caller holds inotify_lock; it is held again on return. For a directory write
  * the lock is released around the openat/readdir snapshot so filesystem I/O
- * does not stall inotify operations on other instances. guest_fd identifies
- * this instance: because the table can change while unlocked, the instance and
- * the watch are re-validated (by host_fd and dev/ino) before the snapshot is
+ * does not stall inotify operations on other instances. @gen identifies this
+ * instance: because the table can change while unlocked, the instance and the
+ * watch are re-validated (by host_fd and dev/ino) before the snapshot is
  * applied, and a teardown or host_fd reuse during the window discards it.
  */
 static int process_vnode_event(inotify_instance_t *inst,
-                               int guest_fd,
+                               uint64_t gen,
                                int host_fd,
                                uint32_t fflags)
 {
@@ -496,7 +483,7 @@ static int process_vnode_event(inotify_instance_t *inst,
              * different file. Any of these discards the stale snapshot.
              */
             widx = watch_find_by_hostfd(inst, host_fd);
-            if (inotify_state[slot].guest_fd != guest_fd || widx < 0) {
+            if (inotify_find_gen(gen) != slot || widx < 0) {
                 free_dir_snapshot(now, now_n);
                 return 0;
             }
@@ -591,24 +578,24 @@ static int collect_events(inotify_instance_t *inst)
      * capture the instance identity to detect teardown across that window.
      */
     int slot = (int) (inst - inotify_state);
-    int guest_fd = inst->guest_fd;
+    uint64_t gen = inst->gen;
 
     int collected = 0;
     bool overflow = false;
     for (int i = 0; i < nev; i++) {
-        int r = process_vnode_event(inst, guest_fd, (int) kevs[i].ident,
+        int r = process_vnode_event(inst, gen, (int) kevs[i].ident,
                                     (uint32_t) kevs[i].fflags);
         if (r < 0) {
             overflow = true;
             break;
         }
         collected += r;
-        if (inotify_state[slot].guest_fd != guest_fd)
+        if (inotify_find_gen(gen) != slot)
             return collected; /* instance closed during snapshot I/O */
     }
 
     /* Signal the self-pipe so poll/epoll sees readability */
-    if ((collected > 0 || overflow) && inotify_state[slot].guest_fd == guest_fd)
+    if ((collected > 0 || overflow) && inotify_find_gen(gen) == slot)
         pipe_signal(inst);
 
     return collected;
@@ -762,9 +749,10 @@ int64_t sys_inotify_add_watch(guest_t *g,
         (void) dir_snapshot_fd(host_fd, &wentries, &wn);
     }
 
+    uint64_t gen = fd_current_generation(inotify_fd);
     pthread_mutex_lock(&inotify_lock);
 
-    int slot = inotify_find(inotify_fd);
+    int slot = inotify_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
@@ -867,9 +855,10 @@ int64_t sys_inotify_add_watch(guest_t *g,
 
 int64_t sys_inotify_rm_watch(int inotify_fd, int wd)
 {
+    uint64_t gen = fd_current_generation(inotify_fd);
     pthread_mutex_lock(&inotify_lock);
 
-    int slot = inotify_find(inotify_fd);
+    int slot = inotify_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
         return -LINUX_EBADF;
@@ -906,14 +895,16 @@ int64_t sys_inotify_rm_watch(int inotify_fd, int wd)
 
 int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 {
-    /* Before inotify_lock: fd_guest_nonblock takes fd_lock, which orders ahead
-     * of this one. The guest's O_NONBLOCK lives in the fd_table shadow because
-     * the host fd behind an inotify fd is elfuse's own pipe.
+    /* Before inotify_lock: fd_block_state takes fd_lock, which orders ahead of
+     * this one. The guest's O_NONBLOCK lives in the fd_table shadow because the
+     * host fd behind an inotify fd is elfuse's own pipe.
      */
-    bool nonblock = fd_guest_nonblock(guest_fd);
+    fd_block_state_t st = fd_block_state(guest_fd);
+    bool nonblock = st.guest_nonblock;
+    uint64_t gen = st.generation;
 
     pthread_mutex_lock(&inotify_lock);
-    int slot = inotify_find(guest_fd);
+    int slot = inotify_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
         return -LINUX_EBADF;
@@ -928,7 +919,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
         /* collect_events may release the lock for directory I/O; bail if the
          * instance was closed in that window.
          */
-        if (inotify_state[slot].guest_fd != guest_fd) {
+        if (inotify_find_gen(gen) != slot) {
             pthread_mutex_unlock(&inotify_lock);
             return -LINUX_EBADF;
         }
@@ -969,7 +960,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
             /* Re-acquire lock and re-validate slot */
             pthread_mutex_lock(&inotify_lock);
-            if (inotify_state[slot].guest_fd != guest_fd) {
+            if (inotify_find_gen(gen) != slot) {
                 pthread_mutex_unlock(&inotify_lock);
                 return -LINUX_EBADF;
             }
@@ -986,13 +977,13 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
              * non-blocking collect path).
              */
             int host_fd = (int) kev.ident;
-            int r = process_vnode_event(inst, guest_fd, host_fd,
-                                        (uint32_t) kev.fflags);
+            int r =
+                process_vnode_event(inst, gen, host_fd, (uint32_t) kev.fflags);
 
             /* process_vnode_event may release the lock for the snapshot; bail
              * if the instance was closed in that window.
              */
-            if (inotify_state[slot].guest_fd != guest_fd) {
+            if (inotify_find_gen(gen) != slot) {
                 pthread_mutex_unlock(&inotify_lock);
                 return -LINUX_EBADF;
             }

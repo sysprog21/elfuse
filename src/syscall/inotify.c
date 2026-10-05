@@ -670,23 +670,21 @@ int64_t sys_inotify_init1(int flags)
     memset(inst->watches, 0, sizeof(inst->watches));
     pthread_mutex_unlock(&inotify_lock);
 
-    /* A close that arrived before the instance was registered found nothing to
-     * tear down. The number no longer carries this generation then, and the
-     * instance is retired here.
-     */
-    if (fd_current_generation(gfd) != gen) {
-        inotify_close(gfd, gen);
-        return gfd;
-    }
-
     /* Linux opens the inotify inode O_RDONLY (anon_inode_getfd in
      * fs/notify/inotify/inotify_user.c), and O_NONBLOCK goes to the shadow
      * rather than the internal pipe, which stays nonblocking so the emulation
      * can do its own waiting.
+     *
+     * A close that arrived before the instance was registered found nothing to
+     * tear down. The number no longer carries this generation then: the publish
+     * writes nothing and the instance is retired here.
      */
-    fd_publish_linux_flags(gfd,
-                           ((flags & IN_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
-                               ((flags & IN_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
+    if (!fd_publish_linux_flags_gen(
+            gfd,
+            ((flags & IN_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                ((flags & IN_NONBLOCK) ? LINUX_O_NONBLOCK : 0),
+            gen))
+        inotify_close(gfd, gen);
 
     return gfd;
 }

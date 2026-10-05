@@ -1385,6 +1385,19 @@ void fd_publish_linux_flags(int guest_fd, int linux_flags)
     pthread_mutex_unlock(&fd_lock);
 }
 
+bool fd_publish_linux_flags_gen(int guest_fd, int linux_flags, uint64_t gen)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return false;
+    pthread_mutex_lock(&fd_lock);
+    fd_entry_t *e = &fd_table[guest_fd];
+    bool ours = e->type != FD_CLOSED && e->generation == gen;
+    if (ours)
+        e->linux_flags = fd_flags_with_accmode(e->type, linux_flags);
+    pthread_mutex_unlock(&fd_lock);
+    return ours;
+}
+
 /* Sized to cover all FD_* constants in abi.h plus a small headroom. Indexed by
  * type. Each slot defaults to NULL (no per-type cleanup). Modules that own a
  * type call fd_register_cleanup() at init time; dup and fork-restore paths read

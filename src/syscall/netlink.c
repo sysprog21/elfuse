@@ -704,24 +704,22 @@ int64_t netlink_socket(int protocol, int type)
         return -LINUX_ENOMEM;
     }
 
-    /* A close that arrived before the slot was registered found nothing to tear
-     * down. The number no longer carries this generation then, and the slot is
-     * retired here.
-     */
-    if (fd_current_generation(gfd) != gen) {
-        netlink_close(gfd, gen);
-        return gfd;
-    }
-
     /* Linux opens a netlink socket O_RDWR; carry SOCK_NONBLOCK into linux_flags
      * so a non-blocking receive on an empty socket reports EAGAIN instead of
      * parking the caller. libusb's uevent monitor opens with
      * SOCK_RAW|SOCK_NONBLOCK|SOCK_CLOEXEC and relies on exactly that.
+     *
+     * A close that arrived before the slot was registered found nothing to tear
+     * down. The number no longer carries this generation then: the publish
+     * writes nothing and the slot is retired here.
      */
-    fd_publish_linux_flags(
-        gfd, LINUX_O_RDWR |
-                 ((type & LINUX_SOCK_NONBLOCK) ? LINUX_O_NONBLOCK : 0) |
-                 ((type & LINUX_SOCK_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
+    if (!fd_publish_linux_flags_gen(
+            gfd,
+            LINUX_O_RDWR |
+                ((type & LINUX_SOCK_NONBLOCK) ? LINUX_O_NONBLOCK : 0) |
+                ((type & LINUX_SOCK_CLOEXEC) ? LINUX_O_CLOEXEC : 0),
+            gen))
+        netlink_close(gfd, gen);
 
     return gfd;
 }

@@ -284,22 +284,20 @@ int64_t sys_timerfd_create(int clockid, int flags)
     timerfd_state[slot].clockid = clockid;
     pthread_mutex_unlock(&sfd_lock);
 
-    /* A close that arrived before the slot was registered found nothing to tear
-     * down. The number no longer carries this generation then, and the slot is
-     * retired here.
-     */
-    if (fd_current_generation(gfd) != gen) {
-        timerfd_close(gfd, gen);
-        return gfd;
-    }
-
     /* Linux opens the timerfd inode O_RDWR (anon_inode_getfd in fs/timerfd.c).
      * Stamp O_RDWR into linux_flags so the F_GETFL branch below can surface the
      * access mode without re-deriving it.
+     *
+     * A close that arrived before the slot was registered found nothing to tear
+     * down. The number no longer carries this generation then: the publish
+     * writes nothing and the slot is retired here.
      */
-    fd_publish_linux_flags(
-        gfd, ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
-                 ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
+    if (!fd_publish_linux_flags_gen(
+            gfd,
+            ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0),
+            gen))
+        timerfd_close(gfd, gen);
     return gfd;
 }
 
@@ -1222,18 +1220,17 @@ int64_t sys_signalfd4(guest_t *g,
     signalfd_state[slot].mask = mask;
     pthread_mutex_unlock(&sfd_lock);
 
-    /* Same window as timerfd_create: a close before the slot was registered. */
-    if (fd_current_generation(gfd) != gen) {
-        signalfd_close(gfd, gen);
-        return gfd;
-    }
-
     /* Linux opens the signalfd inode O_RDWR (anon_inode_getfd in
-     * fs/signalfd.c); same reasoning as eventfd for O_NONBLOCK.
+     * fs/signalfd.c); same reasoning as eventfd for O_NONBLOCK. A false return
+     * is the window timerfd_create describes: a close before the slot was
+     * registered.
      */
-    fd_publish_linux_flags(
-        gfd, ((flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
-                 ((flags & LINUX_SFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
+    if (!fd_publish_linux_flags_gen(
+            gfd,
+            ((flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                ((flags & LINUX_SFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0),
+            gen))
+        signalfd_close(gfd, gen);
 
     return gfd;
 }

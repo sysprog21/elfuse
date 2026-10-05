@@ -613,6 +613,15 @@ bool fd_apply_guest_nonblock(int guest_fd, bool on);
  */
 void fd_publish_linux_flags(int guest_fd, int linux_flags);
 
+/* fd_publish_linux_flags for a creator that kept the generation its allocation
+ * returned. The flags are written only while the slot still carries @gen, in
+ * the fd_lock section that checks it, so a slot a sibling closed and
+ * reallocated keeps its own flags.
+ *
+ * Returns whether the flags were written.
+ */
+bool fd_publish_linux_flags_gen(int guest_fd, int linux_flags, uint64_t gen);
+
 /* Republish the EL1 urandom read fast-path bit for this fd from the current
  * fd_table type and access mode. Only readable /dev/urandom descriptors are
  * eligible for the bitmap.

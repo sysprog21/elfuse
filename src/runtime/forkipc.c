@@ -2242,13 +2242,16 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
         /* A CLONE_VM child has no host pid of its own, so it resolves to -1 and
          * its pidfd carries no monitor.
          */
-        int pfd = pidfd_create(g, ret, proc_resolve_guest_pid(ret));
+        uint64_t gen = 0;
+        int pfd = pidfd_create(g, ret, proc_resolve_guest_pid(ret), &gen);
         if (pfd >= 0) {
             int32_t pfd32 = (int32_t) pfd;
             if (guest_write_small(g, ca.pidfd, &pfd32, sizeof(pfd32)) < 0) {
-                /* GVA invalid; close the newly created pidfd. */
+                /* GVA invalid; close the newly created pidfd. By generation: a
+                 * sibling can have closed and reused the number already.
+                 */
                 fd_entry_t snap;
-                if (fd_snapshot_and_close(pfd, &snap))
+                if (fd_snapshot_and_close_gen(pfd, gen, &snap))
                     fd_cleanup_entry(pfd, &snap);
             }
         }

@@ -203,7 +203,10 @@ static void *pidfd_monitor_thread(void *arg)
     return NULL;
 }
 
-int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
+int pidfd_create(guest_t *g,
+                 int64_t target_pid,
+                 pid_t host_pid,
+                 uint64_t *out_gen)
 {
     (void) g;
     int pfd[2];
@@ -225,14 +228,14 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
         close(pfd[1]);
         return -LINUX_EMFILE;
     }
+    if (out_gen)
+        *out_gen = gen;
 
     pthread_mutex_lock(&pidfd_lock);
     pidfd_entry_t *entry = pidfd_find_free_entry();
     if (!entry) {
         pthread_mutex_unlock(&pidfd_lock);
-        fd_entry_t snap;
-        if (fd_snapshot_and_close(gfd, &snap))
-            fd_cleanup_entry(gfd, &snap);
+        fd_retire_published_gen(gfd, pfd[0], gen);
         close(pfd[1]);
         return -LINUX_EMFILE;
     }
@@ -363,11 +366,11 @@ int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags)
         return -LINUX_EINVAL;
 
     if (pid == proc_get_pid())
-        return pidfd_create(g, pid, 0);
+        return pidfd_create(g, pid, 0, NULL);
 
     pid_t host_pid = proc_resolve_guest_pid(pid);
     if (host_pid > 0)
-        return pidfd_create(g, pid, host_pid);
+        return pidfd_create(g, pid, host_pid, NULL);
 
     return -LINUX_ESRCH;
 }

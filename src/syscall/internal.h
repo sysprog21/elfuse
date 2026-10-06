@@ -812,6 +812,12 @@ void fd_retire_published_gen(int fd, int host_fd, uint64_t gen);
  */
 bool fd_snapshot_and_close(int fd, fd_entry_t *out);
 
+/* fd_snapshot_and_close for a caller that kept the generation its allocation
+ * returned: the slot is closed only while it still carries @gen, so a number a
+ * sibling closed and reallocated stays open.
+ */
+bool fd_snapshot_and_close_gen(int fd, uint64_t gen, fd_entry_t *out);
+
 /* Snapshot and close with a single-thread fast path. Uses the unlocked table
  * update when exactly one guest thread is active, otherwise falls back to
  * fd_snapshot_and_close().

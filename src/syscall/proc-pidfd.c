@@ -25,7 +25,7 @@
 
 /* One entry per pidfd_open. A dup shares the entry of the pidfd it copies, as
  * the two share one open file description on Linux, so an alias takes no entry
- * and no host descriptor of its own.
+ * and no pipe of its own. Its host descriptor is a dup of the entry's read end.
  */
 typedef struct {
     bool active;

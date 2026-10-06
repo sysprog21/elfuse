@@ -6,10 +6,11 @@
  *
  * dup, dup3 and F_DUPFD each hand back a second name for one pidfd. Every alias
  * must signal and wait on the same child, stay unreadable while the child runs
- * whichever alias is closed first, and turn readable when the child exits. The
- * fd table is the only limit on how many aliases there are, and a dup2 onto an
- * open fd succeeds however many pidfds are open. Closing a pidfd lets another
- * be opened in its place, and a dup that fails on EMFILE changes nothing.
+ * whichever alias is closed first, and turn readable when the child exits. An
+ * alias does not count against the number of pidfds that can be open, and a
+ * dup2 onto an open fd succeeds however many pidfds are open. Closing a pidfd
+ * lets another be opened in its place, and a dup that fails on EMFILE changes
+ * nothing.
  */
 
 #include <errno.h>

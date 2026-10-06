@@ -451,6 +451,7 @@ typedef struct {
 typedef struct {
     void *host_base; /* Host pointer to allocated guest memory */
     int shm_fd; /* File fd backing host_base for CoW fork (-1 if MAP_ANON) */
+    bool shm_exported; /* A fork child was handed the shm_fd file itself */
 
     uint64_t guest_size; /* Total size (determined by IPA capacity) */
     uint64_t ipa_base;   /* IPA base for hv_vm_map (GUEST_IPA_BASE) */

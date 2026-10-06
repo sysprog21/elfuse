@@ -203,9 +203,10 @@ int fork_child_main(int ipc_fd,
     guest_t g;
 
     if (hdr.has_shm) {
-        /* CoW fork: receive shm fd via SCM_RIGHTS, then map MAP_PRIVATE. This
-         * gives the child an instant copy-on-write snapshot of the parent's
-         * entire guest memory, with no region enumeration or byte copying.
+        /* CoW fork: receive shm fd via SCM_RIGHTS for guest_init_from_shm to
+         * map. This gives the child an instant copy-on-write snapshot of the
+         * parent's entire guest memory, with no region enumeration or byte
+         * copying.
          */
         int shm_fd = -1, shm_count = 0;
         if (fork_ipc_recv_fds(ipc_fd, &shm_fd, 1, &shm_count) < 0 ||
@@ -1769,8 +1770,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         goto fail_snapshot;
 
     /* CoW fast path: if shm_fd >= 0, send a snapshot of guest memory to the
-     * child instead of the per-region copy. The child maps that snapshot
-     * MAP_PRIVATE; subsequent writes on either side are private.
+     * child instead of the per-region copy; guest_init_from_shm maps it so the
+     * child's writes stay out of the parent's memory.
      *
      * The parent's own mapping cannot be flipped to MAP_PRIVATE here: hv_vm_map
      * caches the host VA->PA mapping, and a MAP_FIXED remap invalidates it (the
@@ -1833,8 +1834,15 @@ int64_t sys_clone(hv_vcpu_t vcpu,
          * fork (Redis BGSAVE, checkpointing runtimes). On failure the fallback
          * differs per design above: Rosetta drops use_shm so the region-copy
          * path runs; native guests keep use_shm and send the live g->shm_fd.
+         * Exercise the fallback on APFS hosts.
          */
-        snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
+        const char *disable_clone = getenv("ELFUSE_DISABLE_FORK_CLONEFILE");
+        if (disable_clone && strcmp(disable_clone, "1") == 0) {
+            snapshot_shm_fd = -1;
+            errno = ENOTSUP;
+        } else {
+            snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
+        }
         if (snapshot_shm_fd < 0) {
             if (g->is_rosetta) {
                 log_warn(
@@ -2010,6 +2018,12 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         goto fail_snapshot;
     }
 
+    /* Only an admitted child keeps the live slab mapped. The flag stays set
+     * after it exits, which costs only the write-back.
+     */
+    if (use_shm && snapshot_shm_fd < 0)
+        g->shm_exported = true;
+
     /* The child's inherited slave copies are live from the moment fork returns,
      * so they go on the shared count here rather than in the child's own init,
      * which the parent's close of its copy can beat.
@@ -2033,8 +2047,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     close(ipc_sock);
 
     /* After CoW fork, parent stays on MAP_SHARED because no remap was done. The
-     * shm fd is kept open so subsequent forks can also use CoW. The child has
-     * its own MAP_PRIVATE view of the same file.
+     * shm fd is kept open so subsequent forks can also use CoW.
      */
 
     /* CLONE_VFORK suspends the parent until the child exits or execs. The

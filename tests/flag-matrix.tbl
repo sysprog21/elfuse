@@ -75,7 +75,7 @@ openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O
 pending openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
 
 # unlinkat(dirfd, path, flags)
-pending unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR
+unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR
 unlinkat | AT_REMOVEDIR@file | CWD p:file F | err:ENOTDIR | absent:p:file
 unlinkat | 0x8000@unknown | CWD p:file F | err:EINVAL | absent:p:file
 

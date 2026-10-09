@@ -3043,15 +3043,28 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
     host_fd_t unlink_dirfd = path_translation_dirfd(&tx, &dir_ref);
 
     struct stat removed_st;
+    bool removed_known = fstatat(unlink_dirfd, tx.host_path, &removed_st,
+                                 AT_SYMLINK_NOFOLLOW) == 0;
     bool clear_removed_overlay =
-        fstatat(unlink_dirfd, tx.host_path, &removed_st, AT_SYMLINK_NOFOLLOW) ==
-            0 &&
+        removed_known &&
         (removed_st.st_nlink <= 1 || (flags & LINUX_AT_REMOVEDIR));
+    bool removed_is_dir = removed_known && S_ISDIR(removed_st.st_mode);
 
     int host_flags = translate_at_flags(flags);
     if (unlinkat(unlink_dirfd, tx.host_path, host_flags) < 0) {
+        int64_t err = linux_errno();
         host_fd_ref_close(&dir_ref);
-        return linux_errno();
+
+        /* unlink of a directory is EISDIR on Linux and EPERM on macOS. The
+         * rewrite is keyed on the host's EPERM so that every other refusal
+         * keeps its own errno. One case is left wrong by it: a directory the
+         * caller may not remove from a sticky or immutable parent is EPERM on
+         * Linux too, and reads EISDIR here.
+         */
+        if (err == -LINUX_EPERM && !(flags & LINUX_AT_REMOVEDIR) &&
+            removed_is_dir)
+            return -LINUX_EISDIR;
+        return err;
     }
 
     if (clear_removed_overlay)

@@ -2922,6 +2922,20 @@ int64_t sys_mmap(guest_t *g,
     if (length == 0)
         return -LINUX_EINVAL;
 
+    /* The mapping type is MAP_SHARED, MAP_PRIVATE or, for a file only, the two
+     * together as MAP_SHARED_VALIDATE. Linux refuses anything else, and a
+     * mapping with neither used to be made here as a private one. Under
+     * MAP_SHARED_VALIDATE a flag the file cannot honor is EOPNOTSUPP rather
+     * than ignored, which is the whole point of asking for validation.
+     */
+    int map_type = flags & LINUX_MAP_TYPE;
+    if (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE &&
+        (map_type != LINUX_MAP_SHARED_VALIDATE || is_anon))
+        return -LINUX_EINVAL;
+    if (map_type == LINUX_MAP_SHARED_VALIDATE &&
+        (flags & ~LINUX_MAP_VALIDATE_MASK))
+        return -LINUX_EOPNOTSUPP;
+
     /* Linux requires page-aligned offset for file-backed mmap */
     if (!is_anon && (offset & 4095))
         return -LINUX_EINVAL;

@@ -61,6 +61,9 @@
 #                                    a read of "file"
 #   region:writable region:readonly region:noread
 #                      the same loads and stores, on the region
+#   child              the call returns a pid, and that process exits 0
+#   child:ptid child:noptid          also, the int at buf holds that pid, or 0
+#   child:pidfd        also, the int at buf is a close-on-exec fd
 #   =                  (last field only) the same answer as with the flag
 #
 # A row that starts with "unsupported:ANSWER" is a flag elfuse declines on
@@ -235,3 +238,14 @@ mprotect | PROT_WRITE | region 4096 F|PROT_READ | region:writable | region:reado
 mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+
+# clone(flags, stack, parent_tid, tls, child_tid), the arm64 argument order.
+# A zero stack with no CLONE_VM is a fork: the child gets a copy and exits.
+pending clone | CLONE_PARENT_SETTID | F|SIGCHLD 0 buf 0 0 | child:ptid | child:noptid
+pending clone | CLONE_PIDFD | F|SIGCHLD 0 buf 0 0 | child:pidfd | child:noptid
+clone | CLONE_VFORK | F|SIGCHLD 0 0 0 0 | child | =
+clone | CLONE_CHILD_SETTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
+clone | CLONE_CHILD_CLEARTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
+# A thread shares signal handlers, and shared handlers need shared memory.
+pending clone | CLONE_THREAD@no-sighand | F|SIGCHLD 0 0 0 0 | err:EINVAL | child
+pending clone | CLONE_SIGHAND@no-vm | F|SIGCHLD 0 0 0 0 | err:EINVAL | child

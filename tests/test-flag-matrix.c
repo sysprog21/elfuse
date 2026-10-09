@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -36,6 +37,7 @@
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -106,6 +108,10 @@ enum fm_expect_kind {
     FM_X_REGION_WRITABLE,
     FM_X_REGION_READONLY,
     FM_X_REGION_NOREAD,
+    FM_X_CHILD,
+    FM_X_CHILD_PTID,
+    FM_X_CHILD_NOPTID,
+    FM_X_CHILD_PIDFD,
 };
 
 struct fm_arg {
@@ -127,6 +133,11 @@ struct fm_row {
     int unsupported;
     struct fm_expect elfuse_with;
 };
+
+/* Newer than some of the toolchains this builds with. */
+#ifndef CLONE_PIDFD
+#define CLONE_PIDFD 0x00001000
+#endif
 
 #include "flag-matrix-vectors.h"
 
@@ -427,6 +438,31 @@ static int answer_matches(const struct fm_expect *x, long rc)
                        x->kind == FM_X_REGION_WRITABLE ? "not " : ""),
                    0;
         return 1;
+    case FM_X_CHILD:
+    case FM_X_CHILD_PTID:
+    case FM_X_CHILD_NOPTID:
+    case FM_X_CHILD_PIDFD: {
+        int status = 0, slot;
+        if (rc <= 0)
+            return WHY("rc=%ld, want a child pid", rc), 0;
+        if (waitpid((pid_t) rc, &status, __WALL) != (pid_t) rc)
+            return WHY("waitpid failed, errno=%d", errno), 0;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            return WHY("child status %#x", status), 0;
+        memcpy(&slot, fm_buf, sizeof(slot));
+        if (x->kind == FM_X_CHILD_PTID && slot != (int) rc)
+            return WHY("the tid slot holds %d, child is %ld", slot, rc), 0;
+        if (x->kind == FM_X_CHILD_NOPTID && slot != 0)
+            return WHY("the tid slot holds %d, want it untouched", slot), 0;
+        if (x->kind == FM_X_CHILD_PIDFD) {
+            fl = slot > 0 ? fcntl(slot, F_GETFD) : -1;
+            if (fl >= 0)
+                close(slot);
+            if (fl < 0 || !(fl & FD_CLOEXEC))
+                return WHY("pidfd slot holds %d, F_GETFD=%d", slot, fl), 0;
+        }
+        return 1;
+    }
     case FM_X_STATX_REG:
     case FM_X_STATX_LNK: {
         struct statx sx;
@@ -524,7 +560,14 @@ static int run_one(const struct fm_row *row, int with, int strict)
     }
 
     fm_arg0 = a[0];
+    long self = raw_syscall0(__NR_getpid);
     long rc = raw_syscall6(row->nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+
+    /* A row that made a process leaves the new one here as well. It has nothing
+     * to report; the parent reads the answer.
+     */
+    if (raw_syscall0(__NR_getpid) != self)
+        _exit(0);
 
     /* A call that fills an fd pair answers through both of them, unless the
      * answer names the second one.
@@ -555,6 +598,11 @@ static int run_one(const struct fm_row *row, int with, int strict)
 
     if (x->kind >= FM_X_MAP && x->kind <= FM_X_MAP_KEEPS_FILE && is_mapping(rc))
         munmap((void *) rc, 4096);
+
+    /* A child the row made without expecting one is not left behind. */
+    if (rc > 0 && !(x->kind >= FM_X_CHILD && x->kind <= FM_X_CHILD_PIDFD) &&
+        row->nargs == 5 && !returns_fd(x))
+        waitpid((pid_t) rc, NULL, __WALL | WNOHANG);
 
 out:
     munmap(fm_region, FM_REGION_SIZE);

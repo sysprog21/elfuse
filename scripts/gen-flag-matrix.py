@@ -80,6 +80,7 @@ PLAIN_EXPECTS = {
 # Expectations whose operand is a C expression.
 EXPR_EXPECTS = {
     "err": "FM_X_ERR",
+    "errkeeps": "FM_X_ERR_KEEPS",
     "fd:getfl": "FM_X_FD_GETFL",
     "fd:nogetfl": "FM_X_FD_NOGETFL",
     "pair1:getfl": "FM_X_PAIR1_GETFL",

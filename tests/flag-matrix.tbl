@@ -27,7 +27,7 @@
 #   F  F|EXPR        the flags slot; EXPR is ORed in for both runs
 #   anything else    a C integer expression
 #
-# Fixture entries, recreated before every run:
+# Fixture entries, built in a fresh directory for every run:
 #   file      regular file, 10 bytes, mode 0644
 #   dir       empty directory
 #   link      symlink to "file"
@@ -38,6 +38,7 @@
 # Answers:
 #   ok                 the call returns >= 0
 #   err:ENAME          the call returns -ENAME
+#   errkeeps:ENAME     the same, and "file" still holds its 10 bytes
 #   fd                 the call returns an fd
 #   fd:cloexec fd:nocloexec          F_GETFD has, or lacks, FD_CLOEXEC
 #   fd:getfl:EXPR fd:nogetfl:EXPR    F_GETFL has every bit, or no bit, of EXPR
@@ -46,8 +47,9 @@
 #   fd:appends fd:overwrites         a 1-byte write at offset 0 grows the file,
 #                                    or leaves its size alone
 #   fd:readebadf       read on the fd gives EBADF
-#   exists:p:NAME absent:p:NAME      lstat finds, or does not find, the entry
-#   lreg:p:NAME llnk:p:NAME          lstat says regular file, or symlink
+#   exists:p:NAME absent:p:NAME      the name is, or is not, there
+#   lreg:p:NAME llnk:p:NAME          the name itself is a regular file, or a
+#                                    symlink
 #   size:p:NAME=N mode:p:NAME=N      stat reports that size, or permission bits
 #   buf:reg buf:lnk    the struct stat in buf is a regular file, or a symlink
 #   bufx:reg bufx:lnk  the same for a struct statx
@@ -77,6 +79,10 @@
 # passes "strict", which makes a pending row an ordinary one.
 
 # openat(dirfd, path, flags, mode)
+# This row reads the guest's own view of the flag. Whether elfuse also passes
+# O_CLOEXEC to the host open cannot be seen from a guest: a guest execve stays
+# in the same host process and closes descriptors from elfuse's table, and the
+# fork helper is spawned with every host descriptor closed by default.
 openat | O_CLOEXEC | CWD p:file F|O_RDONLY 0 | fd:cloexec | fd:nocloexec
 openat | O_NONBLOCK | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
 openat | O_APPEND | CWD p:file F|O_WRONLY 0 | fd:appends | fd:overwrites
@@ -85,8 +91,15 @@ openat | O_CREAT | CWD p:new F|O_WRONLY 0600 | exists:p:new | err:ENOENT
 openat | O_EXCL | CWD p:file F|O_CREAT|O_WRONLY 0600 | err:EEXIST | fd
 openat | O_TRUNC | CWD p:file F|O_WRONLY 0 | size:p:file=0 | size:p:file=10
 openat | O_DIRECTORY | CWD p:file F|O_RDONLY 0 | err:ENOTDIR | fd
+# The refusal comes before the open takes effect: the file is not truncated.
+openat | O_DIRECTORY@no-truncate | CWD p:file F|O_WRONLY|O_TRUNC 0 | errkeeps:ENOTDIR | size:p:file=0
 openat | O_NOFOLLOW | CWD p:link F|O_RDONLY 0 | err:ELOOP | fd
 openat | O_PATH | CWD p:file F|O_RDONLY 0 | fd:readebadf | fd
+# O_PATH with O_NOFOLLOW opens the symlink itself; without O_PATH that is ELOOP.
+openat | O_PATH@symlink | CWD p:link F|O_NOFOLLOW|O_RDONLY 0 | fd | err:ELOOP
+# O_NOCTTY matters only when the name is a terminal the caller could adopt,
+# and AT_EACCESS only when the real and effective ids differ. Neither can be
+# arranged here, so these two rows assert that the flag is accepted.
 openat | O_NOCTTY | CWD p:file F|O_RDONLY 0 | fd | =
 openat | O_SYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_SYNC | fd:nogetfl:O_SYNC
 openat | O_DSYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_DSYNC | fd:nogetfl:O_DSYNC
@@ -98,6 +111,8 @@ openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O
 # documents EISDIR as the answer of a kernel without O_TMPFILE.
 unsupported:err:EISDIR openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
 openat | O_TMPFILE@rdonly | CWD p:dir F|O_RDONLY 0600 | err:EINVAL | fd
+# An empty name is ENOENT before dirfd is looked at.
+pending openat | O_CLOEXEC@empty-path | fd:file p:empty F|O_RDONLY 0 | err:ENOENT | =
 
 # unlinkat(dirfd, path, flags)
 unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR
@@ -119,6 +134,9 @@ statx | AT_STATX_SYNC_TYPE@both | CWD p:file F STATX_BASIC_STATS buf | err:EINVA
 
 # linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 linkat | AT_SYMLINK_FOLLOW | CWD p:link CWD p:new F | lreg:p:new | llnk:p:new
+pending linkat | AT_EMPTY_PATH | fd:file p:empty CWD p:new F | lreg:p:new | err:ENOENT
+pending linkat | AT_SYMLINK_FOLLOW@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+pending linkat | AT_SYMLINK_FOLLOW@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
 
 # fchmodat(dirfd, path, mode): the kernel entry takes three arguments, so a
 # flags word in the fourth is never read.
@@ -143,6 +161,8 @@ faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
 renameat2 | RENAME_NOREPLACE | CWD p:file CWD p:link F | err:EEXIST | lreg:p:link
 renameat2 | RENAME_EXCHANGE | CWD p:file CWD p:link F | llnk:p:file | absent:p:file
 renameat2 | RENAME_NOREPLACE|RENAME_EXCHANGE@both | CWD p:file CWD p:link F | err:EINVAL | lreg:p:link
+pending renameat2 | RENAME_NOREPLACE@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+pending renameat2 | RENAME_NOREPLACE@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
 
 # dup3(oldfd, newfd, flags)
 dup3 | O_CLOEXEC | fd:file 100 F | fd:cloexec | fd:nocloexec
@@ -212,6 +232,8 @@ fcntl | O_SYNC@setfl-ignored | fd:file F_SETFL F | arg0:nogetfl:O_SYNC | =
 
 # mmap(addr, length, prot, flags, fd, offset): the flags are argument 3.
 mmap | MAP_ANONYMOUS | 0 4096 PROT_READ F|MAP_PRIVATE -1 0 | map | err:EBADF
+# The descriptor is looked up before the mapping type is judged.
+pending mmap | MAP_PRIVATE@bad-fd-first | 0 4096 PROT_READ F -1 0 | err:EBADF | =
 mmap | MAP_PRIVATE@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
 mmap | MAP_SHARED@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
 mmap | MAP_FIXED | region 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:atregion | map:elsewhere

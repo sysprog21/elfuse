@@ -73,6 +73,7 @@ enum fm_fd { FM_FD_FILE, FM_FD_DIR, FM_FD_LISTENER };
 enum fm_expect_kind {
     FM_X_OK,
     FM_X_ERR,
+    FM_X_ERR_KEEPS,
     FM_X_FD,
     FM_X_FD_CLOEXEC,
     FM_X_FD_NOCLOEXEC,
@@ -189,31 +190,76 @@ static int is_mapping(long rc)
 static int fm_client = -1;
 static char fm_why[160];
 
-/* Put the fixture directory back to its starting state. The previous run may
- * have removed, renamed, or replaced any entry, so each one is removed as
- * whatever it is now before it is made again.
+/* Every run gets a directory of its own under the base, built from nothing.
+ * Nothing is removed until the end, and the regular file is made with mknod, so
+ * the fixture leans on neither O_CREAT nor AT_REMOVEDIR. A row for one of those
+ * can then fail by itself when elfuse mishandles the flag, where it used to
+ * take the fixture and every later row with it.
  */
-static int fixture_reset(void)
-{
-    static const char *const names[] = {"file",     "dir", "link",
-                                        "dangling", "new", "sock"};
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (unlink(names[i]) < 0 && errno != ENOENT && rmdir(names[i]) < 0 &&
-            errno != ENOENT)
-            return -1;
-    }
+static char fm_base[64];
+static int fm_runs;
 
-    int fd = open("file", O_WRONLY | O_CREAT | O_EXCL, 0644);
+static int fixture_enter(void)
+{
+    char name[16];
+    snprintf(name, sizeof(name), "r%d", fm_runs);
+    if (chdir(fm_base) < 0 || mkdir(name, 0755) < 0 || chdir(name) < 0)
+        return -1;
+    fm_runs++;
+
+    if (mknod("file", S_IFREG | 0644, 0) < 0)
+        return -1;
+    int fd = open("file", O_WRONLY);
     if (fd < 0)
         return -1;
     ssize_t n = write(fd, "0123456789", FM_FILE_SIZE);
     close(fd);
-    if (n != FM_FILE_SIZE || chmod("file", 0644) < 0)
+    if (n != FM_FILE_SIZE)
         return -1;
     if (mkdir("dir", 0755) < 0 || symlink("file", "link") < 0 ||
         symlink("nowhere", "dangling") < 0)
         return -1;
     return 0;
+}
+
+/* Best effort: a run that broke something has already been reported. */
+static void fixture_remove_all(void)
+{
+    static const char *const names[] = {"file",     "dir", "link",
+                                        "dangling", "new", "sock"};
+    for (int run = 0; run < fm_runs; run++) {
+        char name[16];
+        snprintf(name, sizeof(name), "r%d", run);
+        if (chdir(fm_base) < 0 || chdir(name) < 0)
+            continue;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            if (unlink(names[i]) < 0)
+                rmdir(names[i]);
+        }
+        if (chdir(fm_base) == 0)
+            rmdir(name);
+    }
+    if (chdir("/") == 0)
+        rmdir(fm_base);
+}
+
+/* What a fixture name is now, found without lstat: lstat is newfstatat with
+ * AT_SYMLINK_NOFOLLOW, and an answer read through a flag the table tests would
+ * fail rows that have nothing to do with it.
+ */
+enum fm_entry { FM_E_ABSENT, FM_E_LINK, FM_E_REG, FM_E_OTHER };
+
+static enum fm_entry entry_kind(const char *name)
+{
+    char target[64];
+    struct stat st;
+    if (readlink(name, target, sizeof(target)) >= 0)
+        return FM_E_LINK;
+    if (errno != EINVAL)
+        return FM_E_ABSENT;
+    if (stat(name, &st) < 0)
+        return FM_E_OTHER;
+    return S_ISREG(st.st_mode) ? FM_E_REG : FM_E_OTHER;
 }
 
 /* A listening Unix socket with one connection already queued, so that an accept
@@ -313,23 +359,27 @@ static int answer_matches(const struct fm_expect *x, long rc)
     case FM_X_ABSENT:
         if (rc < 0)
             return WHY("rc=%ld, want >= 0", rc), 0;
-        if ((lstat(fm_paths[x->a], &st) == 0) != (x->kind == FM_X_EXISTS))
+        if ((entry_kind(fm_paths[x->a]) != FM_E_ABSENT) !=
+            (x->kind == FM_X_EXISTS))
             return WHY("\"%s\" %s", fm_paths[x->a],
                        x->kind == FM_X_EXISTS ? "is missing" : "still exists"),
                    0;
         return 1;
     case FM_X_LSTAT_REG:
-    case FM_X_LSTAT_LNK:
+    case FM_X_LSTAT_LNK: {
+        enum fm_entry kind = entry_kind(fm_paths[x->a]);
         if (rc < 0)
             return WHY("rc=%ld, want >= 0", rc), 0;
-        if (lstat(fm_paths[x->a], &st) < 0)
-            return WHY("lstat \"%s\" failed, errno=%d", fm_paths[x->a], errno),
+        if (kind != (x->kind == FM_X_LSTAT_REG ? FM_E_REG : FM_E_LINK))
+            return WHY("\"%s\" is entry kind %d", fm_paths[x->a], (int) kind),
                    0;
-        if (x->kind == FM_X_LSTAT_REG ? !S_ISREG(st.st_mode)
-                                      : !S_ISLNK(st.st_mode))
-            return WHY("\"%s\" has mode %#o", fm_paths[x->a],
-                       (unsigned) st.st_mode),
-                   0;
+        return 1;
+    }
+    case FM_X_ERR_KEEPS:
+        if (rc != -x->a)
+            return WHY("rc=%ld, want %ld", rc, -x->a), 0;
+        if (stat("file", &st) < 0 || st.st_size != FM_FILE_SIZE)
+            return WHY("the refused call changed \"file\""), 0;
         return 1;
     case FM_X_SIZE:
     case FM_X_MODE:
@@ -509,9 +559,9 @@ static int run_one(const struct fm_row *row, int with, int strict)
     /* A broken fixture says nothing about this row's flag, so it ends the run
      * rather than failing every row after it.
      */
-    if (fixture_reset() < 0) {
+    if (fixture_enter() < 0) {
         printf("FIXTURE BROKEN (errno=%d)\n", errno);
-        printf("\ntest-flag-matrix: fixture reset failed - FAIL\n");
+        printf("\ntest-flag-matrix: fixture could not be built - FAIL\n");
         exit(2);
     }
     memset(fm_buf, 0, sizeof(fm_buf));
@@ -618,7 +668,6 @@ out:
 int main(int argc, char **argv)
 {
     int strict = argc > 1 && strcmp(argv[1], "strict") == 0;
-    char dir[] = "/tmp/flag-matrix-XXXXXX";
 
     struct sigaction sa = {.sa_handler = on_fault};
     sigemptyset(&sa.sa_mask);
@@ -627,7 +676,8 @@ int main(int argc, char **argv)
 
     printf("test-flag-matrix: %zu rows\n",
            sizeof(fm_rows) / sizeof(fm_rows[0]));
-    if (!mkdtemp(dir) || chdir(dir) < 0) {
+    snprintf(fm_base, sizeof(fm_base), "/tmp/flag-matrix-XXXXXX");
+    if (!mkdtemp(fm_base)) {
         perror("fixture directory");
         return 1;
     }
@@ -645,14 +695,7 @@ int main(int argc, char **argv)
         }
     }
 
-    static const char *const names[] = {"file",     "dir", "link",
-                                        "dangling", "new", "sock"};
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (unlink(names[i]) < 0)
-            rmdir(names[i]);
-    }
-    if (chdir("/") == 0)
-        rmdir(dir);
+    fixture_remove_all();
 
     if (known)
         printf("\n%d known mismatch(es) on pending rows\n", known);

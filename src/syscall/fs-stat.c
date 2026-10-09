@@ -917,6 +917,12 @@ int64_t sys_statx(guest_t *g,
                        LINUX_AT_NO_AUTOMOUNT | LINUX_AT_STATX_SYNC_TYPE))
         return -LINUX_EINVAL;
 
+    /* FORCE_SYNC and DONT_SYNC are two values of one field, and Linux refuses
+     * the value that sets both.
+     */
+    if ((flags & LINUX_AT_STATX_SYNC_TYPE) == LINUX_AT_STATX_SYNC_TYPE)
+        return -LINUX_EINVAL;
+
     /* See sys_fstat comment on the zero-init rationale. */
     struct stat mac_st = {0};
     int64_t rc = stat_at_path(g, dirfd, path_gva, flags, &mac_st);

@@ -72,7 +72,8 @@ enum fm_fd {
     FM_FD_DIR,
     FM_FD_LISTENER,
     FM_FD_SEALED,
-    FM_FD_UNLINKED
+    FM_FD_UNLINKED,
+    FM_FD_PROCPATH
 };
 
 enum fm_expect_kind {
@@ -333,6 +334,8 @@ static long open_fixture_fd(long which)
         return open_listener();
     if (which == FM_FD_SEALED)
         return memfd_create("sealed", MFD_NOEXEC_SEAL);
+    if (which == FM_FD_PROCPATH)
+        return open("/proc/self/status", O_PATH);
     int fd = open("file", O_RDWR);
     if (which == FM_FD_UNLINKED && fd >= 0 && unlink("file") < 0) {
         close(fd);

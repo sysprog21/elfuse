@@ -141,6 +141,11 @@ statx | AT_STATX_SYNC_TYPE@both | CWD p:file F STATX_BASIC_STATS buf | err:EINVA
 
 # linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 linkat | AT_SYMLINK_FOLLOW | CWD p:link CWD p:new F | lreg:p:new | llnk:p:new
+linkat | AT_EMPTY_PATH | fd:file p:empty CWD p:new F | lreg:p:new | err:ENOENT
+# A file of /proc is on a mount of its own, so it links nowhere else.
+linkat | AT_EMPTY_PATH@proc | fd:procpath p:empty CWD p:new F | err:EXDEV | err:ENOENT
+linkat | AT_SYMLINK_FOLLOW@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+linkat | AT_SYMLINK_FOLLOW@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
 
 # fchmodat(dirfd, path, mode): the kernel entry takes three arguments, so a
 # flags word in the fourth is never read.

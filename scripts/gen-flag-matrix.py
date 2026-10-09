@@ -45,7 +45,8 @@ PATHS = {
     "empty": "FM_P_EMPTY",
 }
 FDS = {"file": "FM_FD_FILE", "dir": "FM_FD_DIR", "listener": "FM_FD_LISTENER",
-       "sealed": "FM_FD_SEALED", "unlinked": "FM_FD_UNLINKED"}
+       "sealed": "FM_FD_SEALED", "unlinked": "FM_FD_UNLINKED",
+       "procpath": "FM_FD_PROCPATH"}
 
 # Expectations that take no operand.
 PLAIN_EXPECTS = {

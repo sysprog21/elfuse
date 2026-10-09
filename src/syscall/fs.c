@@ -3563,6 +3563,127 @@ static int64_t linkat_symlink_fallback(host_fd_t old_dirfd,
     return 0;
 }
 
+/* The directory entry that names a descriptor's file: the directory, opened and
+ * returned, and the entry's name in it through *leaf, which points into buf.
+ * Returns -1 when the file has no entry left that this can find. buf needs
+ * LINUX_PATH_MAX bytes, and the caller closes the directory.
+ *
+ * macOS has no call that links a descriptor, so linkat with AT_EMPTY_PATH goes
+ * through a name, and F_GETPATH is the only source of one. Between reading that
+ * name and using it the guest can rename any part of it. Used as a path, it
+ * would let a directory on the way be exchanged for a symlink, which the host
+ * follows out of the tree the guest is held in, or for another directory, which
+ * makes the call act on a file the descriptor does not name. So the directory
+ * is opened with O_NOFOLLOW_ANY and held, the entry is compared with the
+ * descriptor's file, and the caller acts on that one entry without following
+ * it. What a rename can still do after the comparison is put another entry of
+ * the same directory under the name.
+ */
+static int host_fd_live_entry(int host_fd,
+                              const struct stat *fd_st,
+                              char *buf,
+                              const char **leaf)
+{
+    if (fcntl(host_fd, F_GETPATH, buf) < 0)
+        return -1;
+    char *slash = strrchr(buf, '/');
+    if (!slash || slash[1] == '\0')
+        return -1;
+    *leaf = slash + 1;
+
+    /* The entry's directory is everything before the last slash, or "/". */
+    int dir_fd;
+    if (slash == buf) {
+        dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } else {
+        *slash = '\0';
+        dir_fd = open(buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY);
+    }
+    if (dir_fd < 0)
+        return -1;
+
+    struct stat entry_st;
+    if (fstatat(dir_fd, *leaf, &entry_st, AT_SYMLINK_NOFOLLOW) < 0 ||
+        entry_st.st_dev != fd_st->st_dev || entry_st.st_ino != fd_st->st_ino) {
+        close(dir_fd);
+        return -1;
+    }
+    return dir_fd;
+}
+
+/* linkat with AT_EMPTY_PATH and an empty old path: give the file olddirfd names
+ * a second name. A file with no name left is ENOENT, which is also what Linux
+ * answers for a descriptor whose link count has reached zero.
+ */
+static int64_t linkat_empty_path(int olddirfd,
+                                 int newdirfd,
+                                 const char *newpath)
+{
+    /* AT_FDCWD names the current directory, and a directory cannot be
+     * hard-linked.
+     */
+    if (olddirfd == LINUX_AT_FDCWD)
+        return -LINUX_EPERM;
+
+    fd_entry_t snap;
+    if (!fd_snapshot(olddirfd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+        snap.type == FD_FUSE_DIR)
+        return -LINUX_ENOSYS;
+
+    /* A stamped descriptor stands for a synthetic file, and its host fd for a
+     * staging file of elfuse's own that must not get a name in the guest tree.
+     * The synthetic trees are mounts of their own on Linux, which answers EXDEV
+     * for a link out of one.
+     */
+    if (snap.proc_path[0] != '\0')
+        return -LINUX_EXDEV;
+
+    path_translation_t new_tx;
+    if (path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
+                          &new_tx) < 0)
+        return linux_errno();
+    if (new_tx.fuse_path)
+        return -LINUX_ENOSYS;
+
+    host_fd_ref_t old_ref, newdir_ref;
+    int64_t ref_err = host_dirfd_ref_open(olddirfd, &old_ref);
+    if (ref_err < 0)
+        return ref_err;
+    ref_err = host_dirfd_ref_open(newdirfd, &newdir_ref);
+    if (ref_err < 0) {
+        host_fd_ref_close(&old_ref);
+        return ref_err;
+    }
+
+    int64_t rc = 0;
+    char host_path[LINUX_PATH_MAX];
+    const char *leaf;
+    struct stat fd_st;
+    if (fstat(old_ref.fd, &fd_st) < 0) {
+        rc = linux_errno();
+    } else if (S_ISDIR(fd_st.st_mode)) {
+        rc = -LINUX_EPERM;
+    } else {
+        int entry_dir =
+            host_fd_live_entry(old_ref.fd, &fd_st, host_path, &leaf);
+        if (entry_dir < 0)
+            rc = -LINUX_ENOENT;
+        else if (linkat(entry_dir, leaf,
+                        path_translation_dirfd(&new_tx, &newdir_ref),
+                        new_tx.host_path, 0) < 0)
+            rc = linkat_symlink_fallback(
+                entry_dir, leaf, path_translation_dirfd(&new_tx, &newdir_ref),
+                new_tx.host_path);
+        close_keep_errno(entry_dir);
+    }
+
+    host_fd_ref_close(&old_ref);
+    host_fd_ref_close(&newdir_ref);
+    return rc;
+}
+
 int64_t sys_linkat(guest_t *g,
                    int olddirfd,
                    uint64_t oldpath_gva,
@@ -3576,8 +3697,21 @@ int64_t sys_linkat(guest_t *g,
         guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
         return -LINUX_EFAULT;
 
-    if (!validate_at_flags(flags, LINUX_AT_SYMLINK_FOLLOW))
+    if (!validate_at_flags(flags,
+                           LINUX_AT_SYMLINK_FOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
+
+    /* An empty name is ENOENT whatever its dirfd is; see read_translated_path.
+     * The old name alone may be empty, and only with AT_EMPTY_PATH, where it
+     * stands for olddirfd itself.
+     */
+    if (newpath[0] == '\0')
+        return -LINUX_ENOENT;
+    if (oldpath[0] == '\0') {
+        if (!(flags & LINUX_AT_EMPTY_PATH))
+            return -LINUX_ENOENT;
+        return linkat_empty_path(olddirfd, newdirfd, newpath);
+    }
 
     unsigned int old_flags =
         (flags & LINUX_AT_SYMLINK_FOLLOW) ? PATH_TR_NONE : PATH_TR_NOFOLLOW;

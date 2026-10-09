@@ -63,6 +63,29 @@ int main(void)
                     "content mismatch");
     }
 
+    /* The same source reached through a descriptor: an O_PATH fd on the symlink
+     * itself, linked with AT_EMPTY_PATH.
+     */
+    TEST("linkat(AT_EMPTY_PATH) on an O_PATH fd of the symlink succeeds");
+    {
+        int lfd = open("/d1/sym", O_PATH | O_NOFOLLOW);
+        EXPECT_TRUE(lfd >= 0 && linkat(lfd, "", AT_FDCWD, "/d1/hardlink-fd",
+                                       AT_EMPTY_PATH) == 0,
+                    "linkat failed");
+        if (lfd >= 0)
+            close(lfd);
+    }
+
+    TEST("that result is a symlink to the same target");
+    {
+        struct stat st;
+        char buf[64] = {0};
+        ssize_t n = readlink("/d1/hardlink-fd", buf, sizeof(buf) - 1);
+        EXPECT_TRUE(lstat("/d1/hardlink-fd", &st) == 0 && S_ISLNK(st.st_mode) &&
+                        n > 0 && !strncmp(buf, "target.txt", (size_t) n),
+                    "not a symlink to target.txt");
+    }
+
     SUMMARY("test-linkat-symlink-fallback");
     return fails > 0 ? 1 : 0;
 }

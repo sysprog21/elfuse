@@ -3665,7 +3665,9 @@ static int64_t linkat_empty_path(int olddirfd,
         else if (linkat(entry_dir, leaf,
                         path_translation_dirfd(&new_tx, &newdir_ref),
                         new_tx.host_path, 0) < 0)
-            rc = linux_errno();
+            rc = linkat_symlink_fallback(
+                entry_dir, leaf, path_translation_dirfd(&new_tx, &newdir_ref),
+                new_tx.host_path);
         close_keep_errno(entry_dir);
     }
 

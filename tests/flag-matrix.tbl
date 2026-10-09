@@ -22,6 +22,7 @@
 #   p:NAME           path of a fixture entry (see below)
 #   fd:file fd:dir   a fresh O_RDWR fd on "file", an O_RDONLY fd on "dir"
 #   fd:listener      a listening Unix socket with one connection queued
+#   fd:sealed        a memfd made with MFD_NOEXEC_SEAL: mode 0666, F_SEAL_EXEC
 #   pair             an int[2] the call fills with two fds; an fd answer is
 #                    then asked of both
 #   buf              a zeroed 4 KiB scratch buffer; for a row with a child
@@ -153,6 +154,11 @@ linkat | AT_SYMLINK_FOLLOW@empty-new | CWD p:file fd:file p:empty F | err:ENOENT
 # fchmodat(dirfd, path, mode): the kernel entry takes three arguments, so a
 # flags word in the fourth is never read.
 fchmodat | AT_SYMLINK_NOFOLLOW@ignored | CWD p:link 0600 F | mode:p:file=0600 | =
+
+# fchmodat2(dirfd, path, mode, flags)
+# F_SEAL_EXEC belongs to the file, so the descriptor form of chmod meets it
+# too: giving the sealed memfd its execute bits is EPERM.
+fchmodat2 | AT_EMPTY_PATH@exec-seal | fd:sealed p:empty 0777 F | err:EPERM | err:ENOENT
 
 # fchownat(dirfd, path, owner, group, flags)
 fchownat | AT_SYMLINK_NOFOLLOW | CWD p:dangling -1 -1 F | ok | err:ENOENT

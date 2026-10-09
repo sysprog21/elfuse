@@ -69,7 +69,7 @@ enum fm_path {
     FM_P_NEW,
     FM_P_EMPTY
 };
-enum fm_fd { FM_FD_FILE, FM_FD_DIR, FM_FD_LISTENER };
+enum fm_fd { FM_FD_FILE, FM_FD_DIR, FM_FD_LISTENER, FM_FD_SEALED };
 
 enum fm_expect_kind {
     FM_X_OK,
@@ -143,6 +143,12 @@ struct fm_row {
 };
 
 /* Newer than some of the toolchains this builds with. */
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
+#endif
+#ifndef __NR_fchmodat2
+#define __NR_fchmodat2 452
+#endif
 #ifndef CLONE_PIDFD
 #define CLONE_PIDFD 0x00001000
 #endif
@@ -317,6 +323,8 @@ static long open_fixture_fd(long which)
         return open("dir", O_RDONLY | O_DIRECTORY);
     if (which == FM_FD_LISTENER)
         return open_listener();
+    if (which == FM_FD_SEALED)
+        return memfd_create("sealed", MFD_NOEXEC_SEAL);
     return open("file", O_RDWR);
 }
 

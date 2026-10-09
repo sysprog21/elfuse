@@ -469,6 +469,13 @@ $(BUILD_DIR)/test-wait-signal-latency: \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-futex-requeue-race requeues a parked sibling thread and then races a
+# signal against a wake at the new word.
+$(BUILD_DIR)/test-futex-requeue-race: \
+		tests/test-futex-requeue-race.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-nanosleep-process-signal parks several threads in a sleep and sends the
 # group one signal.
 $(BUILD_DIR)/test-nanosleep-process-signal: \

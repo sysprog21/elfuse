@@ -221,6 +221,16 @@ typedef struct futex_waiter {
      * to zero, which is a lost wakeup.
      */
     bool pub_follows;
+
+    /* Index of the bucket whose chain holds this waiter. A wake takes only the
+     * lock of the bucket it finds the waiter in, so the owner has to sleep, and
+     * test woken, under that same lock or the two are not ordered. Requeue
+     * stores this under both bucket locks when it moves the waiter and signals
+     * cond, and the owner loads it to learn which lock to hold. Only a
+     * futex_wait_inner waiter reads it: a PI waiter is never moved, and a
+     * futex_waitv one sleeps on its group.
+     */
+    _Atomic unsigned home;
 } futex_waiter_t;
 
 /* If the waiter belongs to a futex_waitv group, signal the group's cond so the
@@ -375,6 +385,25 @@ static void bucket_unlink_locked(futex_bucket_t *b, const futex_waiter_t *w)
             *pp = w->next;
             return;
         }
+    }
+}
+
+/* Trade @b->lock, which the caller holds, for the lock of the bucket @w is
+ * queued in or was woken from, and return that bucket. home cannot change under
+ * the lock it names, since moving the waiter out takes that lock, so once this
+ * returns a wake has either finished with @w or not found it yet.
+ */
+static futex_bucket_t *futex_waiter_follow(futex_bucket_t *b,
+                                           const futex_waiter_t *w)
+{
+    for (;;) {
+        futex_bucket_t *home =
+            &buckets[atomic_load_explicit(&w->home, memory_order_acquire)];
+        if (home == b)
+            return b;
+        pthread_mutex_unlock(&b->lock);
+        pthread_mutex_lock(&home->lock);
+        b = home;
     }
 }
 
@@ -1144,6 +1173,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
         .next = b->head,
         .pub_bucket = idx,
         .pub_follows = true,
+        .home = idx,
     };
     pthread_cond_init(&waiter.cond, NULL);
     b->head = &waiter;
@@ -1151,7 +1181,14 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
     /* Wait until woken or timeout */
     int ret = 0;
 
-    while (!atomic_load_explicit(&waiter.woken, memory_order_acquire)) {
+    for (;;) {
+        /* FUTEX_REQUEUE may have moved the waiter since the last pass. Sleep
+         * under the lock of the bucket that holds it now.
+         */
+        b = futex_waiter_follow(b, &waiter);
+        if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
+            break;
+
         if (has_timeout) {
             /* Sleep in bounded quanta rather than to the guest deadline: a
              * worker parked here for a long guest timeout (JVM parkNanos,
@@ -1225,43 +1262,14 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
         }
     }
 
-    /* Dequeue waiter. If woken=1, the wake/requeue operation already unlinked
-     * the waiter from the bucket list, so skip dequeue. If woken=0 (timeout /
-     * interrupt), the waiter is still in the list and must self-dequeue.
-     *
-     * For the self-dequeue path: requeue may have moved the waiter to a
-     * different bucket (changed waiter.uaddr), so re-hash. Race: between
-     * releasing the old bucket lock and acquiring the new one, another requeue
-     * can move the waiter again. Loop until the waiter is found and dequeued.
+    /* Dequeue under the lock a wake would hold. A wake unlinks the waiter,
+     * stores woken and signals cond all under that lock, so here it has either
+     * finished, and cond is safe to destroy, or it has not found the waiter,
+     * which is then still in the chain to unlink.
      */
-    if (!atomic_load_explicit(&waiter.woken, memory_order_acquire)) {
-        for (;;) {
-            unsigned dequeue_idx = futex_hash(waiter.uaddr);
-            futex_bucket_t *b_dequeue = &buckets[dequeue_idx];
-            if (b_dequeue != b) {
-                pthread_mutex_unlock(&b->lock);
-                pthread_mutex_lock(&b_dequeue->lock);
-                b = b_dequeue;
-            }
-            /* Search for the current waiter in the bucket */
-            bool found = false;
-            futex_waiter_t **pp = &b->head;
-            while (*pp) {
-                if (*pp == &waiter) {
-                    *pp = waiter.next;
-                    found = true;
-                    break;
-                }
-                pp = &(*pp)->next;
-            }
-            if (found)
-                break;
-
-            /* Not found: waiter was requeued again between the current hash
-             * computation and lock acquisition. Re-read uaddr and retry.
-             */
-        }
-    }
+    b = futex_waiter_follow(b, &waiter);
+    if (!atomic_load_explicit(&waiter.woken, memory_order_acquire))
+        bucket_unlink_locked(b, &waiter);
 
     /* Report where the charge ended up, read while the bucket lock is still
      * held. A requeue rewrites pub_bucket under both bucket locks, so the entry
@@ -1566,6 +1574,12 @@ static int64_t futex_requeue(guest_t *g,
                 w->uaddr = uaddr2;
                 w->next = b_dst->head;
                 b_dst->head = w;
+
+                /* The owner sleeps under the source lock, and a wake at uaddr2
+                 * takes the destination's. Send it to re-park there.
+                 */
+                atomic_store_explicit(&w->home, idx_dst, memory_order_release);
+                pthread_cond_signal(&w->cond);
             }
             requeued++;
         } else {

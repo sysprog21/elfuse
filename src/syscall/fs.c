@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/attr.h>
 #include <sys/mount.h>
 #include <pthread.h>
 
@@ -3609,32 +3610,176 @@ int64_t sys_linkat(guest_t *g,
     return 0;
 }
 
+/* access() on the current directory. */
+static int64_t access_cwd(int mode, int flags)
+{
+    proc_cwd_view_t view;
+    if (proc_acquire_cwd_view(&view) == 0) {
+        if (view.path && view.path[0] == '/' &&
+            fuse_path_matches_mount(view.path)) {
+            char cwd_path[LINUX_PATH_MAX];
+            str_copy_trunc(cwd_path, view.path, sizeof(cwd_path));
+            proc_release_cwd_view(&view);
+            return fuse_access_path(cwd_path, mode, flags);
+        }
+        proc_release_cwd_view(&view);
+    }
+    int mac_flags = translate_faccessat_flags(flags);
+    if (faccessat(AT_FDCWD, ".", mode, mac_flags) < 0)
+        return linux_errno();
+    return 0;
+}
+
+/* access() by mode bits, for a descriptor the host gives no answer about; see
+ * host_fd_user_access. The host answers by the credentials elfuse runs with,
+ * whatever ids the guest reports, so those are the ones used here.
+ * path_check_intercept_access judges by the guest's ids, which is right only
+ * for a synthetic file, whose owner is reported as the guest.
+ */
+static bool host_access_by_mode(const struct stat *st, int mode, int flags)
+{
+    bool effective = (flags & LINUX_AT_EACCESS) != 0;
+    uid_t uid = effective ? geteuid() : getuid();
+    gid_t gid = effective ? getegid() : getgid();
+
+    int granted = 0;
+    if (uid == 0) {
+        /* As generic_permission() has it for root: read and write always,
+         * execute when any execute bit is set.
+         */
+        granted = R_OK | W_OK;
+        if (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+            granted |= X_OK;
+    } else {
+        gid_t groups[NGROUPS_MAX];
+        int ngroups = getgroups(NGROUPS_MAX, groups);
+        bool in_group = gid == st->st_gid;
+        for (int i = 0; i < ngroups && !in_group; i++)
+            in_group = groups[i] == st->st_gid;
+
+        mode_t bits = st->st_mode;
+        if (uid == st->st_uid)
+            bits >>= 6;
+        else if (in_group)
+            bits >>= 3;
+        if (bits & 4)
+            granted |= R_OK;
+        if (bits & 2)
+            granted |= W_OK;
+        if (bits & 1)
+            granted |= X_OK;
+    }
+    return (mode & granted) == mode;
+}
+
+/* What the host grants this process on a descriptor's file, as R_OK | W_OK |
+ * X_OK bits, or -1 when the host has no answer (a pipe or a socket carries no
+ * such attribute).
+ *
+ * ATTR_CMN_USERACCESS is the host's own judgement of the open file: mode bits
+ * and ACL entries both, by the ids the process runs with. No name is involved,
+ * so the answer holds for a file that has been unlinked and a rename cannot
+ * send it to another file.
+ */
+static int host_fd_user_access(int host_fd)
+{
+    struct attrlist attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attrs.commonattr = ATTR_CMN_USERACCESS;
+
+    struct {
+        uint32_t length;
+        uint32_t access;
+    } __attribute__((packed)) reply;
+    if (fgetattrlist(host_fd, &attrs, &reply, sizeof(reply), 0) < 0)
+        return -1;
+    return (int) (reply.access & (R_OK | W_OK | X_OK));
+}
+
+/* access() on the file a descriptor already names: faccessat2 with
+ * AT_EMPTY_PATH and an empty path. The host is asked about the descriptor
+ * itself. Where it has no answer the mode bits decide.
+ */
+static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(dirfd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+        snap.type == FD_FUSE_DIR)
+        return -LINUX_ENOSYS;
+
+    /* A stamped descriptor stands for a synthetic file, whose mode is the
+     * intercept's and not that of the host fd behind it; the path-based branch
+     * of sys_faccessat judges such a file the same way.
+     */
+    if (snap.proc_path[0] != '\0') {
+        struct stat intercepted_st;
+        int intercepted =
+            proc_intercept_stat_at(snap.proc_path, &intercepted_st, false);
+        if (intercepted == -1)
+            return linux_errno();
+        if (intercepted == 0) {
+            if (path_check_intercept_access(&intercepted_st, mode, flags) < 0)
+                return linux_errno();
+            return 0;
+        }
+    }
+
+    host_fd_ref_t ref;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+    if (ref_err < 0)
+        return ref_err;
+
+    int64_t rc = 0;
+    struct stat fd_st;
+    if (mode == F_OK) {
+        /* The descriptor is open, so the file exists. */
+    } else {
+        int granted = host_fd_user_access(ref.fd);
+        if (granted >= 0) {
+            if ((mode & granted) != mode)
+                rc = -LINUX_EACCES;
+        } else if (fstat(ref.fd, &fd_st) < 0) {
+            rc = linux_errno();
+        } else if (!host_access_by_mode(&fd_st, mode, flags)) {
+            rc = -LINUX_EACCES;
+        }
+    }
+    host_fd_ref_close(&ref);
+    return rc;
+}
+
 int64_t sys_faccessat(guest_t *g,
                       int dirfd,
                       uint64_t path_gva,
                       int mode,
                       int flags)
 {
+    /* Linux judges the flags before it reads the path. */
+    if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW |
+                                      LINUX_AT_EMPTY_PATH))
+        return -LINUX_EINVAL;
+
+    if (flags & LINUX_AT_EMPTY_PATH) {
+        char first;
+        if (guest_read_small(g, path_gva, &first, sizeof(first)) < 0)
+            return -LINUX_EFAULT;
+        if (first == '\0') {
+            if ((mode & ~(F_OK | R_OK | W_OK | X_OK)) != 0)
+                return -LINUX_EINVAL;
+            return dirfd == LINUX_AT_FDCWD
+                       ? access_cwd(mode, flags)
+                       : access_empty_path_fd(dirfd, mode, flags);
+        }
+    }
+
     if (dirfd == LINUX_AT_FDCWD) {
         char dot_path[2];
         if (guest_read_small(g, path_gva, dot_path, sizeof(dot_path)) == 0 &&
-            dot_path[0] == '.' && dot_path[1] == '\0') {
-            proc_cwd_view_t view;
-            if (proc_acquire_cwd_view(&view) == 0) {
-                if (view.path && view.path[0] == '/' &&
-                    fuse_path_matches_mount(view.path)) {
-                    char cwd_path[LINUX_PATH_MAX];
-                    str_copy_trunc(cwd_path, view.path, sizeof(cwd_path));
-                    proc_release_cwd_view(&view);
-                    return fuse_access_path(cwd_path, mode, flags);
-                }
-                proc_release_cwd_view(&view);
-            }
-            int mac_flags = translate_faccessat_flags(flags);
-            if (faccessat(AT_FDCWD, ".", mode, mac_flags) < 0)
-                return linux_errno();
-            return 0;
-        }
+            dot_path[0] == '.' && dot_path[1] == '\0')
+            return access_cwd(mode, flags);
     }
 
     char path[LINUX_PATH_MAX];
@@ -3644,9 +3789,6 @@ int64_t sys_faccessat(guest_t *g,
         path, &tx);
     if (rc < 0)
         return rc;
-
-    if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW))
-        return -LINUX_EINVAL;
 
     if (tx.fuse_path)
         return fuse_access_path(tx.intercept_path, mode, flags);
@@ -4217,11 +4359,24 @@ int64_t sys_utimensat(guest_t *g,
     if (ref_err < 0)
         return ref_err;
 
+    /* AT_EMPTY_PATH with an empty path names dirfd itself, the current
+     * directory included. Unlike a NULL path it may carry flags.
+     */
+    bool empty_path = false;
+    if (path_gva != 0 && (flags & LINUX_AT_EMPTY_PATH)) {
+        char first;
+        if (guest_read_small(g, path_gva, &first, sizeof(first)) < 0) {
+            host_fd_ref_close(&dir_ref);
+            return -LINUX_EFAULT;
+        }
+        empty_path = first == '\0';
+    }
+
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
     const char *path_arg = NULL;
     char path[LINUX_PATH_MAX];
     path_translation_t tx;
-    if (path_gva != 0) {
+    if (path_gva != 0 && !empty_path) {
         int64_t rc = read_translated_path(g, dirfd, path_gva,
                                           (flags & LINUX_AT_SYMLINK_NOFOLLOW)
                                               ? PATH_TR_NOFOLLOW
@@ -4264,7 +4419,15 @@ int64_t sys_utimensat(guest_t *g,
      * futimens(AT_FDCWD, ...) be invoked with macOS's AT_FDCWD sentinel (-2),
      * which returns EBADF and would not match Linux semantics.
      */
-    if (!path_arg) {
+    if (empty_path) {
+        int host_rc = dir_ref.fd == AT_FDCWD
+                          ? utimensat(AT_FDCWD, ".", times_gva ? ts : NULL, 0)
+                          : futimens(dir_ref.fd, times_gva ? ts : NULL);
+        if (host_rc < 0) {
+            host_fd_ref_close(&dir_ref);
+            return linux_errno();
+        }
+    } else if (!path_arg) {
         if (flags) {
             host_fd_ref_close(&dir_ref);
             return -LINUX_EINVAL;

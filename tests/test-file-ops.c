@@ -39,6 +39,10 @@
 #define SYS_renameat2 276
 #endif
 
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+
 static int create_test_file(const char *path, const char *contents)
 {
     int rc = -1;
@@ -167,6 +171,27 @@ int main(void)
         char buf[1];
         EXPECT_ERRNO(syscall(SYS_readlinkat, -1, "symlink", buf, sizeof(buf)),
                      EBADF, "expected EBADF for invalid dirfd");
+    }
+
+    /* A descriptor on a synthetic file answers by the file's own mode, as its
+     * path does. Which answer that is depends on who runs the test (root may
+     * write a 0444 file), so the two are compared rather than fixed.
+     */
+    TEST("faccessat2 AT_EMPTY_PATH on O_PATH /proc file matches its path");
+    {
+        const char *proc_file = "/proc/self/status";
+        int fd = open(proc_file, O_PATH);
+        errno = 0;
+        long by_fd =
+            fd < 0 ? -2 : syscall(SYS_faccessat2, fd, "", W_OK, AT_EMPTY_PATH);
+        int fd_errno = errno;
+        errno = 0;
+        long by_path = syscall(SYS_faccessat2, AT_FDCWD, proc_file, W_OK, 0);
+        int path_errno = errno;
+        if (fd >= 0)
+            close(fd);
+        EXPECT_TRUE(by_fd == by_path && fd_errno == path_errno,
+                    "descriptor and path answers differ");
     }
 
     /* Test hardlink */

@@ -2918,8 +2918,10 @@ int64_t sys_mmap(guest_t *g,
      * (CLONE_VM semantics).
      */
 
-    /* Linux requires page-aligned offset for file-backed mmap */
-    if (!is_anon && (offset & 4095))
+    /* The arm64 mmap entry refuses an offset that is not page aligned before it
+     * looks at anything else, anonymous mappings included.
+     */
+    if (offset & 4095)
         return -LINUX_EINVAL;
 
     /* Linux looks the descriptor up before it judges the length or the flags,

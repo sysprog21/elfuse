@@ -3612,22 +3612,23 @@ static int64_t linkat_empty_path(int olddirfd,
     int64_t rc = 0;
     char host_path[LINUX_PATH_MAX];
     const char *leaf;
-    int entry_dir = -1;
     struct stat fd_st;
-    if (fstat(old_ref.fd, &fd_st) < 0)
+    if (fstat(old_ref.fd, &fd_st) < 0) {
         rc = linux_errno();
-    else if (S_ISDIR(fd_st.st_mode))
+    } else if (S_ISDIR(fd_st.st_mode)) {
         rc = -LINUX_EPERM;
-    else if ((entry_dir =
-                  host_fd_live_entry(old_ref.fd, &fd_st, host_path, &leaf)) < 0)
-        rc = -LINUX_ENOENT;
-    else if (linkat(entry_dir, leaf,
-                    path_translation_dirfd(&new_tx, &newdir_ref),
-                    new_tx.host_path, 0) < 0)
-        rc = linux_errno();
-
-    if (entry_dir >= 0)
+    } else {
+        int entry_dir =
+            host_fd_live_entry(old_ref.fd, &fd_st, host_path, &leaf);
+        if (entry_dir < 0)
+            rc = -LINUX_ENOENT;
+        else if (linkat(entry_dir, leaf,
+                        path_translation_dirfd(&new_tx, &newdir_ref),
+                        new_tx.host_path, 0) < 0)
+            rc = linux_errno();
         close_keep_errno(entry_dir);
+    }
+
     host_fd_ref_close(&old_ref);
     host_fd_ref_close(&newdir_ref);
     return rc;
@@ -3818,21 +3819,22 @@ static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
     int64_t rc = 0;
     char host_path[LINUX_PATH_MAX];
     const char *leaf;
-    int entry_dir;
     struct stat fd_st;
     if (mode == F_OK) {
         /* The descriptor is open, so the file exists. */
     } else if (fstat(ref.fd, &fd_st) < 0) {
         rc = linux_errno();
-    } else if ((entry_dir = host_fd_live_entry(ref.fd, &fd_st, host_path,
-                                               &leaf)) >= 0) {
-        if (faccessat(entry_dir, leaf, mode,
-                      translate_faccessat_flags(flags) | AT_SYMLINK_NOFOLLOW) <
-            0)
+    } else {
+        int entry_dir = host_fd_live_entry(ref.fd, &fd_st, host_path, &leaf);
+        if (entry_dir < 0) {
+            if (!host_access_by_mode(&fd_st, mode, flags))
+                rc = -LINUX_EACCES;
+        } else if (faccessat(entry_dir, leaf, mode,
+                             translate_faccessat_flags(flags) |
+                                 AT_SYMLINK_NOFOLLOW) < 0) {
             rc = linux_errno();
+        }
         close_keep_errno(entry_dir);
-    } else if (!host_access_by_mode(&fd_st, mode, flags)) {
-        rc = -LINUX_EACCES;
     }
     host_fd_ref_close(&ref);
     return rc;

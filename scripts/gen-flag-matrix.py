@@ -10,6 +10,11 @@ A row that starts with the word "pending" records an answer elfuse does not
 give yet. The test reports its mismatch as known instead of failing, and fails
 once the row passes, so the mark cannot outlive the divergence.
 
+A row that starts with "unsupported:ANSWER" records a flag elfuse declines on
+purpose. ANSWER is what elfuse gives with the flag set, and it has to be an
+answer Linux itself documents for a kernel or filesystem without the feature.
+The qemu lane still asserts the row's own answer.
+
 Flag names and integer arguments are emitted as C expressions and resolved by
 the guest toolchain's headers. No flag value is recorded in this script.
 """
@@ -145,6 +150,12 @@ def parse_table(path: pathlib.Path, dispatch: set[str]) -> list[dict[str, str]]:
         pending = line.startswith("pending ")
         if pending:
             line = line[len("pending "):]
+        elfuse_text = ""
+        if line.startswith("unsupported:"):
+            elfuse_text, _, line = line[len("unsupported:"):].partition(" ")
+            if pending:
+                raise TableError(f"{where}: a row is pending or unsupported, "
+                                 "not both")
         fields = [f.strip() for f in line.split(" | ")]
         if len(fields) != 5:
             raise TableError(f"{where}: expected 5 ' | '-separated fields, "
@@ -180,7 +191,10 @@ def parse_table(path: pathlib.Path, dispatch: set[str]) -> list[dict[str, str]]:
         with_x = parse_expect(where, with_text)
         without_x = with_x if without_text == "=" else parse_expect(
             where, without_text)
+        elfuse_x = parse_expect(where, elfuse_text) if elfuse_text else with_x
         rows.append({"sys": sysname, "label": flag, "flag": flag_expr,
+                     "elfuse": elfuse_x,
+                     "unsupported": "1" if elfuse_text else "0",
                      "args": ", ".join(args), "nargs": str(len(args)),
                      "with": with_x, "without": without_x,
                      "pending": "1" if pending else "0"})
@@ -201,7 +215,8 @@ def render(rows: list[dict[str, str]]) -> str:
         out.append(f'    {{"{row["sys"]}", "{row["label"]}", __NR_{row["sys"]}, '
                    f'(long) ({row["flag"]}),')
         out.append(f'     {row["pending"]}, {row["nargs"]}, {{{row["args"]}}},')
-        out.append(f'     {row["with"]}, {row["without"]}}},')
+        out.append(f'     {row["with"]}, {row["without"]},')
+        out.append(f'     {row["unsupported"]}, {row["elfuse"]}}},')
     out.append("};")
     out.append("")
     return "\n".join(out)

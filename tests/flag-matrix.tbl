@@ -52,6 +52,11 @@
 #   bufx:reg bufx:lnk  the same for a struct statx
 #   =                  (last field only) the same answer as with the flag
 #
+# A row that starts with "unsupported:ANSWER" is a flag elfuse declines on
+# purpose. ANSWER is what elfuse gives with the flag set, and it must be an
+# answer Linux documents for a kernel or filesystem without the feature, so
+# that a guest already knows what to do with it. A strict run ignores it.
+#
 # A row that starts with "pending" is an answer elfuse does not give yet. Under
 # elfuse its mismatch is reported as KNOWN and does not fail the run; once both
 # runs of the row pass, the test fails until the word is removed. The qemu lane
@@ -72,7 +77,13 @@ openat | O_NOCTTY | CWD p:file F|O_RDONLY 0 | fd | =
 openat | O_SYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_SYNC | fd:nogetfl:O_SYNC
 openat | O_DSYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_DSYNC | fd:nogetfl:O_DSYNC
 openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O_NOATIME
-pending openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
+# macOS cannot give a name back to a file that has none, so a file made with
+# O_TMPFILE could never be linked into place afterwards. Callers that link it
+# fall back to a named temporary file when the open fails, and would have no
+# fallback left if the open succeeded and the linkat then failed. open(2)
+# documents EISDIR as the answer of a kernel without O_TMPFILE.
+unsupported:err:EISDIR openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
+openat | O_TMPFILE@rdonly | CWD p:dir F|O_RDONLY 0600 | err:EINVAL | fd
 
 # unlinkat(dirfd, path, flags)
 unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR

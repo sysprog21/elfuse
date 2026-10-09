@@ -106,6 +106,8 @@ struct fm_row {
     int pending, nargs;
     struct fm_arg args[FM_MAX_ARGS];
     struct fm_expect with, without;
+    int unsupported;
+    struct fm_expect elfuse_with;
 };
 
 #include "flag-matrix-vectors.h"
@@ -314,6 +316,12 @@ static int run_one(const struct fm_row *row, int with, int strict)
 {
     const struct fm_expect *x = with ? &row->with : &row->without;
     char label[96];
+
+    /* A flag elfuse declines on purpose has its own recorded answer, which only
+     * a strict run sets aside.
+     */
+    if (with && row->unsupported && !strict)
+        x = &row->elfuse_with;
     long a[FM_MAX_ARGS] = {0};
     long opened[FM_MAX_ARGS];
     int nopened = 0, matched = 0, pair = 0;

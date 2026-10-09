@@ -861,6 +861,25 @@ int64_t sys_openat_path(guest_t *g,
         (LINUX_O_DIRECTORY | LINUX_O_CREAT))
         return -LINUX_EINVAL;
 
+    /* O_TMPFILE is not provided, and what happens to it is the answer of a
+     * kernel that predates it: the bit is not acted on, O_DIRECTORY with a
+     * write mode stays, and opening the directory for writing is EISDIR.
+     * open(2) documents that errno for exactly this, and callers fall back to a
+     * named temporary file on it. Providing the open alone would be worse than
+     * providing nothing: macOS cannot link a file that has no name, so the
+     * linkat that publishes the file would fail with no fallback left.
+     *
+     * The two misuses Linux refuses while building the flags are refused the
+     * same way. Without the second, O_TMPFILE|O_RDONLY opened the directory
+     * itself and handed it back.
+     */
+    if (linux_flags & LINUX___O_TMPFILE) {
+        if (!(linux_flags & LINUX_O_DIRECTORY))
+            return -LINUX_EINVAL;
+        if ((linux_flags & LINUX_O_ACCMODE) == LINUX_O_RDONLY)
+            return -LINUX_EINVAL;
+    }
+
     path_translation_t tx;
     unsigned int tx_flags =
         (linux_flags & LINUX_O_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE;

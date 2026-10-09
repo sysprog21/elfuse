@@ -932,6 +932,18 @@ bool fd_snapshot_and_close(int fd, fd_entry_t *out)
     return ok;
 }
 
+bool fd_snapshot_and_close_gen(int fd, uint64_t generation, fd_entry_t *out)
+{
+    if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
+        return false;
+    pthread_mutex_lock(&fd_lock);
+    bool ok = fd_table[fd].type != FD_CLOSED &&
+              fd_table[fd].generation == generation &&
+              fd_snapshot_locked(fd, out, true);
+    pthread_mutex_unlock(&fd_lock);
+    return ok;
+}
+
 bool fd_snapshot_and_close_relaxed(int fd, fd_entry_t *out)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))

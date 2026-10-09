@@ -803,6 +803,11 @@ void fd_retire_published(int fd, int host_fd);
  */
 bool fd_snapshot_and_close(int fd, fd_entry_t *out);
 
+/* The same, for the one allocation that stamped generation on the slot. A slot
+ * a sibling has closed and reused holds another generation and is left alone.
+ */
+bool fd_snapshot_and_close_gen(int fd, uint64_t generation, fd_entry_t *out);
+
 /* Snapshot and close with a single-thread fast path. Uses the unlocked table
  * update when exactly one guest thread is active, otherwise falls back to
  * fd_snapshot_and_close().

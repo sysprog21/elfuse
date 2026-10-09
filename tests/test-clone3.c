@@ -257,6 +257,33 @@ static void test_unsupported_flags(void)
           ret);
 }
 
+/* CLONE_PIDFD and CLONE_PARENT_SETTID may both be asked for, but not into the
+ * same word: Linux refuses that before any child exists, and the slot keeps
+ * what it held.
+ */
+static void test_pidfd_parent_tid_alias(void)
+{
+    struct clone_args ca;
+    memset(&ca, 0, sizeof(ca));
+    ca.exit_signal = 17;
+
+    int32_t slot = 0x5a5a5a5a;
+    ca.flags = 0x00001000 | 0x00100000; /* CLONE_PIDFD | CLONE_PARENT_SETTID */
+    ca.pidfd = (uint64_t) &slot;
+    ca.parent_tid = (uint64_t) &slot;
+    long ret = raw_clone3(&ca, CLONE_ARGS_SIZE_VER0);
+    if (ret == 0) {
+        raw_syscall1(__NR_exit, 0);
+        __builtin_unreachable();
+    }
+    if (ret > 0)
+        raw_syscall4(__NR_wait4, ret, 0, 0, 0);
+    CHECK(ret == -22,
+          "clone3 pidfd == parent_tid returned %ld (expected -EINVAL)", ret);
+    CHECK(slot == 0x5a5a5a5a, "clone3 pidfd == parent_tid wrote the slot: %d",
+          slot);
+}
+
 /* Test 5: clone3 with larger struct (zero tail = ok) */
 static void test_larger_struct(void)
 {
@@ -720,6 +747,7 @@ int main(int argc, char **argv)
     test_thread();
     test_invalid_size();
     test_unsupported_flags();
+    test_pidfd_parent_tid_alias();
     test_larger_struct();
     test_nonzero_tail();
     test_csignal_in_flags();

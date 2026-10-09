@@ -105,9 +105,8 @@ openat | O_NOFOLLOW | CWD p:link F|O_RDONLY 0 | err:ELOOP | fd
 openat | O_PATH | CWD p:file F|O_RDONLY 0 | fd:readebadf | fd
 # O_PATH with O_NOFOLLOW opens the symlink itself; without O_PATH that is ELOOP.
 openat | O_PATH@symlink | CWD p:link F|O_NOFOLLOW|O_RDONLY 0 | fd | err:ELOOP
-# O_NOCTTY matters only when the name is a terminal the caller could adopt,
-# and AT_EACCESS only when the real and effective ids differ. Neither can be
-# arranged here, so these two rows assert that the flag is accepted.
+# O_NOCTTY matters only when the name is a terminal the caller could adopt.
+# That cannot be arranged here, so this row asserts that the flag is accepted.
 openat | O_NOCTTY | CWD p:file F|O_RDONLY 0 | fd | =
 openat | O_SYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_SYNC | fd:nogetfl:O_SYNC
 openat | O_DSYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_DSYNC | fd:nogetfl:O_DSYNC
@@ -163,6 +162,8 @@ faccessat2 | AT_SYMLINK_NOFOLLOW | CWD p:dangling F_OK F | ok | err:ENOENT
 faccessat2 | AT_EMPTY_PATH | fd:file p:empty F_OK F | ok | err:ENOENT
 faccessat2 | AT_EMPTY_PATH@write | fd:file p:empty W_OK F | ok | err:ENOENT
 faccessat2 | 0x8000@unknown | CWD p:file F_OK F | err:EINVAL | ok
+# AT_EACCESS matters only when the real and effective ids differ. That cannot
+# be arranged here either, so this row asserts that the flag is accepted.
 faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
 
 # renameat2(olddirfd, oldpath, newdirfd, newpath, flags)

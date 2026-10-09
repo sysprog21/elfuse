@@ -1,0 +1,117 @@
+# What Linux answers for each flag of each syscall, with the flag set and with
+# it clear.
+#
+# Copyright 2026 elfuse contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# scripts/gen-flag-matrix.py turns this file into build/flag-matrix-vectors.h
+# and tests/test-flag-matrix.c runs every row twice: once with the flag ORed
+# into the F argument and once without it. Both answers are asserted, so a row
+# only passes when the flag is what changes the result. The qemu lane runs the
+# same binary on a real kernel, which is what keeps the answers below honest.
+#
+# Format, fields separated by " | ":
+#   syscall | flag[@tag] | arguments | with the flag | without the flag
+#
+# flag is a C expression. @tag only tells apart two rows for the same flag.
+#
+# Arguments, in call order:
+#   CWD              AT_FDCWD
+#   p:NAME           path of a fixture entry (see below)
+#   fd:file fd:dir   a fresh O_RDWR fd on "file", an O_RDONLY fd on "dir"
+#   fd:listener      a listening Unix socket with one connection queued
+#   pair             an int[2] the call fills with two fds; an fd answer is
+#                    then asked of both
+#   buf              a zeroed 4 KiB scratch buffer
+#   F  F|EXPR        the flags slot; EXPR is ORed in for both runs
+#   anything else    a C integer expression
+#
+# Fixture entries, recreated before every run:
+#   file      regular file, 10 bytes, mode 0644
+#   dir       empty directory
+#   link      symlink to "file"
+#   dangling  symlink to a name that does not exist
+#   new       a name that does not exist
+#   empty     the empty string
+#
+# Answers:
+#   ok                 the call returns >= 0
+#   err:ENAME          the call returns -ENAME
+#   fd                 the call returns an fd
+#   fd:cloexec fd:nocloexec          F_GETFD has, or lacks, FD_CLOEXEC
+#   fd:getfl:EXPR fd:nogetfl:EXPR    F_GETFL has every bit, or no bit, of EXPR
+#   pair1:getfl:EXPR pair1:nogetfl:EXPR   the same, asked only of the second
+#                                    fd of a pair
+#   fd:appends fd:overwrites         a 1-byte write at offset 0 grows the file,
+#                                    or leaves its size alone
+#   fd:readebadf       read on the fd gives EBADF
+#   exists:p:NAME absent:p:NAME      lstat finds, or does not find, the entry
+#   lreg:p:NAME llnk:p:NAME          lstat says regular file, or symlink
+#   size:p:NAME=N mode:p:NAME=N      stat reports that size, or permission bits
+#   buf:reg buf:lnk    the struct stat in buf is a regular file, or a symlink
+#   bufx:reg bufx:lnk  the same for a struct statx
+#   =                  (last field only) the same answer as with the flag
+#
+# A row that starts with "pending" is an answer elfuse does not give yet. Under
+# elfuse its mismatch is reported as KNOWN and does not fail the run; once both
+# runs of the row pass, the test fails until the word is removed. The qemu lane
+# passes "strict", which makes a pending row an ordinary one.
+
+# openat(dirfd, path, flags, mode)
+openat | O_CLOEXEC | CWD p:file F|O_RDONLY 0 | fd:cloexec | fd:nocloexec
+openat | O_NONBLOCK | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+openat | O_APPEND | CWD p:file F|O_WRONLY 0 | fd:appends | fd:overwrites
+openat | O_APPEND@getfl | CWD p:file F|O_WRONLY 0 | fd:getfl:O_APPEND | fd:nogetfl:O_APPEND
+openat | O_CREAT | CWD p:new F|O_WRONLY 0600 | exists:p:new | err:ENOENT
+openat | O_EXCL | CWD p:file F|O_CREAT|O_WRONLY 0600 | err:EEXIST | fd
+openat | O_TRUNC | CWD p:file F|O_WRONLY 0 | size:p:file=0 | size:p:file=10
+openat | O_DIRECTORY | CWD p:file F|O_RDONLY 0 | err:ENOTDIR | fd
+openat | O_NOFOLLOW | CWD p:link F|O_RDONLY 0 | err:ELOOP | fd
+openat | O_PATH | CWD p:file F|O_RDONLY 0 | fd:readebadf | fd
+openat | O_NOCTTY | CWD p:file F|O_RDONLY 0 | fd | =
+openat | O_SYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_SYNC | fd:nogetfl:O_SYNC
+openat | O_DSYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_DSYNC | fd:nogetfl:O_DSYNC
+openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O_NOATIME
+pending openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
+
+# unlinkat(dirfd, path, flags)
+pending unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR
+unlinkat | AT_REMOVEDIR@file | CWD p:file F | err:ENOTDIR | absent:p:file
+unlinkat | 0x8000@unknown | CWD p:file F | err:EINVAL | absent:p:file
+
+# newfstatat(dirfd, path, statbuf, flags)
+newfstatat | AT_SYMLINK_NOFOLLOW | CWD p:link buf F | buf:lnk | buf:reg
+pending newfstatat | AT_EMPTY_PATH | fd:file p:empty buf F | buf:reg | err:ENOENT
+newfstatat | AT_NO_AUTOMOUNT | CWD p:file buf F | buf:reg | =
+
+# statx(dirfd, path, flags, mask, statxbuf): the flags are argument 2 here and
+# argument 3 in newfstatat.
+statx | AT_SYMLINK_NOFOLLOW | CWD p:link F STATX_BASIC_STATS buf | bufx:lnk | bufx:reg
+pending statx | AT_EMPTY_PATH | fd:file p:empty F STATX_BASIC_STATS buf | bufx:reg | err:ENOENT
+statx | AT_STATX_FORCE_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
+statx | AT_STATX_DONT_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
+pending statx | AT_STATX_SYNC_TYPE@both | CWD p:file F STATX_BASIC_STATS buf | err:EINVAL | bufx:reg
+
+# linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+linkat | AT_SYMLINK_FOLLOW | CWD p:link CWD p:new F | lreg:p:new | llnk:p:new
+
+# fchmodat(dirfd, path, mode): the kernel entry takes three arguments, so a
+# flags word in the fourth is never read.
+fchmodat | AT_SYMLINK_NOFOLLOW@ignored | CWD p:link 0600 F | mode:p:file=0600 | =
+
+# fchownat(dirfd, path, owner, group, flags)
+fchownat | AT_SYMLINK_NOFOLLOW | CWD p:dangling -1 -1 F | ok | err:ENOENT
+pending fchownat | AT_EMPTY_PATH | fd:file p:empty -1 -1 F | ok | err:ENOENT
+
+# utimensat(dirfd, path, times, flags)
+utimensat | AT_SYMLINK_NOFOLLOW | CWD p:dangling 0 F | ok | err:ENOENT
+
+# faccessat2(dirfd, path, mode, flags)
+faccessat2 | AT_SYMLINK_NOFOLLOW | CWD p:dangling F_OK F | ok | err:ENOENT
+pending faccessat2 | AT_EMPTY_PATH | fd:file p:empty F_OK F | ok | err:ENOENT
+faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
+
+# renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+renameat2 | RENAME_NOREPLACE | CWD p:file CWD p:link F | err:EEXIST | lreg:p:link
+renameat2 | RENAME_EXCHANGE | CWD p:file CWD p:link F | llnk:p:file | absent:p:file
+renameat2 | RENAME_NOREPLACE|RENAME_EXCHANGE@both | CWD p:file CWD p:link F | err:EINVAL | lreg:p:link

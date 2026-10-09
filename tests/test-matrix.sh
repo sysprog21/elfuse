@@ -834,6 +834,14 @@ run_unit_tests()
     test_rc "$runner" "test-exec-handoff" 0 "$bindir/test-exec-handoff"
     test_rc "$runner" "test-pipe-steal" 0 "$bindir/test-pipe-steal"
     test_check "$runner" "test-fcntl-flags" "0 failed" "$bindir/test-fcntl-flags"
+
+    # A real kernel has to give every recorded answer, so the qemu lane runs the
+    # rows strict; under elfuse a row marked pending in tests/flag-matrix.tbl is
+    # reported and not failed.
+    local flag_matrix_mode=""
+    [ "$runner" = "run_qemu" ] && flag_matrix_mode="strict"
+    test_check "$runner" "test-flag-matrix" "0 failed" \
+        "$bindir/test-flag-matrix" $flag_matrix_mode
     test_rc "$runner" "test-mprotect-mt" 0 "$bindir/test-mprotect-mt"
     test_check "$runner" "test-dup-setfl-race" "0 failed" \
         "$bindir/test-dup-setfl-race"
@@ -1535,8 +1543,8 @@ run_suite()
 # respelling of a path to the answer its canonical spelling gets. No fixture,
 # not in either skip list. 255 and 230, observed here at 297 and 275.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|255|0"
-    "qemu-aarch64|230|0"
+    "elfuse-aarch64|256|0"
+    "qemu-aarch64|231|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

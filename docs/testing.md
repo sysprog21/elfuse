@@ -92,6 +92,11 @@ What they do:
 - `make check`: fast elfuse-internal gate. Runs, in order:
   - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
     entry without a direct or aliased test reference fails the build
+    The same script requires the syscalls it lists as flag-taking to keep
+    their rows in `tests/flag-matrix.tbl`
+  - `scripts/gen-flag-matrix.py --check` so the generated rows of
+    `test-flag-matrix` match that table, and so a row naming a syscall
+    `dispatch.tbl` no longer serves fails the build
   - `scripts/check-eintr-contract.py` so a new interruptible wait fails
     the build until it states whether it may be restarted (`forbids`,
     `restartable`, or `not-a-wait`), with the `forbids` claims checked
@@ -534,6 +539,19 @@ whose parent closes its copy of the fd before the backing has been drained
 answers with its primary alone, because the backing half belongs to a stream
 that has gone. Both rows are load-bearing in pairs -- neither number alone
 separates the answers the site could give -- so both are printed.
+
+`test-flag-matrix` records what Linux answers for one flag of one syscall,
+with the flag set and with it clear, one row each in `tests/flag-matrix.tbl`.
+Both answers are asserted, so a row passes only when the flag is what changes
+the result. The qemu lane runs the binary with `strict`, which is what keeps
+the recorded answers true; a row it refuses is a wrong row, not a kernel
+difference to skip. Two marks exist for elfuse. `pending` is a divergence still
+to be fixed: its mismatch is reported and not failed, and the lane fails once
+the row passes, until the mark is removed. `unsupported:ANSWER` is a flag
+elfuse declines on purpose, and ANSWER has to be one Linux documents for a
+kernel or filesystem without the feature. To add a syscall, add rows; the
+driver has no code for any one call. A new kind of argument or answer goes
+into `scripts/gen-flag-matrix.py` and `tests/test-flag-matrix.c` together.
 
 `test-usbdev-ioctl-departed` is the same idea with the recording moved out of
 the lane and into data. Its rows are generated from

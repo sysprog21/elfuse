@@ -50,6 +50,52 @@ INDIRECT_COVERAGE: dict[str, str] = {
 }
 
 
+FLAG_MATRIX = TESTS / "flag-matrix.tbl"
+
+# Syscalls whose flags argument must have rows in tests/flag-matrix.tbl. A name
+# mentioned in a test says the call was made; a row says each flag was asserted
+# set and clear against a real kernel. Dropping the rows for one of these fails
+# the audit, and so does listing a syscall the dispatcher no longer serves.
+FLAG_MATRIX_REQUIRED: set[str] = {
+    "accept4",
+    "clone",
+    "dup3",
+    "epoll_create1",
+    "eventfd2",
+    "faccessat2",
+    "fchmodat",
+    "fchownat",
+    "fcntl",
+    "inotify_init1",
+    "linkat",
+    "memfd_create",
+    "mmap",
+    "mprotect",
+    "newfstatat",
+    "openat",
+    "pipe2",
+    "renameat2",
+    "signalfd4",
+    "socket",
+    "socketpair",
+    "statx",
+    "timerfd_create",
+    "unlinkat",
+    "utimensat",
+}
+
+_ROW_PREFIX = re.compile(r"^(?:pending |unsupported:\S+ )?([a-z][a-z0-9_]*) \| ")
+
+
+def load_flag_matrix_names() -> set[str]:
+    names: set[str] = set()
+    for line in FLAG_MATRIX.read_text(encoding="utf-8").splitlines():
+        match = _ROW_PREFIX.match(line)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
 def load_dispatch_names() -> list[str]:
     names: list[str] = []
     for line in DISPATCH.read_text(encoding="utf-8").splitlines():
@@ -135,7 +181,25 @@ def main() -> int:
             continue
         missing.append(name)
 
+    matrix = load_flag_matrix_names()
+    no_rows = sorted(FLAG_MATRIX_REQUIRED - matrix)
+    not_dispatched = sorted(FLAG_MATRIX_REQUIRED - set(load_dispatch_names()))
+    unlisted = sorted(matrix - FLAG_MATRIX_REQUIRED)
+
     stale_indirect = sorted(set(INDIRECT_COVERAGE) - set(used_indirect))
+    if no_rows or not_dispatched or unlisted:
+        for label, names in (
+            ("Syscalls with no row left in tests/flag-matrix.tbl:", no_rows),
+            ("FLAG_MATRIX_REQUIRED entries absent from dispatch.tbl:",
+             not_dispatched),
+            ("Syscalls with rows but missing from FLAG_MATRIX_REQUIRED:",
+             unlisted),
+        ):
+            if names:
+                print(label, file=sys.stderr)
+                for name in names:
+                    print(f"  - {name}", file=sys.stderr)
+        return 1
     if missing or stale_indirect:
         if missing:
             print("Uncovered syscalls in dispatch.tbl:", file=sys.stderr)
@@ -152,6 +216,7 @@ def main() -> int:
         return 1
 
     print("syscall coverage audit: PASS")
+    print(f"  flag matrix: {len(matrix)} syscalls have per-flag rows")
     for name, reason in sorted(used_indirect.items()):
         print(f"  indirect {name}: {reason}")
     return 0

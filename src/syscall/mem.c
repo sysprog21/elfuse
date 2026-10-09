@@ -2931,6 +2931,13 @@ int64_t sys_mmap(guest_t *g,
         fd_entry_t snap;
         if (!fd_snapshot(fd, &snap))
             return -LINUX_EBADF;
+
+        /* MAP_HUGETLB on a file asks for a hugetlbfs one, and Linux answers
+         * EINVAL for any other (ksys_mmap_pgoff). No file here is one: an
+         * MFD_HUGETLB memfd is backed by ordinary pages as well.
+         */
+        if (flags & LINUX_MAP_HUGETLB)
+            return -LINUX_EINVAL;
     }
 
     /* Linux rejects zero-length mmap */

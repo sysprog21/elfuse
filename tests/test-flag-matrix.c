@@ -385,7 +385,9 @@ static int answer_matches(const struct fm_expect *x, long rc)
     case FM_X_FD_PERM:
         if (rc < 0)
             return WHY("rc=%ld, want an fd", rc), 0;
-        if (fstat((int) rc, &st) < 0 || (long) (st.st_mode & 0777) != x->a)
+        if (fstat((int) rc, &st) < 0)
+            return WHY("fstat failed, errno=%d", errno), 0;
+        if ((long) (st.st_mode & 0777) != x->a)
             return WHY("mode %#o, want %#lo", (unsigned) st.st_mode, x->a), 0;
         return 1;
     case FM_X_FD_READ_EBADF:

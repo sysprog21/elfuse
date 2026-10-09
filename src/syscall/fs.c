@@ -3945,7 +3945,11 @@ int64_t sys_fchmod(int fd, uint32_t mode)
      */
     if (known && (snap.seals & LINUX_F_SEAL_EXEC)) {
         struct stat st;
-        if (fstat(host_ref.fd, &st) < 0 || ((st.st_mode ^ mode) & 0111)) {
+        if (fstat(host_ref.fd, &st) < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        if ((st.st_mode ^ mode) & 0111) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EPERM;
         }

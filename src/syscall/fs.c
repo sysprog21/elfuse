@@ -3524,6 +3524,45 @@ int64_t sys_symlinkat(guest_t *g,
     return 0;
 }
 
+/* A host linkat of (old_dirfd, old_path) without AT_SYMLINK_FOLLOW has failed,
+ * with its errno still set.
+ *
+ * Returns 0 once new_path exists, or a negative Linux errno.
+ *
+ * Darwin's linkat(2) man page: without AT_SYMLINK_FOLLOW, hard-linking a
+ * symlink itself (rather than its target) "may result in some file systems
+ * returning an error" -- reproduced as ENOTSUP on Case-sensitive HFS+ (EPERM
+ * has also been reported on other filesystems/macOS versions for the same
+ * condition), unlike APFS which allows it. Linux allows it unconditionally, so
+ * recreate the same effect with a plain symlink to the same target: a new
+ * directory entry that resolves identically, even though it is a distinct inode
+ * rather than a second link to the original.
+ */
+static int64_t linkat_symlink_fallback(host_fd_t old_dirfd,
+                                       const char *old_path,
+                                       host_fd_t new_dirfd,
+                                       const char *new_path)
+{
+    if (errno != EPERM && errno != ENOTSUP && errno != EINVAL)
+        return linux_errno();
+
+    struct stat old_st;
+    if (fstatat(old_dirfd, old_path, &old_st, AT_SYMLINK_NOFOLLOW) < 0 ||
+        !S_ISLNK(old_st.st_mode))
+        return -LINUX_EPERM;
+
+    char target[LINUX_PATH_MAX];
+    ssize_t target_len =
+        readlinkat(old_dirfd, old_path, target, sizeof(target) - 1);
+    if (target_len < 0)
+        return -LINUX_EPERM;
+    target[target_len] = '\0';
+
+    if (symlinkat(target, new_dirfd, new_path) < 0)
+        return linux_errno();
+    return 0;
+}
+
 /* The directory entry that names a descriptor's file: the directory, opened and
  * returned, and the entry's name in it through *leaf, which points into buf.
  * Returns -1 when the file has no entry left that this can find. buf needs
@@ -3689,49 +3728,18 @@ int64_t sys_linkat(guest_t *g,
      */
     if (old_tx.is_dev_shm)
         mac_flags &= ~AT_SYMLINK_FOLLOW;
+    int64_t rc = 0;
     if (linkat(old_host_dirfd, old_tx.host_path, new_host_dirfd,
                new_tx.host_path, mac_flags) < 0) {
-        /* Darwin's linkat(2) man page: without AT_SYMLINK_FOLLOW, hard-linking
-         * a symlink itself (rather than its target) "may result in some file
-         * systems returning an error" -- reproduced here as ENOTSUP on
-         * Case-sensitive HFS+ (EPERM has also been reported on other
-         * filesystems/macOS versions for the same condition), unlike APFS which
-         * allows it. Linux allows it unconditionally, so recreate the same
-         * effect with a plain symlink to the same target: a new directory entry
-         * that resolves identically, even though it is a distinct inode rather
-         * than a second link to the original.
-         */
-        if ((errno != EPERM && errno != ENOTSUP && errno != EINVAL) ||
-            (flags & LINUX_AT_SYMLINK_FOLLOW)) {
-            host_fd_ref_close(&olddir_ref);
-            host_fd_ref_close(&newdir_ref);
-            return linux_errno();
-        }
-
-        struct stat old_st;
-        char target[LINUX_PATH_MAX];
-        ssize_t target_len;
-        if (fstatat(old_host_dirfd, old_tx.host_path, &old_st,
-                    AT_SYMLINK_NOFOLLOW) < 0 ||
-            !S_ISLNK(old_st.st_mode) ||
-            (target_len = readlinkat(old_host_dirfd, old_tx.host_path, target,
-                                     sizeof(target) - 1)) < 0) {
-            host_fd_ref_close(&olddir_ref);
-            host_fd_ref_close(&newdir_ref);
-            return -LINUX_EPERM;
-        }
-        target[target_len] = '\0';
-
-        if (symlinkat(target, new_host_dirfd, new_tx.host_path) < 0) {
-            host_fd_ref_close(&olddir_ref);
-            host_fd_ref_close(&newdir_ref);
-            return linux_errno();
-        }
+        rc = (flags & LINUX_AT_SYMLINK_FOLLOW)
+                 ? linux_errno()
+                 : linkat_symlink_fallback(old_host_dirfd, old_tx.host_path,
+                                           new_host_dirfd, new_tx.host_path);
     }
 
     host_fd_ref_close(&olddir_ref);
     host_fd_ref_close(&newdir_ref);
-    return 0;
+    return rc;
 }
 
 /* access() on the current directory. */

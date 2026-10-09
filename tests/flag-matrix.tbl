@@ -115,3 +115,56 @@ faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
 renameat2 | RENAME_NOREPLACE | CWD p:file CWD p:link F | err:EEXIST | lreg:p:link
 renameat2 | RENAME_EXCHANGE | CWD p:file CWD p:link F | llnk:p:file | absent:p:file
 renameat2 | RENAME_NOREPLACE|RENAME_EXCHANGE@both | CWD p:file CWD p:link F | err:EINVAL | lreg:p:link
+
+# dup3(oldfd, newfd, flags)
+dup3 | O_CLOEXEC | fd:file 100 F | fd:cloexec | fd:nocloexec
+dup3 | O_NONBLOCK@unknown | fd:file 100 F | err:EINVAL | fd
+
+# pipe2(pipefd, flags)
+pipe2 | O_CLOEXEC | pair F | fd:cloexec | fd:nocloexec
+pipe2 | O_NONBLOCK | pair F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+# Packet mode is a property of the write end; the read end never reports it.
+pending pipe2 | O_DIRECT | pair F | pair1:getfl:O_DIRECT | pair1:nogetfl:O_DIRECT
+pipe2 | O_APPEND@unknown | pair F | err:EINVAL | fd
+
+# eventfd2(initval, flags)
+eventfd2 | EFD_CLOEXEC | 0 F | fd:cloexec | fd:nocloexec
+eventfd2 | EFD_NONBLOCK | 0 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+eventfd2 | EFD_SEMAPHORE | 0 F | fd | =
+eventfd2 | 0x4@unknown | 0 F | err:EINVAL | fd
+
+# epoll_create1(flags)
+epoll_create1 | EPOLL_CLOEXEC | F | fd:cloexec | fd:nocloexec
+pending epoll_create1 | 0x1@unknown | F | err:EINVAL | fd
+
+# inotify_init1(flags)
+inotify_init1 | IN_CLOEXEC | F | fd:cloexec | fd:nocloexec
+inotify_init1 | IN_NONBLOCK | F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+pending inotify_init1 | 0x1@unknown | F | err:EINVAL | fd
+
+# timerfd_create(clockid, flags)
+timerfd_create | TFD_CLOEXEC | CLOCK_MONOTONIC F | fd:cloexec | fd:nocloexec
+timerfd_create | TFD_NONBLOCK | CLOCK_MONOTONIC F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+timerfd_create | 0x1@unknown | CLOCK_MONOTONIC F | err:EINVAL | fd
+
+# signalfd4(fd, mask, sizemask, flags): buf is an empty 8-byte mask.
+signalfd4 | SFD_CLOEXEC | -1 buf 8 F | fd:cloexec | fd:nocloexec
+signalfd4 | SFD_NONBLOCK | -1 buf 8 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+signalfd4 | 0x1@unknown | -1 buf 8 F | err:EINVAL | fd
+
+# memfd_create(name, flags)
+memfd_create | MFD_CLOEXEC | p:file F | fd:cloexec | fd:nocloexec
+pending memfd_create | 0x8000@unknown | p:file F | err:EINVAL | fd
+
+# socket(domain, type, protocol): the flags share the type argument.
+socket | SOCK_CLOEXEC | AF_UNIX F|SOCK_STREAM 0 | fd:cloexec | fd:nocloexec
+socket | SOCK_NONBLOCK | AF_UNIX F|SOCK_STREAM 0 | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+
+# socketpair(domain, type, protocol, sv)
+socketpair | SOCK_CLOEXEC | AF_UNIX F|SOCK_STREAM 0 pair | fd:cloexec | fd:nocloexec
+socketpair | SOCK_NONBLOCK | AF_UNIX F|SOCK_STREAM 0 pair | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+
+# accept4(sockfd, addr, addrlen, flags)
+accept4 | SOCK_CLOEXEC | fd:listener 0 0 F | fd:cloexec | fd:nocloexec
+accept4 | SOCK_NONBLOCK | fd:listener 0 0 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+pending accept4 | 0x1@unknown | fd:listener 0 0 F | err:EINVAL | fd

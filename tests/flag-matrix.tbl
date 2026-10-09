@@ -45,6 +45,7 @@
 #   fd:getfl:EXPR fd:nogetfl:EXPR    F_GETFL has every bit, or no bit, of EXPR
 #   pair1:getfl:EXPR pair1:nogetfl:EXPR   the same, asked only of the second
 #                                    fd of a pair
+#   fd:seals:EXPR      F_GET_SEALS on the fd returns exactly EXPR
 #   fd:appends fd:overwrites         a 1-byte write at offset 0 grows the file,
 #                                    or leaves its size alone
 #   fd:readebadf       read on the fd gives EBADF
@@ -64,6 +65,8 @@
 #                                    a read of "file"
 #   region:writable region:readonly region:noread
 #                      the same loads and stores, on the region
+#   pair:packets pair:stream         one read after two writes returns the
+#                                    first write alone, or both
 #   =                  (last field only) the same answer as with the flag
 #
 # A row that starts with "unsupported:ANSWER" is a flag elfuse declines on
@@ -165,6 +168,10 @@ pipe2 | O_CLOEXEC | pair F | fd:cloexec | fd:nocloexec
 pipe2 | O_NONBLOCK | pair F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
 # Packet mode is a property of the write end; the read end never reports it.
 pipe2 | O_DIRECT | pair F | pair1:getfl:O_DIRECT | pair1:nogetfl:O_DIRECT
+# Packet mode itself. The host pipe is a byte stream and has no such mode, so
+# this stays pending until someone decides between giving the pipe a framed
+# backing and refusing the flag; see the note in docs/testing.md.
+pending pipe2 | O_DIRECT@packets | pair F | pair:packets | pair:stream
 pipe2 | O_APPEND@unknown | pair F | err:EINVAL | fd
 
 # eventfd2(initval, flags)
@@ -197,6 +204,8 @@ memfd_create | MFD_CLOEXEC | p:file F | fd:cloexec | fd:nocloexec
 memfd_create | 0x8000@unknown | p:file F | err:EINVAL | fd
 # MFD_NOEXEC_SEAL and MFD_EXEC contradict each other.
 memfd_create | 0x10@exec-and-noexec | p:file F|0x8 | err:EINVAL | fd
+memfd_create | MFD_ALLOW_SEALING | p:file F | fd:seals:0 | fd:seals:F_SEAL_SEAL
+memfd_create | MFD_HUGETLB | p:file F | fd | =
 
 # socket(domain, type, protocol): the flags share the type argument.
 socket | SOCK_CLOEXEC | AF_UNIX F|SOCK_STREAM 0 | fd:cloexec | fd:nocloexec

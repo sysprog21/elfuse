@@ -81,6 +81,7 @@ enum fm_expect_kind {
     FM_X_PAIR1_NOGETFL,
     FM_X_FD_APPENDS,
     FM_X_FD_OVERWRITES,
+    FM_X_FD_SEALS,
     FM_X_FD_READ_EBADF,
     FM_X_EXISTS,
     FM_X_ABSENT,
@@ -107,6 +108,8 @@ enum fm_expect_kind {
     FM_X_REGION_WRITABLE,
     FM_X_REGION_READONLY,
     FM_X_REGION_NOREAD,
+    FM_X_PAIR_PACKETS,
+    FM_X_PAIR_STREAM,
 };
 
 struct fm_arg {
@@ -351,6 +354,13 @@ static int answer_matches(const struct fm_expect *x, long rc)
             return WHY("size %ld after a write at offset 0", (long) st.st_size),
                    0;
         return 1;
+    case FM_X_FD_SEALS:
+        if (rc < 0)
+            return WHY("rc=%ld, want an fd", rc), 0;
+        fl = fcntl((int) rc, F_GET_SEALS);
+        if (fl != (int) x->a)
+            return WHY("F_GET_SEALS=%#x, want %#lx", fl, x->a), 0;
+        return 1;
     case FM_X_FD_READ_EBADF:
         if (rc < 0)
             return WHY("rc=%ld, want an fd", rc), 0;
@@ -490,6 +500,21 @@ static int answer_matches(const struct fm_expect *x, long rc)
                        x->kind == FM_X_REGION_WRITABLE ? "not " : ""),
                    0;
         return 1;
+    case FM_X_PAIR_PACKETS:
+    case FM_X_PAIR_STREAM: {
+        /* Two writes of two bytes, then one read of four. A packet pipe hands
+         * back the first write alone; a stream hands back both.
+         */
+        char got[4];
+        if (rc != 0)
+            return WHY("rc=%ld, want 0", rc), 0;
+        if (write(fm_pair[1], "ab", 2) != 2 || write(fm_pair[1], "cd", 2) != 2)
+            return WHY("probe write failed, errno=%d", errno), 0;
+        ssize_t n = read(fm_pair[0], got, sizeof(got));
+        if (n != (x->kind == FM_X_PAIR_PACKETS ? 2 : 4))
+            return WHY("one read returned %zd bytes", n), 0;
+        return 1;
+    }
     case FM_X_STATX_REG:
     case FM_X_STATX_LNK: {
         struct statx sx;

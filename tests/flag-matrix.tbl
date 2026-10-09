@@ -90,17 +90,21 @@ openat | O_NOCTTY | CWD p:file F|O_RDONLY 0 | fd | =
 openat | O_SYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_SYNC | fd:nogetfl:O_SYNC
 openat | O_DSYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_DSYNC | fd:nogetfl:O_DSYNC
 openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O_NOATIME
+# An empty name is ENOENT before dirfd is looked at.
+openat | O_CLOEXEC@empty-path | fd:file p:empty F|O_RDONLY 0 | err:ENOENT | =
 
 unlinkat | AT_REMOVEDIR@file | CWD p:file F | err:ENOTDIR | absent:p:file
 unlinkat | 0x8000@unknown | CWD p:file F | err:EINVAL | absent:p:file
 
 # newfstatat(dirfd, path, statbuf, flags)
 newfstatat | AT_SYMLINK_NOFOLLOW | CWD p:link buf F | buf:lnk | buf:reg
+newfstatat | AT_EMPTY_PATH | fd:file p:empty buf F | buf:reg | err:ENOENT
 newfstatat | AT_NO_AUTOMOUNT | CWD p:file buf F | buf:reg | =
 
 # statx(dirfd, path, flags, mask, statxbuf): the flags are argument 2 here and
 # argument 3 in newfstatat.
 statx | AT_SYMLINK_NOFOLLOW | CWD p:link F STATX_BASIC_STATS buf | bufx:lnk | bufx:reg
+statx | AT_EMPTY_PATH | fd:file p:empty F STATX_BASIC_STATS buf | bufx:reg | err:ENOENT
 statx | AT_STATX_FORCE_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
 statx | AT_STATX_DONT_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
 
@@ -113,6 +117,7 @@ fchmodat | AT_SYMLINK_NOFOLLOW@ignored | CWD p:link 0600 F | mode:p:file=0600 | 
 
 # fchownat(dirfd, path, owner, group, flags)
 fchownat | AT_SYMLINK_NOFOLLOW | CWD p:dangling -1 -1 F | ok | err:ENOENT
+fchownat | AT_EMPTY_PATH | fd:file p:empty -1 -1 F | ok | err:ENOENT
 
 # utimensat(dirfd, path, times, flags)
 utimensat | AT_SYMLINK_NOFOLLOW | CWD p:dangling 0 F | ok | err:ENOENT
@@ -127,6 +132,8 @@ faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
 renameat2 | RENAME_NOREPLACE | CWD p:file CWD p:link F | err:EEXIST | lreg:p:link
 renameat2 | RENAME_EXCHANGE | CWD p:file CWD p:link F | llnk:p:file | absent:p:file
 renameat2 | RENAME_NOREPLACE|RENAME_EXCHANGE@both | CWD p:file CWD p:link F | err:EINVAL | lreg:p:link
+renameat2 | RENAME_NOREPLACE@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+renameat2 | RENAME_NOREPLACE@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
 
 # dup3(oldfd, newfd, flags)
 dup3 | O_CLOEXEC | fd:file 100 F | fd:cloexec | fd:nocloexec

@@ -743,6 +743,14 @@ static int64_t read_translated_path(guest_t *g,
 {
     if (guest_read_str(g, path_gva, path, LINUX_PATH_MAX) < 0)
         return -LINUX_EFAULT;
+
+    /* Linux refuses an empty name while it copies it in, before it looks at
+     * dirfd. Left to the host, the answer depended on dirfd: ENOENT against a
+     * directory and ENOTDIR against anything else. A caller that takes
+     * AT_EMPTY_PATH has to act on it before coming here.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
     if (path_translate_at(dirfd, path, tx_flags, tx) < 0)
         return linux_errno();
     return 0;
@@ -852,6 +860,13 @@ int64_t sys_openat_path(guest_t *g,
     if ((linux_flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT)) ==
         (LINUX_O_DIRECTORY | LINUX_O_CREAT))
         return -LINUX_EINVAL;
+
+    /* open has no AT_EMPTY_PATH, so an empty name is ENOENT whatever dirfd is;
+     * see read_translated_path. It comes after the flag checks above because
+     * Linux builds the open flags before it copies the name in.
+     */
+    if (pathp[0] == '\0')
+        return -LINUX_ENOENT;
 
     path_translation_t tx;
     unsigned int tx_flags =
@@ -3114,6 +3129,12 @@ int64_t sys_renameat2(guest_t *g,
         return -LINUX_EINVAL;
     }
 
+    /* An empty name on either side is ENOENT whatever its dirfd is; see
+     * read_translated_path.
+     */
+    if (oldpath[0] == '\0' || newpath[0] == '\0')
+        return -LINUX_ENOENT;
+
     if (path_translate_at(olddirfd, oldpath, PATH_TR_NOFOLLOW, &old_tx) < 0 ||
         path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
                           &new_tx) < 0)
@@ -3758,6 +3779,12 @@ int64_t sys_fchmodat(guest_t *g,
         return 0;
     }
 
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is; see
+     * read_translated_path.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
+
     /* An fd magic link names the descriptor's file, and Linux resolves it
      * inside the syscall. Act on the descriptor so nothing can redirect the
      * chmod between resolution and use; see path_fd_magiclink_open().
@@ -3936,6 +3963,12 @@ int64_t sys_fchownat(guest_t *g,
         host_fd_ref_close(&ref);
         return out;
     }
+
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is; see
+     * read_translated_path.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
 
     /* Same reasoning as the fd magic link branch in sys_fchmodat: act on the
      * descriptor, not on a pathname resolved from it a moment earlier.

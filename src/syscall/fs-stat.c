@@ -314,6 +314,12 @@ static int64_t stat_at_path(guest_t *g,
         dirfd != LINUX_AT_FDCWD)
         return stat_empty_path_fd(dirfd, mac_st);
 
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is. The host
+     * would say ENOTDIR for a dirfd that is not a directory.
+     */
+    if (pathp[0] == '\0' && !(flags & LINUX_AT_EMPTY_PATH))
+        return -LINUX_ENOENT;
+
     if (pathp[0] == '/' && fuse_path_matches_mount(pathp)) {
         int frc = fuse_stat_path(pathp, mac_st, flags);
         if (frc < 0)

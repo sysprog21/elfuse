@@ -67,7 +67,7 @@ enum fm_path {
     FM_P_NEW,
     FM_P_EMPTY
 };
-enum fm_fd { FM_FD_FILE, FM_FD_DIR, FM_FD_LISTENER };
+enum fm_fd { FM_FD_FILE, FM_FD_DIR, FM_FD_LISTENER, FM_FD_SEALED };
 
 enum fm_expect_kind {
     FM_X_OK,
@@ -83,6 +83,7 @@ enum fm_expect_kind {
     FM_X_FD_APPENDS,
     FM_X_FD_OVERWRITES,
     FM_X_FD_SEALS,
+    FM_X_FD_PERM,
     FM_X_FD_READ_EBADF,
     FM_X_EXISTS,
     FM_X_ABSENT,
@@ -135,6 +136,12 @@ struct fm_row {
     struct fm_expect elfuse_with;
 };
 
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
+#endif
+#ifndef __NR_fchmodat2
+#define __NR_fchmodat2 452
+#endif
 #include "flag-matrix-vectors.h"
 
 static const char *const fm_paths[] = {
@@ -318,6 +325,8 @@ static long open_fixture_fd(long which)
         return open("dir", O_RDONLY | O_DIRECTORY);
     if (which == FM_FD_LISTENER)
         return open_listener();
+    if (which == FM_FD_SEALED)
+        return memfd_create("sealed", MFD_NOEXEC_SEAL);
     return open("file", O_RDWR);
 }
 
@@ -382,6 +391,14 @@ static int answer_matches(const struct fm_expect *x, long rc)
         fl = fcntl((int) rc, F_GET_SEALS);
         if (fl != (int) x->a)
             return WHY("F_GET_SEALS=%#x, want %#lx", fl, x->a), 0;
+        return 1;
+    case FM_X_FD_PERM:
+        if (rc < 0)
+            return WHY("rc=%ld, want an fd", rc), 0;
+        if (fstat((int) rc, &st) < 0)
+            return WHY("fstat failed, errno=%d", errno), 0;
+        if ((long) (st.st_mode & 0777) != x->a)
+            return WHY("mode %#o, want %#lo", (unsigned) st.st_mode, x->a), 0;
         return 1;
     case FM_X_FD_READ_EBADF:
         if (rc < 0)

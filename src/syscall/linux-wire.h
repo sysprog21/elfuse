@@ -562,6 +562,7 @@ typedef struct {
 #define LINUX_F_SEAL_GROW 0x0004
 #define LINUX_F_SEAL_WRITE 0x0008
 #define LINUX_F_SEAL_FUTURE_WRITE 0x0010
+#define LINUX_F_SEAL_EXEC 0x0020
 
 /* Not a seal: elfuse's mark, kept beside the seals so that dup and fork carry
  * it, on a memfd made with MFD_HUGETLB. Linux treats such a file as hugetlbfs

@@ -22,6 +22,7 @@
 #   p:NAME           path of a fixture entry (see below)
 #   fd:file fd:dir   a fresh O_RDWR fd on "file", an O_RDONLY fd on "dir"
 #   fd:listener      a listening Unix socket with one connection queued
+#   fd:sealed        a memfd made with MFD_NOEXEC_SEAL: mode 0666, F_SEAL_EXEC
 #   pair             an int[2] the call fills with two fds; an fd answer is
 #                    then asked of both
 #   region           the address of a fresh anonymous read-write mapping
@@ -48,6 +49,7 @@
 #   pair1:getfl:EXPR pair1:nogetfl:EXPR   the same, asked only of the second
 #                                    fd of a pair
 #   fd:seals:EXPR      F_GET_SEALS on the fd returns exactly EXPR
+#   fd:perm:EXPR       fstat on the fd reports exactly those permission bits
 #   fd:appends fd:overwrites         a 1-byte write at offset 0 grows the file,
 #                                    or leaves its size alone
 #   fd:readebadf       read on the fd gives EBADF
@@ -143,6 +145,11 @@ linkat | AT_SYMLINK_FOLLOW | CWD p:link CWD p:new F | lreg:p:new | llnk:p:new
 # flags word in the fourth is never read.
 fchmodat | AT_SYMLINK_NOFOLLOW@ignored | CWD p:link 0600 F | mode:p:file=0600 | =
 
+# fchmodat2(dirfd, path, mode, flags)
+# F_SEAL_EXEC belongs to the file, so the descriptor form of chmod meets it
+# too: giving the sealed memfd its execute bits is EPERM.
+fchmodat2 | AT_EMPTY_PATH@exec-seal | fd:sealed p:empty 0777 F | err:EPERM | err:ENOENT
+
 # fchownat(dirfd, path, owner, group, flags)
 fchownat | AT_SYMLINK_NOFOLLOW | CWD p:dangling -1 -1 F | ok | err:ENOENT
 fchownat | AT_EMPTY_PATH | fd:file p:empty -1 -1 F | ok | err:ENOENT
@@ -209,6 +216,11 @@ memfd_create | 0x8000@unknown | p:file F | err:EINVAL | fd
 # MFD_NOEXEC_SEAL and MFD_EXEC contradict each other.
 memfd_create | 0x10@exec-and-noexec | p:file F|0x8 | err:EINVAL | fd
 memfd_create | MFD_ALLOW_SEALING | p:file F | fd:seals:0 | fd:seals:F_SEAL_SEAL
+# MFD_NOEXEC_SEAL (0x8) allows sealing, sets F_SEAL_EXEC (0x20), and makes the
+# file without its execute bits. MFD_EXEC (0x10) asks for today's default.
+memfd_create | 0x8@noexec-seal | p:file F | fd:seals:0x20 | fd:seals:F_SEAL_SEAL
+memfd_create | 0x8@noexec-mode | p:file F | fd:perm:0666 | fd:perm:0777
+memfd_create | 0x10@exec | p:file F | fd:perm:0777 | =
 memfd_create | MFD_HUGETLB | p:file F | fd | =
 
 # socket(domain, type, protocol): the flags share the type argument.

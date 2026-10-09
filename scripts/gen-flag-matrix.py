@@ -44,7 +44,8 @@ PATHS = {
     "new": "FM_P_NEW",
     "empty": "FM_P_EMPTY",
 }
-FDS = {"file": "FM_FD_FILE", "dir": "FM_FD_DIR", "listener": "FM_FD_LISTENER"}
+FDS = {"file": "FM_FD_FILE", "dir": "FM_FD_DIR", "listener": "FM_FD_LISTENER",
+       "sealed": "FM_FD_SEALED"}
 
 # Expectations that take no operand.
 PLAIN_EXPECTS = {
@@ -84,6 +85,7 @@ EXPR_EXPECTS = {
     "fd:getfl": "FM_X_FD_GETFL",
     "fd:nogetfl": "FM_X_FD_NOGETFL",
     "fd:seals": "FM_X_FD_SEALS",
+    "fd:perm": "FM_X_FD_PERM",
     "pair1:getfl": "FM_X_PAIR1_GETFL",
     "pair1:nogetfl": "FM_X_PAIR1_NOGETFL",
     "arg0:getfl": "FM_X_ARG0_GETFL",

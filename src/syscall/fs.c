@@ -2097,9 +2097,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         }
         int new_seals = (int) arg;
         /* Only allow valid seal bits */
-        if (new_seals &
-            ~(LINUX_F_SEAL_SEAL | LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW |
-              LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE)) {
+        if (new_seals & ~(LINUX_F_SEAL_SEAL | LINUX_F_SEAL_SHRINK |
+                          LINUX_F_SEAL_GROW | LINUX_F_SEAL_WRITE |
+                          LINUX_F_SEAL_FUTURE_WRITE | LINUX_F_SEAL_EXEC)) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
@@ -3786,22 +3786,43 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length)
 
 /* permissions/ownership. */
 
+/* fchmod on the host fd of a guest descriptor that carries seals. Linux keeps
+ * the seals on the inode and tests them in shmem_setattr, so every chmod that
+ * reaches the file meets them; here each spelling that reaches a descriptor
+ * (fchmod, fchmodat with AT_EMPTY_PATH, an fd magic link) comes through this.
+ *
+ * F_SEAL_EXEC holds the execute bits as they are; any other change to the mode
+ * is still allowed.
+ */
+static int64_t fchmod_sealed(int host_fd, int seals, uint32_t mode)
+{
+    if (seals & LINUX_F_SEAL_EXEC) {
+        struct stat st;
+        if (fstat(host_fd, &st) < 0)
+            return linux_errno();
+        if ((st.st_mode ^ mode) & 0111)
+            return -LINUX_EPERM;
+    }
+    if (fchmod(host_fd, mode) < 0)
+        return linux_errno();
+    return 0;
+}
+
 int64_t sys_fchmod(int fd, uint32_t mode)
 {
     /* O_PATH fds do not support fchmod (Linux returns EBADF) */
     fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH)
+    bool known = fd_snapshot(fd, &snap);
+    if (known && snap.type == FD_PATH)
         return -LINUX_EBADF;
     host_fd_ref_t host_ref;
     int64_t ref_err = host_fd_ref_open(fd, &host_ref);
     if (ref_err < 0)
         return ref_err;
-    if (fchmod(host_ref.fd, mode) < 0) {
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
-    }
+
+    int64_t rc = fchmod_sealed(host_ref.fd, known ? snap.seals : 0, mode);
     host_fd_ref_close(&host_ref);
-    return 0;
+    return rc;
 }
 
 int64_t sys_fchmodat(guest_t *g,
@@ -3850,12 +3871,9 @@ int64_t sys_fchmodat(guest_t *g,
         int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
         if (ref_err < 0)
             return ref_err;
-        if (fchmod(ref.fd, mode) < 0) {
-            host_fd_ref_close(&ref);
-            return linux_errno();
-        }
+        int64_t empty_rc = fchmod_sealed(ref.fd, snap.seals, mode);
         host_fd_ref_close(&ref);
-        return 0;
+        return empty_rc;
     }
 
     /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is; see
@@ -3870,10 +3888,11 @@ int64_t sys_fchmodat(guest_t *g,
      */
     if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
         host_fd_ref_t magic;
-        if (path_fd_magiclink_open(path, &magic) == 0) {
-            int mrc = fchmod(magic.fd, mode);
+        fd_entry_t magic_entry;
+        if (path_fd_magiclink_open_entry(path, &magic, &magic_entry) == 0) {
+            int64_t mrc = fchmod_sealed(magic.fd, magic_entry.seals, mode);
             host_fd_ref_close(&magic);
-            return mrc < 0 ? linux_errno() : 0;
+            return mrc;
         }
     }
 

@@ -401,3 +401,11 @@ int path_fd_magiclink_guest_fd(const char *path);
  * between.
  */
 int path_fd_magiclink_open(const char *path, host_fd_ref_t *ref);
+
+/* The same, and *entry is the table entry the reference was taken on, read
+ * under the same fd_lock hold. For a caller whose answer depends on what the
+ * descriptor carries, such as its seals. *entry is unspecified on -1.
+ */
+int path_fd_magiclink_open_entry(const char *path,
+                                 host_fd_ref_t *ref,
+                                 fd_entry_t *entry);

@@ -1504,26 +1504,38 @@ static int fork_snapshot_shm_via_clonefile(int src_fd)
     return clone_fd;
 }
 
-/* Make a pidfd for a child clone just created and store its guest fd number at
- * gva. Shared by clone, which is given the slot in parent_tid, and clone3,
- * which has a field of its own for it.
- */
-static void clone_publish_pidfd(guest_t *g, int64_t child, uint64_t gva)
+static void clone_pidfd_discard(int pfd)
 {
-    /* A CLONE_VM child has no host pid of its own, so it resolves to -1 and its
-     * pidfd carries no monitor.
-     */
-    int pfd = pidfd_create(g, child, proc_resolve_guest_pid(child));
+    fd_entry_t snap;
+    if (fd_snapshot_and_close(pfd, &snap))
+        fd_cleanup_entry(pfd, &snap);
+}
+
+/* CLONE_PIDFD: make a pidfd for target and store its guest fd number at gva,
+ * which is parent_tid for clone and a field of its own for clone3.
+ *
+ * Returns the guest fd, or a negative Linux errno with nothing left behind.
+ *
+ * Linux does both inside copy_process, before the child can run, and fails the
+ * clone when the descriptor table is full (EMFILE) or the slot cannot be
+ * written (EFAULT). The callers run this where the child can still be called
+ * off for the same reason.
+ */
+static int64_t clone_pidfd_publish(guest_t *g,
+                                   int64_t target,
+                                   pid_t host_pid,
+                                   uint64_t gva)
+{
+    int pfd = pidfd_create(g, target, host_pid);
     if (pfd < 0)
-        return;
+        return pfd;
 
     int32_t pfd32 = (int32_t) pfd;
     if (guest_write_small(g, gva, &pfd32, sizeof(pfd32)) < 0) {
-        /* GVA invalid; close the newly created pidfd. */
-        fd_entry_t snap;
-        if (fd_snapshot_and_close(pfd, &snap))
-            fd_cleanup_entry(pfd, &snap);
+        clone_pidfd_discard(pfd);
+        return -LINUX_EFAULT;
     }
+    return pfd;
 }
 
 static int64_t clone_dispatch(hv_vcpu_t vcpu,
@@ -1535,6 +1547,7 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
                               uint64_t ptid_gva,
                               uint64_t tls,
                               uint64_t ctid_gva,
+                              const uint64_t *pidfd_gva,
                               bool verbose);
 
 int64_t sys_clone(hv_vcpu_t vcpu,
@@ -1550,19 +1563,16 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 {
     /* clone(2) has no argument for the pidfd and returns it through parent_tid,
      * which is why Linux refuses CLONE_PIDFD beside CLONE_PARENT_SETTID there.
-     * clone3 strips the flag before it calls in and publishes into its own
-     * field, so this never runs twice.
+     * clone3 has a field of its own for it and calls clone_dispatch itself.
      */
     bool want_pidfd = (flags & LINUX_CLONE_PIDFD) != 0;
     if (want_pidfd && (flags & LINUX_CLONE_PARENT_SETTID))
         return -LINUX_EINVAL;
 
-    int64_t ret = clone_dispatch(vcpu, g, flags & ~(uint64_t) LINUX_CLONE_PIDFD,
-                                 child_stack, stack_map_start, stack_map_end,
-                                 ptid_gva, tls, ctid_gva, verbose);
-    if (ret > 0 && want_pidfd)
-        clone_publish_pidfd(g, ret, ptid_gva);
-    return ret;
+    return clone_dispatch(vcpu, g, flags & ~(uint64_t) LINUX_CLONE_PIDFD,
+                          child_stack, stack_map_start, stack_map_end, ptid_gva,
+                          tls, ctid_gva, want_pidfd ? &ptid_gva : NULL,
+                          verbose);
 }
 
 /* Over the function-size limit on purpose.
@@ -1581,6 +1591,7 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
                               uint64_t ptid_gva,
                               uint64_t tls,
                               uint64_t ctid_gva,
+                              const uint64_t *pidfd_gva,
                               bool verbose)
 {
     /* Namespaces are not implemented. CLONE_NEWTIME (0x80) lives in the CSIGNAL
@@ -1601,11 +1612,43 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     if ((flags & LINUX_CLONE_SIGHAND) && !(flags & LINUX_CLONE_VM))
         return -LINUX_EINVAL;
 
-    /* CLONE_THREAD: create a new thread in the same VM (not a new process) */
-    if (flags & LINUX_CLONE_THREAD) {
-        return sys_clone_thread(vcpu, g, flags, child_stack, stack_map_start,
-                                stack_map_end, ptid_gva, tls, ctid_gva,
-                                verbose);
+    /* A thread and a CLONE_VM child both live in this process and share its
+     * descriptor table, so the pidfd is made and stored before the task exists,
+     * where a failure costs nothing, and pointed at the task once its tid is
+     * known. Neither has a host pid, so the pidfd carries no monitor.
+     */
+    bool is_thread = (flags & LINUX_CLONE_THREAD) != 0;
+    bool is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
+    if (is_thread || ((flags & LINUX_CLONE_VM) && !is_vfork)) {
+        int64_t pfd = -1;
+        if (pidfd_gva) {
+            pfd = clone_pidfd_publish(g, 0, -1, *pidfd_gva);
+            if (pfd < 0)
+                return pfd;
+        }
+
+        /* CLONE_THREAD: a new thread in the same VM (not a new process).
+         *
+         * CLONE_VM without it: an in-process VM-clone child that shares guest
+         * memory and is waitable via wait4/ptrace. CLONE_VFORK is the exception
+         * and goes through the helper-process path below, so the child's later
+         * execve replaces only the child image rather than resetting the
+         * parent's shared guest_t.
+         */
+        int64_t ret =
+            is_thread
+                ? sys_clone_thread(vcpu, g, flags, child_stack, stack_map_start,
+                                   stack_map_end, ptid_gva, tls, ctid_gva,
+                                   verbose)
+                : sys_clone_vm(vcpu, g, flags, child_stack, stack_map_start,
+                               stack_map_end, ptid_gva, tls, ctid_gva, verbose);
+        if (pfd >= 0) {
+            if (ret > 0)
+                pidfd_set_target((int) pfd, ret);
+            else
+                clone_pidfd_discard((int) pfd);
+        }
+        return ret;
     }
 
     /* Rosetta fork takes the helper-process IPC path. The parent cannot remap
@@ -1620,19 +1663,6 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     /* elfuse only supports fork-like clone (SIGCHLD) and posix_spawn-like
      * clone (CLONE_VM|CLONE_VFORK|SIGCHLD)
      */
-    bool is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
-
-    /* CLONE_VM without CLONE_THREAD usually creates an in-process VM-clone
-     * child that shares guest memory and is waitable via wait4/ptrace. However
-     * CLONE_VFORK must go through the helper-process path below so the child's
-     * later execve replaces only the child image rather than resetting the
-     * parent's shared guest_t.
-     */
-    if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD) &&
-        !is_vfork) {
-        return sys_clone_vm(vcpu, g, flags, child_stack, stack_map_start,
-                            stack_map_end, ptid_gva, tls, ctid_gva, verbose);
-    }
 
     log_debug("clone(flags=0x%llx, vfork=%d)", (unsigned long long) flags,
               is_vfork);
@@ -1811,6 +1841,7 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     int snapshot_shm_fd = -1;
     bool siblings_quiesced = false;
     int64_t fail_rc = -LINUX_ENOMEM;
+    int child_pidfd = -1;
 
     /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
      * sibling vCPUs may be actively mutating guest memory during the fork
@@ -2076,6 +2107,21 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
         log_error("clone: failed to commit child bookkeeping");
         goto fail_snapshot;
     }
+
+    /* Linux makes the pidfd after it has copied the descriptor table and before
+     * the child can run. Here that is after the fd table went to the child,
+     * which must not inherit the descriptor, and before the child is admitted,
+     * so a failure unwinds a child that never ran.
+     */
+    if (pidfd_gva) {
+        int64_t prc =
+            clone_pidfd_publish(g, child_guest_pid, child_host_pid, *pidfd_gva);
+        if (prc < 0) {
+            fail_rc = prc;
+            goto fail_snapshot;
+        }
+        child_pidfd = (int) prc;
+    }
     uint8_t admission_ready = 1;
     if (fork_ipc_write_all(ipc_sock, &admission_ready,
                            sizeof(admission_ready)) < 0) {
@@ -2158,6 +2204,8 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     return child_guest_pid;
 
 fail_snapshot:
+    if (child_pidfd >= 0)
+        clone_pidfd_discard(child_pidfd);
     proc_cancel_child(child_guest_pid);
     free(regions_snapshot);
     if (snapshot_shm_fd >= 0)
@@ -2284,11 +2332,11 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
     if ((ca.stack == 0) != (ca.stack_size == 0))
         return -LINUX_EINVAL;
 
-    /* Merge exit_signal into flags for sys_clone compatibility. clone3 moved
-     * exit_signal out of the flags field; sys_clone expects it in the low byte.
-     * Safe because validation confirmed ca.flags low byte is zero. Strip
-     * CLONE_PIDFD before passing to sys_clone (which does not understand it).
-     * Pidfd creation happens after the clone returns.
+    /* Merge exit_signal into flags for clone_dispatch. clone3 moved exit_signal
+     * out of the flags field; clone_dispatch expects it in the low byte. Safe
+     * because validation confirmed ca.flags low byte is zero. CLONE_PIDFD is
+     * not passed as a flag: clone_dispatch is handed the address of the pidfd
+     * field, and makes the pidfd while the child can still be called off.
      */
     bool want_pidfd = (ca.flags & LINUX_CLONE_PIDFD) != 0;
     uint64_t flags =
@@ -2313,15 +2361,7 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
         (unsigned long long) ca.stack, (unsigned long long) ca.stack_size,
         (unsigned long long) ca.tls, (unsigned long long) cl_args_size);
 
-    int64_t ret = sys_clone(vcpu, g, flags, child_stack, ca.stack,
-                            ca.stack + ca.stack_size, ca.parent_tid, ca.tls,
-                            ca.child_tid, verbose);
-
-    /* If clone succeeded and CLONE_PIDFD was requested, create a pidfd for the
-     * child and write the guest FD number to ca.pidfd.
-     */
-    if (ret > 0 && want_pidfd && ca.pidfd != 0)
-        clone_publish_pidfd(g, ret, ca.pidfd);
-
-    return ret;
+    return clone_dispatch(vcpu, g, flags, child_stack, ca.stack,
+                          ca.stack + ca.stack_size, ca.parent_tid, ca.tls,
+                          ca.child_tid, want_pidfd ? &ca.pidfd : NULL, verbose);
 }

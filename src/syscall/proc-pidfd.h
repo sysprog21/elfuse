@@ -18,6 +18,12 @@ void pidfd_init(void);
  * watched (the caller itself, or a CLONE_VM child).
  */
 int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid);
+
+/* Point a pidfd at the task it stands for. clone makes the descriptor for a
+ * thread or a CLONE_VM child before that task exists, with target_pid 0, and
+ * learns the tid only once the task is made.
+ */
+void pidfd_set_target(int guest_fd, int64_t target_pid);
 void proc_pidfd_notify_exit(int64_t exited_pid);
 int64_t proc_pidfd_lookup_pid(int guest_fd);
 int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags);

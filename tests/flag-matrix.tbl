@@ -318,6 +318,9 @@ clone | CLONE_PARENT_SETTID | F|SIGCHLD 0 buf 0 0 | child:ptid | child:noptid
 clone | CLONE_PIDFD | F|SIGCHLD 0 buf 0 0 | child:pidfd | child:noptid
 # clone returns the pidfd through parent_tid, so the two cannot be combined.
 clone | CLONE_PIDFD@with-parent-settid | F|SIGCHLD|CLONE_PARENT_SETTID 0 buf 0 0 | err:EINVAL | child:ptid
+# The pidfd is stored before the child may run: a slot that cannot be written
+# fails the clone and leaves no child.
+clone | CLONE_PIDFD@bad-slot | F|SIGCHLD 0 8 0 0 | err:EFAULT | child
 clone | CLONE_VFORK | F|SIGCHLD 0 0 0 0 | child | =
 clone | CLONE_CHILD_SETTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
 clone | CLONE_CHILD_CLEARTID | F|SIGCHLD 0 0 0 buf | child:noptid | =

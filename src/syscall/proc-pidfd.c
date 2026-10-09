@@ -235,6 +235,15 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     return gfd;
 }
 
+void pidfd_set_target(int guest_fd, int64_t target_pid)
+{
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_entry_t *entry = pidfd_find_guest_fd_entry(guest_fd);
+    if (entry)
+        entry->guest_pid = target_pid;
+    pthread_mutex_unlock(&pidfd_lock);
+}
+
 void proc_pidfd_notify_exit(int64_t exited_pid)
 {
     pthread_mutex_lock(&pidfd_lock);

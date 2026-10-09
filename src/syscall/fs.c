@@ -2097,9 +2097,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         }
         int new_seals = (int) arg;
         /* Only allow valid seal bits */
-        if (new_seals &
-            ~(LINUX_F_SEAL_SEAL | LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW |
-              LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE)) {
+        if (new_seals & ~(LINUX_F_SEAL_SEAL | LINUX_F_SEAL_SHRINK |
+                          LINUX_F_SEAL_GROW | LINUX_F_SEAL_WRITE |
+                          LINUX_F_SEAL_FUTURE_WRITE | LINUX_F_SEAL_EXEC)) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
@@ -3932,12 +3932,24 @@ int64_t sys_fchmod(int fd, uint32_t mode)
 {
     /* O_PATH fds do not support fchmod (Linux returns EBADF) */
     fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH)
+    bool known = fd_snapshot(fd, &snap);
+    if (known && snap.type == FD_PATH)
         return -LINUX_EBADF;
     host_fd_ref_t host_ref;
     int64_t ref_err = host_fd_ref_open(fd, &host_ref);
     if (ref_err < 0)
         return ref_err;
+
+    /* F_SEAL_EXEC holds the execute bits as they are; any other change to the
+     * mode is still allowed.
+     */
+    if (known && (snap.seals & LINUX_F_SEAL_EXEC)) {
+        struct stat st;
+        if (fstat(host_ref.fd, &st) < 0 || ((st.st_mode ^ mode) & 0111)) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EPERM;
+        }
+    }
     if (fchmod(host_ref.fd, mode) < 0) {
         host_fd_ref_close(&host_ref);
         return linux_errno();

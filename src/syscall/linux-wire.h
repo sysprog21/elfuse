@@ -559,6 +559,7 @@ typedef struct {
 #define LINUX_F_SEAL_GROW 0x0004
 #define LINUX_F_SEAL_WRITE 0x0008
 #define LINUX_F_SEAL_FUTURE_WRITE 0x0010
+#define LINUX_F_SEAL_EXEC 0x0020
 
 /* memfd_create flags (MFD_*). */
 #define LINUX_MFD_CLOEXEC 0x0001U

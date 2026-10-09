@@ -1889,6 +1889,18 @@ static int64_t sc_memfd_create(guest_t *g,
     int fd = tmpfile_anon("memfd");
     if (fd < 0)
         return linux_errno();
+
+    /* A memfd is created with every permission bit, or without the execute bits
+     * under MFD_NOEXEC_SEAL. The backing file has no name, so the mode is only
+     * what fstat reports and what F_SEAL_EXEC then holds in place.
+     */
+    bool noexec = (flags & LINUX_MFD_NOEXEC_SEAL) != 0;
+    if (fchmod(fd, noexec ? 0666 : 0777) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return linux_errno();
+    }
     int gfd = fd_alloc(FD_REGULAR, fd, NULL);
     if (gfd < 0) {
         close(fd);
@@ -1903,8 +1915,15 @@ static int64_t sc_memfd_create(guest_t *g,
     fd_publish_linux_flags(
         gfd,
         LINUX_O_RDWR | ((flags & LINUX_MFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
-    fd_table[gfd].seals =
-        (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
+
+    /* MFD_NOEXEC_SEAL implies MFD_ALLOW_SEALING and starts with F_SEAL_EXEC
+     * set. MFD_EXEC asks for what is already the default.
+     */
+    if (noexec)
+        fd_table[gfd].seals = LINUX_F_SEAL_EXEC;
+    else
+        fd_table[gfd].seals =
+            (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
     return gfd;
 }
 

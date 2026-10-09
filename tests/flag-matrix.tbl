@@ -220,9 +220,9 @@ memfd_create | 0x10@exec-and-noexec | p:file F|0x8 | err:EINVAL | fd
 memfd_create | MFD_ALLOW_SEALING | p:file F | fd:seals:0 | fd:seals:F_SEAL_SEAL
 # MFD_NOEXEC_SEAL (0x8) allows sealing, sets F_SEAL_EXEC (0x20), and makes the
 # file without its execute bits. MFD_EXEC (0x10) asks for today's default.
-pending memfd_create | 0x8@noexec-seal | p:file F | fd:seals:0x20 | fd:seals:F_SEAL_SEAL
-pending memfd_create | 0x8@noexec-mode | p:file F | fd:perm:0666 | fd:perm:0777
-pending memfd_create | 0x10@exec | p:file F | fd:perm:0777 | =
+memfd_create | 0x8@noexec-seal | p:file F | fd:seals:0x20 | fd:seals:F_SEAL_SEAL
+memfd_create | 0x8@noexec-mode | p:file F | fd:perm:0666 | fd:perm:0777
+memfd_create | 0x10@exec | p:file F | fd:perm:0777 | =
 memfd_create | MFD_HUGETLB | p:file F | fd | =
 
 # socket(domain, type, protocol): the flags share the type argument.

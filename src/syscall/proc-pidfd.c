@@ -166,6 +166,11 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
         return -LINUX_EMFILE;
     }
 
+    /* Linux makes every pidfd close-on-exec, from pidfd_open and from
+     * CLONE_PIDFD alike, and has no flag to ask for anything else.
+     */
+    fd_publish_linux_flags(gfd, LINUX_O_CLOEXEC);
+
     pthread_mutex_lock(&pidfd_lock);
     pidfd_entry_t *entry = pidfd_find_free_entry();
     if (!entry) {

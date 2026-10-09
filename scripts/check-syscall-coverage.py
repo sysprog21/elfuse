@@ -64,6 +64,7 @@ FLAG_MATRIX_REQUIRED: set[str] = {
     "eventfd2",
     "faccessat2",
     "fchmodat",
+    "fchmodat2",
     "fchownat",
     "fcntl",
     "inotify_init1",

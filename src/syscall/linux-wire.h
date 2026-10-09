@@ -58,6 +58,7 @@ typedef struct {
 #define LINUX_EXDEV 18
 #define LINUX_ENODEV 19
 #define LINUX_ENOTDIR 20
+#define LINUX_EISDIR 21
 #define LINUX_EINVAL 22
 #define LINUX_EMFILE 24
 #define LINUX_ENOTTY 25

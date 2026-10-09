@@ -3021,6 +3021,45 @@ int64_t sys_readlinkat(guest_t *g,
     return (int64_t) copy_len;
 }
 
+/* Whether Linux refuses to remove this entry before it looks at what kind of
+ * entry it is. may_delete() answers EPERM for an immutable or append-only
+ * victim, for an immutable or append-only parent, and for a sticky parent when
+ * the caller owns neither it nor the victim; only after those does unlink of a
+ * directory become EISDIR. The host enforces all three against its own
+ * credentials, so those are the ones compared.
+ */
+static bool unlink_refused_before_type(host_fd_t dirfd,
+                                       const char *host_path,
+                                       const struct stat *victim)
+{
+    const uint32_t locked = UF_IMMUTABLE | SF_IMMUTABLE | UF_APPEND | SF_APPEND;
+    if (victim->st_flags & locked)
+        return true;
+
+    char parent[LINUX_PATH_MAX];
+    str_copy_trunc(parent, host_path, sizeof(parent));
+    size_t len = strlen(parent);
+    while (len > 1 && parent[len - 1] == '/')
+        parent[--len] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash)
+        str_copy_trunc(parent, ".", sizeof(parent));
+    else if (slash == parent)
+        parent[1] = '\0';
+    else
+        *slash = '\0';
+
+    struct stat dir_st;
+    if (fstatat(dirfd, parent, &dir_st, 0) < 0)
+        return false;
+    if (dir_st.st_flags & locked)
+        return true;
+
+    uid_t euid = geteuid();
+    return (dir_st.st_mode & S_ISVTX) && euid != 0 && euid != victim->st_uid &&
+           euid != dir_st.st_uid;
+}
+
 int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
 {
     char path[LINUX_PATH_MAX];
@@ -3050,15 +3089,29 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
     host_fd_t unlink_dirfd = path_translation_dirfd(&tx, &dir_ref);
 
     struct stat removed_st;
+    bool removed_known = fstatat(unlink_dirfd, tx.host_path, &removed_st,
+                                 AT_SYMLINK_NOFOLLOW) == 0;
     bool clear_removed_overlay =
-        fstatat(unlink_dirfd, tx.host_path, &removed_st, AT_SYMLINK_NOFOLLOW) ==
-            0 &&
+        removed_known &&
         (removed_st.st_nlink <= 1 || (flags & LINUX_AT_REMOVEDIR));
+    bool removed_is_dir = removed_known && S_ISDIR(removed_st.st_mode);
 
     int host_flags = translate_at_flags(flags);
     if (unlinkat(unlink_dirfd, tx.host_path, host_flags) < 0) {
+        int64_t err = linux_errno();
+
+        /* unlink of a directory is EISDIR on Linux and EPERM on macOS. The
+         * rewrite is keyed on the host's EPERM so that every other refusal
+         * keeps its own errno, and it stands aside for the refusals Linux also
+         * reports as EPERM, which it decides before the entry's type.
+         */
+        if (err == -LINUX_EPERM && !(flags & LINUX_AT_REMOVEDIR) &&
+            removed_is_dir &&
+            !unlink_refused_before_type(unlink_dirfd, tx.host_path,
+                                        &removed_st))
+            err = -LINUX_EISDIR;
         host_fd_ref_close(&dir_ref);
-        return linux_errno();
+        return err;
     }
 
     if (clear_removed_overlay)

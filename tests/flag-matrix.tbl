@@ -93,6 +93,8 @@ openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O
 # An empty name is ENOENT before dirfd is looked at.
 openat | O_CLOEXEC@empty-path | fd:file p:empty F|O_RDONLY 0 | err:ENOENT | =
 
+# unlinkat(dirfd, path, flags)
+unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR
 unlinkat | AT_REMOVEDIR@file | CWD p:file F | err:ENOTDIR | absent:p:file
 unlinkat | 0x8000@unknown | CWD p:file F | err:EINVAL | absent:p:file
 

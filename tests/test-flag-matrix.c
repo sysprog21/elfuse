@@ -21,6 +21,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +55,7 @@ enum fm_arg_kind {
     FM_A_FD,
     FM_A_BUF,
     FM_A_PAIR,
+    FM_A_REGION,
     FM_A_FLAGS,
 };
 enum fm_path {
@@ -88,6 +91,21 @@ enum fm_expect_kind {
     FM_X_STAT_LNK,
     FM_X_STATX_REG,
     FM_X_STATX_LNK,
+    FM_X_ARG0_CLOEXEC,
+    FM_X_ARG0_NOCLOEXEC,
+    FM_X_ARG0_GETFL,
+    FM_X_ARG0_NOGETFL,
+    FM_X_MAP,
+    FM_X_MAP_AT_REGION,
+    FM_X_MAP_ELSEWHERE,
+    FM_X_MAP_WRITABLE,
+    FM_X_MAP_READONLY,
+    FM_X_MAP_NOREAD,
+    FM_X_MAP_WRITES_FILE,
+    FM_X_MAP_KEEPS_FILE,
+    FM_X_REGION_WRITABLE,
+    FM_X_REGION_READONLY,
+    FM_X_REGION_NOREAD,
 };
 
 struct fm_arg {
@@ -119,6 +137,44 @@ static const char *const fm_paths[] = {
 
 static char fm_buf[4096];
 static int fm_pair[2];
+static long fm_arg0;
+
+/* A fresh anonymous read-write mapping for the rows that need an address that
+ * is already taken, or pages whose protection they change.
+ */
+#define FM_REGION_SIZE (2 * 65536)
+static char *fm_region;
+
+static sigjmp_buf fm_fault_jmp;
+
+static void on_fault(int sig)
+{
+    (void) sig;
+    siglongjmp(fm_fault_jmp, 1);
+}
+
+static int can_read(const volatile char *p)
+{
+    if (sigsetjmp(fm_fault_jmp, 1))
+        return 0;
+    volatile char c = *p;
+    (void) c;
+    return 1;
+}
+
+static int can_write(volatile char *p)
+{
+    if (sigsetjmp(fm_fault_jmp, 1))
+        return 0;
+    *p = 'Z';
+    return 1;
+}
+
+/* A raw mmap return is an address unless it is one of the top 4095 values. */
+static int is_mapping(long rc)
+{
+    return (unsigned long) rc < (unsigned long) -4095L;
+}
 static int fm_client = -1;
 static char fm_why[160];
 
@@ -287,6 +343,90 @@ static int answer_matches(const struct fm_expect *x, long rc)
             return WHY("st_mode=%#o", (unsigned) st.st_mode), 0;
         return 1;
     }
+    case FM_X_ARG0_CLOEXEC:
+    case FM_X_ARG0_NOCLOEXEC:
+        if (rc < 0)
+            return WHY("rc=%ld, want >= 0", rc), 0;
+        fl = fcntl((int) fm_arg0, F_GETFD);
+        if (fl < 0 || !!(fl & FD_CLOEXEC) != (x->kind == FM_X_ARG0_CLOEXEC))
+            return WHY("F_GETFD=%#x", fl), 0;
+        return 1;
+    case FM_X_ARG0_GETFL:
+    case FM_X_ARG0_NOGETFL:
+        if (rc < 0)
+            return WHY("rc=%ld, want >= 0", rc), 0;
+        fl = fcntl((int) fm_arg0, F_GETFL);
+        if (fl < 0 || (x->kind == FM_X_ARG0_GETFL ? (fl & x->a) != x->a
+                                                  : (fl & x->a) != 0))
+            return WHY("F_GETFL=%#x, bits %#lx", fl, x->a), 0;
+        return 1;
+    case FM_X_MAP:
+    case FM_X_MAP_AT_REGION:
+    case FM_X_MAP_ELSEWHERE:
+    case FM_X_MAP_WRITABLE:
+    case FM_X_MAP_READONLY:
+    case FM_X_MAP_NOREAD:
+    case FM_X_MAP_WRITES_FILE:
+    case FM_X_MAP_KEEPS_FILE: {
+        char *p = (char *) rc;
+        if (!is_mapping(rc))
+            return WHY("rc=%ld, want an address", rc), 0;
+        if (x->kind == FM_X_MAP)
+            return 1;
+        if (x->kind == FM_X_MAP_AT_REGION || x->kind == FM_X_MAP_ELSEWHERE) {
+            if ((p == fm_region) != (x->kind == FM_X_MAP_AT_REGION))
+                return WHY("mapped at %p, region is %p", (void *) p,
+                           (void *) fm_region),
+                       0;
+            return 1;
+        }
+        if (x->kind == FM_X_MAP_NOREAD) {
+            if (can_read(p))
+                return WHY("the mapping is readable"), 0;
+            return 1;
+        }
+        if (!can_read(p))
+            return WHY("the mapping is not readable"), 0;
+        if (x->kind == FM_X_MAP_READONLY) {
+            if (can_write(p))
+                return WHY("the mapping is writable"), 0;
+            return 1;
+        }
+        if (!can_write(p))
+            return WHY("the mapping is not writable"), 0;
+        if (x->kind == FM_X_MAP_WRITABLE)
+            return 1;
+
+        /* The store above put 'Z' over the first byte. A shared mapping shows
+         * it to a read of the file; a private one keeps it to itself.
+         */
+        char first = 0;
+        int fd = open("file", O_RDONLY);
+        if (fd < 0 || pread(fd, &first, 1, 0) != 1) {
+            if (fd >= 0)
+                close(fd);
+            return WHY("cannot read the file back, errno=%d", errno), 0;
+        }
+        close(fd);
+        if ((first == 'Z') != (x->kind == FM_X_MAP_WRITES_FILE))
+            return WHY("the file starts with '%c'", first), 0;
+        return 1;
+    }
+    case FM_X_REGION_WRITABLE:
+    case FM_X_REGION_READONLY:
+    case FM_X_REGION_NOREAD:
+        if (rc < 0)
+            return WHY("rc=%ld, want >= 0", rc), 0;
+        if (can_read(fm_region) != (x->kind != FM_X_REGION_NOREAD))
+            return WHY("the region is %sreadable",
+                       x->kind == FM_X_REGION_NOREAD ? "" : "not "),
+                   0;
+        if (x->kind != FM_X_REGION_NOREAD &&
+            can_write(fm_region) != (x->kind == FM_X_REGION_WRITABLE))
+            return WHY("the region is %swritable",
+                       x->kind == FM_X_REGION_WRITABLE ? "not " : ""),
+                   0;
+        return 1;
     case FM_X_STATX_REG:
     case FM_X_STATX_LNK: {
         struct statx sx;
@@ -339,6 +479,12 @@ static int run_one(const struct fm_row *row, int with, int strict)
         exit(2);
     }
     memset(fm_buf, 0, sizeof(fm_buf));
+    fm_region = mmap(NULL, FM_REGION_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fm_region == MAP_FAILED) {
+        FAIL("fixture region mmap failed");
+        return 0;
+    }
 
     for (int i = 0; i < row->nargs; i++) {
         const struct fm_arg *arg = &row->args[i];
@@ -368,12 +514,16 @@ static int run_one(const struct fm_row *row, int with, int strict)
             a[i] = (long) fm_pair;
             pair = 1;
             break;
+        case FM_A_REGION:
+            a[i] = (long) fm_region;
+            break;
         case FM_A_FLAGS:
             a[i] = arg->val | (with ? row->bits : 0);
             break;
         }
     }
 
+    fm_arg0 = a[0];
     long rc = raw_syscall6(row->nr, a[0], a[1], a[2], a[3], a[4], a[5]);
 
     /* A call that fills an fd pair answers through both of them, unless the
@@ -403,7 +553,11 @@ static int run_one(const struct fm_row *row, int with, int strict)
         close((int) rc);
     }
 
+    if (x->kind >= FM_X_MAP && x->kind <= FM_X_MAP_KEEPS_FILE && is_mapping(rc))
+        munmap((void *) rc, 4096);
+
 out:
+    munmap(fm_region, FM_REGION_SIZE);
     while (nopened > 0)
         close((int) opened[--nopened]);
     if (fm_client >= 0) {
@@ -417,6 +571,11 @@ int main(int argc, char **argv)
 {
     int strict = argc > 1 && strcmp(argv[1], "strict") == 0;
     char dir[] = "/tmp/flag-matrix-XXXXXX";
+
+    struct sigaction sa = {.sa_handler = on_fault};
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
 
     printf("test-flag-matrix: %zu rows\n",
            sizeof(fm_rows) / sizeof(fm_rows[0]));

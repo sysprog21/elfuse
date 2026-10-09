@@ -59,6 +59,19 @@ PLAIN_EXPECTS = {
     "buf:lnk": "FM_X_STAT_LNK",
     "bufx:reg": "FM_X_STATX_REG",
     "bufx:lnk": "FM_X_STATX_LNK",
+    "arg0:cloexec": "FM_X_ARG0_CLOEXEC",
+    "arg0:nocloexec": "FM_X_ARG0_NOCLOEXEC",
+    "map": "FM_X_MAP",
+    "map:atregion": "FM_X_MAP_AT_REGION",
+    "map:elsewhere": "FM_X_MAP_ELSEWHERE",
+    "map:writable": "FM_X_MAP_WRITABLE",
+    "map:readonly": "FM_X_MAP_READONLY",
+    "map:noread": "FM_X_MAP_NOREAD",
+    "map:writesfile": "FM_X_MAP_WRITES_FILE",
+    "map:keepsfile": "FM_X_MAP_KEEPS_FILE",
+    "region:writable": "FM_X_REGION_WRITABLE",
+    "region:readonly": "FM_X_REGION_READONLY",
+    "region:noread": "FM_X_REGION_NOREAD",
 }
 # Expectations whose operand is a C expression.
 EXPR_EXPECTS = {
@@ -67,6 +80,8 @@ EXPR_EXPECTS = {
     "fd:nogetfl": "FM_X_FD_NOGETFL",
     "pair1:getfl": "FM_X_PAIR1_GETFL",
     "pair1:nogetfl": "FM_X_PAIR1_NOGETFL",
+    "arg0:getfl": "FM_X_ARG0_GETFL",
+    "arg0:nogetfl": "FM_X_ARG0_NOGETFL",
 }
 # Expectations whose operand is a fixture path.
 PATH_EXPECTS = {
@@ -109,6 +124,8 @@ def parse_arg(where: str, token: str) -> tuple[str, bool]:
         return "{FM_A_BUF, 0}", False
     if token == "pair":
         return "{FM_A_PAIR, 0}", False
+    if token == "region":
+        return "{FM_A_REGION, 0}", False
     if token.startswith("p:"):
         return f"{{FM_A_PATH, {path_token(where, token[2:])}}}", False
     if token.startswith("fd:"):

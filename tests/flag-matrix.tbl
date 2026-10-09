@@ -23,6 +23,7 @@
 #   pair             an int[2] the call fills with two fds; an fd answer is
 #                    then asked of both
 #   buf              a zeroed 4 KiB scratch buffer
+#   region           the address of a fresh anonymous read-write mapping
 #   F  F|EXPR        the flags slot; EXPR is ORed in for both runs
 #   anything else    a C integer expression
 #
@@ -50,6 +51,16 @@
 #   size:p:NAME=N mode:p:NAME=N      stat reports that size, or permission bits
 #   buf:reg buf:lnk    the struct stat in buf is a regular file, or a symlink
 #   bufx:reg bufx:lnk  the same for a struct statx
+#   arg0:cloexec arg0:nocloexec arg0:getfl:EXPR arg0:nogetfl:EXPR
+#                      the fd answers, asked of the fd passed as first argument
+#   map                the call returns an address
+#   map:atregion map:elsewhere       that address is, or is not, the region's
+#   map:writable map:readonly map:noread
+#                      a load and a store at that address work or fault
+#   map:writesfile map:keepsfile     a store there shows, or does not show, in
+#                                    a read of "file"
+#   region:writable region:readonly region:noread
+#                      the same loads and stores, on the region
 #   =                  (last field only) the same answer as with the flag
 #
 # A row that starts with "unsupported:ANSWER" is a flag elfuse declines on
@@ -184,3 +195,42 @@ socketpair | SOCK_NONBLOCK | AF_UNIX F|SOCK_STREAM 0 pair | fd:getfl:O_NONBLOCK 
 accept4 | SOCK_CLOEXEC | fd:listener 0 0 F | fd:cloexec | fd:nocloexec
 accept4 | SOCK_NONBLOCK | fd:listener 0 0 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
 accept4 | 0x1@unknown | fd:listener 0 0 F | err:EINVAL | fd
+
+# fcntl(fd, cmd, arg): the flags are the argument of F_SETFL and F_SETFD.
+fcntl | O_NONBLOCK@setfl | fd:file F_SETFL F | arg0:getfl:O_NONBLOCK | arg0:nogetfl:O_NONBLOCK
+fcntl | O_APPEND@setfl | fd:file F_SETFL F | arg0:getfl:O_APPEND | arg0:nogetfl:O_APPEND
+fcntl | O_NOATIME@setfl | fd:file F_SETFL F | arg0:getfl:O_NOATIME | arg0:nogetfl:O_NOATIME
+# A regular file has no fasync handler, so F_SETFL leaves O_ASYNC clear on it.
+fcntl | O_ASYNC@setfl-file | fd:file F_SETFL F | arg0:nogetfl:O_ASYNC | =
+fcntl | FD_CLOEXEC@setfd | fd:file F_SETFD F | arg0:cloexec | arg0:nocloexec
+# F_SETFL changes only the status flags; a creation flag in it is dropped.
+fcntl | O_TRUNC@setfl-ignored | fd:file F_SETFL F | size:p:file=10 | =
+fcntl | O_SYNC@setfl-ignored | fd:file F_SETFL F | arg0:nogetfl:O_SYNC | =
+
+# mmap(addr, length, prot, flags, fd, offset): the flags are argument 3.
+mmap | MAP_ANONYMOUS | 0 4096 PROT_READ F|MAP_PRIVATE -1 0 | map | err:EBADF
+pending mmap | MAP_PRIVATE@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
+pending mmap | MAP_SHARED@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
+mmap | MAP_FIXED | region 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:atregion | map:elsewhere
+mmap | MAP_FIXED_NOREPLACE | region 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | err:EEXIST | map:elsewhere
+# MAP_SHARED beside MAP_PRIVATE is MAP_SHARED_VALIDATE, which is shared.
+mmap | MAP_SHARED@file | 0 4096 PROT_READ|PROT_WRITE F|MAP_PRIVATE fd:file 0 | map:writesfile | map:keepsfile
+# MAP_SHARED_VALIDATE refuses a flag the file cannot honor; MAP_SYNC (0x80000)
+# needs DAX. Plain MAP_SHARED ignores the same bit.
+pending mmap | 0x80000@sync-validate | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
+# An anonymous mapping takes MAP_SHARED or MAP_PRIVATE and not the two at once.
+pending mmap | MAP_SHARED@anon-validate | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | err:EINVAL | map
+mmap | 0x80000@sync-legacy | 0 4096 PROT_READ F|MAP_SHARED fd:file 0 | map | =
+mmap | MAP_POPULATE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
+mmap | MAP_NORESERVE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
+mmap | MAP_STACK | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
+
+# mmap again, for the protection bits in argument 2.
+pending mmap | PROT_READ | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | map:noread
+pending mmap | PROT_WRITE | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:writable | map:readonly
+
+# mprotect(addr, length, prot)
+mprotect | PROT_READ | region 4096 F | region:readonly | region:noread
+mprotect | PROT_WRITE | region 4096 F|PROT_READ | region:writable | region:readonly
+pending mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+pending mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:readonly

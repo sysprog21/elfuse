@@ -83,6 +83,7 @@
  * sys_clone further down.
  */
 #define LINUX_CLONE_VM 0x00000100
+#define LINUX_CLONE_SIGHAND 0x00000800
 #define LINUX_CLONE_VFORK 0x00004000
 #define LINUX_CLONE_THREAD 0x00010000
 #define LINUX_CLONE_SETTLS 0x00080000
@@ -1526,6 +1527,16 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * reachable here.
      */
     if ((flags & ~(uint64_t) 0xff) & LINUX_CLONE3_NS_FLAGS)
+        return -LINUX_EINVAL;
+
+    /* A thread shares its signal handlers, and shared handlers need shared
+     * memory. Linux refuses either flag without the one it depends on, and
+     * every libc sets all three for a thread. Taken at its word, CLONE_THREAD
+     * alone started a thread here, on whatever stack it came with.
+     */
+    if ((flags & LINUX_CLONE_THREAD) && !(flags & LINUX_CLONE_SIGHAND))
+        return -LINUX_EINVAL;
+    if ((flags & LINUX_CLONE_SIGHAND) && !(flags & LINUX_CLONE_VM))
         return -LINUX_EINVAL;
 
     /* CLONE_THREAD: create a new thread in the same VM (not a new process) */

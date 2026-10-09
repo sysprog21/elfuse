@@ -325,3 +325,6 @@ mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 clone | CLONE_VFORK | F|SIGCHLD 0 0 0 0 | child | =
 clone | CLONE_CHILD_SETTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
 clone | CLONE_CHILD_CLEARTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
+# A thread shares signal handlers, and shared handlers need shared memory.
+clone | CLONE_THREAD@no-sighand | F|SIGCHLD 0 0 0 0 | err:EINVAL | child
+clone | CLONE_SIGHAND@no-vm | F|SIGCHLD 0 0 0 0 | err:EINVAL | child

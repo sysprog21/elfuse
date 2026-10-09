@@ -4,9 +4,9 @@
  * musl's private condvar (pthread_cond_timedwait.c: lock()/unlock_requeue())
  * parks waiters with a plain FUTEX_WAIT on a per-node "barrier" word, then its
  * broadcast/handoff path uses FUTEX_REQUEUE to move those parked waiters from
- * the barrier word onto the mutex word. Plain FUTEX_WAIT once parked on a
- * Darwin address-wait queue that FUTEX_REQUEUE could not walk, and a requeue
- * that reaches nobody strands the waiter until its 100 ms polling quantum ends.
+ * the barrier word onto the mutex word. A plain FUTEX_WAIT parked on a queue
+ * FUTEX_REQUEUE does not walk is one the requeue cannot reach, and it stays
+ * stranded until its 100 ms polling quantum ends.
  *
  * This reproduces the pattern with raw syscalls (libc-agnostic) and measures
  * the wake latency. A correct requeue path wakes the waiter in well under the

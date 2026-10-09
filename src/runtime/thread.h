@@ -43,16 +43,16 @@
  * signal API without an include cycle.
  */
 typedef struct thread_entry {
-    /* Read without thread_lock. Three scans walk the table lock-free
-     * (thread_pending_union, thread_tid_alive, thread_signal_deliverable): each
-     * loads active, then one of blocked, guest_tid, or tpending.pending, with
-     * nothing in between. A scanner that saw active as 1 just before this slot
-     * went inactive can still be loading one of those when thread_alloc
-     * recycles the slot, so none of them may be plain-written there. They are
-     * grouped here, cleared with atomic stores, and deliberately excluded from
-     * the memset that clears the rest. Keep them ahead of the rest of the
-     * struct; thread.c asserts that each one sits below where its memset
-     * starts.
+    /* Read without thread_lock. Four scans walk the table lock-free
+     * (thread_pending_union, thread_tid_alive, thread_signal_deliverable,
+     * thread_kick_futex_waiters): each loads active, then blocked, guest_tid,
+     * or tpending.pending, with nothing in between. A scanner that saw active
+     * as 1 just before this slot went inactive can still be loading one of
+     * those when thread_alloc recycles the slot, so none of them may be
+     * plain-written there. They are grouped here, cleared with atomic stores,
+     * and deliberately excluded from the memset that clears the rest. Keep them
+     * ahead of the rest of the struct; thread.c asserts that each one sits
+     * below where its memset starts.
      */
     _Atomic int active; /* Non-zero while thread is running. Stays int (not
                          * bool) because lock-free paths in thread.c use

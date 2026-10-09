@@ -1667,6 +1667,18 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     log_debug("clone(flags=0x%llx, vfork=%d)", (unsigned long long) flags,
               is_vfork);
 
+    /* The pidfd slot is stored once the child exists, and a failure there
+     * unwinds a helper process that was spawned for nothing. A slot that cannot
+     * be written now gets its EFAULT before any of that, by storing back the
+     * four bytes it holds.
+     */
+    if (pidfd_gva) {
+        int32_t held;
+        if (guest_read_small(g, *pidfd_gva, &held, sizeof(held)) < 0 ||
+            guest_write_small(g, *pidfd_gva, &held, sizeof(held)) < 0)
+            return -LINUX_EFAULT;
+    }
+
     /* socketpair provides the control channel used to transfer snapshot state
      * and SCM_RIGHTS file descriptors to the fork-child process.
      */

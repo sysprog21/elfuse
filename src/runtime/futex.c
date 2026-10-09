@@ -48,25 +48,6 @@
 #include "proved/futexwakeop.h"
 #include "proved/timespec.h"
 
-/* macOS 14.4+ ships os_sync_{wait_on_address_with_timeout,wake_by_address_any}
- * with futex-style compare-and-wait semantics on process-private addresses.
- * elfuse routes plain FUTEX_WAIT / FUTEX_WAKE through this path. Darwin folds
- * the Linux -EAGAIN pre-block race into a successful wait; futex_os_sync_wait
- * closes that common gap with a compare-after-block re-check (word moved off
- * the expected value on a rc>=0 return maps to -EAGAIN). FUTEX_WAIT_BITSET, PI
- * variants, and futex_waitv stay on the bucket path: they need state the kernel
- * API does not expose.
- *
- * SDK gate: probe the header via __has_include so older SDKs build clean.
- * Runtime gate: __builtin_available cached in futex_init().
- */
-#if __has_include(<os/os_sync_wait_on_address.h>)
-#include <os/os_sync_wait_on_address.h>
-#define ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS 1
-#else
-#define ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS 0
-#endif
-
 /* Interrupt flag: when set, futex_wait returns -EINTR. Raised only by teardown
  * through thread_wake_all_blocked, so every blocked wait can observe that the
  * process is tearing down without a full exit_group.
@@ -114,14 +95,7 @@ _Static_assert(FUTEX_WAKE_BITSET == 10,
  * which carries the layout and Linux's own constants.
  */
 
-/* Address-wait helper state.
- *
- * os_sync_available is set in futex_init() when the runtime supports the
- * os_sync_wait_on_address family (macOS 14.4+). os_sync_wait_enabled gates
- * whether plain FUTEX_WAIT / FUTEX_WAKE use the address-wait path; futex_init()
- * leaves it off and says why.
- *
- * The wait quantum is capped at 100 ms so proc_exit_group_requested() and
+/* The wait quantum is capped at 100 ms so proc_exit_group_requested() and
  * futex_interrupt_consume() get noticed promptly without a process-wide
  * broadcast channel. EINTR is only returned when an actual deliverable signal
  * is queued for this thread (confirmed under sig_lock via signal_pending(), not
@@ -132,23 +106,18 @@ _Static_assert(FUTEX_WAKE_BITSET == 10,
  * multi-threaded runtimes, but that broke POSIX sem_wait callers that do not
  * retry on EINTR (e.g. foot's render worker).
  */
-#if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
-static bool os_sync_available;
-static bool os_sync_wait_enabled;
-#endif
-
 #define FUTEX_OS_SYNC_POLL_CAP_NS (100ULL * 1000 * 1000)
 
 /* Hash table.
  *
  * Sized for wakers, not waiters. At most MAX_THREADS (64) threads can be queued
  * at once, so 64 buckets would already keep the chains short; what makes the
- * table too narrow is that futex_wake takes the bucket lock even when the
- * waiter it is looking for lives on the Darwin address-wait queue rather than
- * in the chain. Two threads waking unrelated futexes therefore serialize
- * whenever their addresses collide, which at 64 buckets is often enough to cost
- * more than the wake itself: eight threads each waking their own private futex
- * measured 801 ns per wake, worse than the same test at four threads.
+ * table too narrow is that futex_wake takes the bucket lock even when nothing
+ * is queued in the chain. Two threads waking unrelated futexes therefore
+ * serialize whenever their addresses collide, which at 64 buckets is often
+ * enough to cost more than the wake itself: eight threads each waking their own
+ * private futex measured 801 ns per wake, worse than the same test at four
+ * threads.
  *
  * At 1024, paired with the multiply-shift hash below, the collapse is gone (316
  * ns per wake against 801, and eight threads now beat four). Width alone was
@@ -247,70 +216,17 @@ static void futex_waiter_notify_group(futex_waiter_t *w)
 
 /* One bucket in the hash table. Protected by its own mutex. Lock order: 7 (leaf
  * locks, index-ordered when two acquired). Padded to a cache line. The struct
- * is 80 bytes and this host's line is 128, so unpadded neighbours share a line
+ * is 72 bytes and this host's line is 128, so unpadded neighbours share a line
  * and two futexes the hash correctly separated still contend on it. Measured
  * with eight threads each taking its own adjacent bucket: 16-18 ns per lock
  * unpadded against 5-8 ns padded, a 2-4x share of exactly the contention the
  * 64-to-1024 widening was made to remove. The padding itself costs BSS only,
- * 81920 bytes to 131072 at this bucket count; the table's total is above
+ * 73728 bytes to 131072 at this bucket count; the table's total is above
  * FUTEX_BUCKETS.
  */
 typedef struct {
     pthread_mutex_t lock;
     futex_waiter_t *head; /* Linked list of waiters hashing to this bucket */
-
-    /* Threads inside futex_os_sync_wait for an address hashing here, so a wake
-     * can tell an empty Darwin address-wait queue from a populated one without
-     * asking the kernel.
-     *
-     * Every bucket-walking wake tops up from that queue when it woke fewer than
-     * asked, and the top-up costs a guest_ptr walk plus an
-     * os_sync_wake_by_address_any syscall whether or not anyone is queued
-     * (measured: 242 ns per wake). Only plain FUTEX_WAIT enqueues there, so a
-     * guest whose waiters are all FUTEX_WAIT_BITSET, PI, or futex_waitv paid
-     * for a queue that could not hold a waiter.
-     *
-     * Per bucket rather than process-wide: one idle worker parked in
-     * pthread_cond_wait puts musl on that queue, and a single global count then
-     * re-enables the walk and the syscall for every wake on every unrelated
-     * address, which is the steady state of any threaded guest.
-     *
-     * Ordering, and why a wake cannot be lost. The waiter increments before
-     * loading the futex word, and both that increment and the waker's read are
-     * seq_cst, so a waker reading zero is ordered before the increment and
-     * hence before the waiter's load of the word, which therefore sees the
-     * waker's store and returns EAGAIN rather than blocking. Waiter and waker
-     * reach the same counter because both index it with futex_hash(uaddr). Two
-     * addresses colliding in one bucket read as occupied, which costs one
-     * pointless syscall, the behavior this replaces.
-     *
-     * What orders the guest's store to the word against the waker's read is
-     * that every call site reaches futex_wake_topup_osync just after a
-     * pthread_mutex_unlock, whose release store supplies the edge, and that the
-     * guest's own unlock is an STLR on the same hardware thread as the vCPU.
-     * Moving the read above that unlock would break it.
-     *
-     * Not a licence to drop the bucket mutex on an empty wake. This counts the
-     * Darwin queue only; FUTEX_WAIT_BITSET, PI and futex_waitv still live in
-     * head, and an unlocked pre-check of head is unsound anyway: the waiter is
-     * load-then-store (read the word under the lock, then publish) against the
-     * waker's store-then-load, which is not the store-buffer shape and so is
-     * permitted to miss.
-     *
-     * Keyed on the guest VA, like the chain beside it, which costs nothing
-     * observable here. The reflex worry is a futex reached through two
-     * mappings: keyed per VA the wake consults one bucket and misses a waiter
-     * parked under the other. It does not arise. GUEST_IPA_BASE is 0, so a GVA
-     * is its own GPA and two mappings of one file get two GPAs, hence two host
-     * addresses; the Darwin queue keys on the host address, so such a wake
-     * could not have reached across the aliases before this change either. The
-     * one genuine GVA alias onto a single GPA is the Rosetta kbuf TTBR0/TTBR1
-     * pair, which holds no futexes. Every other futex path here is already
-     * GVA-keyed (the chain walk compares w->uaddr exactly), so this keeps the
-     * file uniform. Linux does match across aliases, keying a shared futex on
-     * (inode, offset); that gap is older and wider than this counter.
-     */
-    _Atomic uint32_t os_sync_waiters;
 } __attribute__((aligned(128))) futex_bucket_t;
 
 static futex_bucket_t buckets[FUTEX_BUCKETS];
@@ -518,30 +434,25 @@ static bool futex_word_load(const uint32_t *word, uint32_t *out)
  * into a wait nothing will ever satisfy.
  *
  * Returns 0 when the caller should block, -LINUX_EAGAIN when the word moved,
- * -LINUX_EFAULT when uaddr does not resolve or the load faults. word_out, when
- * non-NULL, receives the resolved host pointer; only futex_os_sync_wait needs
- * it, to hand to the kernel address-wait.
+ * -LINUX_EFAULT when uaddr does not resolve or the load faults.
  *
- * Four callers share this: futex_os_sync_wait, futex_wait, futex_requeue's
- * CMP_REQUEUE, and futex_waitv. What differs between them is which bucket locks
- * are held on an error return, so each keeps its own unlock ladder rather than
- * this taking one.
+ * Three callers share this: futex_wait, futex_requeue's CMP_REQUEUE, and
+ * futex_waitv. What differs between them is which bucket locks are held on an
+ * error return, so each keeps its own unlock ladder rather than this taking
+ * one.
  *
- * futex_wait_fast in core/shim.S is a fifth implementation, in EL1 assembly,
+ * futex_wait_fast in core/shim.S is a fourth implementation, in EL1 assembly,
  * answering the -LINUX_EAGAIN case without the HVC round trip. It bails to the
  * host for every input this function would answer differently, so a change to
  * the outcomes or their order here needs the same change there.
  */
 static int64_t futex_should_block(const guest_t *g,
                                   uint64_t uaddr,
-                                  uint32_t expected,
-                                  uint32_t **word_out)
+                                  uint32_t expected)
 {
     uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
     if (!word)
         return -LINUX_EFAULT;
-    if (word_out)
-        *word_out = word;
 
     uint32_t current;
     if (!futex_word_load(word, &current))
@@ -659,28 +570,7 @@ void futex_init(void)
     for (unsigned i = 0; i < FUTEX_BUCKETS; i++) {
         pthread_mutex_init(&buckets[i].lock, NULL);
         buckets[i].head = NULL;
-
-        /* Reset with head, not left to BSS. The shim reads a bucket's published
-         * count without a lock and answers a wake with zero when it is zero, so
-         * a count that survived a reinit would leave that bucket permanently
-         * occupied and its wake fast path silently dead.
-         */
-        atomic_store_explicit(&buckets[i].os_sync_waiters, 0,
-                              memory_order_relaxed);
     }
-#if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
-    if (__builtin_available(macOS 14.4, *)) {
-        os_sync_available = true;
-
-        /* os_sync_wait_enabled stays false, so plain FUTEX_WAIT parks on the
-         * bucket path with the rest. A queued signal has to end the wait with
-         * EINTR, and the only way to reach an address-wait park is to wake its
-         * address, which the waiter cannot tell from a FUTEX_WAKE: it reports
-         * EINTR for a wake that counted it, or 0 for a signal it could not
-         * claim. A bucket waiter has waiter.woken to tell the two apart.
-         */
-    }
-#endif
 }
 
 void futex_interrupt_request(void)
@@ -888,276 +778,6 @@ static bool futex_quantum_deadline(const struct timespec *deadline,
     return true;
 }
 
-#if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
-
-/* Wake up to budget kernel-side waiters at uaddr via
- * os_sync_wake_by_address_any. Loops until the cap is hit or the API stops
- * finding waiters; ENOENT (no more waiters) and any other error break out. _all
- * overshoots the syscall return -- the count must be exact -- so this function
- * intentionally calls _any in a loop instead.
- *
- * budget is uint64_t to accommodate FUTEX_REQUEUE's wake + requeue sum after
- * the bucket walk; the loop counter is clamped to UINT32_MAX, which still
- * preserves the INT_MAX "wake all" sentinel without overflow.
- */
-static uint32_t futex_os_sync_wake_n(const guest_t *g,
-                                     uint64_t uaddr,
-                                     uint64_t budget)
-{
-    if (!os_sync_available || !os_sync_wait_enabled || budget == 0)
-        return 0;
-
-    /* Nobody is on the Darwin queue for this address, so skip the walk and the
-     * syscall.
-     */
-    if (atomic_load_explicit(&buckets[futex_hash(uaddr)].os_sync_waiters,
-                             memory_order_seq_cst) == 0)
-        return 0;
-    void *host_addr = guest_ptr(g, uaddr);
-    if (!host_addr)
-        return 0;
-    if (budget > UINT32_MAX)
-        budget = UINT32_MAX;
-
-    uint32_t woken = 0;
-    while (woken < (uint32_t) budget) {
-        int rc = os_sync_wake_by_address_any(host_addr, 4,
-                                             OS_SYNC_WAKE_BY_ADDRESS_NONE);
-        if (rc < 0)
-            break;
-        woken++;
-    }
-    return woken;
-}
-
-/* Plain FUTEX_WAIT routed through os_sync_wait_on_address_with_timeout.
- *
- * The pre-check is required: the kernel API silently returns rc>=0 when the
- * value already differs at entry, indistinguishable from a real wakeup. Linux
- * returns -EAGAIN in that case, so an explicit atomic load bridges the contract
- * gap.
- *
- * Quantum is bounded by FUTEX_OS_SYNC_POLL_CAP_NS so proc_exit_group_requested
- * and futex_interrupt_consume get observed without a global wake-everyone
- * broadcast channel. ETIMEDOUT, EINTR, EFAULT, and ENOMEM are all transient per
- * Apple's docs; each must run the flag check before re-arming. EINVAL would
- * indicate a programmer error here (size != 4/8 or bad flags), so it surfaces
- * directly rather than spinning.
- */
-static int64_t futex_os_sync_wait(guest_t *g,
-                                  uint64_t uaddr,
-                                  uint32_t expected,
-                                  uint64_t timeout_gva)
-{
-    if (!futex_uaddr_is_aligned(uaddr))
-        return -LINUX_EINVAL;
-
-    bool has_timeout = (timeout_gva != 0);
-    struct timespec deadline;
-    if (has_timeout) {
-        int rc =
-            futex_make_deadline(g, timeout_gva, /*is_absolute=*/0, &deadline);
-        if (rc == -1)
-            return -LINUX_EFAULT;
-        if (rc == -2)
-            return -LINUX_EINVAL;
-    }
-
-    uint32_t *host_addr;
-    int64_t block = futex_should_block(g, uaddr, expected, &host_addr);
-    if (block != 0)
-        return block;
-
-    /* Bound consecutive EFAULT retries. Apple documents EFAULT as transient
-     * (kernel copyin failure under memory pressure), so a few retries are fine;
-     * but a genuinely bad page would otherwise cause the loop to spin with no
-     * real sleep (timeout_ns is supplied to a syscall that returns immediately)
-     * until the user deadline finally bails out. Surface EFAULT to the guest
-     * after this many back-to-back failures so the host CPU does not burn for
-     * ~1 s.
-     */
-    int efault_retries = 0;
-
-    /* Once, before the wait, not inside it. The spin exists to catch a waker's
-     * store racing the entry to this wait, which is the handoff case. On a
-     * re-arm after a 100 ms quantum there is no imminent handoff, and the "word
-     * moved between the checks and the syscall" case is already covered
-     * atomically by os_sync_wait_on_address_with_timeout, which returns rc >= 0
-     * when the value already differs at entry. Inside the loop this burned 4.3
-     * us per parked thread per quantum for nothing: 0.28 percent of a core with
-     * MAX_THREADS parked.
-     */
-    if (!has_timeout ||
-        futex_remaining_ns(&deadline, FUTEX_OS_SYNC_POLL_CAP_NS, NULL) > 0) {
-        if (futex_spin_word_moved(host_addr, expected))
-            return -LINUX_EAGAIN;
-    }
-
-    for (;;) {
-        uint64_t timeout_ns;
-        if (has_timeout) {
-            timeout_ns =
-                futex_remaining_ns(&deadline, FUTEX_OS_SYNC_POLL_CAP_NS, NULL);
-            if (timeout_ns == 0)
-                return -LINUX_ETIMEDOUT;
-        } else {
-            timeout_ns = FUTEX_OS_SYNC_POLL_CAP_NS;
-        }
-
-        int rc = os_sync_wait_on_address_with_timeout(
-            host_addr, (uint64_t) expected, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE,
-            OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns);
-        if (rc >= 0) {
-            /* Compare-after-block re-check. Darwin folds two distinct Linux
-             * outcomes into a single rc>=0: a genuine wake, and the racy "value
-             * moved off expected between the pre-check and the in-kernel
-             * compare" case that Linux reports as -EAGAIN. Reload the word:
-             * value still == expected means a real (or spurious) wake -> return
-             * 0; value != expected means it moved, which is -EAGAIN under Linux
-             * for the pre-block race and is equally safe for the post-wake
-             * case, since a correct futex caller must re-read the word and
-             * re-test its condition on either return. This is not a perfect
-             * oracle: a value that moves off expected and back before the
-             * reload returns 0 where Linux returns -EAGAIN, a benign spurious
-             * wake the futex contract permits. No wake is lost: the kernel's
-             * atomic compare-and-block already guarantees a waiter enqueued at
-             * expected cannot miss an os_sync_wake_by_address, and any value
-             * change carries the state the caller re-reads.
-             */
-            uint32_t observed;
-            if (!futex_word_load(host_addr, &observed))
-                return -LINUX_EFAULT;
-            return observed == expected ? 0 : -LINUX_EAGAIN;
-        }
-
-        int err = errno;
-        if (err != ETIMEDOUT && err != EINTR && err != EFAULT && err != ENOMEM)
-            return -LINUX_EINVAL;
-
-        if (err == EFAULT) {
-            if (++efault_retries >= 8)
-                return -LINUX_EFAULT;
-        } else {
-            efault_retries = 0;
-        }
-
-        if (thread_stop_requested() || futex_interrupt_consume()) {
-            /* This path's deadline is relative (futex_make_deadline above is
-             * called with is_absolute = 0), so part of it is already spent and
-             * a restart would re-derive it from the guest's original value.
-             */
-            if (has_timeout)
-                syscall_restart_forbid();
-            return -LINUX_EINTR;
-        }
-
-        /* Drain any expired guest itimer so its SIGALRM / SIGVTALRM / SIGPROF
-         * queues into sig_state.pending; without this poke, a guest with all
-         * threads parked in futex_wait would never advance the timers.
-         */
-        signal_check_timer_real();
-
-        /* Return EINTR only when a real deliverable signal is queued for this
-         * thread. POSIX callers (e.g. glibc sem_wait, foot's render worker)
-         * often do not retry on EINTR, so synthetic spurious wakeups cannot be
-         * issued here. The claim confirms under sig_lock, so the atomic hint
-         * cannot produce a stale-true edge after rt_sigprocmask masked the
-         * queued signal, and takes a process-directed signal for this thread so
-         * a sibling woken by the same one does not report EINTR for it too.
-         */
-        if (signal_claim_interruption()) {
-            if (has_timeout)
-                syscall_restart_forbid();
-            return -LINUX_EINTR;
-        }
-
-        /* For has_timeout: futex_remaining_ns returns 0 next iteration once the
-         * user deadline elapses, so the loop exits with -ETIMEDOUT.
-         */
-    }
-}
-
-/* Hold this address's bucket census up for the whole wait, from before
- * futex_os_sync_wait's first load of the futex word to after its last. That
- * function returns from a dozen places; counting out here rather than in it is
- * what makes "every exit decrements" a property of the code rather than a rule
- * each new return has to remember. futex_os_sync_wait keeps its own name so
- * scripts/check-eintr-contract.py still records its EINTR returns against it.
- */
-static int64_t futex_os_sync_wait_counted(guest_t *g,
-                                          uint64_t uaddr,
-                                          uint32_t expected,
-                                          uint64_t timeout_gva)
-{
-    unsigned idx = futex_hash(uaddr);
-    futex_bucket_t *b = &buckets[idx];
-
-    /* Both counts go up before the wait reads the futex word, and the shim's
-     * wake path depends on that order: see shim_globals_futex_waiters_add.
-     * os_sync_waiters stays separate because it answers a narrower question,
-     * whether the Darwin queue specifically needs draining.
-     *
-     * The published count strictly encloses os_sync_waiters, rather than the
-     * two nesting the other way round. futex_wake reads this bucket's census as
-     * the chain plus os_sync_waiters and holds the published count to be no
-     * lower, which is the invariant its contract assert checks and the one the
-     * shim reads a zero against. Charging os_sync_waiters first, or dropping
-     * the published count first, opens an instant on either side where the
-     * census counts a waiter the published count does not: a contended plain
-     * FUTEX_WAIT workload trips that assert within a second.
-     */
-    shim_globals_futex_waiters_add(g, idx, +1);
-    atomic_fetch_add_explicit(&b->os_sync_waiters, 1, memory_order_seq_cst);
-    int64_t rc = futex_os_sync_wait(g, uaddr, expected, timeout_gva);
-    atomic_fetch_sub_explicit(&b->os_sync_waiters, 1, memory_order_seq_cst);
-    shim_globals_futex_waiters_add(g, idx, -1);
-    return rc;
-}
-
-#else /* !ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS */
-
-/* Stub fallback: dead branch on builds whose SDK lacks the header. The dispatch
- * sites guard on os_sync_available, so this stub is unreachable at runtime, but
- * it keeps the link clean.
- */
-static uint32_t futex_os_sync_wake_n(const guest_t *g,
-                                     uint64_t uaddr,
-                                     uint64_t budget)
-{
-    (void) g;
-    (void) uaddr;
-    (void) budget;
-    return 0;
-}
-
-#endif /* ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS */
-
-/* Top up a wake after the bucket walk. A plain FUTEX_WAIT enqueues on the
- * kernel os_sync queue, not the hash bucket, so any site that wakes by walking
- * the bucket must also drain the os_sync queue at the same address or it
- * strands those waiters. woken is how many of target the bucket walk already
- * satisfied at uaddr; this drains the shortfall and returns the new total.
- * futex_os_sync_wake_n is a no-op when the address-wait path is disabled or
- * when no kernel waiter sits at uaddr, so this is safe to call unconditionally.
- * Call it AFTER dropping the bucket lock: os_sync_wake is a syscall and must
- * not run under the leaf lock.
- *
- * Every bucket-walking wake site (futex_wake, futex_requeue, futex_wake_op)
- * routes through here so the "drain both queues" invariant is one named step,
- * not a rule each new caller has to remember. The int64_t return absorbs
- * futex_os_sync_wake_n's uint32_t count without sign-extension.
- */
-static int64_t futex_wake_topup_osync(const guest_t *g,
-                                      uint64_t uaddr,
-                                      int64_t woken,
-                                      uint64_t target)
-{
-    if ((uint64_t) woken >= target)
-        return woken;
-    uint64_t budget = target - (uint64_t) woken;
-    return woken + (int64_t) futex_os_sync_wake_n(g, uaddr, budget);
-}
-
 /* FUTEX_WAIT / FUTEX_WAIT_BITSET: atomically check word == val, then sleep. */
 static int64_t futex_wait_inner(unsigned *pub_bucket_out,
                                 guest_t *g,
@@ -1214,7 +834,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
      * is ordered against a concurrent wake. A mismatch returns EAGAIN and never
      * enqueues.
      */
-    int64_t block = futex_should_block(g, uaddr, expected, NULL);
+    int64_t block = futex_should_block(g, uaddr, expected);
     if (block != 0) {
         pthread_mutex_unlock(&b->lock);
         return block;
@@ -1370,13 +990,10 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
  * waiters are unlinked from the bucket list so subsequent operations do not
  * count them as still-sleeping entries.
  *
- * After walking the bucket, futex_wake_topup_osync drains any kernel-side
- * waiters at the same address up to the remaining budget so a wake that walked
- * only the bucket does not strand them; it is a no-op when the Darwin
- * address-wait path is inactive. Plain FUTEX_WAIT enqueues with implicit
- * FUTEX_BITSET_MATCH_ANY, which matches every legal FUTEX_WAKE_BITSET mask
- * (mask must be non-zero by Linux contract), so those waiters remain valid wake
- * targets. Publish this bucket's waiter count around the whole wait.
+ * Plain FUTEX_WAIT enqueues with implicit FUTEX_BITSET_MATCH_ANY, which matches
+ * every legal FUTEX_WAKE_BITSET mask (mask must be non-zero by Linux contract),
+ * so those waiters remain valid wake targets. Publish this bucket's waiter
+ * count around the whole wait.
  *
  * The increment has to land before the wait reads the futex word, which it does
  * here because every read futex_wait_inner makes is inside the call. A wrapper
@@ -1458,13 +1075,9 @@ static int64_t futex_wake(const guest_t *g,
         /* Re-read before believing a violation, because a single reading of
          * this cannot tell one from a transient.
          *
-         * The chain is stable here: this holds the bucket lock. os_sync_waiters
-         * is not, by design, since the Darwin address-wait path takes no lock.
-         * So the three loads are not one instant, and either order is wrong in
-         * one direction. Read the census last and a waiter that finishes in
-         * between drops it under a population already counted; read it first
-         * and a waiter that arrives in between raises the population above a
-         * census already read. Neither is an understatement.
+         * The chain is stable here, under the bucket lock, but the published
+         * count is not: a waiter charges it before it takes this lock and drops
+         * the charge after releasing it.
          *
          * A real one is a charge that is missing rather than in flight, so it
          * does not go away when looked at again. Requiring the violation to
@@ -1477,16 +1090,12 @@ static int64_t futex_wake(const guest_t *g,
         unsigned parked = 0;
         for (const futex_waiter_t *q = b->head; q; q = q->next)
             parked++;
-        parked +=
-            atomic_load_explicit(&b->os_sync_waiters, memory_order_seq_cst);
         if (shim_globals_futex_waiters_get(g, idx) < parked) {
             int persisted = 0;
             for (int retry = 0; retry < FUTEX_CENSUS_RECHECKS; retry++) {
                 unsigned again = 0;
                 for (const futex_waiter_t *q = b->head; q; q = q->next)
                     again++;
-                again += atomic_load_explicit(&b->os_sync_waiters,
-                                              memory_order_seq_cst);
                 if (shim_globals_futex_waiters_get(g, idx) < again)
                     persisted++;
             }
@@ -1514,7 +1123,7 @@ static int64_t futex_wake(const guest_t *g,
 
     pthread_mutex_unlock(&b->lock);
 
-    return futex_wake_topup_osync(g, uaddr, woken, val);
+    return woken;
 }
 
 /* FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: wake val waiters at uaddr, then move up to
@@ -1565,7 +1174,7 @@ static int64_t futex_requeue(guest_t *g,
 
     /* CMP_REQUEUE: atomically verify *uaddr == expected */
     if (do_cmp) {
-        int64_t block = futex_should_block(g, uaddr, expected, NULL);
+        int64_t block = futex_should_block(g, uaddr, expected);
         if (block != 0) {
             if (idx_src != idx_dst)
                 pthread_mutex_unlock(&b_dst->lock);
@@ -1665,16 +1274,7 @@ static int64_t futex_requeue(guest_t *g,
         pthread_mutex_unlock(&b_dst->lock);
     }
 
-    /* The kernel os_sync API cannot migrate waiters between addresses, so the
-     * requeue portion degrades into a wake at the source uaddr: os_sync waiters
-     * return to userland and re-acquire what they actually need (typically the
-     * mutex pthread_cond_broadcast wanted to requeue onto). Both the wake and
-     * requeue shortfalls therefore drain as wakes at uaddr; target is the full
-     * wake_count + requeue_count so the returned count stays within the Linux
-     * contract (woken + requeued must not exceed that sum).
-     */
-    return futex_wake_topup_osync(g, uaddr, (int64_t) woken + requeued,
-                                  (uint64_t) wake_count + requeue_count);
+    return (int64_t) woken + requeued;
 }
 
 /* FUTEX_WAKE_OP: atomically modify *uaddr2, wake val waiters at uaddr, then
@@ -1853,14 +1453,7 @@ static int64_t futex_wake_op(guest_t *g,
         pthread_mutex_unlock(&b2->lock);
     }
 
-    /* Drain the os_sync queue at each address for the bucket shortfall. The
-     * uaddr2 wake only fires when the predicate matched the old *uaddr2.
-     */
-    int64_t total1 = futex_wake_topup_osync(g, uaddr, woken1, val);
-    int64_t total2 =
-        cond_met ? futex_wake_topup_osync(g, uaddr2, woken2, val2) : woken2;
-
-    return total1 + total2;
+    return (int64_t) woken1 + woken2;
 }
 
 /* PI (Priority-Inheritance) futex.
@@ -2285,10 +1878,13 @@ int64_t sys_futex(guest_t *g,
 
     switch (cmd) {
     case FUTEX_WAIT:
-#if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
-        if (os_sync_available && os_sync_wait_enabled)
-            return futex_os_sync_wait_counted(g, uaddr, val, timeout_gva);
-#endif
+        /* On the bucket, like FUTEX_WAIT_BITSET. Darwin's
+         * os_sync_wait_on_address would park it with no bucket lock, but the
+         * only way to reach a thread parked there is to wake its address, which
+         * it cannot tell from a FUTEX_WAKE. Ending the wait for a queued signal
+         * that way reports EINTR for a wake that counted the waiter, or 0 for a
+         * signal it could not claim. waiter.woken is what tells them apart.
+         */
         return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
                           /*is_absolute=*/0);
 
@@ -2311,17 +1907,6 @@ int64_t sys_futex(guest_t *g,
                              val3);
 
     case FUTEX_WAIT_BITSET:
-        /* Stays on the bucket even when val3 is MATCH_ANY, which is
-         * semantically a plain wait and could take the address-wait backend
-         * instead. Measured on the bench-futex handoff with that spelling, n=45
-         * paired runs: 1.03x, p=0.16. There is no win to bank, and routing it
-         * would cost one: a kernel address-wait waiter cannot be migrated
-         * between addresses, so futex_requeue degrades to a wake in place, and
-         * that divergence is today confined to plain FUTEX_WAIT. Widening it
-         * for an effect that does not survive its own error bars is the wrong
-         * trade. tests/bench-futex.c keeps the row (BENCH_FUTEX_HANDOFF_BITSET)
-         * so the next attempt starts from a measurement rather than the idea.
-         */
         return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
 
     case FUTEX_WAKE_BITSET:
@@ -2571,7 +2156,7 @@ int64_t sys_futex_waitv(guest_t *g,
         unsigned idx = entry_bucket[i];
         futex_bucket_t *b = &buckets[idx];
 
-        int64_t block = futex_should_block(g, uaddr, expected, NULL);
+        int64_t block = futex_should_block(g, uaddr, expected);
         if (block != 0) {
             result_err = block;
             goto unlock_early;

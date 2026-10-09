@@ -1009,8 +1009,7 @@ attn_bail:
  * because every wait there genuinely blocks.
  *
  * No address check beyond alignment. The host resolves nothing for a wake
- * either: futex_wake matches enqueued waiters by raw uaddr, and the os_sync
- * top-up returns 0 rather than EFAULT when guest_ptr fails. So an unmapped or
+ * either: futex_wake matches enqueued waiters by raw uaddr. So an unmapped or
  * tagged address answers 0 on both sides, and hashing the raw value here is
  * what keeps the two agreeing.
  */

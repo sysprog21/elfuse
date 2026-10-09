@@ -26,6 +26,9 @@
 #   fd:unlinked      an O_RDWR fd on "file", which is then unlinked
 #   pair             an int[2] the call fills with two fds; an fd answer is
 #                    then asked of both
+#   buf              a zeroed 4 KiB scratch buffer; for a row with a child
+#                    answer its first int starts at -1, which is neither a
+#                    pid nor an fd
 #   region           the address of a fresh anonymous read-write mapping
 #   stackpage        a 64 KiB span of the caller's own stack, below every
 #                    frame in use
@@ -74,6 +77,10 @@
 #                                    first write alone, or both
 #   stack:lowreadonly stack:lowwritable
 #                      a store into the stack beneath stackpage faults, or works
+#   child              the call returns a pid, and that process exits 0
+#   child:ptid child:noptid          also, the int at buf holds that pid, or
+#                                    still holds -1
+#   child:pidfd        also, the int at buf is a close-on-exec fd
 #   =                  (last field only) the same answer as with the flag
 #
 # A row that starts with "unsupported:ANSWER" is a flag elfuse declines on
@@ -314,3 +321,7 @@ mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:re
 unsupported:err:EINVAL mprotect | 0x10@prot-bti | region 4096 F|PROT_READ | region:readonly | =
 mprotect | 0x20@prot-mte | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+
+clone | CLONE_VFORK | F|SIGCHLD 0 0 0 0 | child | =
+clone | CLONE_CHILD_SETTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
+clone | CLONE_CHILD_CLEARTID | F|SIGCHLD 0 0 0 buf | child:noptid | =

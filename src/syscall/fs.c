@@ -880,6 +880,13 @@ int64_t sys_openat_path(guest_t *g,
             return -LINUX_EINVAL;
     }
 
+    /* open has no AT_EMPTY_PATH, so an empty name is ENOENT whatever dirfd is;
+     * see read_translated_path. It comes after the flag checks above because
+     * Linux builds the open flags before it copies the name in.
+     */
+    if (pathp[0] == '\0')
+        return -LINUX_ENOENT;
+
     path_translation_t tx;
     unsigned int tx_flags =
         (linux_flags & LINUX_O_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE;
@@ -3161,6 +3168,12 @@ int64_t sys_renameat2(guest_t *g,
         return -LINUX_EINVAL;
     }
 
+    /* An empty name on either side is ENOENT whatever its dirfd is; see
+     * read_translated_path.
+     */
+    if (oldpath[0] == '\0' || newpath[0] == '\0')
+        return -LINUX_ENOENT;
+
     if (path_translate_at(olddirfd, oldpath, PATH_TR_NOFOLLOW, &old_tx) < 0 ||
         path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
                           &new_tx) < 0)
@@ -3470,6 +3483,77 @@ int64_t sys_symlinkat(guest_t *g,
     return 0;
 }
 
+/* The host path a descriptor was opened by, when that path still names the
+ * descriptor's file. macOS has no way to act on a descriptor for the calls that
+ * take AT_EMPTY_PATH, so they go through the name, and a name that was renamed
+ * over or unlinked since must not stand in for the file. out needs
+ * LINUX_PATH_MAX bytes.
+ */
+static bool host_fd_live_path(int host_fd, const struct stat *fd_st, char *out)
+{
+    struct stat path_st;
+    return fcntl(host_fd, F_GETPATH, out) == 0 &&
+           fstatat(AT_FDCWD, out, &path_st, AT_SYMLINK_NOFOLLOW) == 0 &&
+           path_st.st_dev == fd_st->st_dev && path_st.st_ino == fd_st->st_ino;
+}
+
+/* linkat with AT_EMPTY_PATH and an empty old path: give the file olddirfd names
+ * a second name. A file with no name left is ENOENT, which is also what Linux
+ * answers for a descriptor whose link count has reached zero.
+ */
+static int64_t linkat_empty_path(int olddirfd,
+                                 int newdirfd,
+                                 const char *newpath)
+{
+    /* AT_FDCWD names the current directory, and a directory cannot be
+     * hard-linked.
+     */
+    if (olddirfd == LINUX_AT_FDCWD)
+        return -LINUX_EPERM;
+
+    fd_entry_t snap;
+    if (!fd_snapshot(olddirfd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+        snap.type == FD_FUSE_DIR)
+        return -LINUX_ENOSYS;
+
+    path_translation_t new_tx;
+    if (path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
+                          &new_tx) < 0)
+        return linux_errno();
+    if (new_tx.fuse_path)
+        return -LINUX_ENOSYS;
+
+    host_fd_ref_t old_ref, newdir_ref;
+    int64_t ref_err = host_dirfd_ref_open(olddirfd, &old_ref);
+    if (ref_err < 0)
+        return ref_err;
+    ref_err = host_dirfd_ref_open(newdirfd, &newdir_ref);
+    if (ref_err < 0) {
+        host_fd_ref_close(&old_ref);
+        return ref_err;
+    }
+
+    int64_t rc = 0;
+    char host_path[LINUX_PATH_MAX];
+    struct stat fd_st;
+    if (fstat(old_ref.fd, &fd_st) < 0)
+        rc = linux_errno();
+    else if (S_ISDIR(fd_st.st_mode))
+        rc = -LINUX_EPERM;
+    else if (!host_fd_live_path(old_ref.fd, &fd_st, host_path))
+        rc = -LINUX_ENOENT;
+    else if (linkat(AT_FDCWD, host_path,
+                    path_translation_dirfd(&new_tx, &newdir_ref),
+                    new_tx.host_path, 0) < 0)
+        rc = linux_errno();
+
+    host_fd_ref_close(&old_ref);
+    host_fd_ref_close(&newdir_ref);
+    return rc;
+}
+
 int64_t sys_linkat(guest_t *g,
                    int olddirfd,
                    uint64_t oldpath_gva,
@@ -3483,8 +3567,21 @@ int64_t sys_linkat(guest_t *g,
         guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
         return -LINUX_EFAULT;
 
-    if (!validate_at_flags(flags, LINUX_AT_SYMLINK_FOLLOW))
+    if (!validate_at_flags(flags,
+                           LINUX_AT_SYMLINK_FOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
+
+    /* An empty name is ENOENT whatever its dirfd is; see read_translated_path.
+     * The old name alone may be empty, and only with AT_EMPTY_PATH, where it
+     * stands for olddirfd itself.
+     */
+    if (newpath[0] == '\0')
+        return -LINUX_ENOENT;
+    if (oldpath[0] == '\0') {
+        if (!(flags & LINUX_AT_EMPTY_PATH))
+            return -LINUX_ENOENT;
+        return linkat_empty_path(olddirfd, newdirfd, newpath);
+    }
 
     unsigned int old_flags =
         (flags & LINUX_AT_SYMLINK_FOLLOW) ? PATH_TR_NONE : PATH_TR_NOFOLLOW;
@@ -3579,9 +3676,8 @@ static int64_t access_cwd(int mode, int flags)
 /* access() on the file a descriptor already names: faccessat2 with
  * AT_EMPTY_PATH and an empty path. macOS has no call that takes a descriptor,
  * so the question is put to the host through the path the descriptor was opened
- * by, which is the answer the same guest would get by name. That path is used
- * only while it still names the descriptor's file; one that was renamed over or
- * unlinked is judged by its mode bits instead.
+ * by, which is the answer the same guest would get by name. A file that was
+ * renamed over or unlinked is judged by its mode bits instead.
  */
 static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
 {
@@ -3599,16 +3695,12 @@ static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
 
     int64_t rc = 0;
     char host_path[LINUX_PATH_MAX];
-    struct stat fd_st, path_st;
+    struct stat fd_st;
     if (mode == F_OK) {
         /* The descriptor is open, so the file exists. */
     } else if (fstat(ref.fd, &fd_st) < 0) {
         rc = linux_errno();
-    } else if (fcntl(ref.fd, F_GETPATH, host_path) == 0 &&
-               fstatat(AT_FDCWD, host_path, &path_st, AT_SYMLINK_NOFOLLOW) ==
-                   0 &&
-               path_st.st_dev == fd_st.st_dev &&
-               path_st.st_ino == fd_st.st_ino) {
+    } else if (host_fd_live_path(ref.fd, &fd_st, host_path)) {
         if (faccessat(AT_FDCWD, host_path, mode,
                       translate_faccessat_flags(flags)) < 0)
             rc = linux_errno();

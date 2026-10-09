@@ -112,7 +112,7 @@ openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O
 unsupported:err:EISDIR openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
 openat | O_TMPFILE@rdonly | CWD p:dir F|O_RDONLY 0600 | err:EINVAL | fd
 # An empty name is ENOENT before dirfd is looked at.
-pending openat | O_CLOEXEC@empty-path | fd:file p:empty F|O_RDONLY 0 | err:ENOENT | =
+openat | O_CLOEXEC@empty-path | fd:file p:empty F|O_RDONLY 0 | err:ENOENT | =
 
 # unlinkat(dirfd, path, flags)
 unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR
@@ -134,9 +134,9 @@ statx | AT_STATX_SYNC_TYPE@both | CWD p:file F STATX_BASIC_STATS buf | err:EINVA
 
 # linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 linkat | AT_SYMLINK_FOLLOW | CWD p:link CWD p:new F | lreg:p:new | llnk:p:new
-pending linkat | AT_EMPTY_PATH | fd:file p:empty CWD p:new F | lreg:p:new | err:ENOENT
-pending linkat | AT_SYMLINK_FOLLOW@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
-pending linkat | AT_SYMLINK_FOLLOW@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
+linkat | AT_EMPTY_PATH | fd:file p:empty CWD p:new F | lreg:p:new | err:ENOENT
+linkat | AT_SYMLINK_FOLLOW@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+linkat | AT_SYMLINK_FOLLOW@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
 
 # fchmodat(dirfd, path, mode): the kernel entry takes three arguments, so a
 # flags word in the fourth is never read.
@@ -161,8 +161,8 @@ faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
 renameat2 | RENAME_NOREPLACE | CWD p:file CWD p:link F | err:EEXIST | lreg:p:link
 renameat2 | RENAME_EXCHANGE | CWD p:file CWD p:link F | llnk:p:file | absent:p:file
 renameat2 | RENAME_NOREPLACE|RENAME_EXCHANGE@both | CWD p:file CWD p:link F | err:EINVAL | lreg:p:link
-pending renameat2 | RENAME_NOREPLACE@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
-pending renameat2 | RENAME_NOREPLACE@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
+renameat2 | RENAME_NOREPLACE@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+renameat2 | RENAME_NOREPLACE@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
 
 # dup3(oldfd, newfd, flags)
 dup3 | O_CLOEXEC | fd:file 100 F | fd:cloexec | fd:nocloexec

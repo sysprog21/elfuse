@@ -543,6 +543,10 @@ void signal_set_shim_globals_guest(guest_t *g)
  * wait -- which hv_vcpus_exit cannot reach because it is not inside hv_vcpu_run
  * -- wakes and rechecks signal_pending(). Matches how exit_group and
  * futex_interrupt already signal the pipe.
+ *
+ * A futex wait is on neither, so it gets a kick of its own. The shared set is
+ * read without sig_lock, like the pending hint: a signal queued before this
+ * call is in it, and a bit that has since been taken costs one spare kick.
  */
 static inline void attention_raise(void)
 {
@@ -552,6 +556,7 @@ static inline void attention_raise(void)
     else
         thread_interrupt_all();
     wakeup_pipe_signal();
+    thread_kick_futex_waiters(pending_load(&sig_state.shared.pending));
 }
 
 /* Predicate matches the deliverability gate used by signal_queue and

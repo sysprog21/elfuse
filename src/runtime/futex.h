@@ -29,6 +29,13 @@ void futex_interrupt_request(void);
 void futex_interrupt_clear(void);
 int futex_interrupt_consume(void);
 
+/* Tell @t that a signal it can take was queued, and wake it if it is parked in
+ * FUTEX_WAIT or FUTEX_WAIT_BITSET. The kick is remembered, so one that lands
+ * before @t parks is answered when it does. FUTEX_LOCK_PI and futex_waitv do
+ * not take part and keep their polling quantum.
+ */
+void futex_kick(thread_entry_t *t);
+
 /* Main futex syscall entry point. op: futex operation (FUTEX_WAIT, FUTEX_WAKE,
  * etc.) uaddr: guest virtual address of the futex word val: expected value
  * (WAIT) or max wakeups (WAKE) timeout_gva: guest pointer to timespec (or 0 for

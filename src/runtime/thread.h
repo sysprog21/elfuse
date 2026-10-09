@@ -74,6 +74,15 @@ typedef struct thread_entry {
      */
     _Atomic int32_t in_syscall;
 
+    /* Where this thread is parked in a futex wait, for futex_kick, which loads
+     * these with no lock (runtime/futex.c states the protocol). Not cleared on
+     * recycle: a thread leaves its wait before it exits, and a kick left set
+     * costs the next owner one early pass of its wait loop.
+     */
+    pthread_mutex_t *_Atomic futex_park_lock; /* Mutex of a condvar park */
+    pthread_cond_t *_Atomic futex_park_cond;  /* Valid under that mutex */
+    _Atomic uint32_t futex_kick;              /* A kick not answered yet */
+
     /* Thread-directed pending signals (Linux task->pending). tgkill/tkill and
      * pthread_kill queue here so only this thread consumes them. Written and
      * read under the signal module's sig_lock; do not touch without it. Only
@@ -467,6 +476,13 @@ void thread_wake_exit_waiters(void);
  * NOT acquire thread_lock.
  */
 bool thread_signal_deliverable(uint64_t sigbit);
+
+/* Kick every other thread that has a pending signal it does not block, so one
+ * parked in a futex wait re-checks now rather than when its polling quantum
+ * ends. @shared_pending is the process-directed pending set. Lock-free scan;
+ * safe from any thread.
+ */
+void thread_kick_futex_waiters(uint64_t shared_pending);
 
 /* Fork quiesce helpers. */
 

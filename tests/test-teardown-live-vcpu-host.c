@@ -45,6 +45,11 @@ int proc_exit_group_requested(void)
 
 void futex_interrupt_request(void) {}
 
+void futex_kick(thread_entry_t *t)
+{
+    (void) t;
+}
+
 void wakeup_pipe_signal(void) {}
 
 void exec_handoff_wake_waiters(void) {}

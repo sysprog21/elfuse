@@ -373,6 +373,75 @@ static bool futex_poll_signal_relock(futex_bucket_t *b)
     return sig_ready;
 }
 
+/* Signal kick. A thread parked in FUTEX_WAIT or FUTEX_WAIT_BITSET watches
+ * neither the wakeup pipe nor its condition variable, so futex_kick is what
+ * tells it a signal was queued. The polling quantum stays, for teardown.
+ *
+ * The kicker sets futex_kick and then looks for a park; the thread publishes
+ * its park and then tests futex_kick before it sleeps. All of it is seq_cst, so
+ * at least one of the two sees the other. The park is signalled under the mutex
+ * it published, which closes the window between its test and its sleep. A
+ * waiter FUTEX_REQUEUE moved publishes again under its new bucket's lock.
+ */
+static bool futex_kick_consume(void)
+{
+    thread_entry_t *t = current_thread;
+    return t && atomic_exchange_explicit(&t->futex_kick, 0,
+                                         memory_order_seq_cst) != 0;
+}
+
+/* Caller holds @lock, and holds it again whenever it tests the kick. */
+static void futex_park_publish(pthread_mutex_t *lock, pthread_cond_t *cond)
+{
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return;
+    atomic_store_explicit(&t->futex_park_cond, cond, memory_order_seq_cst);
+    atomic_store_explicit(&t->futex_park_lock, lock, memory_order_seq_cst);
+}
+
+/* Under the mutex the park published and before its condvar is destroyed: the
+ * kicker signals only while futex_park_lock, re-read under that mutex, still
+ * names it.
+ */
+static void futex_park_withdraw(void)
+{
+    thread_entry_t *t = current_thread;
+    if (t)
+        atomic_store_explicit(&t->futex_park_lock, NULL, memory_order_seq_cst);
+}
+
+/* Sleep on a published park until @until, unless a kick is already waiting. The
+ * caller runs its signal check after either.
+ */
+static void futex_park_wait(pthread_cond_t *cond,
+                            pthread_mutex_t *lock,
+                            const struct timespec *until)
+{
+    if (!futex_kick_consume())
+        pthread_cond_timedwait(cond, lock, until);
+}
+
+void futex_kick(thread_entry_t *t)
+{
+    atomic_store_explicit(&t->futex_kick, 1, memory_order_seq_cst);
+
+    pthread_mutex_t *lock =
+        atomic_load_explicit(&t->futex_park_lock, memory_order_seq_cst);
+    if (!lock)
+        return;
+
+    pthread_mutex_lock(lock);
+    pthread_mutex_t *still =
+        atomic_load_explicit(&t->futex_park_lock, memory_order_seq_cst);
+    if (still == lock) {
+        pthread_cond_t *cond =
+            atomic_load_explicit(&t->futex_park_cond, memory_order_seq_cst);
+        pthread_cond_signal(cond);
+    }
+    pthread_mutex_unlock(lock);
+}
+
 /* Unlink a waiter from its bucket's singly-linked list. Caller must hold
  * b->lock. Silently returns if the waiter is not in the list (already unlinked
  * by a wake/requeue).
@@ -1163,15 +1232,21 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
     };
     pthread_cond_init(&waiter.cond, NULL);
     b->head = &waiter;
+    futex_park_publish(&b->lock, &waiter.cond);
 
     /* Wait until woken or timeout */
     int ret = 0;
 
     for (;;) {
-        /* FUTEX_REQUEUE may have moved the waiter since the last pass. Sleep
+        /* FUTEX_REQUEUE may have moved the waiter since the last pass. Re-park
          * under the lock of the bucket that holds it now.
          */
-        b = futex_waiter_follow(b, &waiter);
+        if (&buckets[atomic_load_explicit(&waiter.home,
+                                          memory_order_acquire)] != b) {
+            futex_park_withdraw();
+            b = futex_waiter_follow(b, &waiter);
+            futex_park_publish(&b->lock, &waiter.cond);
+        }
         if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
             break;
 
@@ -1188,7 +1263,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
                 ret = -LINUX_ETIMEDOUT;
                 break;
             }
-            pthread_cond_timedwait(&waiter.cond, &b->lock, &quantum);
+            futex_park_wait(&waiter.cond, &b->lock, &quantum);
             if (thread_stop_requested() || futex_interrupt_consume()) {
                 ret = -LINUX_EINTR;
                 break;
@@ -1216,11 +1291,12 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
         }
 
         /* No timeout specified: poll every 100 ms to check for exit_group,
-         * futex_interrupt, expired guest itimers, and queued signals.
+         * futex_interrupt and expired guest itimers. A queued signal does not
+         * wait for the poll: its kick ends the sleep.
          */
         struct timespec poll_ts;
         timespec_deadline_in_ms(&poll_ts, 100);
-        pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
+        futex_park_wait(&waiter.cond, &b->lock, &poll_ts);
 
         if (thread_stop_requested() || futex_interrupt_consume()) {
             ret = -LINUX_EINTR;
@@ -1247,6 +1323,11 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
             break;
         }
     }
+
+    /* Still under the bucket lock the park was published with; the dequeue
+     * below may trade it for another.
+     */
+    futex_park_withdraw();
 
     /* Dequeue under the lock a wake would hold. A wake unlinks the waiter,
      * stores woken and signals cond all under that lock, so here it has either

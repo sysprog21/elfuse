@@ -247,5 +247,5 @@ clone | CLONE_VFORK | F|SIGCHLD 0 0 0 0 | child | =
 clone | CLONE_CHILD_SETTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
 clone | CLONE_CHILD_CLEARTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
 # A thread shares signal handlers, and shared handlers need shared memory.
-pending clone | CLONE_THREAD@no-sighand | F|SIGCHLD 0 0 0 0 | err:EINVAL | child
-pending clone | CLONE_SIGHAND@no-vm | F|SIGCHLD 0 0 0 0 | err:EINVAL | child
+clone | CLONE_THREAD@no-sighand | F|SIGCHLD 0 0 0 0 | err:EINVAL | child
+clone | CLONE_SIGHAND@no-vm | F|SIGCHLD 0 0 0 0 | err:EINVAL | child

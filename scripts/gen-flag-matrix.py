@@ -197,7 +197,7 @@ def parse_table(path: pathlib.Path, dispatch: set[str]) -> list[dict[str, str]]:
             raise TableError(f"{where}: {sysname} is not in dispatch.tbl")
 
         flag_expr, _, tag = flag.partition("@")
-        if tag and not TAG_RE.match(tag):
+        if "@" in flag and not TAG_RE.match(tag):
             raise TableError(f"{where}: malformed tag '{tag}'")
         if not flag_expr:
             raise TableError(f"{where}: empty flag expression")

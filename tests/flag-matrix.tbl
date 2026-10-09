@@ -90,7 +90,7 @@ statx | AT_SYMLINK_NOFOLLOW | CWD p:link F STATX_BASIC_STATS buf | bufx:lnk | bu
 statx | AT_EMPTY_PATH | fd:file p:empty F STATX_BASIC_STATS buf | bufx:reg | err:ENOENT
 statx | AT_STATX_FORCE_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
 statx | AT_STATX_DONT_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
-pending statx | AT_STATX_SYNC_TYPE@both | CWD p:file F STATX_BASIC_STATS buf | err:EINVAL | bufx:reg
+statx | AT_STATX_SYNC_TYPE@both | CWD p:file F STATX_BASIC_STATS buf | err:EINVAL | bufx:reg
 
 # linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 linkat | AT_SYMLINK_FOLLOW | CWD p:link CWD p:new F | lreg:p:new | llnk:p:new

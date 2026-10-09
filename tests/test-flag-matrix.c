@@ -568,10 +568,10 @@ static int answer_matches(const struct fm_expect *x, long rc)
         memcpy(&slot, fm_buf, sizeof(slot));
         if (x->kind == FM_X_CHILD_PTID && slot != (int) rc)
             return WHY("the tid slot holds %d, child is %ld", slot, rc), 0;
-        if (x->kind == FM_X_CHILD_NOPTID && slot != 0)
+        if (x->kind == FM_X_CHILD_NOPTID && slot != -1)
             return WHY("the tid slot holds %d, want it untouched", slot), 0;
         if (x->kind == FM_X_CHILD_PIDFD) {
-            fl = slot > 0 ? fcntl(slot, F_GETFD) : -1;
+            fl = slot >= 0 ? fcntl(slot, F_GETFD) : -1;
             if (fl >= 0)
                 close(slot);
             if (fl < 0 || !(fl & FD_CLOEXEC))
@@ -631,6 +631,13 @@ static int run_one(const struct fm_row *row, int with, int strict)
         exit(2);
     }
     memset(fm_buf, 0, sizeof(fm_buf));
+
+    /* A clone row reads a tid or a pidfd back out of the buffer. 0 is a
+     * descriptor a pidfd can be given, so the slot starts at -1, which is
+     * neither.
+     */
+    if (x->kind >= FM_X_CHILD && x->kind <= FM_X_CHILD_PIDFD)
+        memset(fm_buf, 0xff, sizeof(int));
     stack_prepare();
     fm_region = mmap(NULL, FM_REGION_SIZE, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

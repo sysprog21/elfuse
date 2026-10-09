@@ -469,6 +469,20 @@ $(BUILD_DIR)/test-wait-signal-latency: \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-futex-requeue-race requeues a parked sibling thread and then races a
+# signal against a wake at the new word.
+$(BUILD_DIR)/test-futex-requeue-race: \
+		tests/test-futex-requeue-race.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-futex-signal-latency aims a signal at a sibling thread parked in a futex
+# wait.
+$(BUILD_DIR)/test-futex-signal-latency: \
+		tests/test-futex-signal-latency.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-nanosleep-process-signal parks several threads in a sleep and sends the
 # group one signal.
 $(BUILD_DIR)/test-nanosleep-process-signal: \
@@ -574,8 +588,8 @@ $(BUILD_DIR)/test-sigtimedwait: tests/test-sigtimedwait.c | $(BUILD_DIR)
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 # test-osync-requeue drives a raw FUTEX_REQUEUE against a plain-FUTEX_WAIT
-# waiter (musl unlock_requeue pattern) to guard the os_sync wake-at-source
-# degradation; needs -lpthread.
+# waiter (musl unlock_requeue pattern), which a requeue that only walked part of
+# the waiters would strand; needs -lpthread.
 $(BUILD_DIR)/test-osync-requeue: tests/test-osync-requeue.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread

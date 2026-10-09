@@ -1,14 +1,12 @@
 /*
- * Spike probe: does routing plain FUTEX_WAIT to the Darwin os_sync address-wait
- * queue break FUTEX_REQUEUE of that waiter?
+ * Does FUTEX_REQUEUE reach a waiter parked by plain FUTEX_WAIT?
  *
  * musl's private condvar (pthread_cond_timedwait.c: lock()/unlock_requeue())
  * parks waiters with a plain FUTEX_WAIT on a per-node "barrier" word, then its
  * broadcast/handoff path uses FUTEX_REQUEUE to move those parked waiters from
- * the barrier word onto the mutex word. If plain FUTEX_WAIT enqueues on the
- * kernel os_sync queue while FUTEX_REQUEUE only walks the emulator's hash
- * bucket, the requeue reaches nobody: the waiter is stranded until the 100 ms
- * os_sync poll cap re-checks the (now changed) word and returns.
+ * the barrier word onto the mutex word. A plain FUTEX_WAIT parked on a queue
+ * FUTEX_REQUEUE does not walk is one the requeue cannot reach, and it stays
+ * stranded until its 100 ms polling quantum ends.
  *
  * This reproduces the pattern with raw syscalls (libc-agnostic) and measures
  * the wake latency. A correct requeue path wakes the waiter in well under the
@@ -69,9 +67,8 @@ int main(void)
     }
 
     /* Let the waiter reach FUTEX_WAIT. Keep this well below the difference
-     * between the 100 ms os_sync poll cap (FUTEX_OS_SYNC_POLL_CAP_NS) and the
-     * pass threshold below, so a stranded waiter (regression: requeue no longer
-     * degrades to a wake at the source address) surfaces near the cap, far
+     * between the 100 ms polling quantum (FUTEX_OS_SYNC_POLL_CAP_NS) and the
+     * pass threshold below, so a stranded waiter surfaces near the quantum, far
      * above the threshold, instead of landing on it.
      */
     usleep(10 * 1000);
@@ -96,12 +93,12 @@ int main(void)
     printf("  requeue rc=%d wake rc=%d\n", rq, wk);
     printf("  wake latency: %.2f ms\n", latency);
 
-    /* A working requeue path wakes well under the 100 ms os_sync poll cap.
-     * Allow generous headroom for scheduler jitter; a stranded waiter only
-     * comes back on the ~100 ms timeout. Also require the requeue or wake to
-     * have reached the waiter (rq/wk > 0): if the waiter had not blocked yet,
-     * both reach nobody and the waiter exits fast on its own, which would
-     * otherwise show a false sub-threshold PASS.
+    /* A working requeue path wakes well under the 100 ms polling quantum. Allow
+     * generous headroom for scheduler jitter; a stranded waiter only comes back
+     * on the ~100 ms timeout. Also require the requeue or wake to have reached
+     * the waiter (rq/wk > 0): if the waiter had not blocked yet, both reach
+     * nobody and the waiter exits fast on its own, which would otherwise show a
+     * false sub-threshold PASS.
      */
     int reached = (rq > 0) || (wk > 0);
     int pass = reached && latency < 50.0;

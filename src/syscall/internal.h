@@ -100,7 +100,14 @@
  *                                     cwd_lock dropped
  *   pid_lock     (syscall/proc.c):    process table / wait state
  *   pidfd_lock   (syscall/proc-pidfd.c): pidfd registry
- *   futex bucket (runtime/futex.c):   per-bucket, index-ordered if >1
+ *   futex bucket (runtime/futex.c):   per-bucket, index-ordered if >1. Also
+ *                                     taken alone by futex_kick, beneath
+ *                                     whatever lock a signal is queued under,
+ *                                     the FUSE session lock among them. That
+ *                                     closes no cycle: a bucket lock holds only
+ *                                     another bucket's and a futex_waitv group
+ *                                     lock beneath it, and a signal is queued
+ *                                     under neither
  *   cwd_lock     (syscall/proc-state.c): cached guest cwd. A leaf on every
  *                                     path but one: proc_acquire_cwd_view
  *                                     returns still holding it, and both

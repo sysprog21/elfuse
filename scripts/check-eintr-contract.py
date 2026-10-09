@@ -76,10 +76,6 @@ INVENTORY = {
         "A finite epoll wait has spent part of the guest's timeout, and ready "
         "events outrank leader work because kqueue consumes the edge.",
     ),
-    "runtime/futex.c::futex_os_sync_wait": (
-        "forbids",
-        "The address-wait path plain FUTEX_WAIT takes; its deadline is " "relative.",
-    ),
     "runtime/futex.c::futex_wait_inner": (
         "forbids",
         "Relative FUTEX_WAIT has spent part of its timeout; FUTEX_WAIT_BITSET "

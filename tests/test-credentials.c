@@ -105,8 +105,7 @@ static void release_priority_child(void)
 {
     prio_child_release = 1;
     raw_futex_wake((int *) &prio_child_release, 1);
-    while (prio_child_tid != 0)
-        raw_futex_wait_cleartid((int *) &prio_child_tid, prio_child_tid);
+    raw_wait_cleartid(&prio_child_tid);
 }
 
 static long wait_for_dead_priority_tid(int tid)

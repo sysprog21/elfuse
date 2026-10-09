@@ -34,9 +34,9 @@
  * as a regression.
  *
  * Set BENCH_FUTEX_HANDOFF_BITSET to run the handoff with FUTEX_WAIT_BITSET and
- * MATCH_ANY instead of plain FUTEX_WAIT. Semantically the same wait, but the
- * two take different backends inside elfuse, and that row is how the difference
- * is measured.
+ * MATCH_ANY instead of plain FUTEX_WAIT. Semantically the same wait, on the
+ * same bucket path inside elfuse; the row is kept for comparing the two
+ * spellings.
  *
  * Run under ELFUSE_SHIM_STATS=1 to attribute the fast-path rows: the host
  * prints FUTEX_EAGAIN_HIT, FUTEX_EFAULT_HIT, FUTEX_SHAPE_BAIL and
@@ -50,6 +50,7 @@
 
 #include <errno.h>
 #include <linux/futex.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -364,17 +365,26 @@ static double run_mainworker_floor(unsigned long iters)
 
 /* concurrent wake scaling */
 
-/* futex_wake takes the hash-bucket lock even when the waiter it is looking for
- * sits on the Darwin address-wait queue rather than in the chain, so threads
- * waking unrelated futexes contend whenever their addresses collide. This row
- * is that collision and nothing else: every thread wakes its own private word
- * and no waiter exists anywhere, so all it measures is a lock acquire and an
- * empty walk. Divide it by the single-threaded wake-nowaiter row to read the
- * contention factor. A bucket table too narrow to keep those two close is what
- * this catches, and nothing else in the suite does.
+/* futex_wake takes the hash-bucket lock before it looks for a waiter, so
+ * threads waking unrelated futexes contend whenever their addresses collide.
+ * These rows are that collision and nothing else: every thread wakes its own
+ * private word and wakes nobody.
+ *
+ * The shim answers a wake at EL1 while the bucket's published waiter count is
+ * zero, so a wake with no waiter never reaches futex_wake. Each word therefore
+ * carries one parked waiter. It waits on SCALE_PARK_BIT and the wakes ask for
+ * SCALE_WAKE_BIT, so the host takes the lock, walks one entry and matches
+ * nothing.
+ *
+ * The one-thread row is the same call with nobody to contend with. Divide the
+ * concurrent row by it to read the contention factor. A bucket table too narrow
+ * to keep those two close is what this catches, and nothing else in the suite
+ * does.
  */
 #define WAKE_SCALE_THREADS 8
 #define WAKE_SCALE_STACK 4096
+#define SCALE_PARK_BIT 1
+#define SCALE_WAKE_BIT 2
 
 /* One page apart. A power-of-two stride is what real allocators emit, and it is
  * the layout a shift-xor bucket hash aliases on, so this stride is what makes
@@ -383,23 +393,92 @@ static double run_mainworker_floor(unsigned long iters)
 static int scale_words[WAKE_SCALE_THREADS][1024];
 static int scale_stacks[WAKE_SCALE_THREADS - 1][WAKE_SCALE_STACK]
     __attribute__((aligned(16)));
+static int scale_park_stacks[WAKE_SCALE_THREADS][WAKE_SCALE_STACK]
+    __attribute__((aligned(16)));
 static unsigned long scale_iters;
 static int scale_go;
 static int scale_done;
+static int scale_parking;
+static int scale_unparked;
+
+static long scale_wake(int id)
+{
+    return raw_syscall6(__NR_futex, (long) &scale_words[id][0],
+                        FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, 0, 0,
+                        SCALE_WAKE_BIT);
+}
+
+static void scale_parker(int id)
+{
+    int *w = &scale_words[id][0];
+
+    __atomic_add_fetch(&scale_parking, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(w, __ATOMIC_ACQUIRE) == 0)
+        raw_syscall6(__NR_futex, (long) w,
+                     FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, 0, 0, 0,
+                     SCALE_PARK_BIT);
+    __atomic_add_fetch(&scale_unparked, 1, __ATOMIC_RELEASE);
+    raw_futex_wake(&scale_unparked, 1);
+    raw_exit(0);
+}
+
+/* Release @parked waiters and wait for each to leave its stack. */
+static void scale_unpark(int parked)
+{
+    for (int i = 0; i < parked; i++) {
+        __atomic_store_n(&scale_words[i][0], 1, __ATOMIC_RELEASE);
+        raw_futex_wake(&scale_words[i][0], 1);
+    }
+    for (;;) {
+        int seen = __atomic_load_n(&scale_unparked, __ATOMIC_ACQUIRE);
+        if (seen >= parked)
+            break;
+        raw_futex_wait(&scale_unparked, seen);
+    }
+}
+
+/* Park one waiter on every word. False on a failed spawn. */
+static bool scale_park(void)
+{
+    int parked = 0;
+
+    for (int i = 0; i < WAKE_SCALE_THREADS; i++) {
+        void *top =
+            (char *) scale_park_stacks[i] + sizeof(scale_park_stacks[i]);
+        long rc = raw_clone(HANDOFF_CLONE_FLAGS, top, NULL, 0, NULL);
+        if (rc == 0)
+            scale_parker(i);
+        if (rc < 0)
+            break;
+        parked++;
+    }
+    if (parked != WAKE_SCALE_THREADS) {
+        scale_unpark(parked);
+        return false;
+    }
+
+    /* A waiter counts itself just before its wait, and nothing reports the park
+     * itself, so give the last one time to reach the bucket.
+     */
+    while (__atomic_load_n(&scale_parking, __ATOMIC_ACQUIRE) < parked)
+        ;
+    usleep(10 * 1000);
+    return true;
+}
 
 static void scale_worker(int id)
 {
     while (__atomic_load_n(&scale_go, __ATOMIC_ACQUIRE) == 0)
         ;
     for (unsigned long i = 0; i < scale_iters; i++)
-        raw_futex_wake(&scale_words[id][0], 1);
+        scale_wake(id);
     __atomic_add_fetch(&scale_done, 1, __ATOMIC_RELEASE);
     raw_futex_wake(&scale_done, 1);
     raw_exit(0);
 }
 
-/* Returns ns per wake aggregated over every thread, or -1 on a failed spawn. */
-static double run_wake_scale(unsigned long iters)
+/* Returns ns per wake aggregated over @threads, or -1 on a failed spawn. */
+static double run_wake_scale(unsigned long iters, int threads)
 {
     uint64_t start, elapsed;
     int spawned = 0;
@@ -408,7 +487,7 @@ static double run_wake_scale(unsigned long iters)
     scale_go = 0;
     scale_done = 0;
 
-    for (int i = 1; i < WAKE_SCALE_THREADS; i++) {
+    for (int i = 1; i < threads; i++) {
         void *top = (char *) scale_stacks[i - 1] + sizeof(scale_stacks[i - 1]);
         long rc = raw_clone(HANDOFF_CLONE_FLAGS, top, NULL, 0, NULL);
         if (rc == 0)
@@ -417,7 +496,7 @@ static double run_wake_scale(unsigned long iters)
             break;
         spawned++;
     }
-    if (spawned != WAKE_SCALE_THREADS - 1) {
+    if (spawned != threads - 1) {
         /* Release the workers that did start, or they spin on scale_go for ever
          * and the process never exits. They finish their loop against an
          * unmeasured word; the caller discards the run either way.
@@ -435,7 +514,7 @@ static double run_wake_scale(unsigned long iters)
     start = monotonic_ns();
     __atomic_store_n(&scale_go, 1, __ATOMIC_RELEASE);
     for (unsigned long i = 0; i < iters; i++)
-        raw_futex_wake(&scale_words[0][0], 1);
+        scale_wake(0);
     for (;;) {
         int seen = __atomic_load_n(&scale_done, __ATOMIC_ACQUIRE);
         if (seen >= spawned)
@@ -444,7 +523,7 @@ static double run_wake_scale(unsigned long iters)
     }
     elapsed = monotonic_ns() - start;
 
-    return (double) elapsed / (double) (iters * WAKE_SCALE_THREADS);
+    return (double) elapsed / (double) (iters * (unsigned long) threads);
 }
 
 /* harness */
@@ -565,14 +644,23 @@ int main(int argc, char **argv)
     printf("\n[concurrent wake scaling]\n");
     {
         unsigned long n = iters < 60000 ? iters : 60000;
-        double per = run_wake_scale(n);
+        double one, per;
 
+        if (!scale_park()) {
+            fprintf(stderr, "  wake-scale: clone failed\n");
+            return 1;
+        }
+        one = run_wake_scale(n, 1);
+        per = run_wake_scale(n, WAKE_SCALE_THREADS);
+        scale_unpark(WAKE_SCALE_THREADS);
         if (per < 0.0) {
             fprintf(stderr, "  wake-scale: clone failed\n");
             return 1;
         }
+        printf("  %-28s %9.1f ns/wake  %6.2fx floor  (1 thread)\n",
+               "wake-nomatch", one, one / floor_ns);
         printf("  %-28s %9.1f ns/wake  %6.2fx floor  (%d threads)\n",
-               "wake-nowaiter-concurrent", per, per / floor_ns,
+               "wake-nomatch-concurrent", per, per / floor_ns,
                WAKE_SCALE_THREADS);
     }
 

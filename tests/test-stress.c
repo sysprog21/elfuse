@@ -73,9 +73,7 @@ static void test_max_threads(void)
 
     /* Wait for all children to exit via CLONE_CHILD_CLEARTID */
     for (int i = 0; i < STRESS_THREADS; i++) {
-        while (thread_tids[i] != 0) {
-            raw_futex_wait_cleartid((int *) &thread_tids[i], thread_tids[i]);
-        }
+        raw_wait_cleartid(&thread_tids[i]);
     }
 
     /* Verify all threads ran */

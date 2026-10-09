@@ -2870,6 +2870,14 @@ int64_t sys_mmap(guest_t *g,
                  int fd,
                  int64_t offset)
 {
+    /* A protection is its three access bits. Linux drops PROT_SEM when it turns
+     * prot into the mapping's flags (calc_vm_prot_bits) and ignores a bit it
+     * does not define, and BTI and MTE are not acted on here. A request with
+     * none of the three is PROT_NONE whatever else it carries; kept, the other
+     * bits made it fail every PROT_NONE test below and come out readable.
+     */
+    prot &= LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
     bool is_prot_none = (prot == LINUX_PROT_NONE);
@@ -4658,10 +4666,13 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
     if (length == 0)
         return 0;
 
-    /* BTI and MTE are accepted and not acted on, as before. */
+    /* PROT_SEM, BTI and MTE are accepted and not acted on. Only the access bits
+     * go further, so a request with none of them is PROT_NONE; see sys_mmap.
+     */
     if (prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC |
                  LINUX_PROT_SEM | LINUX_PROT_BTI | LINUX_PROT_MTE))
         return -LINUX_EINVAL;
+    prot &= LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC;
 
     /* PROT_GROWSDOWN is only valid on a mapping that grows down, which here is
      * the main stack; glibc uses it to make the stack executable and falls back

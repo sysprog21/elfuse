@@ -295,10 +295,14 @@ mmap | MAP_POPULATE@odd-offset | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1
 # mmap again, for the protection bits in argument 2.
 mmap | PROT_READ | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | map:noread
 mmap | PROT_WRITE | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:writable | map:readonly
+# PROT_SEM (0x8) is accepted and grants nothing: alone it is PROT_NONE.
+mmap | 0x8@prot-sem | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:noread | =
+mmap | 0x8@prot-sem-read | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | =
 
 # mprotect(addr, length, prot)
 mprotect | PROT_READ | region 4096 F | region:readonly | region:noread
 mprotect | PROT_WRITE | region 4096 F|PROT_READ | region:writable | region:readonly
+mprotect | 0x8@prot-sem | region 4096 F | region:noread | =
 mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 # On the stack the bit extends the change down to the mapping's low end.
 mprotect | PROT_GROWSDOWN@stack | stackpage 65536 F|PROT_READ | stack:lowreadonly | stack:lowwritable

@@ -279,8 +279,10 @@ mmap | MAP_SHARED@file | 0 4096 PROT_READ|PROT_WRITE F|MAP_PRIVATE fd:file 0 | m
 mmap | 0x80000@sync-validate | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
 # What it accepts is LEGACY_MAP_MASK, which leaves out MAP_FIXED_NOREPLACE and
 # the top bit of the huge page size field (bit 31). The other five bits of the
-# field are in it, and without MAP_HUGETLB they mean nothing.
+# field are in it, and without MAP_HUGETLB they mean nothing. The flags are a
+# long, so a bit above 31 is refused the same way.
 mmap | 0x80000000@validate-bit31 | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
+mmap | 0x100000000@validate-bit32 | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
 mmap | MAP_FIXED_NOREPLACE@validate | 0x10000 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
 mmap | 0x7c000000@validate-huge-size | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | map | =
 # MAP_HUGETLB on a file asks for a hugetlbfs file, whatever the mapping type.
@@ -289,6 +291,7 @@ mmap | MAP_HUGETLB@file-validate | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:fil
 # An anonymous mapping takes MAP_SHARED or MAP_PRIVATE and not the two at once.
 mmap | MAP_SHARED@anon-validate | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | err:EINVAL | map
 mmap | 0x80000@sync-legacy | 0 4096 PROT_READ F|MAP_SHARED fd:file 0 | map | =
+mmap | 0x100000000@bit32-legacy | 0 4096 PROT_READ F|MAP_SHARED fd:file 0 | map | =
 mmap | MAP_POPULATE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 mmap | MAP_NORESERVE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 mmap | MAP_STACK | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =

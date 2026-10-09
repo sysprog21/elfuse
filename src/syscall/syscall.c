@@ -985,8 +985,18 @@ static int64_t sc_mmap(guest_t *g,
                        uint64_t x5,
                        bool verbose)
 {
+    /* Linux takes the flags as a long, and MAP_SHARED_VALIDATE refuses a bit
+     * above 31 like any other it does not know, where sys_mmap works on an int.
+     * Bit 31 is outside the validation mask and has no meaning anywhere else in
+     * sys_mmap, so it stands in for all of them.
+     */
+    uint32_t flags = (uint32_t) x3;
+    if (x3 >> 32)
+        flags |= UINT32_C(1) << 31;
+
     mmap_lock_acquire();
-    int64_t r = sys_mmap(g, x0, x1, (int) x2, (int) x3, (int) x4, (int64_t) x5);
+    int64_t r =
+        sys_mmap(g, x0, x1, (int) x2, (int) flags, (int) x4, (int64_t) x5);
     mmap_lock_release();
     log_debug("  mmap(0x%llx, 0x%llx) \xe2\x86\x92 0x%llx",
               (unsigned long long) x0, (unsigned long long) x1,

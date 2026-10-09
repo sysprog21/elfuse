@@ -255,6 +255,16 @@ static inline long raw_futex_wait_cleartid(int *addr, int val)
                         0);
 }
 
+/* Wait until CLONE_CHILD_CLEARTID has cleared *@tid. The tid is read once per
+ * pass. Read a second time for the futex argument, it can already be 0, and the
+ * wait then parks on a word whose exit wake has passed.
+ */
+static inline void raw_wait_cleartid(volatile int *tid)
+{
+    for (int seen; (seen = *tid) != 0;)
+        raw_futex_wait_cleartid((int *) tid, seen);
+}
+
 static inline long raw_futex_wake(int *addr, int count)
 {
     return raw_syscall6(__NR_futex, (long) addr,

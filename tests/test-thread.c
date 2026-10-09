@@ -134,9 +134,7 @@ static void test_parent_settid(void)
     /* child_tid was set by CLONE_PARENT_SETTID in test_clone_thread Wait for
      * child to fully exit (CLONE_CHILD_CLEARTID clears it)
      */
-    while (child_tid != 0) {
-        raw_futex_wait_cleartid((int *) &child_tid, child_tid);
-    }
+    raw_wait_cleartid(&child_tid);
 
     /* If execution reaches this point, CHILD_CLEARTID cleared it and FUTEX_WAKE
      * woke the parent. The original value was > 0 (written by PARENT_SETTID).
@@ -212,9 +210,7 @@ static void test_multi_thread(void)
 
     /* Wait for all children to complete (CHILD_CLEARTID clears tids) */
     for (int i = 0; i < N_THREADS; i++) {
-        while (mt_tids[i] != 0) {
-            raw_futex_wait_cleartid((int *) &mt_tids[i], mt_tids[i]);
-        }
+        raw_wait_cleartid(&mt_tids[i]);
     }
 
     /* Verify all threads ran and got unique TIDs */
@@ -282,8 +278,7 @@ static void test_clone_stack_unmap_reuse(void)
     parked_state = 2;
     raw_futex_wake((int *) &parked_state, 1);
 
-    while (child_tid != 0)
-        raw_futex_wait_cleartid((int *) &child_tid, child_tid);
+    raw_wait_cleartid(&child_tid);
 
     void *reuse =
         mmap(stack, stack_size, PROT_READ | PROT_WRITE,

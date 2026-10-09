@@ -1860,6 +1860,9 @@ static inline void epoll_merge_event(linux_epoll_event_t *out,
 
 int64_t sys_epoll_create1(int flags)
 {
+    if (flags & ~LINUX_EPOLL_CLOEXEC)
+        return -LINUX_EINVAL;
+
     int kq = kqueue();
     if (kq < 0)
         return linux_errno();

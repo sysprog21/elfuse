@@ -735,6 +735,9 @@ int64_t sys_accept4(guest_t *g,
                     uint64_t addrlen_gva,
                     int flags)
 {
+    if (flags & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC))
+        return -LINUX_EINVAL;
+
     int nonblock = (flags & LINUX_SOCK_NONBLOCK) != 0;
     int cloexec = (flags & LINUX_SOCK_CLOEXEC) != 0;
     return do_accept(g, fd, addr_gva, addrlen_gva, nonblock, cloexec);

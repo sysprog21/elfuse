@@ -1863,10 +1863,24 @@ static int64_t sc_memfd_create(guest_t *g,
     (void) x4;
     (void) x5;
     (void) verbose;
+    const unsigned int flags = (unsigned int) x1;
+
+    /* Linux judges the flags before it reads the name. Which of the defined
+     * flags are honored is a separate question; this only refuses what Linux
+     * refuses.
+     */
+    unsigned int known = LINUX_MFD_CLOEXEC | LINUX_MFD_ALLOW_SEALING |
+                         LINUX_MFD_HUGETLB | LINUX_MFD_NOEXEC_SEAL |
+                         LINUX_MFD_EXEC;
+    if (flags & LINUX_MFD_HUGETLB)
+        known |= LINUX_MFD_HUGE_MASK;
+    if (flags & ~known)
+        return -LINUX_EINVAL;
+    if ((flags & LINUX_MFD_EXEC) && (flags & LINUX_MFD_NOEXEC_SEAL))
+        return -LINUX_EINVAL;
+
     if (!x0)
         return -LINUX_EFAULT;
-
-    const unsigned int flags = (unsigned int) x1;
 
     char first = '\0';
     if (guest_read_small(g, x0, &first, sizeof(first)) < 0)

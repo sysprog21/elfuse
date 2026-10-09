@@ -280,7 +280,7 @@ mprotect | PROT_READ | region 4096 F | region:readonly | region:noread
 mprotect | PROT_WRITE | region 4096 F|PROT_READ | region:writable | region:readonly
 mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 # On the stack the bit extends the change down to the mapping's low end.
-pending mprotect | PROT_GROWSDOWN@stack | stackpage 65536 F|PROT_READ | stack:lowreadonly | stack:lowwritable
+mprotect | PROT_GROWSDOWN@stack | stackpage 65536 F|PROT_READ | stack:lowreadonly | stack:lowwritable
 mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 

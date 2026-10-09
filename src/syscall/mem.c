@@ -4658,15 +4658,21 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
 
     /* PROT_GROWSDOWN is only valid on a mapping that grows down, which here is
      * the main stack; glibc uses it to make the stack executable and falls back
-     * to plain mprotect on EINVAL. No arm64 mapping grows up. The range is then
-     * changed as given rather than extended to the stack's low end.
+     * to plain mprotect on EINVAL. No arm64 mapping grows up. On the stack the
+     * bit means "from the mapping's low end up to the end of this range", so
+     * the start moves down to the first page above the guard.
      */
     if (grows == LINUX_PROT_GROWSUP)
         return -LINUX_EINVAL;
     if (grows == LINUX_PROT_GROWSDOWN) {
         uint64_t off = addr - g->ipa_base;
-        if (addr < g->ipa_base || off < g->stack_base || off >= g->stack_top)
+        uint64_t low = g->stack_base + STACK_GUARD_SIZE;
+        if (addr < g->ipa_base || off < low || off >= g->stack_top)
             return -LINUX_EINVAL;
+        if (length > UINT64_MAX - (off - low))
+            return -LINUX_EINVAL;
+        length += off - low;
+        addr = g->ipa_base + low;
     }
     length = PAGE_ALIGN_UP(length);
     if (length == 0)

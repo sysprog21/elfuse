@@ -549,7 +549,15 @@ difference to skip. Two marks exist for elfuse. `pending` is a divergence still
 to be fixed: its mismatch is reported and not failed, and the lane fails once
 the row passes, until the mark is removed. `unsupported:ANSWER` is a flag
 elfuse declines on purpose, and ANSWER has to be one Linux documents for a
-kernel or filesystem without the feature. To add a syscall, add rows; the
+kernel or filesystem without the feature. One row is pending by decision
+rather than by backlog: `pipe2 O_DIRECT@packets`. The host pipe is a byte
+stream, so an `O_DIRECT` pipe here delivers two writes in one read where Linux
+delivers the first alone. Giving the pipe a framed backing would fix `pipe2`
+and could not fix `F_SETFL` on a pipe that already exists; refusing the flag
+with `EINVAL`, which `pipe2(2)` documents for kernels that predate it, would
+undo the acceptance `test-negative` and `test-fcntl-flags` assert. Until one
+of those is chosen the row reports the difference on every run. To add a
+syscall, add rows; the
 driver has no code for any one call. A new kind of argument or answer goes
 into `scripts/gen-flag-matrix.py` and `tests/test-flag-matrix.c` together.
 

@@ -127,7 +127,7 @@ dup3 | O_NONBLOCK@unknown | fd:file 100 F | err:EINVAL | fd
 pipe2 | O_CLOEXEC | pair F | fd:cloexec | fd:nocloexec
 pipe2 | O_NONBLOCK | pair F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
 # Packet mode is a property of the write end; the read end never reports it.
-pending pipe2 | O_DIRECT | pair F | pair1:getfl:O_DIRECT | pair1:nogetfl:O_DIRECT
+pipe2 | O_DIRECT | pair F | pair1:getfl:O_DIRECT | pair1:nogetfl:O_DIRECT
 pipe2 | O_APPEND@unknown | pair F | err:EINVAL | fd
 
 # eventfd2(initval, flags)

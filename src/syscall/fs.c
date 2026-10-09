@@ -2918,7 +2918,14 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
      */
     int shadow = linux_flags & (LINUX_O_CLOEXEC | LINUX_O_NONBLOCK);
     fd_publish_linux_flags(guest_fds[0], shadow);
-    fd_publish_linux_flags(guest_fds[1], shadow);
+
+    /* Linux keeps O_DIRECT on the write end only, since packet mode is decided
+     * by the writer. F_SETFL already records the bit for a pipe, so a pipe made
+     * with it reads back the same way. Neither path gives the pipe packet
+     * semantics: the host has none.
+     */
+    fd_publish_linux_flags(guest_fds[1],
+                           shadow | (linux_flags & LINUX_O_DIRECT));
 
     /* fd_alloc owns O_NONBLOCK on a pipe, so the guest's request is recorded
      * above and the host fds are already nonblocking. If ownership was refused

@@ -476,11 +476,10 @@ static void expect_timeout_still_expires(void)
     double sleep_ms = elapsed_ms(&t0, &t1);
 
     /* The other two relative-timeout waits reach the same hazard through
-     * different code: a plain FUTEX_WAIT, which elfuse serves on an
-     * address-wait fast path rather than the bucket path FUTEX_WAIT_BITSET
-     * uses, and sigtimedwait, which spends its timeout in a chunk loop of its
-     * own. Neither is retried here, because one bounded return is the whole
-     * question.
+     * different code: a plain FUTEX_WAIT, whose timeout is relative where
+     * FUTEX_WAIT_BITSET's is absolute, and sigtimedwait, which spends its
+     * timeout in a chunk loop of its own. Neither is retried here, because one
+     * bounded return is the whole question.
      */
     int word = 0;
     struct timespec rel = {1, 0};

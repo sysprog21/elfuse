@@ -60,8 +60,7 @@ static void *spinner_fn(void *arg)
 }
 
 /* Park in a timed futex wait far in the future. FUTEX_WAIT_BITSET takes an
- * absolute deadline and is what glibc timed waits issue; on elfuse it maps to
- * the condvar wait path rather than the os_sync one, so this exercises the
+ * absolute deadline and is what glibc timed waits issue, so this exercises the
  * bounded-quantum teardown re-check. Re-arm on any spurious wake; exit_group is
  * the only way out.
  */

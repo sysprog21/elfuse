@@ -581,8 +581,8 @@ $(BUILD_DIR)/test-sigtimedwait: tests/test-sigtimedwait.c | $(BUILD_DIR)
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 # test-osync-requeue drives a raw FUTEX_REQUEUE against a plain-FUTEX_WAIT
-# waiter (musl unlock_requeue pattern) to guard the os_sync wake-at-source
-# degradation; needs -lpthread.
+# waiter (musl unlock_requeue pattern), which a requeue that only walked part of
+# the waiters would strand; needs -lpthread.
 $(BUILD_DIR)/test-osync-requeue: tests/test-osync-requeue.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread

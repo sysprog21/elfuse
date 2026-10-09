@@ -34,9 +34,9 @@
  * as a regression.
  *
  * Set BENCH_FUTEX_HANDOFF_BITSET to run the handoff with FUTEX_WAIT_BITSET and
- * MATCH_ANY instead of plain FUTEX_WAIT. Semantically the same wait, but the
- * two take different backends inside elfuse, and that row is how the difference
- * is measured.
+ * MATCH_ANY instead of plain FUTEX_WAIT. Semantically the same wait, on the
+ * same bucket path inside elfuse; the row is kept for comparing the two
+ * spellings.
  *
  * Run under ELFUSE_SHIM_STATS=1 to attribute the fast-path rows: the host
  * prints FUTEX_EAGAIN_HIT, FUTEX_EFAULT_HIT, FUTEX_SHAPE_BAIL and
@@ -364,14 +364,13 @@ static double run_mainworker_floor(unsigned long iters)
 
 /* concurrent wake scaling */
 
-/* futex_wake takes the hash-bucket lock even when the waiter it is looking for
- * sits on the Darwin address-wait queue rather than in the chain, so threads
- * waking unrelated futexes contend whenever their addresses collide. This row
- * is that collision and nothing else: every thread wakes its own private word
- * and no waiter exists anywhere, so all it measures is a lock acquire and an
- * empty walk. Divide it by the single-threaded wake-nowaiter row to read the
- * contention factor. A bucket table too narrow to keep those two close is what
- * this catches, and nothing else in the suite does.
+/* futex_wake takes the hash-bucket lock even when nothing is queued in the
+ * chain, so threads waking unrelated futexes contend whenever their addresses
+ * collide. This row is that collision and nothing else: every thread wakes its
+ * own private word and no waiter exists anywhere, so all it measures is a lock
+ * acquire and an empty walk. Divide it by the single-threaded wake-nowaiter row
+ * to read the contention factor. A bucket table too narrow to keep those two
+ * close is what this catches, and nothing else in the suite does.
  */
 #define WAKE_SCALE_THREADS 8
 #define WAKE_SCALE_STACK 4096

@@ -118,9 +118,8 @@ _Static_assert(FUTEX_WAKE_BITSET == 10,
  *
  * os_sync_available is set in futex_init() when the runtime supports the
  * os_sync_wait_on_address family (macOS 14.4+). os_sync_wait_enabled gates
- * whether plain FUTEX_WAIT / FUTEX_WAKE use the address-wait path; it is set
- * alongside os_sync_available now that futex_os_sync_wait's compare-after-block
- * re-check preserves Linux's -EAGAIN race semantics.
+ * whether plain FUTEX_WAIT / FUTEX_WAKE use the address-wait path; futex_init()
+ * leaves it off and says why.
  *
  * The wait quantum is capped at 100 ms so proc_exit_group_requested() and
  * futex_interrupt_consume() get noticed promptly without a process-wide
@@ -604,26 +603,13 @@ void futex_init(void)
     if (__builtin_available(macOS 14.4, *)) {
         os_sync_available = true;
 
-        /* Plain FUTEX_WAIT / FUTEX_WAKE take the Darwin address-wait path.
-         * Enable the gate only where the API is actually available so the two
-         * flags cannot disagree. The late-EAGAIN gap is bridged by the
-         * compare-after-block re-check in futex_os_sync_wait (a rc>=0 return
-         * with the word moved off expected maps to -EAGAIN, matching Linux for
-         * the pre-block race; the post-wake case is equally safe since a
-         * correct caller re-reads the word either way). FUTEX_REQUEUE of such a
-         * waiter cannot migrate a kernel os_sync waiter between addresses, so
-         * futex_requeue degrades the requeue portion into a wake at the source
-         * address; woken callers re-acquire what they need in userspace. glibc
-         * condvars are safe because broadcast/signal wake with FUTEX_WAKE, not
-         * requeue (2.25+ dropped the requeue optimization); musl's
-         * private-condvar barrier->mutex handoff tolerates wake-in-place,
-         * matching its own emscripten fallback. Only plain FUTEX_WAIT enqueues
-         * on the os_sync queue; FUTEX_WAIT_BITSET, PI waits, and futex_waitv
-         * stay on the bucket path. Every wake site drains both queues via
-         * futex_wake_topup_osync, so os_sync waiters are reached regardless of
-         * which wake op (FUTEX_WAKE, requeue, wake_op) fires.
+        /* os_sync_wait_enabled stays false, so plain FUTEX_WAIT parks on the
+         * bucket path with the rest. A queued signal has to end the wait with
+         * EINTR, and the only way to reach an address-wait park is to wake its
+         * address, which the waiter cannot tell from a FUTEX_WAKE: it reports
+         * EINTR for a wake that counted it, or 0 for a signal it could not
+         * claim. A bucket waiter has waiter.woken to tell the two apart.
          */
-        os_sync_wait_enabled = true;
     }
 #endif
 }

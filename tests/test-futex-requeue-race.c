@@ -202,6 +202,10 @@ int main(void)
     }
 
     int bitset = FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME;
+    check("FUTEX_WAIT requeued, then woken", FUTEX_WAIT, LEAVE_NEVER);
+    check("FUTEX_WAIT requeued, signal against wake", FUTEX_WAIT, LEAVE_SIGNAL);
+    check("FUTEX_WAIT requeued, timeout against wake", FUTEX_WAIT,
+          LEAVE_TIMEOUT);
     check("FUTEX_WAIT_BITSET requeued, then woken", bitset, LEAVE_NEVER);
     check("FUTEX_WAIT_BITSET requeued, signal against wake", bitset,
           LEAVE_SIGNAL);

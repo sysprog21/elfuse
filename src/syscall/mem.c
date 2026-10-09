@@ -4615,10 +4615,37 @@ static bool mprotect_same_prot_fast_path_safe(int prot)
 
 int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
 {
+    /* The two grow bits are a request about the range, not a protection, and
+     * Linux takes them off before it looks at anything else. Left in, they were
+     * recorded as part of the region's protection.
+     */
+    const int grows = prot & (LINUX_PROT_GROWSDOWN | LINUX_PROT_GROWSUP);
+    prot &= ~grows;
+    if (grows == (LINUX_PROT_GROWSDOWN | LINUX_PROT_GROWSUP))
+        return -LINUX_EINVAL;
+
     if (addr & 4095)
         return -LINUX_EINVAL;
     if (length == 0)
         return 0;
+
+    /* BTI and MTE are accepted and not acted on, as before. */
+    if (prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC |
+                 LINUX_PROT_SEM | LINUX_PROT_BTI | LINUX_PROT_MTE))
+        return -LINUX_EINVAL;
+
+    /* PROT_GROWSDOWN is only valid on a mapping that grows down, which here is
+     * the main stack; glibc uses it to make the stack executable and falls back
+     * to plain mprotect on EINVAL. No arm64 mapping grows up. The range is then
+     * changed as given rather than extended to the stack's low end.
+     */
+    if (grows == LINUX_PROT_GROWSUP)
+        return -LINUX_EINVAL;
+    if (grows == LINUX_PROT_GROWSDOWN) {
+        uint64_t off = addr - g->ipa_base;
+        if (addr < g->ipa_base || off < g->stack_base || off >= g->stack_top)
+            return -LINUX_EINVAL;
+    }
     length = PAGE_ALIGN_UP(length);
     if (length == 0)
         return -LINUX_EINVAL;

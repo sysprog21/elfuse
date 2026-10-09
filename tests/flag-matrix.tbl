@@ -233,7 +233,7 @@ fcntl | O_SYNC@setfl-ignored | fd:file F_SETFL F | arg0:nogetfl:O_SYNC | =
 # mmap(addr, length, prot, flags, fd, offset): the flags are argument 3.
 mmap | MAP_ANONYMOUS | 0 4096 PROT_READ F|MAP_PRIVATE -1 0 | map | err:EBADF
 # The descriptor is looked up before the mapping type is judged.
-pending mmap | MAP_PRIVATE@bad-fd-first | 0 4096 PROT_READ F -1 0 | err:EBADF | =
+mmap | MAP_PRIVATE@bad-fd-first | 0 4096 PROT_READ F -1 0 | err:EBADF | =
 mmap | MAP_PRIVATE@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
 mmap | MAP_SHARED@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
 mmap | MAP_FIXED | region 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:atregion | map:elsewhere

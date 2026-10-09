@@ -2918,6 +2918,19 @@ int64_t sys_mmap(guest_t *g,
      * (CLONE_VM semantics).
      */
 
+    /* Linux requires page-aligned offset for file-backed mmap */
+    if (!is_anon && (offset & 4095))
+        return -LINUX_EINVAL;
+
+    /* Linux looks the descriptor up before it judges the length or the flags,
+     * so a bad one is EBADF whatever else is wrong with the call.
+     */
+    if (!is_anon) {
+        fd_entry_t snap;
+        if (!fd_snapshot(fd, &snap))
+            return -LINUX_EBADF;
+    }
+
     /* Linux rejects zero-length mmap */
     if (length == 0)
         return -LINUX_EINVAL;
@@ -2935,10 +2948,6 @@ int64_t sys_mmap(guest_t *g,
     if (map_type == LINUX_MAP_SHARED_VALIDATE &&
         (flags & ~LINUX_MAP_VALIDATE_MASK))
         return -LINUX_EOPNOTSUPP;
-
-    /* Linux requires page-aligned offset for file-backed mmap */
-    if (!is_anon && (offset & 4095))
-        return -LINUX_EINVAL;
 
     if (!is_anon && fuse_fd_refuse_mmap(fd)) {
         bool allow_materialized_fuse_mmap =

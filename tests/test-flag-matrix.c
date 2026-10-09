@@ -58,6 +58,7 @@ enum fm_arg_kind {
     FM_A_BUF,
     FM_A_PAIR,
     FM_A_REGION,
+    FM_A_STACK,
     FM_A_FLAGS,
 };
 enum fm_path {
@@ -83,6 +84,8 @@ enum fm_expect_kind {
     FM_X_PAIR1_NOGETFL,
     FM_X_FD_APPENDS,
     FM_X_FD_OVERWRITES,
+    FM_X_FD_SEALS,
+    FM_X_FD_PERM,
     FM_X_FD_READ_EBADF,
     FM_X_EXISTS,
     FM_X_ABSENT,
@@ -113,6 +116,10 @@ enum fm_expect_kind {
     FM_X_CHILD_PTID,
     FM_X_CHILD_NOPTID,
     FM_X_CHILD_PIDFD,
+    FM_X_PAIR_PACKETS,
+    FM_X_PAIR_STREAM,
+    FM_X_STACK_LOW_READONLY,
+    FM_X_STACK_LOW_WRITABLE,
 };
 
 struct fm_arg {
@@ -180,6 +187,25 @@ static int can_write(volatile char *p)
         return 0;
     *p = 'Z';
     return 1;
+}
+
+/* A 64 KiB-aligned span of this thread's own stack that nothing is using: far
+ * enough below the live frames that a row may take write permission away from
+ * it and from everything beneath it, and with touched pages beneath it so that
+ * those belong to the stack mapping already. The signal frame of a probe that
+ * faults lands just under the live frames, well above the span.
+ */
+#define FM_STACK_DEPTH (256 * 1024)
+#define FM_STACK_SPAN 65536
+static char *fm_stack_page;
+
+static void __attribute__((noinline)) stack_prepare(void)
+{
+    volatile char deep[FM_STACK_DEPTH];
+    for (size_t off = 0; off < sizeof(deep); off += 4096)
+        deep[off] = 0;
+    fm_stack_page =
+        (char *) (((unsigned long) deep + 2 * FM_STACK_SPAN) & ~0xffffUL);
 }
 
 /* A raw mmap return is an address unless it is one of the top 4095 values. */
@@ -349,6 +375,19 @@ static int answer_matches(const struct fm_expect *x, long rc)
             return WHY("size %ld after a write at offset 0", (long) st.st_size),
                    0;
         return 1;
+    case FM_X_FD_SEALS:
+        if (rc < 0)
+            return WHY("rc=%ld, want an fd", rc), 0;
+        fl = fcntl((int) rc, F_GET_SEALS);
+        if (fl != (int) x->a)
+            return WHY("F_GET_SEALS=%#x, want %#lx", fl, x->a), 0;
+        return 1;
+    case FM_X_FD_PERM:
+        if (rc < 0)
+            return WHY("rc=%ld, want an fd", rc), 0;
+        if (fstat((int) rc, &st) < 0 || (long) (st.st_mode & 0777) != x->a)
+            return WHY("mode %#o, want %#lo", (unsigned) st.st_mode, x->a), 0;
+        return 1;
     case FM_X_FD_READ_EBADF:
         if (rc < 0)
             return WHY("rc=%ld, want an fd", rc), 0;
@@ -488,6 +527,31 @@ static int answer_matches(const struct fm_expect *x, long rc)
                        x->kind == FM_X_REGION_WRITABLE ? "not " : ""),
                    0;
         return 1;
+    case FM_X_PAIR_PACKETS:
+    case FM_X_PAIR_STREAM: {
+        /* Two writes of two bytes, then one read of four. A packet pipe hands
+         * back the first write alone; a stream hands back both.
+         */
+        char got[4];
+        if (rc != 0)
+            return WHY("rc=%ld, want 0", rc), 0;
+        if (write(fm_pair[1], "ab", 2) != 2 || write(fm_pair[1], "cd", 2) != 2)
+            return WHY("probe write failed, errno=%d", errno), 0;
+        ssize_t n = read(fm_pair[0], got, sizeof(got));
+        if (n != (x->kind == FM_X_PAIR_PACKETS ? 2 : 4))
+            return WHY("one read returned %zd bytes", n), 0;
+        return 1;
+    }
+    case FM_X_STACK_LOW_READONLY:
+    case FM_X_STACK_LOW_WRITABLE:
+        if (rc < 0)
+            return WHY("rc=%ld, want >= 0", rc), 0;
+        if (can_write(fm_stack_page - FM_STACK_SPAN) !=
+            (x->kind == FM_X_STACK_LOW_WRITABLE))
+            return WHY("the stack below the range is %swritable",
+                       x->kind == FM_X_STACK_LOW_WRITABLE ? "not " : ""),
+                   0;
+        return 1;
     case FM_X_CHILD:
     case FM_X_CHILD_PTID:
     case FM_X_CHILD_NOPTID:
@@ -550,7 +614,7 @@ static int run_one(const struct fm_row *row, int with, int strict)
         x = &row->elfuse_with;
     long a[FM_MAX_ARGS] = {0};
     long opened[FM_MAX_ARGS];
-    int nopened = 0, matched = 0, pair = 0;
+    int nopened = 0, matched = 0, pair = 0, used_stack = 0;
 
     snprintf(label, sizeof(label), "%s %s %s", row->sys, row->flag,
              with ? "set" : "clear");
@@ -565,6 +629,7 @@ static int run_one(const struct fm_row *row, int with, int strict)
         exit(2);
     }
     memset(fm_buf, 0, sizeof(fm_buf));
+    stack_prepare();
     fm_region = mmap(NULL, FM_REGION_SIZE, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (fm_region == MAP_FAILED) {
@@ -602,6 +667,10 @@ static int run_one(const struct fm_row *row, int with, int strict)
             break;
         case FM_A_REGION:
             a[i] = (long) fm_region;
+            break;
+        case FM_A_STACK:
+            a[i] = (long) fm_stack_page;
+            used_stack = 1;
             break;
         case FM_A_FLAGS:
             a[i] = arg->val | (with ? row->bits : 0);
@@ -653,6 +722,16 @@ static int run_one(const struct fm_row *row, int with, int strict)
     if (rc > 0 && !(x->kind >= FM_X_CHILD && x->kind <= FM_X_CHILD_PIDFD) &&
         row->nargs == 5 && !returns_fd(x))
         waitpid((pid_t) rc, NULL, __WALL | WNOHANG);
+
+    /* Give the stack back whatever the row did to it, with the grow bit so that
+     * everything beneath the span comes back too, and without it in case the
+     * bit was refused.
+     */
+    if (used_stack) {
+        mprotect(fm_stack_page, FM_STACK_SPAN,
+                 PROT_READ | PROT_WRITE | PROT_GROWSDOWN);
+        mprotect(fm_stack_page, FM_STACK_SPAN, PROT_READ | PROT_WRITE);
+    }
 
 out:
     munmap(fm_region, FM_REGION_SIZE);

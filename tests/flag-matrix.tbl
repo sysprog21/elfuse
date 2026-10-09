@@ -24,6 +24,8 @@
 #                    then asked of both
 #   buf              a zeroed 4 KiB scratch buffer
 #   region           the address of a fresh anonymous read-write mapping
+#   stackpage        a 64 KiB span of the caller's own stack, below every
+#                    frame in use
 #   F  F|EXPR        the flags slot; EXPR is ORed in for both runs
 #   anything else    a C integer expression
 #
@@ -44,6 +46,8 @@
 #   fd:getfl:EXPR fd:nogetfl:EXPR    F_GETFL has every bit, or no bit, of EXPR
 #   pair1:getfl:EXPR pair1:nogetfl:EXPR   the same, asked only of the second
 #                                    fd of a pair
+#   fd:seals:EXPR      F_GET_SEALS on the fd returns exactly EXPR
+#   fd:perm:EXPR       fstat on the fd reports exactly those permission bits
 #   fd:appends fd:overwrites         a 1-byte write at offset 0 grows the file,
 #                                    or leaves its size alone
 #   fd:readebadf       read on the fd gives EBADF
@@ -63,6 +67,10 @@
 #                                    a read of "file"
 #   region:writable region:readonly region:noread
 #                      the same loads and stores, on the region
+#   pair:packets pair:stream         one read after two writes returns the
+#                                    first write alone, or both
+#   stack:lowreadonly stack:lowwritable
+#                      a store into the stack beneath stackpage faults, or works
 #   child              the call returns a pid, and that process exits 0
 #   child:ptid child:noptid          also, the int at buf holds that pid, or 0
 #   child:pidfd        also, the int at buf is a close-on-exec fd
@@ -173,6 +181,10 @@ pipe2 | O_CLOEXEC | pair F | fd:cloexec | fd:nocloexec
 pipe2 | O_NONBLOCK | pair F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
 # Packet mode is a property of the write end; the read end never reports it.
 pipe2 | O_DIRECT | pair F | pair1:getfl:O_DIRECT | pair1:nogetfl:O_DIRECT
+# Packet mode itself. The host pipe is a byte stream and has no such mode, so
+# this stays pending until someone decides between giving the pipe a framed
+# backing and refusing the flag; see the note in docs/testing.md.
+pending pipe2 | O_DIRECT@packets | pair F | pair:packets | pair:stream
 pipe2 | O_APPEND@unknown | pair F | err:EINVAL | fd
 
 # eventfd2(initval, flags)
@@ -205,6 +217,13 @@ memfd_create | MFD_CLOEXEC | p:file F | fd:cloexec | fd:nocloexec
 memfd_create | 0x8000@unknown | p:file F | err:EINVAL | fd
 # MFD_NOEXEC_SEAL and MFD_EXEC contradict each other.
 memfd_create | 0x10@exec-and-noexec | p:file F|0x8 | err:EINVAL | fd
+memfd_create | MFD_ALLOW_SEALING | p:file F | fd:seals:0 | fd:seals:F_SEAL_SEAL
+# MFD_NOEXEC_SEAL (0x8) allows sealing, sets F_SEAL_EXEC (0x20), and makes the
+# file without its execute bits. MFD_EXEC (0x10) asks for today's default.
+pending memfd_create | 0x8@noexec-seal | p:file F | fd:seals:0x20 | fd:seals:F_SEAL_SEAL
+pending memfd_create | 0x8@noexec-mode | p:file F | fd:perm:0666 | fd:perm:0777
+pending memfd_create | 0x10@exec | p:file F | fd:perm:0777 | =
+memfd_create | MFD_HUGETLB | p:file F | fd | =
 
 # socket(domain, type, protocol): the flags share the type argument.
 socket | SOCK_CLOEXEC | AF_UNIX F|SOCK_STREAM 0 | fd:cloexec | fd:nocloexec
@@ -249,6 +268,8 @@ mmap | 0x80000@sync-legacy | 0 4096 PROT_READ F|MAP_SHARED fd:file 0 | map | =
 mmap | MAP_POPULATE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 mmap | MAP_NORESERVE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 mmap | MAP_STACK | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
+# The offset has to be page aligned even when no file is involved.
+pending mmap | MAP_POPULATE@odd-offset | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 1 | err:EINVAL | =
 
 # mmap again, for the protection bits in argument 2.
 mmap | PROT_READ | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | map:noread
@@ -258,6 +279,8 @@ mmap | PROT_WRITE | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:wri
 mprotect | PROT_READ | region 4096 F | region:readonly | region:noread
 mprotect | PROT_WRITE | region 4096 F|PROT_READ | region:writable | region:readonly
 mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+# On the stack the bit extends the change down to the mapping's low end.
+pending mprotect | PROT_GROWSDOWN@stack | stackpage 65536 F|PROT_READ | stack:lowreadonly | stack:lowwritable
 mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 

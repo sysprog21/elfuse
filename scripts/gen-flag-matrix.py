@@ -59,6 +59,10 @@ PLAIN_EXPECTS = {
     "buf:lnk": "FM_X_STAT_LNK",
     "bufx:reg": "FM_X_STATX_REG",
     "bufx:lnk": "FM_X_STATX_LNK",
+    "pair:packets": "FM_X_PAIR_PACKETS",
+    "pair:stream": "FM_X_PAIR_STREAM",
+    "stack:lowreadonly": "FM_X_STACK_LOW_READONLY",
+    "stack:lowwritable": "FM_X_STACK_LOW_WRITABLE",
     "child": "FM_X_CHILD",
     "child:ptid": "FM_X_CHILD_PTID",
     "child:noptid": "FM_X_CHILD_NOPTID",
@@ -83,6 +87,8 @@ EXPR_EXPECTS = {
     "errkeeps": "FM_X_ERR_KEEPS",
     "fd:getfl": "FM_X_FD_GETFL",
     "fd:nogetfl": "FM_X_FD_NOGETFL",
+    "fd:seals": "FM_X_FD_SEALS",
+    "fd:perm": "FM_X_FD_PERM",
     "pair1:getfl": "FM_X_PAIR1_GETFL",
     "pair1:nogetfl": "FM_X_PAIR1_NOGETFL",
     "arg0:getfl": "FM_X_ARG0_GETFL",
@@ -131,6 +137,8 @@ def parse_arg(where: str, token: str) -> tuple[str, bool]:
         return "{FM_A_PAIR, 0}", False
     if token == "region":
         return "{FM_A_REGION, 0}", False
+    if token == "stackpage":
+        return "{FM_A_STACK, 0}", False
     if token.startswith("p:"):
         return f"{{FM_A_PATH, {path_token(where, token[2:])}}}", False
     if token.startswith("fd:"):

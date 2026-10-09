@@ -3530,32 +3530,98 @@ int64_t sys_linkat(guest_t *g,
     return 0;
 }
 
+/* access() on the current directory. */
+static int64_t access_cwd(int mode, int flags)
+{
+    proc_cwd_view_t view;
+    if (proc_acquire_cwd_view(&view) == 0) {
+        if (view.path && view.path[0] == '/' &&
+            fuse_path_matches_mount(view.path)) {
+            char cwd_path[LINUX_PATH_MAX];
+            str_copy_trunc(cwd_path, view.path, sizeof(cwd_path));
+            proc_release_cwd_view(&view);
+            return fuse_access_path(cwd_path, mode, flags);
+        }
+        proc_release_cwd_view(&view);
+    }
+    int mac_flags = translate_faccessat_flags(flags);
+    if (faccessat(AT_FDCWD, ".", mode, mac_flags) < 0)
+        return linux_errno();
+    return 0;
+}
+
+/* access() on the file a descriptor already names: faccessat2 with
+ * AT_EMPTY_PATH and an empty path. macOS has no call that takes a descriptor,
+ * so the question is put to the host through the path the descriptor was opened
+ * by, which is the answer the same guest would get by name. That path is used
+ * only while it still names the descriptor's file; one that was renamed over or
+ * unlinked is judged by its mode bits instead.
+ */
+static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(dirfd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+        snap.type == FD_FUSE_DIR)
+        return -LINUX_ENOSYS;
+
+    host_fd_ref_t ref;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+    if (ref_err < 0)
+        return ref_err;
+
+    int64_t rc = 0;
+    char host_path[LINUX_PATH_MAX];
+    struct stat fd_st, path_st;
+    if (mode == F_OK) {
+        /* The descriptor is open, so the file exists. */
+    } else if (fstat(ref.fd, &fd_st) < 0) {
+        rc = linux_errno();
+    } else if (fcntl(ref.fd, F_GETPATH, host_path) == 0 &&
+               fstatat(AT_FDCWD, host_path, &path_st, AT_SYMLINK_NOFOLLOW) ==
+                   0 &&
+               path_st.st_dev == fd_st.st_dev &&
+               path_st.st_ino == fd_st.st_ino) {
+        if (faccessat(AT_FDCWD, host_path, mode,
+                      translate_faccessat_flags(flags)) < 0)
+            rc = linux_errno();
+    } else if (path_check_intercept_access(&fd_st, mode, flags) < 0) {
+        rc = linux_errno();
+    }
+    host_fd_ref_close(&ref);
+    return rc;
+}
+
 int64_t sys_faccessat(guest_t *g,
                       int dirfd,
                       uint64_t path_gva,
                       int mode,
                       int flags)
 {
+    /* Linux judges the flags before it reads the path. */
+    if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW |
+                                      LINUX_AT_EMPTY_PATH))
+        return -LINUX_EINVAL;
+
+    if (flags & LINUX_AT_EMPTY_PATH) {
+        char first;
+        if (guest_read_small(g, path_gva, &first, sizeof(first)) < 0)
+            return -LINUX_EFAULT;
+        if (first == '\0') {
+            if ((mode & ~(F_OK | R_OK | W_OK | X_OK)) != 0)
+                return -LINUX_EINVAL;
+            return dirfd == LINUX_AT_FDCWD
+                       ? access_cwd(mode, flags)
+                       : access_empty_path_fd(dirfd, mode, flags);
+        }
+    }
+
     if (dirfd == LINUX_AT_FDCWD) {
         char dot_path[2];
         if (guest_read_small(g, path_gva, dot_path, sizeof(dot_path)) == 0 &&
-            dot_path[0] == '.' && dot_path[1] == '\0') {
-            proc_cwd_view_t view;
-            if (proc_acquire_cwd_view(&view) == 0) {
-                if (view.path && view.path[0] == '/' &&
-                    fuse_path_matches_mount(view.path)) {
-                    char cwd_path[LINUX_PATH_MAX];
-                    str_copy_trunc(cwd_path, view.path, sizeof(cwd_path));
-                    proc_release_cwd_view(&view);
-                    return fuse_access_path(cwd_path, mode, flags);
-                }
-                proc_release_cwd_view(&view);
-            }
-            int mac_flags = translate_faccessat_flags(flags);
-            if (faccessat(AT_FDCWD, ".", mode, mac_flags) < 0)
-                return linux_errno();
-            return 0;
-        }
+            dot_path[0] == '.' && dot_path[1] == '\0')
+            return access_cwd(mode, flags);
     }
 
     char path[LINUX_PATH_MAX];
@@ -3565,9 +3631,6 @@ int64_t sys_faccessat(guest_t *g,
         path, &tx);
     if (rc < 0)
         return rc;
-
-    if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW))
-        return -LINUX_EINVAL;
 
     if (tx.fuse_path)
         return fuse_access_path(tx.intercept_path, mode, flags);
@@ -4119,11 +4182,24 @@ int64_t sys_utimensat(guest_t *g,
     if (ref_err < 0)
         return ref_err;
 
+    /* AT_EMPTY_PATH with an empty path names dirfd itself, the current
+     * directory included. Unlike a NULL path it may carry flags.
+     */
+    bool empty_path = false;
+    if (path_gva != 0 && (flags & LINUX_AT_EMPTY_PATH)) {
+        char first;
+        if (guest_read_small(g, path_gva, &first, sizeof(first)) < 0) {
+            host_fd_ref_close(&dir_ref);
+            return -LINUX_EFAULT;
+        }
+        empty_path = first == '\0';
+    }
+
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
     const char *path_arg = NULL;
     char path[LINUX_PATH_MAX];
     path_translation_t tx;
-    if (path_gva != 0) {
+    if (path_gva != 0 && !empty_path) {
         int64_t rc = read_translated_path(g, dirfd, path_gva,
                                           (flags & LINUX_AT_SYMLINK_NOFOLLOW)
                                               ? PATH_TR_NOFOLLOW
@@ -4166,7 +4242,15 @@ int64_t sys_utimensat(guest_t *g,
      * futimens(AT_FDCWD, ...) be invoked with macOS's AT_FDCWD sentinel (-2),
      * which returns EBADF and would not match Linux semantics.
      */
-    if (!path_arg) {
+    if (empty_path) {
+        int host_rc = dir_ref.fd == AT_FDCWD
+                          ? utimensat(AT_FDCWD, ".", times_gva ? ts : NULL, 0)
+                          : futimens(dir_ref.fd, times_gva ? ts : NULL);
+        if (host_rc < 0) {
+            host_fd_ref_close(&dir_ref);
+            return linux_errno();
+        }
+    } else if (!path_arg) {
         if (flags) {
             host_fd_ref_close(&dir_ref);
             return -LINUX_EINVAL;

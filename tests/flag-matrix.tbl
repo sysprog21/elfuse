@@ -105,10 +105,13 @@ fchownat | AT_EMPTY_PATH | fd:file p:empty -1 -1 F | ok | err:ENOENT
 
 # utimensat(dirfd, path, times, flags)
 utimensat | AT_SYMLINK_NOFOLLOW | CWD p:dangling 0 F | ok | err:ENOENT
+utimensat | AT_EMPTY_PATH | fd:file p:empty 0 F | ok | err:ENOENT
 
 # faccessat2(dirfd, path, mode, flags)
 faccessat2 | AT_SYMLINK_NOFOLLOW | CWD p:dangling F_OK F | ok | err:ENOENT
-pending faccessat2 | AT_EMPTY_PATH | fd:file p:empty F_OK F | ok | err:ENOENT
+faccessat2 | AT_EMPTY_PATH | fd:file p:empty F_OK F | ok | err:ENOENT
+faccessat2 | AT_EMPTY_PATH@write | fd:file p:empty W_OK F | ok | err:ENOENT
+faccessat2 | 0x8000@unknown | CWD p:file F_OK F | err:EINVAL | ok
 faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
 
 # renameat2(olddirfd, oldpath, newdirfd, newpath, flags)

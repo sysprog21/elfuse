@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-usbdev-departed check-flag-matrix check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -309,7 +309,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-flag-matrix check-usb-fixture-bin test-config test-runner \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
@@ -1828,6 +1828,13 @@ check-usb-fixture-bin:
 # what Linux answers for it on a device that has gone.
 check-usbdev-departed: $(DEPARTED_HEADER)
 	@python3 $(DEPARTED_GENERATOR) --check --output $(DEPARTED_HEADER)
+
+## Verify the generated flag-matrix rows still match tests/flag-matrix.tbl
+#
+# The generator also joins the table against dispatch.tbl, so a row for a
+# syscall the dispatcher no longer serves fails here.
+check-flag-matrix: $(FLAG_MATRIX_HEADER)
+	@python3 $(FLAG_MATRIX_GENERATOR) --check --output $(FLAG_MATRIX_HEADER)
 
 ## Build the fixture-enabled binary the two loopback lanes run
 #

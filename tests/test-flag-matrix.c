@@ -121,6 +121,7 @@ enum fm_expect_kind {
     FM_X_CHILD,
     FM_X_CHILD_PTID,
     FM_X_CHILD_NOPTID,
+    FM_X_CHILD_OWNPTID,
     FM_X_CHILD_PIDFD,
     FM_X_PAIR_PACKETS,
     FM_X_PAIR_STREAM,
@@ -589,6 +590,7 @@ static int answer_matches(const struct fm_expect *x, long rc)
     case FM_X_CHILD:
     case FM_X_CHILD_PTID:
     case FM_X_CHILD_NOPTID:
+    case FM_X_CHILD_OWNPTID:
     case FM_X_CHILD_PIDFD: {
         int status = 0, slot;
         if (rc <= 0)
@@ -598,7 +600,8 @@ static int answer_matches(const struct fm_expect *x, long rc)
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
             return WHY("child status %#x", status), 0;
         memcpy(&slot, fm_buf, sizeof(slot));
-        if (x->kind == FM_X_CHILD_PTID && slot != (int) rc)
+        if ((x->kind == FM_X_CHILD_PTID || x->kind == FM_X_CHILD_OWNPTID) &&
+            slot != (int) rc)
             return WHY("the tid slot holds %d, child is %ld", slot, rc), 0;
         if (x->kind == FM_X_CHILD_NOPTID && slot != -1)
             return WHY("the tid slot holds %d, want it untouched", slot), 0;
@@ -723,11 +726,17 @@ static int run_one(const struct fm_row *row, int with, int strict)
     long self = raw_syscall0(__NR_getpid);
     long rc = raw_syscall6(row->nr, a[0], a[1], a[2], a[3], a[4], a[5]);
 
-    /* A row that made a process leaves the new one here as well. It has nothing
-     * to report; the parent reads the answer.
+    /* A row that made a process leaves the new one here as well. The parent
+     * reads the answer, and the one thing the new process reports, through its
+     * exit status, is whether it found its own tid in the slot when the row
+     * asks for that.
      */
-    if (raw_syscall0(__NR_getpid) != self)
-        _exit(0);
+    if (raw_syscall0(__NR_getpid) != self) {
+        int seen;
+        memcpy(&seen, fm_buf, sizeof(seen));
+        _exit(x->kind == FM_X_CHILD_OWNPTID &&
+              seen != (int) raw_syscall0(__NR_gettid));
+    }
 
     /* A call that fills an fd pair answers through both of them, unless the
      * answer names the second one.

@@ -80,6 +80,8 @@
 #   child              the call returns a pid, and that process exits 0
 #   child:ptid child:noptid          also, the int at buf holds that pid, or
 #                                    still holds -1
+#   child:ownptid      as child:ptid, and the new process found its own tid
+#                      there too
 #   child:pidfd        also, the int at buf is a close-on-exec fd
 #   =                  (last field only) the same answer as with the flag
 #
@@ -318,6 +320,8 @@ mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 # clone(flags, stack, parent_tid, tls, child_tid), the arm64 argument order.
 # A zero stack with no CLONE_VM is a fork: the child gets a copy and exits.
 clone | CLONE_PARENT_SETTID | F|SIGCHLD 0 buf 0 0 | child:ptid | child:noptid
+# With CLONE_VM the two share memory, so the child sees the slot as well.
+clone | CLONE_PARENT_SETTID@vm-child | F|SIGCHLD|CLONE_VM|CLONE_VFORK 0 buf 0 0 | child:ownptid | child
 clone | CLONE_PIDFD | F|SIGCHLD 0 buf 0 0 | child:pidfd | child:noptid
 # clone returns the pidfd through parent_tid, so the two cannot be combined.
 clone | CLONE_PIDFD@with-parent-settid | F|SIGCHLD|CLONE_PARENT_SETTID 0 buf 0 0 | err:EINVAL | child:ptid

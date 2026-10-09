@@ -1853,6 +1853,8 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     bool siblings_quiesced = false;
     int64_t fail_rc = -LINUX_ENOMEM;
     int child_pidfd = -1;
+    bool ptid_stored_early = false;
+    int32_t ptid_before = 0;
 
     /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
      * sibling vCPUs may be actively mutating guest memory during the fork
@@ -1870,6 +1872,20 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
         goto fail_snapshot;
     }
     siblings_quiesced = true;
+
+    /* With CLONE_VM the child runs on the parent's memory, so on Linux it finds
+     * its own tid in the CLONE_PARENT_SETTID slot from its first instruction.
+     * The child here is a helper process that runs on a snapshot, so the tid
+     * has to be in the snapshot: it is stored before one is taken, and what the
+     * slot held is put back if the clone fails. A slot that cannot be written
+     * is passed over, as Linux passes over it.
+     */
+    if ((flags & LINUX_CLONE_PARENT_SETTID) && (flags & LINUX_CLONE_VM) &&
+        guest_read_small(g, ptid_gva, &ptid_before, sizeof(ptid_before)) == 0) {
+        int32_t tid32 = (int32_t) child_guest_pid;
+        ptid_stored_early =
+            guest_write_small(g, ptid_gva, &tid32, sizeof(tid32)) == 0;
+    }
 
     /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd into
      * memfd-backed overlay regions. The conversion seeds a private temp file
@@ -2202,7 +2218,8 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     /* The thread and CLONE_VM paths store the child's tid for
      * CLONE_PARENT_SETTID themselves. A fork has to as well: Linux writes it
      * into the parent's memory once the child exists, and ignores a slot it
-     * cannot write.
+     * cannot write. A CLONE_VM|CLONE_VFORK child had it stored before the
+     * snapshot too, so that the child sees it.
      */
     if (flags & LINUX_CLONE_PARENT_SETTID) {
         int32_t tid32 = (int32_t) child_guest_pid;
@@ -2217,6 +2234,9 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
 fail_snapshot:
     if (child_pidfd >= 0)
         clone_pidfd_discard(child_pidfd);
+    if (ptid_stored_early)
+        (void) guest_write_small(g, ptid_gva, &ptid_before,
+                                 sizeof(ptid_before));
     proc_cancel_child(child_guest_pid);
     free(regions_snapshot);
     if (snapshot_shm_fd >= 0)

@@ -67,6 +67,7 @@ PLAIN_EXPECTS = {
     "child": "FM_X_CHILD",
     "child:ptid": "FM_X_CHILD_PTID",
     "child:noptid": "FM_X_CHILD_NOPTID",
+    "child:ownptid": "FM_X_CHILD_OWNPTID",
     "child:pidfd": "FM_X_CHILD_PIDFD",
     "arg0:cloexec": "FM_X_ARG0_CLOEXEC",
     "arg0:nocloexec": "FM_X_ARG0_NOCLOEXEC",

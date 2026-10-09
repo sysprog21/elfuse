@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/attr.h>
 #include <sys/mount.h>
 #include <pthread.h>
 
@@ -3528,16 +3529,16 @@ int64_t sys_symlinkat(guest_t *g,
  * Returns -1 when the file has no entry left that this can find. buf needs
  * LINUX_PATH_MAX bytes, and the caller closes the directory.
  *
- * macOS has no call that acts on a descriptor for the operations that take
- * AT_EMPTY_PATH, so they go through a name, and F_GETPATH is the only source of
- * one. Between reading that name and using it the guest can rename any part of
- * it. Used as a path, it would let a directory on the way be exchanged for a
- * symlink, which the host follows out of the tree the guest is held in, or for
- * another directory, which makes the call act on a file the descriptor does not
- * name. So the directory is opened with O_NOFOLLOW_ANY and held, the entry is
- * compared with the descriptor's file, and the caller acts on that one entry
- * without following it. What a rename can still do after the comparison is put
- * another entry of the same directory under the name.
+ * macOS has no call that links a descriptor, so linkat with AT_EMPTY_PATH goes
+ * through a name, and F_GETPATH is the only source of one. Between reading that
+ * name and using it the guest can rename any part of it. Used as a path, it
+ * would let a directory on the way be exchanged for a symlink, which the host
+ * follows out of the tree the guest is held in, or for another directory, which
+ * makes the call act on a file the descriptor does not name. So the directory
+ * is opened with O_NOFOLLOW_ANY and held, the entry is compared with the
+ * descriptor's file, and the caller acts on that one entry without following
+ * it. What a rename can still do after the comparison is put another entry of
+ * the same directory under the name.
  */
 static int host_fd_live_entry(int host_fd,
                               const struct stat *fd_st,
@@ -3753,8 +3754,8 @@ static int64_t access_cwd(int mode, int flags)
     return 0;
 }
 
-/* access() by mode bits, for a host file with no name left to ask the host
- * about. The host answers for a named file by the credentials elfuse runs with,
+/* access() by mode bits, for a descriptor the host gives no answer about; see
+ * host_fd_user_access. The host answers by the credentials elfuse runs with,
  * whatever ids the guest reports, so those are the ones used here.
  * path_check_intercept_access judges by the guest's ids, which is right only
  * for a synthetic file, whose owner is reported as the guest.
@@ -3795,12 +3796,34 @@ static bool host_access_by_mode(const struct stat *st, int mode, int flags)
     return (mode & granted) == mode;
 }
 
+/* What the host grants this process on a descriptor's file, as R_OK | W_OK |
+ * X_OK bits, or -1 when the host has no answer (a pipe or a socket carries no
+ * such attribute).
+ *
+ * ATTR_CMN_USERACCESS is the host's own judgement of the open file: mode bits
+ * and ACL entries both, by the ids the process runs with. No name is involved,
+ * so the answer holds for a file that has been unlinked and a rename cannot
+ * send it to another file.
+ */
+static int host_fd_user_access(int host_fd)
+{
+    struct attrlist attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attrs.commonattr = ATTR_CMN_USERACCESS;
+
+    struct {
+        uint32_t length;
+        uint32_t access;
+    } __attribute__((packed)) reply;
+    if (fgetattrlist(host_fd, &attrs, &reply, sizeof(reply), 0) < 0)
+        return -1;
+    return (int) (reply.access & (R_OK | W_OK | X_OK));
+}
+
 /* access() on the file a descriptor already names: faccessat2 with
- * AT_EMPTY_PATH and an empty path. macOS has no call that takes a descriptor,
- * so the question is put to the host through the path the descriptor was opened
- * by, which is the answer the same guest would get by name. A file that was
- * renamed over or unlinked is judged by its mode bits instead. The name is used
- * the way host_fd_live_entry describes, and never followed.
+ * AT_EMPTY_PATH and an empty path. The host is asked about the descriptor
+ * itself. Where it has no answer the mode bits decide.
  */
 static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
 {
@@ -3817,24 +3840,19 @@ static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
         return ref_err;
 
     int64_t rc = 0;
-    char host_path[LINUX_PATH_MAX];
-    const char *leaf;
     struct stat fd_st;
     if (mode == F_OK) {
         /* The descriptor is open, so the file exists. */
-    } else if (fstat(ref.fd, &fd_st) < 0) {
-        rc = linux_errno();
     } else {
-        int entry_dir = host_fd_live_entry(ref.fd, &fd_st, host_path, &leaf);
-        if (entry_dir < 0) {
-            if (!host_access_by_mode(&fd_st, mode, flags))
+        int granted = host_fd_user_access(ref.fd);
+        if (granted >= 0) {
+            if ((mode & granted) != mode)
                 rc = -LINUX_EACCES;
-        } else if (faccessat(entry_dir, leaf, mode,
-                             translate_faccessat_flags(flags) |
-                                 AT_SYMLINK_NOFOLLOW) < 0) {
+        } else if (fstat(ref.fd, &fd_st) < 0) {
             rc = linux_errno();
+        } else if (!host_access_by_mode(&fd_st, mode, flags)) {
+            rc = -LINUX_EACCES;
         }
-        close_keep_errno(entry_dir);
     }
     host_fd_ref_close(&ref);
     return rc;

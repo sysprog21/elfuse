@@ -3713,6 +3713,48 @@ static int64_t access_cwd(int mode, int flags)
     return 0;
 }
 
+/* access() by mode bits, for a host file with no name left to ask the host
+ * about. The host answers for a named file by the credentials elfuse runs with,
+ * whatever ids the guest reports, so those are the ones used here.
+ * path_check_intercept_access judges by the guest's ids, which is right only
+ * for a synthetic file, whose owner is reported as the guest.
+ */
+static bool host_access_by_mode(const struct stat *st, int mode, int flags)
+{
+    bool effective = (flags & LINUX_AT_EACCESS) != 0;
+    uid_t uid = effective ? geteuid() : getuid();
+    gid_t gid = effective ? getegid() : getgid();
+
+    int granted = 0;
+    if (uid == 0) {
+        /* As generic_permission() has it for root: read and write always,
+         * execute when any execute bit is set.
+         */
+        granted = R_OK | W_OK;
+        if (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+            granted |= X_OK;
+    } else {
+        gid_t groups[NGROUPS_MAX];
+        int ngroups = getgroups(NGROUPS_MAX, groups);
+        bool in_group = gid == st->st_gid;
+        for (int i = 0; i < ngroups && !in_group; i++)
+            in_group = groups[i] == st->st_gid;
+
+        mode_t bits = st->st_mode;
+        if (uid == st->st_uid)
+            bits >>= 6;
+        else if (in_group)
+            bits >>= 3;
+        if (bits & 4)
+            granted |= R_OK;
+        if (bits & 2)
+            granted |= W_OK;
+        if (bits & 1)
+            granted |= X_OK;
+    }
+    return (mode & granted) == mode;
+}
+
 /* access() on the file a descriptor already names: faccessat2 with
  * AT_EMPTY_PATH and an empty path. macOS has no call that takes a descriptor,
  * so the question is put to the host through the path the descriptor was opened
@@ -3744,8 +3786,8 @@ static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
         if (faccessat(AT_FDCWD, host_path, mode,
                       translate_faccessat_flags(flags)) < 0)
             rc = linux_errno();
-    } else if (path_check_intercept_access(&fd_st, mode, flags) < 0) {
-        rc = linux_errno();
+    } else if (!host_access_by_mode(&fd_st, mode, flags)) {
+        rc = -LINUX_EACCES;
     }
     host_fd_ref_close(&ref);
     return rc;

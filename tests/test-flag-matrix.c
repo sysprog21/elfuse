@@ -69,7 +69,13 @@ enum fm_path {
     FM_P_NEW,
     FM_P_EMPTY
 };
-enum fm_fd { FM_FD_FILE, FM_FD_DIR, FM_FD_LISTENER, FM_FD_SEALED };
+enum fm_fd {
+    FM_FD_FILE,
+    FM_FD_DIR,
+    FM_FD_LISTENER,
+    FM_FD_SEALED,
+    FM_FD_UNLINKED
+};
 
 enum fm_expect_kind {
     FM_X_OK,
@@ -325,7 +331,12 @@ static long open_fixture_fd(long which)
         return open_listener();
     if (which == FM_FD_SEALED)
         return memfd_create("sealed", MFD_NOEXEC_SEAL);
-    return open("file", O_RDWR);
+    int fd = open("file", O_RDWR);
+    if (which == FM_FD_UNLINKED && fd >= 0 && unlink("file") < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 /* Read back one answer. rc is the raw syscall return. On a mismatch the reason

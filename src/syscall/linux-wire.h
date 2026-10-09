@@ -544,6 +544,14 @@ typedef struct {
 /* memfd_create flags (MFD_*). */
 #define LINUX_MFD_CLOEXEC 0x0001U
 #define LINUX_MFD_ALLOW_SEALING 0x0002U
+#define LINUX_MFD_HUGETLB 0x0004U
+#define LINUX_MFD_NOEXEC_SEAL 0x0008U
+#define LINUX_MFD_EXEC 0x0010U
+
+/* The huge page size rides in the top bits and means something only beside
+ * MFD_HUGETLB.
+ */
+#define LINUX_MFD_HUGE_MASK (0x3fU << 26)
 
 /* fcntl sealing commands */
 #define LINUX_F_ADD_SEALS 1033

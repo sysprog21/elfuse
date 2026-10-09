@@ -135,12 +135,12 @@ eventfd2 | 0x4@unknown | 0 F | err:EINVAL | fd
 
 # epoll_create1(flags)
 epoll_create1 | EPOLL_CLOEXEC | F | fd:cloexec | fd:nocloexec
-pending epoll_create1 | 0x1@unknown | F | err:EINVAL | fd
+epoll_create1 | 0x1@unknown | F | err:EINVAL | fd
 
 # inotify_init1(flags)
 inotify_init1 | IN_CLOEXEC | F | fd:cloexec | fd:nocloexec
 inotify_init1 | IN_NONBLOCK | F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
-pending inotify_init1 | 0x1@unknown | F | err:EINVAL | fd
+inotify_init1 | 0x1@unknown | F | err:EINVAL | fd
 
 # timerfd_create(clockid, flags)
 timerfd_create | TFD_CLOEXEC | CLOCK_MONOTONIC F | fd:cloexec | fd:nocloexec
@@ -154,7 +154,9 @@ signalfd4 | 0x1@unknown | -1 buf 8 F | err:EINVAL | fd
 
 # memfd_create(name, flags)
 memfd_create | MFD_CLOEXEC | p:file F | fd:cloexec | fd:nocloexec
-pending memfd_create | 0x8000@unknown | p:file F | err:EINVAL | fd
+memfd_create | 0x8000@unknown | p:file F | err:EINVAL | fd
+# MFD_NOEXEC_SEAL and MFD_EXEC contradict each other.
+memfd_create | 0x10@exec-and-noexec | p:file F|0x8 | err:EINVAL | fd
 
 # socket(domain, type, protocol): the flags share the type argument.
 socket | SOCK_CLOEXEC | AF_UNIX F|SOCK_STREAM 0 | fd:cloexec | fd:nocloexec
@@ -167,4 +169,4 @@ socketpair | SOCK_NONBLOCK | AF_UNIX F|SOCK_STREAM 0 pair | fd:getfl:O_NONBLOCK 
 # accept4(sockfd, addr, addrlen, flags)
 accept4 | SOCK_CLOEXEC | fd:listener 0 0 F | fd:cloexec | fd:nocloexec
 accept4 | SOCK_NONBLOCK | fd:listener 0 0 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
-pending accept4 | 0x1@unknown | fd:listener 0 0 F | err:EINVAL | fd
+accept4 | 0x1@unknown | fd:listener 0 0 F | err:EINVAL | fd

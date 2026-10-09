@@ -94,9 +94,6 @@ What they do:
     entry without a direct or aliased test reference fails the build
     The same script requires the syscalls it lists as flag-taking to keep
     their rows in `tests/flag-matrix.tbl`
-  - `scripts/gen-flag-matrix.py --check` so the generated rows of
-    `test-flag-matrix` match that table, and so a row naming a syscall
-    `dispatch.tbl` no longer serves fails the build
   - `scripts/check-eintr-contract.py` so a new interruptible wait fails
     the build until it states whether it may be restarted (`forbids`,
     `restartable`, or `not-a-wait`), with the `forbids` claims checked
@@ -121,6 +118,9 @@ What they do:
     asks make for the target list, which is the point: a `VERIFY_<T>_SRC`
     block written below the `:=` that builds `VERIFY_TARGETS` parses fine
     and generates no rule
+  - `scripts/gen-flag-matrix.py --check` so the generated rows of
+    `test-flag-matrix` match `tests/flag-matrix.tbl`, and so a row naming a
+    syscall `dispatch.tbl` no longer serves fails the build
   - the two harness self-tests, `test-config` (that `tests/test-config.sh`
     keeps its CLI mode separate from its sourced mode) and `test-runner`
     (the shared shell runner's output matching and exit-status checks), so

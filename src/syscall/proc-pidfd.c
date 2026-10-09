@@ -147,7 +147,25 @@ static void *pidfd_monitor_thread(void *arg)
     return NULL;
 }
 
+static int pidfd_create_entry(guest_t *g,
+                              int64_t target_pid,
+                              pid_t host_pid,
+                              uint64_t *gen_out);
+
 int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
+{
+    return pidfd_create_entry(g, target_pid, host_pid, NULL);
+}
+
+int pidfd_create_unbound(guest_t *g, uint64_t *gen)
+{
+    return pidfd_create_entry(g, 0, -1, gen);
+}
+
+static int pidfd_create_entry(guest_t *g,
+                              int64_t target_pid,
+                              pid_t host_pid,
+                              uint64_t *gen_out)
 {
     (void) g;
     int pfd[2];
@@ -189,6 +207,8 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     entry->gen = ++pidfd_next_gen;
     uint64_t gen = entry->gen;
     pthread_mutex_unlock(&pidfd_lock);
+    if (gen_out)
+        *gen_out = gen;
 
     /* host_pid <= 0 means the target lives inside this host process -- the
      * caller itself, or a CLONE_VM child, which holds a guest tid but no host
@@ -235,12 +255,15 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     return gfd;
 }
 
-void pidfd_set_target(int guest_fd, int64_t target_pid)
+void pidfd_set_target(uint64_t gen, int64_t target_pid)
 {
     pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_guest_fd_entry(guest_fd);
-    if (entry)
-        entry->guest_pid = target_pid;
+    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
+        if (pidfd_table[i].active && pidfd_table[i].gen == gen) {
+            pidfd_table[i].guest_pid = target_pid;
+            break;
+        }
+    }
     pthread_mutex_unlock(&pidfd_lock);
 }
 

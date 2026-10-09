@@ -1511,22 +1511,19 @@ static void clone_pidfd_discard(int pfd)
         fd_cleanup_entry(pfd, &snap);
 }
 
-/* CLONE_PIDFD: make a pidfd for target and store its guest fd number at gva,
- * which is parent_tid for clone and a field of its own for clone3.
+/* CLONE_PIDFD: store the guest fd number of a pidfd just made at gva, which is
+ * parent_tid for clone and a field of its own for clone3. pfd is what the call
+ * that made the pidfd returned.
  *
  * Returns the guest fd, or a negative Linux errno with nothing left behind.
  *
- * Linux does both inside copy_process, before the child can run, and fails the
- * clone when the descriptor table is full (EMFILE) or the slot cannot be
- * written (EFAULT). The callers run this where the child can still be called
- * off for the same reason.
+ * Linux makes and stores the pidfd inside copy_process, before the child can
+ * run, and fails the clone when the descriptor table is full (EMFILE) or the
+ * slot cannot be written (EFAULT). The callers run this where the child can
+ * still be called off for the same reason.
  */
-static int64_t clone_pidfd_publish(guest_t *g,
-                                   int64_t target,
-                                   pid_t host_pid,
-                                   uint64_t gva)
+static int64_t clone_pidfd_store(guest_t *g, int pfd, uint64_t gva)
 {
-    int pfd = pidfd_create(g, target, host_pid);
     if (pfd < 0)
         return pfd;
 
@@ -1621,8 +1618,10 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
     bool is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
     if (is_thread || ((flags & LINUX_CLONE_VM) && !is_vfork)) {
         int64_t pfd = -1;
+        uint64_t pfd_gen = 0;
         if (pidfd_gva) {
-            pfd = clone_pidfd_publish(g, 0, -1, *pidfd_gva);
+            pfd = clone_pidfd_store(g, pidfd_create_unbound(g, &pfd_gen),
+                                    *pidfd_gva);
             if (pfd < 0)
                 return pfd;
         }
@@ -1644,7 +1643,7 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
                                stack_map_end, ptid_gva, tls, ctid_gva, verbose);
         if (pfd >= 0) {
             if (ret > 0)
-                pidfd_set_target((int) pfd, ret);
+                pidfd_set_target(pfd_gen, ret);
             else
                 clone_pidfd_discard((int) pfd);
         }
@@ -2126,8 +2125,8 @@ static int64_t clone_dispatch(hv_vcpu_t vcpu,
      * so a failure unwinds a child that never ran.
      */
     if (pidfd_gva) {
-        int64_t prc =
-            clone_pidfd_publish(g, child_guest_pid, child_host_pid, *pidfd_gva);
+        int64_t prc = clone_pidfd_store(
+            g, pidfd_create(g, child_guest_pid, child_host_pid), *pidfd_gva);
         if (prc < 0) {
             fail_rc = prc;
             goto fail_snapshot;

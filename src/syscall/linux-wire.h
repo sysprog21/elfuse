@@ -321,6 +321,11 @@ typedef struct {
 #define LINUX_PROT_READ 0x1
 #define LINUX_PROT_WRITE 0x2
 #define LINUX_PROT_EXEC 0x4
+#define LINUX_PROT_SEM 0x8
+#define LINUX_PROT_BTI 0x10 /* arm64 */
+#define LINUX_PROT_MTE 0x20 /* arm64 */
+#define LINUX_PROT_GROWSDOWN 0x01000000
+#define LINUX_PROT_GROWSUP 0x02000000
 
 #define LINUX_MAP_SHARED 0x01
 #define LINUX_MAP_PRIVATE 0x02

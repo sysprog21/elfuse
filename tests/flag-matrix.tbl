@@ -25,6 +25,8 @@
 #   pair             an int[2] the call fills with two fds; an fd answer is
 #                    then asked of both
 #   region           the address of a fresh anonymous read-write mapping
+#   stackpage        a 64 KiB span of the caller's own stack, below every
+#                    frame in use
 #   F  F|EXPR        the flags slot; EXPR is ORed in for both runs
 #   anything else    a C integer expression
 #
@@ -67,6 +69,8 @@
 #                      the same loads and stores, on the region
 #   pair:packets pair:stream         one read after two writes returns the
 #                                    first write alone, or both
+#   stack:lowreadonly stack:lowwritable
+#                      a store into the stack beneath stackpage faults, or works
 #   =                  (last field only) the same answer as with the flag
 #
 # A row that starts with "unsupported:ANSWER" is a flag elfuse declines on
@@ -264,3 +268,13 @@ mmap | MAP_STACK | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 # mprotect(addr, length, prot)
 mprotect | PROT_READ | region 4096 F | region:readonly | region:noread
 mprotect | PROT_WRITE | region 4096 F|PROT_READ | region:writable | region:readonly
+mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+# On the stack the bit extends the change down to the mapping's low end.
+mprotect | PROT_GROWSDOWN@stack | stackpage 65536 F|PROT_READ | stack:lowreadonly | stack:lowwritable
+mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+# arm64 admits PROT_BTI and PROT_MTE only on a CPU with the feature. The qemu
+# guest is shown BTI where the host has it, and elfuse's guest is shown neither
+# (ID_AA64PFR1_EL1 reads 0), so elfuse answers as a kernel on a CPU without BTI.
+unsupported:err:EINVAL mprotect | 0x10@prot-bti | region 4096 F|PROT_READ | region:readonly | =
+mprotect | 0x20@prot-mte | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly

@@ -61,6 +61,8 @@ PLAIN_EXPECTS = {
     "bufx:lnk": "FM_X_STATX_LNK",
     "pair:packets": "FM_X_PAIR_PACKETS",
     "pair:stream": "FM_X_PAIR_STREAM",
+    "stack:lowreadonly": "FM_X_STACK_LOW_READONLY",
+    "stack:lowwritable": "FM_X_STACK_LOW_WRITABLE",
     "arg0:cloexec": "FM_X_ARG0_CLOEXEC",
     "arg0:nocloexec": "FM_X_ARG0_NOCLOEXEC",
     "map": "FM_X_MAP",
@@ -130,6 +132,8 @@ def parse_arg(where: str, token: str) -> tuple[str, bool]:
         return "{FM_A_PAIR, 0}", False
     if token == "region":
         return "{FM_A_REGION, 0}", False
+    if token == "stackpage":
+        return "{FM_A_STACK, 0}", False
     if token.startswith("p:"):
         return f"{{FM_A_PATH, {path_token(where, token[2:])}}}", False
     if token.startswith("fd:"):

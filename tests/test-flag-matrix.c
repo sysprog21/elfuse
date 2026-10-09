@@ -56,6 +56,7 @@ enum fm_arg_kind {
     FM_A_BUF,
     FM_A_PAIR,
     FM_A_REGION,
+    FM_A_STACK,
     FM_A_FLAGS,
 };
 enum fm_path {
@@ -110,6 +111,8 @@ enum fm_expect_kind {
     FM_X_REGION_NOREAD,
     FM_X_PAIR_PACKETS,
     FM_X_PAIR_STREAM,
+    FM_X_STACK_LOW_READONLY,
+    FM_X_STACK_LOW_WRITABLE,
 };
 
 struct fm_arg {
@@ -185,6 +188,25 @@ static int can_write(volatile char *p)
     *p = 'Z';
     fm_probe_armed = 0;
     return 1;
+}
+
+/* A 64 KiB-aligned span of this thread's own stack that nothing is using: far
+ * enough below the live frames that a row may take write permission away from
+ * it and from everything beneath it, and with touched pages beneath it so that
+ * those belong to the stack mapping already. The signal frame of a probe that
+ * faults lands just under the live frames, well above the span.
+ */
+#define FM_STACK_DEPTH (256 * 1024)
+#define FM_STACK_SPAN 65536
+static char *fm_stack_page;
+
+static void __attribute__((noinline)) stack_prepare(void)
+{
+    volatile char deep[FM_STACK_DEPTH];
+    for (size_t off = 0; off < sizeof(deep); off += 4096)
+        deep[off] = 0;
+    fm_stack_page =
+        (char *) (((unsigned long) deep + 2 * FM_STACK_SPAN) & ~0xffffUL);
 }
 
 /* A raw mmap return is an address unless it is one of the top 4095 values. */
@@ -515,6 +537,16 @@ static int answer_matches(const struct fm_expect *x, long rc)
             return WHY("one read returned %zd bytes", n), 0;
         return 1;
     }
+    case FM_X_STACK_LOW_READONLY:
+    case FM_X_STACK_LOW_WRITABLE:
+        if (rc < 0)
+            return WHY("rc=%ld, want >= 0", rc), 0;
+        if (can_write(fm_stack_page - FM_STACK_SPAN) !=
+            (x->kind == FM_X_STACK_LOW_WRITABLE))
+            return WHY("the stack below the range is %swritable",
+                       x->kind == FM_X_STACK_LOW_WRITABLE ? "not " : ""),
+                   0;
+        return 1;
     case FM_X_STATX_REG:
     case FM_X_STATX_LNK: {
         struct statx sx;
@@ -552,7 +584,7 @@ static int run_one(const struct fm_row *row, int with, int strict)
         x = &row->elfuse_with;
     long a[FM_MAX_ARGS] = {0};
     long opened[FM_MAX_ARGS];
-    int nopened = 0, matched = 0, pair = 0;
+    int nopened = 0, matched = 0, pair = 0, used_stack = 0;
 
     snprintf(label, sizeof(label), "%s %s %s", row->sys, row->flag,
              with ? "set" : "clear");
@@ -567,6 +599,7 @@ static int run_one(const struct fm_row *row, int with, int strict)
         exit(2);
     }
     memset(fm_buf, 0, sizeof(fm_buf));
+    stack_prepare();
     fm_region = mmap(NULL, FM_REGION_SIZE, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (fm_region == MAP_FAILED) {
@@ -604,6 +637,10 @@ static int run_one(const struct fm_row *row, int with, int strict)
             break;
         case FM_A_REGION:
             a[i] = (long) fm_region;
+            break;
+        case FM_A_STACK:
+            a[i] = (long) fm_stack_page;
+            used_stack = 1;
             break;
         case FM_A_FLAGS:
             a[i] = arg->val | (with ? row->bits : 0);
@@ -643,6 +680,16 @@ static int run_one(const struct fm_row *row, int with, int strict)
 
     if (x->kind >= FM_X_MAP && x->kind <= FM_X_MAP_KEEPS_FILE && is_mapping(rc))
         munmap((void *) rc, 4096);
+
+    /* Give the stack back whatever the row did to it, with the grow bit so that
+     * everything beneath the span comes back too, and without it in case the
+     * bit was refused.
+     */
+    if (used_stack) {
+        mprotect(fm_stack_page, FM_STACK_SPAN,
+                 PROT_READ | PROT_WRITE | PROT_GROWSDOWN);
+        mprotect(fm_stack_page, FM_STACK_SPAN, PROT_READ | PROT_WRITE);
+    }
 
 out:
     munmap(fm_region, FM_REGION_SIZE);

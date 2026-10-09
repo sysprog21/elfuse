@@ -2870,6 +2870,14 @@ int64_t sys_mmap(guest_t *g,
                  int fd,
                  int64_t offset)
 {
+    /* A protection is its three access bits. Linux drops PROT_SEM when it turns
+     * prot into the mapping's flags (calc_vm_prot_bits) and ignores a bit it
+     * does not define, and BTI and MTE are not acted on here. A request with
+     * none of the three is PROT_NONE whatever else it carries; kept, the other
+     * bits made it fail every PROT_NONE test below and come out readable.
+     */
+    prot &= LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
     bool is_prot_none = (prot == LINUX_PROT_NONE);
@@ -2918,13 +2926,45 @@ int64_t sys_mmap(guest_t *g,
      * (CLONE_VM semantics).
      */
 
+    /* The arm64 mmap entry refuses an offset that is not page aligned before it
+     * looks at anything else, anonymous mappings included.
+     */
+    if (offset & 4095)
+        return -LINUX_EINVAL;
+
+    /* Linux looks the descriptor up before it judges the length or the flags,
+     * so a bad one is EBADF whatever else is wrong with the call.
+     */
+    if (!is_anon) {
+        fd_entry_t snap;
+        if (!fd_snapshot(fd, &snap))
+            return -LINUX_EBADF;
+
+        /* MAP_HUGETLB on a file asks for a hugetlbfs one, and Linux answers
+         * EINVAL for any other (ksys_mmap_pgoff). No file here is one: an
+         * MFD_HUGETLB memfd is backed by ordinary pages as well.
+         */
+        if (flags & LINUX_MAP_HUGETLB)
+            return -LINUX_EINVAL;
+    }
+
     /* Linux rejects zero-length mmap */
     if (length == 0)
         return -LINUX_EINVAL;
 
-    /* Linux requires page-aligned offset for file-backed mmap */
-    if (!is_anon && (offset & 4095))
+    /* The mapping type is MAP_SHARED, MAP_PRIVATE or, for a file only, the two
+     * together as MAP_SHARED_VALIDATE. Linux refuses anything else, and a
+     * mapping with neither used to be made here as a private one. Under
+     * MAP_SHARED_VALIDATE a flag the file cannot honor is EOPNOTSUPP rather
+     * than ignored, which is the whole point of asking for validation.
+     */
+    int map_type = flags & LINUX_MAP_TYPE;
+    if (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE &&
+        (map_type != LINUX_MAP_SHARED_VALIDATE || is_anon))
         return -LINUX_EINVAL;
+    if (map_type == LINUX_MAP_SHARED_VALIDATE &&
+        (flags & ~LINUX_MAP_VALIDATE_MASK))
+        return -LINUX_EOPNOTSUPP;
 
     if (!is_anon && fuse_fd_refuse_mmap(fd)) {
         bool allow_materialized_fuse_mmap =
@@ -3438,7 +3478,16 @@ int64_t sys_mmap(guest_t *g,
              *    so the memory syscall layer must re-create them with the
              *    correct permissions.
              */
-            guest_update_perms(g, result_off, result_off + length, ext_perms);
+            /* The block is extended read-write because it is shared with
+             * whatever else lands in it, but the range itself gets what was
+             * asked for. A PROT_READ mapping used to keep the block's write
+             * permission until some later mprotect, so a store into it
+             * succeeded where Linux raises SIGSEGV, and /proc/self/maps said
+             * r--p throughout.
+             */
+            int range_perms =
+                (prot & LINUX_PROT_WRITE) ? ext_perms : prot_to_perms(prot);
+            guest_update_perms(g, result_off, result_off + length, range_perms);
             if (ext_end > g->mmap_end)
                 g->mmap_end = ext_end;
         }
@@ -4591,9 +4640,11 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
 
 static bool mprotect_same_prot_fast_path_safe(int prot)
 {
-    /* Non-fixed main-arena mmap initially installs RW PTEs for PROT_READ
-     * mappings, relying on mprotect to tighten them later. Do not trust the
-     * region tracker alone for read-only same-prot requests.
+    /* Non-fixed main-arena mmap used to install RW PTEs for PROT_READ mappings
+     * and rely on mprotect to tighten them. sys_mmap now gives such a range
+     * read-only PTEs itself, but this stays conservative: a read-only same-prot
+     * request still does the PTE work rather than trusting the region tracker
+     * alone.
      */
     return prot == LINUX_PROT_NONE || (prot & LINUX_PROT_WRITE) ||
            (prot & LINUX_PROT_EXEC);
@@ -4601,10 +4652,46 @@ static bool mprotect_same_prot_fast_path_safe(int prot)
 
 int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
 {
+    /* The two grow bits are a request about the range, not a protection, and
+     * Linux takes them off before it looks at anything else. Left in, they were
+     * recorded as part of the region's protection.
+     */
+    const int grows = prot & (LINUX_PROT_GROWSDOWN | LINUX_PROT_GROWSUP);
+    prot &= ~grows;
+    if (grows == (LINUX_PROT_GROWSDOWN | LINUX_PROT_GROWSUP))
+        return -LINUX_EINVAL;
+
     if (addr & 4095)
         return -LINUX_EINVAL;
     if (length == 0)
         return 0;
+
+    /* PROT_SEM, BTI and MTE are accepted and not acted on. Only the access bits
+     * go further, so a request with none of them is PROT_NONE; see sys_mmap.
+     */
+    if (prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC |
+                 LINUX_PROT_SEM | LINUX_PROT_BTI | LINUX_PROT_MTE))
+        return -LINUX_EINVAL;
+    prot &= LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+
+    /* PROT_GROWSDOWN is only valid on a mapping that grows down, which here is
+     * the main stack; glibc uses it to make the stack executable and falls back
+     * to plain mprotect on EINVAL. No arm64 mapping grows up. On the stack the
+     * bit means "from the mapping's low end up to the end of this range", so
+     * the start moves down to the first page above the guard.
+     */
+    if (grows == LINUX_PROT_GROWSUP)
+        return -LINUX_EINVAL;
+    if (grows == LINUX_PROT_GROWSDOWN) {
+        uint64_t off = addr - g->ipa_base;
+        uint64_t low = g->stack_base + STACK_GUARD_SIZE;
+        if (addr < g->ipa_base || off < low || off >= g->stack_top)
+            return -LINUX_EINVAL;
+        if (length > UINT64_MAX - (off - low))
+            return -LINUX_EINVAL;
+        length += off - low;
+        addr = g->ipa_base + low;
+    }
     length = PAGE_ALIGN_UP(length);
     if (length == 0)
         return -LINUX_EINVAL;

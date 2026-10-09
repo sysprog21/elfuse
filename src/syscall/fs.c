@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/attr.h>
 #include <sys/mount.h>
 #include <pthread.h>
 
@@ -743,6 +744,14 @@ static int64_t read_translated_path(guest_t *g,
 {
     if (guest_read_str(g, path_gva, path, LINUX_PATH_MAX) < 0)
         return -LINUX_EFAULT;
+
+    /* Linux refuses an empty name while it copies it in, before it looks at
+     * dirfd. Left to the host, the answer depended on dirfd: ENOENT against a
+     * directory and ENOTDIR against anything else. A caller that takes
+     * AT_EMPTY_PATH has to act on it before coming here.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
     if (path_translate_at(dirfd, path, tx_flags, tx) < 0)
         return linux_errno();
     return 0;
@@ -852,6 +861,32 @@ int64_t sys_openat_path(guest_t *g,
     if ((linux_flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT)) ==
         (LINUX_O_DIRECTORY | LINUX_O_CREAT))
         return -LINUX_EINVAL;
+
+    /* O_TMPFILE is not provided, and what happens to it is the answer of a
+     * kernel that predates it: the bit is not acted on, O_DIRECTORY with a
+     * write mode stays, and opening the directory for writing is EISDIR.
+     * open(2) documents that errno for exactly this, and callers fall back to a
+     * named temporary file on it. Providing the open alone would be worse than
+     * providing nothing: macOS cannot link a file that has no name, so the
+     * linkat that publishes the file would fail with no fallback left.
+     *
+     * The two misuses Linux refuses while building the flags are refused the
+     * same way. Without the second, O_TMPFILE|O_RDONLY opened the directory
+     * itself and handed it back.
+     */
+    if (linux_flags & LINUX___O_TMPFILE) {
+        if (!(linux_flags & LINUX_O_DIRECTORY))
+            return -LINUX_EINVAL;
+        if ((linux_flags & LINUX_O_ACCMODE) == LINUX_O_RDONLY)
+            return -LINUX_EINVAL;
+    }
+
+    /* open has no AT_EMPTY_PATH, so an empty name is ENOENT whatever dirfd is;
+     * see read_translated_path. It comes after the flag checks above because
+     * Linux builds the open flags before it copies the name in.
+     */
+    if (pathp[0] == '\0')
+        return -LINUX_ENOENT;
 
     path_translation_t tx;
     unsigned int tx_flags =
@@ -2063,9 +2098,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         }
         int new_seals = (int) arg;
         /* Only allow valid seal bits */
-        if (new_seals &
-            ~(LINUX_F_SEAL_SEAL | LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW |
-              LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE)) {
+        if (new_seals & ~(LINUX_F_SEAL_SEAL | LINUX_F_SEAL_SHRINK |
+                          LINUX_F_SEAL_GROW | LINUX_F_SEAL_WRITE |
+                          LINUX_F_SEAL_FUTURE_WRITE | LINUX_F_SEAL_EXEC)) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
@@ -2910,7 +2945,14 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
      */
     int shadow = linux_flags & (LINUX_O_CLOEXEC | LINUX_O_NONBLOCK);
     fd_publish_linux_flags(guest_fds[0], shadow);
-    fd_publish_linux_flags(guest_fds[1], shadow);
+
+    /* Linux keeps O_DIRECT on the write end only, since packet mode is decided
+     * by the writer. F_SETFL already records the bit for a pipe, so a pipe made
+     * with it reads back the same way. Neither path gives the pipe packet
+     * semantics: the host has none.
+     */
+    fd_publish_linux_flags(guest_fds[1],
+                           shadow | (linux_flags & LINUX_O_DIRECT));
 
     /* fd_alloc owns O_NONBLOCK on a pipe, so the guest's request is recorded
      * above and the host fds are already nonblocking. If ownership was refused
@@ -3006,6 +3048,45 @@ int64_t sys_readlinkat(guest_t *g,
     return (int64_t) copy_len;
 }
 
+/* Whether Linux refuses to remove this entry before it looks at what kind of
+ * entry it is. may_delete() answers EPERM for an immutable or append-only
+ * victim, for an immutable or append-only parent, and for a sticky parent when
+ * the caller owns neither it nor the victim; only after those does unlink of a
+ * directory become EISDIR. The host enforces all three against its own
+ * credentials, so those are the ones compared.
+ */
+static bool unlink_refused_before_type(host_fd_t dirfd,
+                                       const char *host_path,
+                                       const struct stat *victim)
+{
+    const uint32_t locked = UF_IMMUTABLE | SF_IMMUTABLE | UF_APPEND | SF_APPEND;
+    if (victim->st_flags & locked)
+        return true;
+
+    char parent[LINUX_PATH_MAX];
+    str_copy_trunc(parent, host_path, sizeof(parent));
+    size_t len = strlen(parent);
+    while (len > 1 && parent[len - 1] == '/')
+        parent[--len] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash)
+        str_copy_trunc(parent, ".", sizeof(parent));
+    else if (slash == parent)
+        parent[1] = '\0';
+    else
+        *slash = '\0';
+
+    struct stat dir_st;
+    if (fstatat(dirfd, parent, &dir_st, 0) < 0)
+        return false;
+    if (dir_st.st_flags & locked)
+        return true;
+
+    uid_t euid = geteuid();
+    return (dir_st.st_mode & S_ISVTX) && euid != 0 && euid != victim->st_uid &&
+           euid != dir_st.st_uid;
+}
+
 int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
 {
     char path[LINUX_PATH_MAX];
@@ -3035,15 +3116,29 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
     host_fd_t unlink_dirfd = path_translation_dirfd(&tx, &dir_ref);
 
     struct stat removed_st;
+    bool removed_known = fstatat(unlink_dirfd, tx.host_path, &removed_st,
+                                 AT_SYMLINK_NOFOLLOW) == 0;
     bool clear_removed_overlay =
-        fstatat(unlink_dirfd, tx.host_path, &removed_st, AT_SYMLINK_NOFOLLOW) ==
-            0 &&
+        removed_known &&
         (removed_st.st_nlink <= 1 || (flags & LINUX_AT_REMOVEDIR));
+    bool removed_is_dir = removed_known && S_ISDIR(removed_st.st_mode);
 
     int host_flags = translate_at_flags(flags);
     if (unlinkat(unlink_dirfd, tx.host_path, host_flags) < 0) {
+        int64_t err = linux_errno();
+
+        /* unlink of a directory is EISDIR on Linux and EPERM on macOS. The
+         * rewrite is keyed on the host's EPERM so that every other refusal
+         * keeps its own errno, and it stands aside for the refusals Linux also
+         * reports as EPERM, which it decides before the entry's type.
+         */
+        if (err == -LINUX_EPERM && !(flags & LINUX_AT_REMOVEDIR) &&
+            removed_is_dir &&
+            !unlink_refused_before_type(unlink_dirfd, tx.host_path,
+                                        &removed_st))
+            err = -LINUX_EISDIR;
         host_fd_ref_close(&dir_ref);
-        return linux_errno();
+        return err;
     }
 
     if (clear_removed_overlay)
@@ -3113,6 +3208,12 @@ int64_t sys_renameat2(guest_t *g,
         ((flags & LINUX_RENAME_NOREPLACE) && (flags & LINUX_RENAME_EXCHANGE))) {
         return -LINUX_EINVAL;
     }
+
+    /* An empty name on either side is ENOENT whatever its dirfd is; see
+     * read_translated_path.
+     */
+    if (oldpath[0] == '\0' || newpath[0] == '\0')
+        return -LINUX_ENOENT;
 
     if (path_translate_at(olddirfd, oldpath, PATH_TR_NOFOLLOW, &old_tx) < 0 ||
         path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
@@ -3423,6 +3524,158 @@ int64_t sys_symlinkat(guest_t *g,
     return 0;
 }
 
+/* A host linkat of (old_dirfd, old_path) without AT_SYMLINK_FOLLOW has failed,
+ * with its errno still set.
+ *
+ * Returns 0 once new_path exists, or a negative Linux errno.
+ *
+ * Darwin's linkat(2) man page: without AT_SYMLINK_FOLLOW, hard-linking a
+ * symlink itself (rather than its target) "may result in some file systems
+ * returning an error" -- reproduced as ENOTSUP on Case-sensitive HFS+ (EPERM
+ * has also been reported on other filesystems/macOS versions for the same
+ * condition), unlike APFS which allows it. Linux allows it unconditionally, so
+ * recreate the same effect with a plain symlink to the same target: a new
+ * directory entry that resolves identically, even though it is a distinct inode
+ * rather than a second link to the original.
+ */
+static int64_t linkat_symlink_fallback(host_fd_t old_dirfd,
+                                       const char *old_path,
+                                       host_fd_t new_dirfd,
+                                       const char *new_path)
+{
+    if (errno != EPERM && errno != ENOTSUP && errno != EINVAL)
+        return linux_errno();
+
+    struct stat old_st;
+    if (fstatat(old_dirfd, old_path, &old_st, AT_SYMLINK_NOFOLLOW) < 0 ||
+        !S_ISLNK(old_st.st_mode))
+        return -LINUX_EPERM;
+
+    char target[LINUX_PATH_MAX];
+    ssize_t target_len =
+        readlinkat(old_dirfd, old_path, target, sizeof(target) - 1);
+    if (target_len < 0)
+        return -LINUX_EPERM;
+    target[target_len] = '\0';
+
+    if (symlinkat(target, new_dirfd, new_path) < 0)
+        return linux_errno();
+    return 0;
+}
+
+/* The directory entry that names a descriptor's file: the directory, opened and
+ * returned, and the entry's name in it through *leaf, which points into buf.
+ * Returns -1 when the file has no entry left that this can find. buf needs
+ * LINUX_PATH_MAX bytes, and the caller closes the directory.
+ *
+ * macOS has no call that links a descriptor, so linkat with AT_EMPTY_PATH goes
+ * through a name, and F_GETPATH is the only source of one. Between reading that
+ * name and using it the guest can rename any part of it. Used as a path, it
+ * would let a directory on the way be exchanged for a symlink, which the host
+ * follows out of the tree the guest is held in, or for another directory, which
+ * makes the call act on a file the descriptor does not name. So the directory
+ * is opened with O_NOFOLLOW_ANY and held, the entry is compared with the
+ * descriptor's file, and the caller acts on that one entry without following
+ * it. What a rename can still do after the comparison is put another entry of
+ * the same directory under the name.
+ */
+static int host_fd_live_entry(int host_fd,
+                              const struct stat *fd_st,
+                              char *buf,
+                              const char **leaf)
+{
+    if (fcntl(host_fd, F_GETPATH, buf) < 0)
+        return -1;
+    char *slash = strrchr(buf, '/');
+    if (!slash || slash[1] == '\0')
+        return -1;
+    *leaf = slash + 1;
+
+    /* The entry's directory is everything before the last slash, or "/". */
+    int dir_fd;
+    if (slash == buf) {
+        dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } else {
+        *slash = '\0';
+        dir_fd = open(buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY);
+    }
+    if (dir_fd < 0)
+        return -1;
+
+    struct stat entry_st;
+    if (fstatat(dir_fd, *leaf, &entry_st, AT_SYMLINK_NOFOLLOW) < 0 ||
+        entry_st.st_dev != fd_st->st_dev || entry_st.st_ino != fd_st->st_ino) {
+        close(dir_fd);
+        return -1;
+    }
+    return dir_fd;
+}
+
+/* linkat with AT_EMPTY_PATH and an empty old path: give the file olddirfd names
+ * a second name. A file with no name left is ENOENT, which is also what Linux
+ * answers for a descriptor whose link count has reached zero.
+ */
+static int64_t linkat_empty_path(int olddirfd,
+                                 int newdirfd,
+                                 const char *newpath)
+{
+    /* AT_FDCWD names the current directory, and a directory cannot be
+     * hard-linked.
+     */
+    if (olddirfd == LINUX_AT_FDCWD)
+        return -LINUX_EPERM;
+
+    fd_entry_t snap;
+    if (!fd_snapshot(olddirfd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+        snap.type == FD_FUSE_DIR)
+        return -LINUX_ENOSYS;
+
+    path_translation_t new_tx;
+    if (path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
+                          &new_tx) < 0)
+        return linux_errno();
+    if (new_tx.fuse_path)
+        return -LINUX_ENOSYS;
+
+    host_fd_ref_t old_ref, newdir_ref;
+    int64_t ref_err = host_dirfd_ref_open(olddirfd, &old_ref);
+    if (ref_err < 0)
+        return ref_err;
+    ref_err = host_dirfd_ref_open(newdirfd, &newdir_ref);
+    if (ref_err < 0) {
+        host_fd_ref_close(&old_ref);
+        return ref_err;
+    }
+
+    int64_t rc = 0;
+    char host_path[LINUX_PATH_MAX];
+    const char *leaf;
+    struct stat fd_st;
+    if (fstat(old_ref.fd, &fd_st) < 0) {
+        rc = linux_errno();
+    } else if (S_ISDIR(fd_st.st_mode)) {
+        rc = -LINUX_EPERM;
+    } else {
+        int entry_dir =
+            host_fd_live_entry(old_ref.fd, &fd_st, host_path, &leaf);
+        if (entry_dir < 0)
+            rc = -LINUX_ENOENT;
+        else if (linkat(entry_dir, leaf,
+                        path_translation_dirfd(&new_tx, &newdir_ref),
+                        new_tx.host_path, 0) < 0)
+            rc = linkat_symlink_fallback(
+                entry_dir, leaf, path_translation_dirfd(&new_tx, &newdir_ref),
+                new_tx.host_path);
+        close_keep_errno(entry_dir);
+    }
+
+    host_fd_ref_close(&old_ref);
+    host_fd_ref_close(&newdir_ref);
+    return rc;
+}
+
 int64_t sys_linkat(guest_t *g,
                    int olddirfd,
                    uint64_t oldpath_gva,
@@ -3436,8 +3689,21 @@ int64_t sys_linkat(guest_t *g,
         guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
         return -LINUX_EFAULT;
 
-    if (!validate_at_flags(flags, LINUX_AT_SYMLINK_FOLLOW))
+    if (!validate_at_flags(flags,
+                           LINUX_AT_SYMLINK_FOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
+
+    /* An empty name is ENOENT whatever its dirfd is; see read_translated_path.
+     * The old name alone may be empty, and only with AT_EMPTY_PATH, where it
+     * stands for olddirfd itself.
+     */
+    if (newpath[0] == '\0')
+        return -LINUX_ENOENT;
+    if (oldpath[0] == '\0') {
+        if (!(flags & LINUX_AT_EMPTY_PATH))
+            return -LINUX_ENOENT;
+        return linkat_empty_path(olddirfd, newdirfd, newpath);
+    }
 
     unsigned int old_flags =
         (flags & LINUX_AT_SYMLINK_FOLLOW) ? PATH_TR_NONE : PATH_TR_NOFOLLOW;
@@ -3464,49 +3730,142 @@ int64_t sys_linkat(guest_t *g,
      */
     if (old_tx.is_dev_shm)
         mac_flags &= ~AT_SYMLINK_FOLLOW;
+    int64_t rc = 0;
     if (linkat(old_host_dirfd, old_tx.host_path, new_host_dirfd,
                new_tx.host_path, mac_flags) < 0) {
-        /* Darwin's linkat(2) man page: without AT_SYMLINK_FOLLOW, hard-linking
-         * a symlink itself (rather than its target) "may result in some file
-         * systems returning an error" -- reproduced here as ENOTSUP on
-         * Case-sensitive HFS+ (EPERM has also been reported on other
-         * filesystems/macOS versions for the same condition), unlike APFS which
-         * allows it. Linux allows it unconditionally, so recreate the same
-         * effect with a plain symlink to the same target: a new directory entry
-         * that resolves identically, even though it is a distinct inode rather
-         * than a second link to the original.
-         */
-        if ((errno != EPERM && errno != ENOTSUP && errno != EINVAL) ||
-            (flags & LINUX_AT_SYMLINK_FOLLOW)) {
-            host_fd_ref_close(&olddir_ref);
-            host_fd_ref_close(&newdir_ref);
-            return linux_errno();
-        }
-
-        struct stat old_st;
-        char target[LINUX_PATH_MAX];
-        ssize_t target_len;
-        if (fstatat(old_host_dirfd, old_tx.host_path, &old_st,
-                    AT_SYMLINK_NOFOLLOW) < 0 ||
-            !S_ISLNK(old_st.st_mode) ||
-            (target_len = readlinkat(old_host_dirfd, old_tx.host_path, target,
-                                     sizeof(target) - 1)) < 0) {
-            host_fd_ref_close(&olddir_ref);
-            host_fd_ref_close(&newdir_ref);
-            return -LINUX_EPERM;
-        }
-        target[target_len] = '\0';
-
-        if (symlinkat(target, new_host_dirfd, new_tx.host_path) < 0) {
-            host_fd_ref_close(&olddir_ref);
-            host_fd_ref_close(&newdir_ref);
-            return linux_errno();
-        }
+        rc = (flags & LINUX_AT_SYMLINK_FOLLOW)
+                 ? linux_errno()
+                 : linkat_symlink_fallback(old_host_dirfd, old_tx.host_path,
+                                           new_host_dirfd, new_tx.host_path);
     }
 
     host_fd_ref_close(&olddir_ref);
     host_fd_ref_close(&newdir_ref);
+    return rc;
+}
+
+/* access() on the current directory. */
+static int64_t access_cwd(int mode, int flags)
+{
+    proc_cwd_view_t view;
+    if (proc_acquire_cwd_view(&view) == 0) {
+        if (view.path && view.path[0] == '/' &&
+            fuse_path_matches_mount(view.path)) {
+            char cwd_path[LINUX_PATH_MAX];
+            str_copy_trunc(cwd_path, view.path, sizeof(cwd_path));
+            proc_release_cwd_view(&view);
+            return fuse_access_path(cwd_path, mode, flags);
+        }
+        proc_release_cwd_view(&view);
+    }
+    int mac_flags = translate_faccessat_flags(flags);
+    if (faccessat(AT_FDCWD, ".", mode, mac_flags) < 0)
+        return linux_errno();
     return 0;
+}
+
+/* access() by mode bits, for a descriptor the host gives no answer about; see
+ * host_fd_user_access. The host answers by the credentials elfuse runs with,
+ * whatever ids the guest reports, so those are the ones used here.
+ * path_check_intercept_access judges by the guest's ids, which is right only
+ * for a synthetic file, whose owner is reported as the guest.
+ */
+static bool host_access_by_mode(const struct stat *st, int mode, int flags)
+{
+    bool effective = (flags & LINUX_AT_EACCESS) != 0;
+    uid_t uid = effective ? geteuid() : getuid();
+    gid_t gid = effective ? getegid() : getgid();
+
+    int granted = 0;
+    if (uid == 0) {
+        /* As generic_permission() has it for root: read and write always,
+         * execute when any execute bit is set.
+         */
+        granted = R_OK | W_OK;
+        if (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+            granted |= X_OK;
+    } else {
+        gid_t groups[NGROUPS_MAX];
+        int ngroups = getgroups(NGROUPS_MAX, groups);
+        bool in_group = gid == st->st_gid;
+        for (int i = 0; i < ngroups && !in_group; i++)
+            in_group = groups[i] == st->st_gid;
+
+        mode_t bits = st->st_mode;
+        if (uid == st->st_uid)
+            bits >>= 6;
+        else if (in_group)
+            bits >>= 3;
+        if (bits & 4)
+            granted |= R_OK;
+        if (bits & 2)
+            granted |= W_OK;
+        if (bits & 1)
+            granted |= X_OK;
+    }
+    return (mode & granted) == mode;
+}
+
+/* What the host grants this process on a descriptor's file, as R_OK | W_OK |
+ * X_OK bits, or -1 when the host has no answer (a pipe or a socket carries no
+ * such attribute).
+ *
+ * ATTR_CMN_USERACCESS is the host's own judgement of the open file: mode bits
+ * and ACL entries both, by the ids the process runs with. No name is involved,
+ * so the answer holds for a file that has been unlinked and a rename cannot
+ * send it to another file.
+ */
+static int host_fd_user_access(int host_fd)
+{
+    struct attrlist attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attrs.commonattr = ATTR_CMN_USERACCESS;
+
+    struct {
+        uint32_t length;
+        uint32_t access;
+    } __attribute__((packed)) reply;
+    if (fgetattrlist(host_fd, &attrs, &reply, sizeof(reply), 0) < 0)
+        return -1;
+    return (int) (reply.access & (R_OK | W_OK | X_OK));
+}
+
+/* access() on the file a descriptor already names: faccessat2 with
+ * AT_EMPTY_PATH and an empty path. The host is asked about the descriptor
+ * itself. Where it has no answer the mode bits decide.
+ */
+static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(dirfd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+        snap.type == FD_FUSE_DIR)
+        return -LINUX_ENOSYS;
+
+    host_fd_ref_t ref;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+    if (ref_err < 0)
+        return ref_err;
+
+    int64_t rc = 0;
+    struct stat fd_st;
+    if (mode == F_OK) {
+        /* The descriptor is open, so the file exists. */
+    } else {
+        int granted = host_fd_user_access(ref.fd);
+        if (granted >= 0) {
+            if ((mode & granted) != mode)
+                rc = -LINUX_EACCES;
+        } else if (fstat(ref.fd, &fd_st) < 0) {
+            rc = linux_errno();
+        } else if (!host_access_by_mode(&fd_st, mode, flags)) {
+            rc = -LINUX_EACCES;
+        }
+    }
+    host_fd_ref_close(&ref);
+    return rc;
 }
 
 int64_t sys_faccessat(guest_t *g,
@@ -3515,26 +3874,29 @@ int64_t sys_faccessat(guest_t *g,
                       int mode,
                       int flags)
 {
+    /* Linux judges the flags before it reads the path. */
+    if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW |
+                                      LINUX_AT_EMPTY_PATH))
+        return -LINUX_EINVAL;
+
+    if (flags & LINUX_AT_EMPTY_PATH) {
+        char first;
+        if (guest_read_small(g, path_gva, &first, sizeof(first)) < 0)
+            return -LINUX_EFAULT;
+        if (first == '\0') {
+            if ((mode & ~(F_OK | R_OK | W_OK | X_OK)) != 0)
+                return -LINUX_EINVAL;
+            return dirfd == LINUX_AT_FDCWD
+                       ? access_cwd(mode, flags)
+                       : access_empty_path_fd(dirfd, mode, flags);
+        }
+    }
+
     if (dirfd == LINUX_AT_FDCWD) {
         char dot_path[2];
         if (guest_read_small(g, path_gva, dot_path, sizeof(dot_path)) == 0 &&
-            dot_path[0] == '.' && dot_path[1] == '\0') {
-            proc_cwd_view_t view;
-            if (proc_acquire_cwd_view(&view) == 0) {
-                if (view.path && view.path[0] == '/' &&
-                    fuse_path_matches_mount(view.path)) {
-                    char cwd_path[LINUX_PATH_MAX];
-                    str_copy_trunc(cwd_path, view.path, sizeof(cwd_path));
-                    proc_release_cwd_view(&view);
-                    return fuse_access_path(cwd_path, mode, flags);
-                }
-                proc_release_cwd_view(&view);
-            }
-            int mac_flags = translate_faccessat_flags(flags);
-            if (faccessat(AT_FDCWD, ".", mode, mac_flags) < 0)
-                return linux_errno();
-            return 0;
-        }
+            dot_path[0] == '.' && dot_path[1] == '\0')
+            return access_cwd(mode, flags);
     }
 
     char path[LINUX_PATH_MAX];
@@ -3544,9 +3906,6 @@ int64_t sys_faccessat(guest_t *g,
         path, &tx);
     if (rc < 0)
         return rc;
-
-    if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW))
-        return -LINUX_EINVAL;
 
     if (tx.fuse_path)
         return fuse_access_path(tx.intercept_path, mode, flags);
@@ -3686,22 +4045,43 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length)
 
 /* permissions/ownership. */
 
+/* fchmod on the host fd of a guest descriptor that carries seals. Linux keeps
+ * the seals on the inode and tests them in shmem_setattr, so every chmod that
+ * reaches the file meets them; here each spelling that reaches a descriptor
+ * (fchmod, fchmodat with AT_EMPTY_PATH, an fd magic link) comes through this.
+ *
+ * F_SEAL_EXEC holds the execute bits as they are; any other change to the mode
+ * is still allowed.
+ */
+static int64_t fchmod_sealed(int host_fd, int seals, uint32_t mode)
+{
+    if (seals & LINUX_F_SEAL_EXEC) {
+        struct stat st;
+        if (fstat(host_fd, &st) < 0)
+            return linux_errno();
+        if ((st.st_mode ^ mode) & 0111)
+            return -LINUX_EPERM;
+    }
+    if (fchmod(host_fd, mode) < 0)
+        return linux_errno();
+    return 0;
+}
+
 int64_t sys_fchmod(int fd, uint32_t mode)
 {
     /* O_PATH fds do not support fchmod (Linux returns EBADF) */
     fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH)
+    bool known = fd_snapshot(fd, &snap);
+    if (known && snap.type == FD_PATH)
         return -LINUX_EBADF;
     host_fd_ref_t host_ref;
     int64_t ref_err = host_fd_ref_open(fd, &host_ref);
     if (ref_err < 0)
         return ref_err;
-    if (fchmod(host_ref.fd, mode) < 0) {
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
-    }
+
+    int64_t rc = fchmod_sealed(host_ref.fd, known ? snap.seals : 0, mode);
     host_fd_ref_close(&host_ref);
-    return 0;
+    return rc;
 }
 
 int64_t sys_fchmodat(guest_t *g,
@@ -3750,13 +4130,16 @@ int64_t sys_fchmodat(guest_t *g,
         int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
         if (ref_err < 0)
             return ref_err;
-        if (fchmod(ref.fd, mode) < 0) {
-            host_fd_ref_close(&ref);
-            return linux_errno();
-        }
+        int64_t empty_rc = fchmod_sealed(ref.fd, snap.seals, mode);
         host_fd_ref_close(&ref);
-        return 0;
+        return empty_rc;
     }
+
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is; see
+     * read_translated_path.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
 
     /* An fd magic link names the descriptor's file, and Linux resolves it
      * inside the syscall. Act on the descriptor so nothing can redirect the
@@ -3764,10 +4147,11 @@ int64_t sys_fchmodat(guest_t *g,
      */
     if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
         host_fd_ref_t magic;
-        if (path_fd_magiclink_open(path, &magic) == 0) {
-            int mrc = fchmod(magic.fd, mode);
+        fd_entry_t magic_entry;
+        if (path_fd_magiclink_open_entry(path, &magic, &magic_entry) == 0) {
+            int64_t mrc = fchmod_sealed(magic.fd, magic_entry.seals, mode);
             host_fd_ref_close(&magic);
-            return mrc < 0 ? linux_errno() : 0;
+            return mrc;
         }
     }
 
@@ -3937,6 +4321,12 @@ int64_t sys_fchownat(guest_t *g,
         return out;
     }
 
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is; see
+     * read_translated_path.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
+
     /* Same reasoning as the fd magic link branch in sys_fchmodat: act on the
      * descriptor, not on a pathname resolved from it a moment earlier.
      */
@@ -4086,11 +4476,24 @@ int64_t sys_utimensat(guest_t *g,
     if (ref_err < 0)
         return ref_err;
 
+    /* AT_EMPTY_PATH with an empty path names dirfd itself, the current
+     * directory included. Unlike a NULL path it may carry flags.
+     */
+    bool empty_path = false;
+    if (path_gva != 0 && (flags & LINUX_AT_EMPTY_PATH)) {
+        char first;
+        if (guest_read_small(g, path_gva, &first, sizeof(first)) < 0) {
+            host_fd_ref_close(&dir_ref);
+            return -LINUX_EFAULT;
+        }
+        empty_path = first == '\0';
+    }
+
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
     const char *path_arg = NULL;
     char path[LINUX_PATH_MAX];
     path_translation_t tx;
-    if (path_gva != 0) {
+    if (path_gva != 0 && !empty_path) {
         int64_t rc = read_translated_path(g, dirfd, path_gva,
                                           (flags & LINUX_AT_SYMLINK_NOFOLLOW)
                                               ? PATH_TR_NOFOLLOW
@@ -4133,7 +4536,15 @@ int64_t sys_utimensat(guest_t *g,
      * futimens(AT_FDCWD, ...) be invoked with macOS's AT_FDCWD sentinel (-2),
      * which returns EBADF and would not match Linux semantics.
      */
-    if (!path_arg) {
+    if (empty_path) {
+        int host_rc = dir_ref.fd == AT_FDCWD
+                          ? utimensat(AT_FDCWD, ".", times_gva ? ts : NULL, 0)
+                          : futimens(dir_ref.fd, times_gva ? ts : NULL);
+        if (host_rc < 0) {
+            host_fd_ref_close(&dir_ref);
+            return linux_errno();
+        }
+    } else if (!path_arg) {
         if (flags) {
             host_fd_ref_close(&dir_ref);
             return -LINUX_EINVAL;

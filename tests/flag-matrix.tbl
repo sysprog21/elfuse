@@ -1,0 +1,336 @@
+# What Linux answers for each flag of each syscall, with the flag set and with
+# it clear.
+#
+# Copyright 2026 elfuse contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# scripts/gen-flag-matrix.py turns this file into build/flag-matrix-vectors.h
+# and tests/test-flag-matrix.c runs every row twice: once with the flag ORed
+# into the F argument and once without it. Both answers are asserted. Where they
+# differ, a row only passes when the flag is what changes the result; a row
+# ending in "=" records that the answer is the same either way. The qemu lane
+# runs the same binary on a real kernel, which is what keeps the answers below
+# honest.
+#
+# Format, fields separated by " | ":
+#   syscall | flag[@tag] | arguments | with the flag | without the flag
+#
+# flag is a C expression. @tag only tells apart two rows for the same flag.
+#
+# Arguments, in call order:
+#   CWD              AT_FDCWD
+#   p:NAME           path of a fixture entry (see below)
+#   fd:file fd:dir   a fresh O_RDWR fd on "file", an O_RDONLY fd on "dir"
+#   fd:listener      a listening Unix socket with one connection queued
+#   fd:sealed        a memfd made with MFD_NOEXEC_SEAL: mode 0666, F_SEAL_EXEC
+#   fd:unlinked      an O_RDWR fd on "file", which is then unlinked
+#   pair             an int[2] the call fills with two fds; an fd answer is
+#                    then asked of both
+#   buf              a zeroed 4 KiB scratch buffer; for a row with a child
+#                    answer its first int starts at -1, which is neither a
+#                    pid nor an fd
+#   region           the address of a fresh anonymous read-write mapping
+#   stackpage        a 64 KiB span of the caller's own stack, below every
+#                    frame in use
+#   F  F|EXPR        the flags slot; EXPR is ORed in for both runs
+#   anything else    a C integer expression
+#
+# Fixture entries, built in a fresh directory for every run:
+#   file      regular file, 10 bytes, mode 0644
+#   dir       empty directory
+#   link      symlink to "file"
+#   dangling  symlink to a name that does not exist
+#   new       a name that does not exist
+#   empty     the empty string
+#
+# Answers:
+#   ok                 the call returns >= 0
+#   err:ENAME          the call returns -ENAME
+#   errkeeps:ENAME     the same, and "file" still holds its 10 bytes
+#   fd                 the call returns an fd
+#   fd:cloexec fd:nocloexec          F_GETFD has, or lacks, FD_CLOEXEC
+#   fd:getfl:EXPR fd:nogetfl:EXPR    F_GETFL has every bit, or no bit, of EXPR
+#   pair1:getfl:EXPR pair1:nogetfl:EXPR   the same, asked only of the second
+#                                    fd of a pair
+#   fd:seals:EXPR      F_GET_SEALS on the fd returns exactly EXPR
+#   fd:perm:EXPR       fstat on the fd reports exactly those permission bits
+#   fd:appends fd:overwrites         a 1-byte write at offset 0 grows the file,
+#                                    or leaves its size alone
+#   fd:readebadf       read on the fd gives EBADF
+#   exists:p:NAME absent:p:NAME      the name is, or is not, there
+#   lreg:p:NAME llnk:p:NAME          the name itself is a regular file, or a
+#                                    symlink
+#   size:p:NAME=N mode:p:NAME=N      stat reports that size, or permission bits
+#   buf:reg buf:lnk    the struct stat in buf is a regular file, or a symlink
+#   bufx:reg bufx:lnk  the same for a struct statx
+#   arg0:cloexec arg0:nocloexec arg0:getfl:EXPR arg0:nogetfl:EXPR
+#                      the fd answers, asked of the fd passed as first argument
+#   map                the call returns an address
+#   map:atregion map:elsewhere       that address is, or is not, the region's
+#   map:writable map:readonly map:noread
+#                      a load and a store at that address work or fault
+#   map:writesfile map:keepsfile     a store there shows, or does not show, in
+#                                    a read of "file"
+#   region:writable region:readonly region:noread
+#                      the same loads and stores, on the region
+#   pair:packets pair:stream         one read after two writes returns the
+#                                    first write alone, or both
+#   stack:lowreadonly stack:lowwritable
+#                      a store into the stack beneath stackpage faults, or works
+#   child              the call returns a pid, and that process exits 0
+#   child:ptid child:noptid          also, the int at buf holds that pid, or
+#                                    still holds -1
+#   child:ownptid      as child:ptid, and the new process found its own tid
+#                      there too
+#   child:pidfd        also, the int at buf is a close-on-exec fd
+#   =                  (last field only) the same answer as with the flag
+#
+# A row that starts with "unsupported:ANSWER" is a flag elfuse declines on
+# purpose. ANSWER is what elfuse gives with the flag set, and it must be an
+# answer Linux documents for a kernel or filesystem without the feature, so
+# that a guest already knows what to do with it. A strict run ignores it.
+#
+# A row that starts with "pending" is an answer elfuse does not give yet. Under
+# elfuse its mismatch is reported as KNOWN and does not fail the run; once both
+# runs of the row pass, the test fails until the word is removed. The qemu lane
+# passes "strict", which makes a pending row an ordinary one.
+
+# openat(dirfd, path, flags, mode)
+# This row reads the guest's own view of the flag. Whether elfuse also passes
+# O_CLOEXEC to the host open cannot be seen from a guest: a guest execve stays
+# in the same host process and closes descriptors from elfuse's table, and the
+# fork helper is spawned with every host descriptor closed by default.
+openat | O_CLOEXEC | CWD p:file F|O_RDONLY 0 | fd:cloexec | fd:nocloexec
+openat | O_NONBLOCK | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+openat | O_APPEND | CWD p:file F|O_WRONLY 0 | fd:appends | fd:overwrites
+openat | O_APPEND@getfl | CWD p:file F|O_WRONLY 0 | fd:getfl:O_APPEND | fd:nogetfl:O_APPEND
+openat | O_CREAT | CWD p:new F|O_WRONLY 0600 | exists:p:new | err:ENOENT
+openat | O_EXCL | CWD p:file F|O_CREAT|O_WRONLY 0600 | err:EEXIST | fd
+openat | O_TRUNC | CWD p:file F|O_WRONLY 0 | size:p:file=0 | size:p:file=10
+openat | O_DIRECTORY | CWD p:file F|O_RDONLY 0 | err:ENOTDIR | fd
+# The refusal comes before the open takes effect: the file is not truncated.
+openat | O_DIRECTORY@no-truncate | CWD p:file F|O_WRONLY|O_TRUNC 0 | errkeeps:ENOTDIR | size:p:file=0
+openat | O_NOFOLLOW | CWD p:link F|O_RDONLY 0 | err:ELOOP | fd
+openat | O_PATH | CWD p:file F|O_RDONLY 0 | fd:readebadf | fd
+# O_PATH with O_NOFOLLOW opens the symlink itself; without O_PATH that is ELOOP.
+openat | O_PATH@symlink | CWD p:link F|O_NOFOLLOW|O_RDONLY 0 | fd | err:ELOOP
+# O_NOCTTY matters only when the name is a terminal the caller could adopt.
+# That cannot be arranged here, so this row asserts that the flag is accepted.
+openat | O_NOCTTY | CWD p:file F|O_RDONLY 0 | fd | =
+openat | O_SYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_SYNC | fd:nogetfl:O_SYNC
+openat | O_DSYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_DSYNC | fd:nogetfl:O_DSYNC
+openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O_NOATIME
+# macOS cannot give a name back to a file that has none, so a file made with
+# O_TMPFILE could never be linked into place afterwards. Callers that link it
+# fall back to a named temporary file when the open fails, and would have no
+# fallback left if the open succeeded and the linkat then failed. open(2)
+# documents EISDIR as the answer of a kernel without O_TMPFILE.
+unsupported:err:EISDIR openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
+openat | O_TMPFILE@rdonly | CWD p:dir F|O_RDONLY 0600 | err:EINVAL | fd
+# An empty name is ENOENT before dirfd is looked at.
+openat | O_CLOEXEC@empty-path | fd:file p:empty F|O_RDONLY 0 | err:ENOENT | =
+
+# unlinkat(dirfd, path, flags)
+unlinkat | AT_REMOVEDIR | CWD p:dir F | absent:p:dir | err:EISDIR
+unlinkat | AT_REMOVEDIR@file | CWD p:file F | err:ENOTDIR | absent:p:file
+unlinkat | 0x8000@unknown | CWD p:file F | err:EINVAL | absent:p:file
+
+# newfstatat(dirfd, path, statbuf, flags)
+newfstatat | AT_SYMLINK_NOFOLLOW | CWD p:link buf F | buf:lnk | buf:reg
+newfstatat | AT_EMPTY_PATH | fd:file p:empty buf F | buf:reg | err:ENOENT
+newfstatat | AT_NO_AUTOMOUNT | CWD p:file buf F | buf:reg | =
+
+# statx(dirfd, path, flags, mask, statxbuf): the flags are argument 2 here and
+# argument 3 in newfstatat.
+statx | AT_SYMLINK_NOFOLLOW | CWD p:link F STATX_BASIC_STATS buf | bufx:lnk | bufx:reg
+statx | AT_EMPTY_PATH | fd:file p:empty F STATX_BASIC_STATS buf | bufx:reg | err:ENOENT
+statx | AT_STATX_FORCE_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
+statx | AT_STATX_DONT_SYNC | CWD p:file F STATX_BASIC_STATS buf | bufx:reg | =
+statx | AT_STATX_SYNC_TYPE@both | CWD p:file F STATX_BASIC_STATS buf | err:EINVAL | bufx:reg
+
+# linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+linkat | AT_SYMLINK_FOLLOW | CWD p:link CWD p:new F | lreg:p:new | llnk:p:new
+linkat | AT_EMPTY_PATH | fd:file p:empty CWD p:new F | lreg:p:new | err:ENOENT
+linkat | AT_SYMLINK_FOLLOW@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+linkat | AT_SYMLINK_FOLLOW@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
+
+# fchmodat(dirfd, path, mode): the kernel entry takes three arguments, so a
+# flags word in the fourth is never read.
+fchmodat | AT_SYMLINK_NOFOLLOW@ignored | CWD p:link 0600 F | mode:p:file=0600 | =
+
+# fchmodat2(dirfd, path, mode, flags)
+# F_SEAL_EXEC belongs to the file, so the descriptor form of chmod meets it
+# too: giving the sealed memfd its execute bits is EPERM.
+fchmodat2 | AT_EMPTY_PATH@exec-seal | fd:sealed p:empty 0777 F | err:EPERM | err:ENOENT
+
+# fchownat(dirfd, path, owner, group, flags)
+fchownat | AT_SYMLINK_NOFOLLOW | CWD p:dangling -1 -1 F | ok | err:ENOENT
+fchownat | AT_EMPTY_PATH | fd:file p:empty -1 -1 F | ok | err:ENOENT
+
+# utimensat(dirfd, path, times, flags)
+utimensat | AT_SYMLINK_NOFOLLOW | CWD p:dangling 0 F | ok | err:ENOENT
+utimensat | AT_EMPTY_PATH | fd:file p:empty 0 F | ok | err:ENOENT
+
+# faccessat2(dirfd, path, mode, flags)
+faccessat2 | AT_SYMLINK_NOFOLLOW | CWD p:dangling F_OK F | ok | err:ENOENT
+faccessat2 | AT_EMPTY_PATH | fd:file p:empty F_OK F | ok | err:ENOENT
+faccessat2 | AT_EMPTY_PATH@write | fd:file p:empty W_OK F | ok | err:ENOENT
+# The owner may write a file of mode 0644 after its last name is gone as well.
+faccessat2 | AT_EMPTY_PATH@unlinked | fd:unlinked p:empty W_OK F | ok | err:ENOENT
+faccessat2 | 0x8000@unknown | CWD p:file F_OK F | err:EINVAL | ok
+# AT_EACCESS matters only when the real and effective ids differ. That cannot
+# be arranged here either, so this row asserts that the flag is accepted.
+faccessat2 | AT_EACCESS | CWD p:file F_OK F | ok | =
+
+# renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+renameat2 | RENAME_NOREPLACE | CWD p:file CWD p:link F | err:EEXIST | lreg:p:link
+renameat2 | RENAME_EXCHANGE | CWD p:file CWD p:link F | llnk:p:file | absent:p:file
+renameat2 | RENAME_NOREPLACE|RENAME_EXCHANGE@both | CWD p:file CWD p:link F | err:EINVAL | lreg:p:link
+renameat2 | RENAME_NOREPLACE@empty-old | fd:file p:empty CWD p:new F | err:ENOENT | =
+renameat2 | RENAME_NOREPLACE@empty-new | CWD p:file fd:file p:empty F | err:ENOENT | =
+
+# dup3(oldfd, newfd, flags)
+dup3 | O_CLOEXEC | fd:file 100 F | fd:cloexec | fd:nocloexec
+dup3 | O_NONBLOCK@unknown | fd:file 100 F | err:EINVAL | fd
+
+# pipe2(pipefd, flags)
+pipe2 | O_CLOEXEC | pair F | fd:cloexec | fd:nocloexec
+pipe2 | O_NONBLOCK | pair F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+# Packet mode is a property of the write end; the read end never reports it.
+pipe2 | O_DIRECT | pair F | pair1:getfl:O_DIRECT | pair1:nogetfl:O_DIRECT
+# Packet mode itself. The host pipe is a byte stream and has no such mode, so
+# this stays pending until someone decides between giving the pipe a framed
+# backing and refusing the flag; see the note in docs/testing.md.
+pending pipe2 | O_DIRECT@packets | pair F | pair:packets | pair:stream
+pipe2 | O_APPEND@unknown | pair F | err:EINVAL | fd
+
+# eventfd2(initval, flags)
+eventfd2 | EFD_CLOEXEC | 0 F | fd:cloexec | fd:nocloexec
+eventfd2 | EFD_NONBLOCK | 0 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+eventfd2 | EFD_SEMAPHORE | 0 F | fd | =
+eventfd2 | 0x4@unknown | 0 F | err:EINVAL | fd
+
+# epoll_create1(flags)
+epoll_create1 | EPOLL_CLOEXEC | F | fd:cloexec | fd:nocloexec
+epoll_create1 | 0x1@unknown | F | err:EINVAL | fd
+
+# inotify_init1(flags)
+inotify_init1 | IN_CLOEXEC | F | fd:cloexec | fd:nocloexec
+inotify_init1 | IN_NONBLOCK | F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+inotify_init1 | 0x1@unknown | F | err:EINVAL | fd
+
+# timerfd_create(clockid, flags)
+timerfd_create | TFD_CLOEXEC | CLOCK_MONOTONIC F | fd:cloexec | fd:nocloexec
+timerfd_create | TFD_NONBLOCK | CLOCK_MONOTONIC F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+timerfd_create | 0x1@unknown | CLOCK_MONOTONIC F | err:EINVAL | fd
+
+# signalfd4(fd, mask, sizemask, flags): buf is an empty 8-byte mask.
+signalfd4 | SFD_CLOEXEC | -1 buf 8 F | fd:cloexec | fd:nocloexec
+signalfd4 | SFD_NONBLOCK | -1 buf 8 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+signalfd4 | 0x1@unknown | -1 buf 8 F | err:EINVAL | fd
+
+# memfd_create(name, flags)
+memfd_create | MFD_CLOEXEC | p:file F | fd:cloexec | fd:nocloexec
+memfd_create | 0x8000@unknown | p:file F | err:EINVAL | fd
+# MFD_NOEXEC_SEAL and MFD_EXEC contradict each other.
+memfd_create | 0x10@exec-and-noexec | p:file F|0x8 | err:EINVAL | fd
+memfd_create | MFD_ALLOW_SEALING | p:file F | fd:seals:0 | fd:seals:F_SEAL_SEAL
+# MFD_NOEXEC_SEAL (0x8) allows sealing, sets F_SEAL_EXEC (0x20), and makes the
+# file without its execute bits. MFD_EXEC (0x10) asks for today's default.
+memfd_create | 0x8@noexec-seal | p:file F | fd:seals:0x20 | fd:seals:F_SEAL_SEAL
+memfd_create | 0x8@noexec-mode | p:file F | fd:perm:0666 | fd:perm:0777
+memfd_create | 0x10@exec | p:file F | fd:perm:0777 | =
+memfd_create | MFD_HUGETLB | p:file F | fd | =
+
+# socket(domain, type, protocol): the flags share the type argument.
+socket | SOCK_CLOEXEC | AF_UNIX F|SOCK_STREAM 0 | fd:cloexec | fd:nocloexec
+socket | SOCK_NONBLOCK | AF_UNIX F|SOCK_STREAM 0 | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+
+# socketpair(domain, type, protocol, sv)
+socketpair | SOCK_CLOEXEC | AF_UNIX F|SOCK_STREAM 0 pair | fd:cloexec | fd:nocloexec
+socketpair | SOCK_NONBLOCK | AF_UNIX F|SOCK_STREAM 0 pair | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+
+# accept4(sockfd, addr, addrlen, flags)
+accept4 | SOCK_CLOEXEC | fd:listener 0 0 F | fd:cloexec | fd:nocloexec
+accept4 | SOCK_NONBLOCK | fd:listener 0 0 F | fd:getfl:O_NONBLOCK | fd:nogetfl:O_NONBLOCK
+accept4 | 0x1@unknown | fd:listener 0 0 F | err:EINVAL | fd
+
+# fcntl(fd, cmd, arg): the flags are the argument of F_SETFL and F_SETFD.
+fcntl | O_NONBLOCK@setfl | fd:file F_SETFL F | arg0:getfl:O_NONBLOCK | arg0:nogetfl:O_NONBLOCK
+fcntl | O_APPEND@setfl | fd:file F_SETFL F | arg0:getfl:O_APPEND | arg0:nogetfl:O_APPEND
+fcntl | O_NOATIME@setfl | fd:file F_SETFL F | arg0:getfl:O_NOATIME | arg0:nogetfl:O_NOATIME
+# A regular file has no fasync handler, so F_SETFL leaves O_ASYNC clear on it.
+fcntl | O_ASYNC@setfl-file | fd:file F_SETFL F | arg0:nogetfl:O_ASYNC | =
+fcntl | FD_CLOEXEC@setfd | fd:file F_SETFD F | arg0:cloexec | arg0:nocloexec
+# F_SETFL changes only the status flags; a creation flag in it is dropped.
+fcntl | O_TRUNC@setfl-ignored | fd:file F_SETFL F | size:p:file=10 | =
+fcntl | O_SYNC@setfl-ignored | fd:file F_SETFL F | arg0:nogetfl:O_SYNC | =
+
+# mmap(addr, length, prot, flags, fd, offset): the flags are argument 3.
+mmap | MAP_ANONYMOUS | 0 4096 PROT_READ F|MAP_PRIVATE -1 0 | map | err:EBADF
+# The descriptor is looked up before the mapping type is judged.
+mmap | MAP_PRIVATE@bad-fd-first | 0 4096 PROT_READ F -1 0 | err:EBADF | =
+mmap | MAP_PRIVATE@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
+mmap | MAP_SHARED@neither | 0 4096 PROT_READ F|MAP_ANONYMOUS -1 0 | map | err:EINVAL
+mmap | MAP_FIXED | region 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:atregion | map:elsewhere
+mmap | MAP_FIXED_NOREPLACE | region 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | err:EEXIST | map:elsewhere
+# MAP_SHARED beside MAP_PRIVATE is MAP_SHARED_VALIDATE, which is shared.
+mmap | MAP_SHARED@file | 0 4096 PROT_READ|PROT_WRITE F|MAP_PRIVATE fd:file 0 | map:writesfile | map:keepsfile
+# MAP_SHARED_VALIDATE refuses a flag the file cannot honor; MAP_SYNC (0x80000)
+# needs DAX. Plain MAP_SHARED ignores the same bit.
+mmap | 0x80000@sync-validate | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
+# What it accepts is LEGACY_MAP_MASK, which leaves out MAP_FIXED_NOREPLACE and
+# the top bit of the huge page size field (bit 31). The other five bits of the
+# field are in it, and without MAP_HUGETLB they mean nothing. The flags are a
+# long, so a bit above 31 is refused the same way.
+mmap | 0x80000000@validate-bit31 | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
+mmap | 0x100000000@validate-bit32 | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
+mmap | MAP_FIXED_NOREPLACE@validate | 0x10000 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EOPNOTSUPP | map
+mmap | 0x7c000000@validate-huge-size | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | map | =
+# MAP_HUGETLB on a file asks for a hugetlbfs file, whatever the mapping type.
+mmap | MAP_HUGETLB@file | 0 4096 PROT_READ F|MAP_SHARED fd:file 0 | err:EINVAL | map
+mmap | MAP_HUGETLB@file-validate | 0 4096 PROT_READ F|MAP_SHARED_VALIDATE fd:file 0 | err:EINVAL | map
+# An anonymous mapping takes MAP_SHARED or MAP_PRIVATE and not the two at once.
+mmap | MAP_SHARED@anon-validate | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | err:EINVAL | map
+mmap | 0x80000@sync-legacy | 0 4096 PROT_READ F|MAP_SHARED fd:file 0 | map | =
+mmap | 0x100000000@bit32-legacy | 0 4096 PROT_READ F|MAP_SHARED fd:file 0 | map | =
+mmap | MAP_POPULATE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
+mmap | MAP_NORESERVE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
+mmap | MAP_STACK | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
+# The offset has to be page aligned even when no file is involved.
+mmap | MAP_POPULATE@odd-offset | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 1 | err:EINVAL | =
+
+# mmap again, for the protection bits in argument 2.
+mmap | PROT_READ | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | map:noread
+mmap | PROT_WRITE | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:writable | map:readonly
+# PROT_SEM (0x8) is accepted and grants nothing: alone it is PROT_NONE.
+mmap | 0x8@prot-sem | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:noread | =
+mmap | 0x8@prot-sem-read | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | =
+
+# mprotect(addr, length, prot)
+mprotect | PROT_READ | region 4096 F | region:readonly | region:noread
+mprotect | PROT_WRITE | region 4096 F|PROT_READ | region:writable | region:readonly
+mprotect | 0x8@prot-sem | region 4096 F | region:noread | =
+mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+# On the stack the bit extends the change down to the mapping's low end.
+mprotect | PROT_GROWSDOWN@stack | stackpage 65536 F|PROT_READ | stack:lowreadonly | stack:lowwritable
+mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
+
+# clone(flags, stack, parent_tid, tls, child_tid), the arm64 argument order.
+# A zero stack with no CLONE_VM is a fork: the child gets a copy and exits.
+clone | CLONE_PARENT_SETTID | F|SIGCHLD 0 buf 0 0 | child:ptid | child:noptid
+# With CLONE_VM the two share memory, so the child sees the slot as well.
+clone | CLONE_PARENT_SETTID@vm-child | F|SIGCHLD|CLONE_VM|CLONE_VFORK 0 buf 0 0 | child:ownptid | child
+clone | CLONE_PIDFD | F|SIGCHLD 0 buf 0 0 | child:pidfd | child:noptid
+# clone returns the pidfd through parent_tid, so the two cannot be combined.
+clone | CLONE_PIDFD@with-parent-settid | F|SIGCHLD|CLONE_PARENT_SETTID 0 buf 0 0 | err:EINVAL | child:ptid
+# The pidfd is stored before the child may run: a slot that cannot be written
+# fails the clone and leaves no child.
+clone | CLONE_PIDFD@bad-slot | F|SIGCHLD 0 8 0 0 | err:EFAULT | child
+clone | CLONE_VFORK | F|SIGCHLD 0 0 0 0 | child | =
+clone | CLONE_CHILD_SETTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
+clone | CLONE_CHILD_CLEARTID | F|SIGCHLD 0 0 0 buf | child:noptid | =
+# A thread shares signal handlers, and shared handlers need shared memory.
+clone | CLONE_THREAD@no-sighand | F|SIGCHLD 0 0 0 0 | err:EINVAL | child
+clone | CLONE_SIGHAND@no-vm | F|SIGCHLD 0 0 0 0 | err:EINVAL | child

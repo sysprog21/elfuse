@@ -114,6 +114,11 @@ DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
 DEPARTED_MANIFEST := tests/usbdev-ioctl-departed.tbl
 DEPARTED_GENERATOR := scripts/gen-usbdev-ioctl-departed.py
 DEPARTED_HEADER := $(BUILD_DIR)/usbdev-ioctl-departed-vectors.h
+# The per-flag rows tests/test-flag-matrix.c runs. Generated under build/ for
+# the same reason the departed-device vectors are.
+FLAG_MATRIX_MANIFEST := tests/flag-matrix.tbl
+FLAG_MATRIX_GENERATOR := scripts/gen-flag-matrix.py
+FLAG_MATRIX_HEADER := $(BUILD_DIR)/flag-matrix-vectors.h
 HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -arch arm64
 
 # Generated headers under build/ that must exist before compiling sources that
@@ -154,6 +159,11 @@ $(DISPATCH_HEADER): $(DISPATCH_MANIFEST) $(DISPATCH_GENERATOR) src/syscall/abi.h
 	rm -f "$$tmp"
 
 $(BUILD_DIR)/syscall/syscall.o: $(DISPATCH_HEADER)
+
+$(FLAG_MATRIX_HEADER): $(FLAG_MATRIX_MANIFEST) $(FLAG_MATRIX_GENERATOR) \
+		$(DISPATCH_MANIFEST) | $(BUILD_DIR)
+	@echo "  GEN     $@"
+	$(Q)python3 $(FLAG_MATRIX_GENERATOR) --output $@
 
 $(DEPARTED_HEADER): $(DEPARTED_MANIFEST) $(DEPARTED_GENERATOR) \
 		src/syscall/usbdev.c | $(BUILD_DIR)
@@ -399,6 +409,12 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 # not.
 $(BUILD_DIR)/test-usbdev-ioctl-departed: tests/test-usbdev-ioctl-departed.c \
 		$(DEPARTED_HEADER) | $(BUILD_DIR)
+	@echo "  CROSS   $<"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -I$(BUILD_DIR) -o $@ $<
+
+# test-flag-matrix includes its generated rows the same way.
+$(BUILD_DIR)/test-flag-matrix: tests/test-flag-matrix.c \
+		$(FLAG_MATRIX_HEADER) | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -I$(BUILD_DIR) -o $@ $<
 

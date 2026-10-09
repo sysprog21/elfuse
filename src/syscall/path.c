@@ -453,6 +453,14 @@ static inline bool magiclink_type_acts_on_host_fd(int type)
 
 int path_fd_magiclink_open(const char *path, host_fd_ref_t *ref)
 {
+    fd_entry_t entry;
+    return path_fd_magiclink_open_entry(path, ref, &entry);
+}
+
+int path_fd_magiclink_open_entry(const char *path,
+                                 host_fd_ref_t *ref,
+                                 fd_entry_t *entry)
+{
     ref->fd = -1;
     ref->lifetime = NULL;
 
@@ -474,20 +482,19 @@ int path_fd_magiclink_open(const char *path, host_fd_ref_t *ref)
      * replacement while the type it was admitted on describes the object that
      * is gone.
      */
-    fd_entry_t snap;
     if (thread_is_single_active()) {
-        if (!fd_snapshot(fd, &snap) || snap.host_fd < 0)
+        if (!fd_snapshot(fd, entry) || entry->host_fd < 0)
             return -1;
-        if (!magiclink_type_acts_on_host_fd(snap.type))
+        if (!magiclink_type_acts_on_host_fd(entry->type))
             return -1;
-        ref->fd = snap.host_fd;
+        ref->fd = entry->host_fd;
         return 0;
     }
 
-    int host_fd = fd_host_ref_acquire(fd, &snap, &ref->lifetime);
+    int host_fd = fd_host_ref_acquire(fd, entry, &ref->lifetime);
     if (host_fd < 0)
         return -1;
-    if (!magiclink_type_acts_on_host_fd(snap.type)) {
+    if (!magiclink_type_acts_on_host_fd(entry->type)) {
         host_fd_ref_close(ref);
         return -1;
     }

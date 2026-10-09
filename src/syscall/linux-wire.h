@@ -58,6 +58,7 @@ typedef struct {
 #define LINUX_EXDEV 18
 #define LINUX_ENODEV 19
 #define LINUX_ENOTDIR 20
+#define LINUX_EISDIR 21
 #define LINUX_EINVAL 22
 #define LINUX_EMFILE 24
 #define LINUX_ENOTTY 25
@@ -320,13 +321,34 @@ typedef struct {
 #define LINUX_PROT_READ 0x1
 #define LINUX_PROT_WRITE 0x2
 #define LINUX_PROT_EXEC 0x4
+#define LINUX_PROT_SEM 0x8
+#define LINUX_PROT_BTI 0x10 /* arm64 */
+#define LINUX_PROT_MTE 0x20 /* arm64 */
+#define LINUX_PROT_GROWSDOWN 0x01000000
+#define LINUX_PROT_GROWSUP 0x02000000
 
 #define LINUX_MAP_SHARED 0x01
 #define LINUX_MAP_PRIVATE 0x02
+#define LINUX_MAP_SHARED_VALIDATE 0x03
+#define LINUX_MAP_TYPE 0x0f
 #define LINUX_MAP_FIXED 0x10
 #define LINUX_MAP_ANONYMOUS 0x20
 #define LINUX_MAP_NORESERVE 0x4000
+#define LINUX_MAP_HUGETLB 0x40000
 #define LINUX_MAP_FIXED_NOREPLACE 0x100000
+
+/* Every flag a MAP_SHARED_VALIDATE mapping may carry: Linux's LEGACY_MAP_MASK
+ * (include/linux/mman.h), which is DENYWRITE, EXECUTABLE, GROWSDOWN, LOCKED,
+ * NORESERVE, POPULATE, NONBLOCK, STACK, HUGETLB, the three named above, and of
+ * the huge page size field the five bits MAP_HUGE_2MB and MAP_HUGE_1GB cover
+ * between them. Bit 31 is the field's sixth bit and is not in the mask, and
+ * neither is MAP_FIXED_NOREPLACE, so both are EOPNOTSUPP like MAP_SYNC, which
+ * needs a DAX file, and like the bits nothing defines.
+ */
+#define LINUX_MAP_VALIDATE_MASK                                          \
+    (LINUX_MAP_TYPE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS | 0x0100 |   \
+     0x0800 | 0x1000 | 0x2000 | LINUX_MAP_NORESERVE | 0x8000 | 0x10000 | \
+     0x20000 | LINUX_MAP_HUGETLB | (0x1f << 26))
 
 /* Linux msync flags. */
 #define LINUX_MS_ASYNC 0x1
@@ -540,10 +562,19 @@ typedef struct {
 #define LINUX_F_SEAL_GROW 0x0004
 #define LINUX_F_SEAL_WRITE 0x0008
 #define LINUX_F_SEAL_FUTURE_WRITE 0x0010
+#define LINUX_F_SEAL_EXEC 0x0020
 
 /* memfd_create flags (MFD_*). */
 #define LINUX_MFD_CLOEXEC 0x0001U
 #define LINUX_MFD_ALLOW_SEALING 0x0002U
+#define LINUX_MFD_HUGETLB 0x0004U
+#define LINUX_MFD_NOEXEC_SEAL 0x0008U
+#define LINUX_MFD_EXEC 0x0010U
+
+/* The huge page size rides in the top bits and means something only beside
+ * MFD_HUGETLB.
+ */
+#define LINUX_MFD_HUGE_MASK (0x3fU << 26)
 
 /* fcntl sealing commands */
 #define LINUX_F_ADD_SEALS 1033

@@ -985,8 +985,18 @@ static int64_t sc_mmap(guest_t *g,
                        uint64_t x5,
                        bool verbose)
 {
+    /* Linux takes the flags as a long, and MAP_SHARED_VALIDATE refuses a bit
+     * above 31 like any other it does not know, where sys_mmap works on an int.
+     * Bit 31 is outside the validation mask and has no meaning anywhere else in
+     * sys_mmap, so it stands in for all of them.
+     */
+    uint32_t flags = (uint32_t) x3;
+    if (x3 >> 32)
+        flags |= UINT32_C(1) << 31;
+
     mmap_lock_acquire();
-    int64_t r = sys_mmap(g, x0, x1, (int) x2, (int) x3, (int) x4, (int64_t) x5);
+    int64_t r =
+        sys_mmap(g, x0, x1, (int) x2, (int) flags, (int) x4, (int64_t) x5);
     mmap_lock_release();
     log_debug("  mmap(0x%llx, 0x%llx) \xe2\x86\x92 0x%llx",
               (unsigned long long) x0, (unsigned long long) x1,
@@ -1863,10 +1873,24 @@ static int64_t sc_memfd_create(guest_t *g,
     (void) x4;
     (void) x5;
     (void) verbose;
+    const unsigned int flags = (unsigned int) x1;
+
+    /* Linux judges the flags before it reads the name. Which of the defined
+     * flags are honored is a separate question; this only refuses what Linux
+     * refuses.
+     */
+    unsigned int known = LINUX_MFD_CLOEXEC | LINUX_MFD_ALLOW_SEALING |
+                         LINUX_MFD_HUGETLB | LINUX_MFD_NOEXEC_SEAL |
+                         LINUX_MFD_EXEC;
+    if (flags & LINUX_MFD_HUGETLB)
+        known |= LINUX_MFD_HUGE_MASK;
+    if (flags & ~known)
+        return -LINUX_EINVAL;
+    if ((flags & LINUX_MFD_EXEC) && (flags & LINUX_MFD_NOEXEC_SEAL))
+        return -LINUX_EINVAL;
+
     if (!x0)
         return -LINUX_EFAULT;
-
-    const unsigned int flags = (unsigned int) x1;
 
     char first = '\0';
     if (guest_read_small(g, x0, &first, sizeof(first)) < 0)
@@ -1875,6 +1899,18 @@ static int64_t sc_memfd_create(guest_t *g,
     int fd = tmpfile_anon("memfd");
     if (fd < 0)
         return linux_errno();
+
+    /* A memfd is created with every permission bit, or without the execute bits
+     * under MFD_NOEXEC_SEAL. The backing file has no name, so the mode is only
+     * what fstat reports and what F_SEAL_EXEC then holds in place.
+     */
+    bool noexec = (flags & LINUX_MFD_NOEXEC_SEAL) != 0;
+    if (fchmod(fd, noexec ? 0666 : 0777) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return linux_errno();
+    }
     int gfd = fd_alloc(FD_REGULAR, fd, NULL);
     if (gfd < 0) {
         close(fd);
@@ -1889,8 +1925,15 @@ static int64_t sc_memfd_create(guest_t *g,
     fd_publish_linux_flags(
         gfd,
         LINUX_O_RDWR | ((flags & LINUX_MFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
-    fd_table[gfd].seals =
-        (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
+
+    /* MFD_NOEXEC_SEAL implies MFD_ALLOW_SEALING and starts with F_SEAL_EXEC
+     * set. MFD_EXEC asks for what is already the default.
+     */
+    if (noexec)
+        fd_table[gfd].seals = LINUX_F_SEAL_EXEC;
+    else
+        fd_table[gfd].seals =
+            (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
     return gfd;
 }
 

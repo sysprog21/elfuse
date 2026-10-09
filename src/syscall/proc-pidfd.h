@@ -18,6 +18,17 @@ void pidfd_init(void);
  * watched (the caller itself, or a CLONE_VM child).
  */
 int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid);
+
+/* Create a pidfd that stands for no task yet, and point it at one later. clone
+ * makes the descriptor for a thread or a CLONE_VM child before that task exists
+ * and learns the tid only once the task is made.
+ *
+ * *gen names the new entry for pidfd_set_target. The guest fd number cannot:
+ * the slot is visible to the guest from the moment it is made, and a close
+ * followed by another pidfd would hand the same number to a different entry.
+ */
+int pidfd_create_unbound(guest_t *g, uint64_t *gen);
+void pidfd_set_target(uint64_t gen, int64_t target_pid);
 void proc_pidfd_notify_exit(int64_t exited_pid);
 int64_t proc_pidfd_lookup_pid(int guest_fd);
 int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags);

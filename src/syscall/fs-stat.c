@@ -314,6 +314,12 @@ static int64_t stat_at_path(guest_t *g,
         dirfd != LINUX_AT_FDCWD)
         return stat_empty_path_fd(dirfd, mac_st);
 
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is. The host
+     * would say ENOTDIR for a dirfd that is not a directory.
+     */
+    if (pathp[0] == '\0' && !(flags & LINUX_AT_EMPTY_PATH))
+        return -LINUX_ENOENT;
+
     if (pathp[0] == '/' && fuse_path_matches_mount(pathp)) {
         int frc = fuse_stat_path(pathp, mac_st, flags);
         if (frc < 0)
@@ -909,6 +915,12 @@ int64_t sys_statx(guest_t *g,
     if (!validate_at_flags(
             flags, LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH |
                        LINUX_AT_NO_AUTOMOUNT | LINUX_AT_STATX_SYNC_TYPE))
+        return -LINUX_EINVAL;
+
+    /* FORCE_SYNC and DONT_SYNC are two values of one field, and Linux refuses
+     * the value that sets both.
+     */
+    if ((flags & LINUX_AT_STATX_SYNC_TYPE) == LINUX_AT_STATX_SYNC_TYPE)
         return -LINUX_EINVAL;
 
     /* See sys_fstat comment on the zero-init rationale. */

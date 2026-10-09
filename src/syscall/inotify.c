@@ -596,6 +596,9 @@ static int collect_events(inotify_instance_t *inst)
 
 int64_t sys_inotify_init1(int flags)
 {
+    if (flags & ~(IN_CLOEXEC | IN_NONBLOCK))
+        return -LINUX_EINVAL;
+
     int kq = kqueue();
     if (kq < 0)
         return linux_errno();

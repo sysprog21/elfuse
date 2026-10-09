@@ -92,6 +92,8 @@ What they do:
 - `make check`: fast elfuse-internal gate. Runs, in order:
   - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
     entry without a direct or aliased test reference fails the build
+    The same script requires the syscalls it lists as flag-taking to keep
+    their rows in `tests/flag-matrix.tbl`
   - `scripts/check-eintr-contract.py` so a new interruptible wait fails
     the build until it states whether it may be restarted (`forbids`,
     `restartable`, or `not-a-wait`), with the `forbids` claims checked
@@ -116,6 +118,9 @@ What they do:
     asks make for the target list, which is the point: a `VERIFY_<T>_SRC`
     block written below the `:=` that builds `VERIFY_TARGETS` parses fine
     and generates no rule
+  - `scripts/gen-flag-matrix.py --check` so the generated rows of
+    `test-flag-matrix` match `tests/flag-matrix.tbl`, and so a row naming a
+    syscall `dispatch.tbl` no longer serves fails the build
   - the two harness self-tests, `test-config` (that `tests/test-config.sh`
     keeps its CLI mode separate from its sourced mode) and `test-runner`
     (the shared shell runner's output matching and exit-status checks), so
@@ -534,6 +539,29 @@ whose parent closes its copy of the fd before the backing has been drained
 answers with its primary alone, because the backing half belongs to a stream
 that has gone. Both rows are load-bearing in pairs -- neither number alone
 separates the answers the site could give -- so both are printed.
+
+`test-flag-matrix` records what Linux answers for one flag of one syscall,
+with the flag set and with it clear, one row each in `tests/flag-matrix.tbl`.
+Both answers are asserted. Where they differ, the row passes only when the flag
+is what changes the result; a row whose last field is `=` records that Linux
+answers the same either way, and passes only when it does. The qemu lane runs
+the binary with `strict`, which is what keeps
+the recorded answers true; a row it refuses is a wrong row, not a kernel
+difference to skip. Two marks exist for elfuse. `pending` is a divergence still
+to be fixed: its mismatch is reported and not failed, and the lane fails once
+the row passes, until the mark is removed. `unsupported:ANSWER` is a flag
+elfuse declines on purpose, and ANSWER has to be one Linux documents for a
+kernel or filesystem without the feature. One row is pending by decision
+rather than by backlog: `pipe2 O_DIRECT@packets`. The host pipe is a byte
+stream, so an `O_DIRECT` pipe here delivers two writes in one read where Linux
+delivers the first alone. Giving the pipe a framed backing would fix `pipe2`
+and could not fix `F_SETFL` on a pipe that already exists; refusing the flag
+with `EINVAL`, which `pipe2(2)` documents for kernels that predate it, would
+undo the acceptance `test-negative` and `test-fcntl-flags` assert. Until one
+of those is chosen the row reports the difference on every run. To add a
+syscall, add rows; the
+driver has no code for any one call. A new kind of argument or answer goes
+into `scripts/gen-flag-matrix.py` and `tests/test-flag-matrix.c` together.
 
 `test-usbdev-ioctl-departed` is the same idea with the recording moved out of
 the lane and into data. Its rows are generated from

@@ -90,6 +90,13 @@ openat | O_NOCTTY | CWD p:file F|O_RDONLY 0 | fd | =
 openat | O_SYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_SYNC | fd:nogetfl:O_SYNC
 openat | O_DSYNC | CWD p:file F|O_WRONLY 0 | fd:getfl:O_DSYNC | fd:nogetfl:O_DSYNC
 openat | O_NOATIME | CWD p:file F|O_RDONLY 0 | fd:getfl:O_NOATIME | fd:nogetfl:O_NOATIME
+# macOS cannot give a name back to a file that has none, so a file made with
+# O_TMPFILE could never be linked into place afterwards. Callers that link it
+# fall back to a named temporary file when the open fails, and would have no
+# fallback left if the open succeeded and the linkat then failed. open(2)
+# documents EISDIR as the answer of a kernel without O_TMPFILE.
+unsupported:err:EISDIR openat | O_TMPFILE | CWD p:dir F|O_RDWR 0600 | fd | err:EISDIR
+openat | O_TMPFILE@rdonly | CWD p:dir F|O_RDONLY 0600 | err:EINVAL | fd
 # An empty name is ENOENT before dirfd is looked at.
 openat | O_CLOEXEC@empty-path | fd:file p:empty F|O_RDONLY 0 | err:ENOENT | =
 

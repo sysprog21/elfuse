@@ -743,6 +743,14 @@ static int64_t read_translated_path(guest_t *g,
 {
     if (guest_read_str(g, path_gva, path, LINUX_PATH_MAX) < 0)
         return -LINUX_EFAULT;
+
+    /* Linux refuses an empty name while it copies it in, before it looks at
+     * dirfd. Left to the host, the answer depended on dirfd: ENOENT against a
+     * directory and ENOTDIR against anything else. A caller that takes
+     * AT_EMPTY_PATH has to act on it before coming here.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
     if (path_translate_at(dirfd, path, tx_flags, tx) < 0)
         return linux_errno();
     return 0;
@@ -3758,6 +3766,12 @@ int64_t sys_fchmodat(guest_t *g,
         return 0;
     }
 
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is; see
+     * read_translated_path.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
+
     /* An fd magic link names the descriptor's file, and Linux resolves it
      * inside the syscall. Act on the descriptor so nothing can redirect the
      * chmod between resolution and use; see path_fd_magiclink_open().
@@ -3936,6 +3950,12 @@ int64_t sys_fchownat(guest_t *g,
         host_fd_ref_close(&ref);
         return out;
     }
+
+    /* Without AT_EMPTY_PATH an empty name is ENOENT whatever dirfd is; see
+     * read_translated_path.
+     */
+    if (path[0] == '\0')
+        return -LINUX_ENOENT;
 
     /* Same reasoning as the fd magic link branch in sys_fchmodat: act on the
      * descriptor, not on a pathname resolved from it a moment earlier.

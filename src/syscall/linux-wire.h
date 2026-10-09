@@ -324,10 +324,25 @@ typedef struct {
 
 #define LINUX_MAP_SHARED 0x01
 #define LINUX_MAP_PRIVATE 0x02
+#define LINUX_MAP_SHARED_VALIDATE 0x03
+#define LINUX_MAP_TYPE 0x0f
 #define LINUX_MAP_FIXED 0x10
 #define LINUX_MAP_ANONYMOUS 0x20
 #define LINUX_MAP_NORESERVE 0x4000
 #define LINUX_MAP_FIXED_NOREPLACE 0x100000
+
+/* Every flag a MAP_SHARED_VALIDATE mapping may carry: Linux's LEGACY_MAP_MASK
+ * (include/linux/mman.h), which is DENYWRITE, EXECUTABLE, GROWSDOWN, LOCKED,
+ * NORESERVE, POPULATE, NONBLOCK, STACK, HUGETLB, the three named above, and of
+ * the huge page size field the five bits MAP_HUGE_2MB and MAP_HUGE_1GB cover
+ * between them. Bit 31 is the field's sixth bit and is not in the mask, and
+ * neither is MAP_FIXED_NOREPLACE, so both are EOPNOTSUPP like MAP_SYNC, which
+ * needs a DAX file, and like the bits nothing defines.
+ */
+#define LINUX_MAP_VALIDATE_MASK                                          \
+    (LINUX_MAP_TYPE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS | 0x0100 |   \
+     0x0800 | 0x1000 | 0x2000 | LINUX_MAP_NORESERVE | 0x8000 | 0x10000 | \
+     0x20000 | 0x40000 | (0x1f << 26))
 
 /* Linux msync flags. */
 #define LINUX_MS_ASYNC 0x1

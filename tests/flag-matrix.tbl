@@ -22,7 +22,9 @@
 #   fd:listener      a listening Unix socket with one connection queued
 #   pair             an int[2] the call fills with two fds; an fd answer is
 #                    then asked of both
-#   buf              a zeroed 4 KiB scratch buffer
+#   buf              a zeroed 4 KiB scratch buffer; for a row with a child
+#                    answer its first int starts at -1, which is neither a
+#                    pid nor an fd
 #   region           the address of a fresh anonymous read-write mapping
 #   stackpage        a 64 KiB span of the caller's own stack, below every
 #                    frame in use
@@ -72,7 +74,8 @@
 #   stack:lowreadonly stack:lowwritable
 #                      a store into the stack beneath stackpage faults, or works
 #   child              the call returns a pid, and that process exits 0
-#   child:ptid child:noptid          also, the int at buf holds that pid, or 0
+#   child:ptid child:noptid          also, the int at buf holds that pid, or
+#                                    still holds -1
 #   child:pidfd        also, the int at buf is a close-on-exec fd
 #   =                  (last field only) the same answer as with the flag
 #

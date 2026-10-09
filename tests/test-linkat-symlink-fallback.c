@@ -82,7 +82,8 @@ int main(void)
         char buf[64] = {0};
         ssize_t n = readlink("/d1/hardlink-fd", buf, sizeof(buf) - 1);
         EXPECT_TRUE(lstat("/d1/hardlink-fd", &st) == 0 && S_ISLNK(st.st_mode) &&
-                        n > 0 && !strncmp(buf, "target.txt", (size_t) n),
+                        n == (ssize_t) strlen("target.txt") &&
+                        !strcmp(buf, "target.txt"),
                     "not a symlink to target.txt");
     }
 

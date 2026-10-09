@@ -177,10 +177,19 @@ static long fm_arg0;
 static char *fm_region;
 
 static sigjmp_buf fm_fault_jmp;
+static volatile sig_atomic_t fm_probe_armed;
 
+/* fm_fault_jmp is only a place to jump to while can_read or can_write is
+ * running. A fault from anywhere else gets the default action, so it ends the
+ * run with the signal rather than resuming in a frame that has returned.
+ */
 static void on_fault(int sig)
 {
-    (void) sig;
+    if (!fm_probe_armed) {
+        signal(sig, SIG_DFL);
+        return;
+    }
+    fm_probe_armed = 0;
     siglongjmp(fm_fault_jmp, 1);
 }
 
@@ -188,8 +197,10 @@ static int can_read(const volatile char *p)
 {
     if (sigsetjmp(fm_fault_jmp, 1))
         return 0;
+    fm_probe_armed = 1;
     volatile char c = *p;
     (void) c;
+    fm_probe_armed = 0;
     return 1;
 }
 
@@ -197,7 +208,9 @@ static int can_write(volatile char *p)
 {
     if (sigsetjmp(fm_fault_jmp, 1))
         return 0;
+    fm_probe_armed = 1;
     *p = 'Z';
+    fm_probe_armed = 0;
     return 1;
 }
 

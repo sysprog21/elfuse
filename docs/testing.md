@@ -92,6 +92,8 @@ What they do:
 - `make check`: fast elfuse-internal gate. Runs, in order:
   - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
     entry without a direct or aliased test reference fails the build
+    (the same script also requires the syscalls it lists as flag-taking to
+    keep their rows in `tests/flag-matrix.tbl`)
   - `scripts/check-eintr-contract.py` so a new interruptible wait fails
     the build until it states whether it may be restarted (`forbids`,
     `restartable`, or `not-a-wait`), with the `forbids` claims checked

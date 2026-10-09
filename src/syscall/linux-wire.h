@@ -334,6 +334,7 @@ typedef struct {
 #define LINUX_MAP_FIXED 0x10
 #define LINUX_MAP_ANONYMOUS 0x20
 #define LINUX_MAP_NORESERVE 0x4000
+#define LINUX_MAP_HUGETLB 0x40000
 #define LINUX_MAP_FIXED_NOREPLACE 0x100000
 
 /* Every flag a MAP_SHARED_VALIDATE mapping may carry: Linux's LEGACY_MAP_MASK
@@ -347,7 +348,7 @@ typedef struct {
 #define LINUX_MAP_VALIDATE_MASK                                          \
     (LINUX_MAP_TYPE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS | 0x0100 |   \
      0x0800 | 0x1000 | 0x2000 | LINUX_MAP_NORESERVE | 0x8000 | 0x10000 | \
-     0x20000 | 0x40000 | (0x1f << 26))
+     0x20000 | LINUX_MAP_HUGETLB | (0x1f << 26))
 
 /* Linux msync flags. */
 #define LINUX_MS_ASYNC 0x1
@@ -561,6 +562,12 @@ typedef struct {
 #define LINUX_F_SEAL_GROW 0x0004
 #define LINUX_F_SEAL_WRITE 0x0008
 #define LINUX_F_SEAL_FUTURE_WRITE 0x0010
+
+/* Not a seal: elfuse's mark, kept beside the seals so that dup and fork carry
+ * it, on a memfd made with MFD_HUGETLB. Linux treats such a file as hugetlbfs
+ * and lets mmap ask for MAP_HUGETLB on it. F_GET_SEALS leaves it out.
+ */
+#define FD_SEALS_MFD_HUGETLB 0x40000000
 
 /* memfd_create flags (MFD_*). */
 #define LINUX_MFD_CLOEXEC 0x0001U

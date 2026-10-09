@@ -2083,7 +2083,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         /* macOS does not support pipe size setting; pretend success */
         return (int64_t) arg;
     case LINUX_F_GET_SEALS:
-        return fd_table[fd].seals;
+        return fd_table[fd].seals & ~FD_SEALS_MFD_HUGETLB;
     case LINUX_F_ADD_SEALS: {
         host_fd_ref_t host_ref;
         int64_t ref_err = host_fd_ref_open(fd, &host_ref);

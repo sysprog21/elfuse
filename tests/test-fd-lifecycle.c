@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -34,6 +35,14 @@
 
 #ifndef F_ADD_SEALS
 #define F_ADD_SEALS 1033
+#endif
+
+#ifndef F_GET_SEALS
+#define F_GET_SEALS 1034
+#endif
+
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
 #endif
 
 #ifndef F_SEAL_WRITE
@@ -60,6 +69,38 @@ static void test_memfd_accepts_valid_linux_flags(void)
     }
     close(fd);
     PASS();
+}
+
+/* An MFD_HUGETLB memfd is a hugetlbfs file, the one kind of file Linux lets
+ * MAP_HUGETLB name. Without a huge page pool the mapping can still fail with
+ * ENOMEM, so only EINVAL is wrong.
+ */
+static void test_memfd_hugetlb_maps_hugetlb(void)
+{
+    TEST("MAP_HUGETLB on an MFD_HUGETLB memfd");
+
+    int fd = (int) syscall(SYS_memfd_create, "elfuse-hugetlb",
+                           MFD_ALLOW_SEALING | MFD_HUGETLB);
+    if (fd < 0) {
+        FAIL("memfd_create failed");
+        return;
+    }
+
+    int seals = fcntl(fd, F_GET_SEALS);
+    size_t len = 2u << 20;
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB,
+                   fd, 0);
+    int map_errno = p == MAP_FAILED ? errno : 0;
+    if (p != MAP_FAILED)
+        munmap(p, len);
+    close(fd);
+
+    if (seals != 0)
+        FAIL("F_GET_SEALS reported bits that are not seals");
+    else if (map_errno == EINVAL)
+        FAIL("mmap refused MAP_HUGETLB with EINVAL");
+    else
+        PASS();
 }
 
 static void test_memfd_seals_survive_dup(void)
@@ -303,6 +344,7 @@ int main(void)
     test_memfd_seals_propagate_to_dup();
     test_memfd_seals_cleared_on_reuse();
     test_memfd_accepts_valid_linux_flags();
+    test_memfd_hugetlb_maps_hugetlb();
     test_rlimit_nofile_reports_emfile();
     test_dup3_above_rlimit_fails();
     test_nofile_hides_host_reserve();

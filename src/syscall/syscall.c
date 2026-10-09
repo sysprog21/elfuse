@@ -1915,6 +1915,8 @@ static int64_t sc_memfd_create(guest_t *g,
         LINUX_O_RDWR | ((flags & LINUX_MFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
     fd_table[gfd].seals =
         (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
+    if (flags & LINUX_MFD_HUGETLB)
+        fd_table[gfd].seals |= FD_SEALS_MFD_HUGETLB;
     return gfd;
 }
 

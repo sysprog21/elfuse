@@ -6,9 +6,11 @@
 #
 # scripts/gen-flag-matrix.py turns this file into build/flag-matrix-vectors.h
 # and tests/test-flag-matrix.c runs every row twice: once with the flag ORed
-# into the F argument and once without it. Both answers are asserted, so a row
-# only passes when the flag is what changes the result. The qemu lane runs the
-# same binary on a real kernel, which is what keeps the answers below honest.
+# into the F argument and once without it. Both answers are asserted. Where they
+# differ, a row only passes when the flag is what changes the result; a row
+# ending in "=" records that the answer is the same either way. The qemu lane
+# runs the same binary on a real kernel, which is what keeps the answers below
+# honest.
 #
 # Format, fields separated by " | ":
 #   syscall | flag[@tag] | arguments | with the flag | without the flag

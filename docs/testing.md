@@ -542,8 +542,10 @@ separates the answers the site could give -- so both are printed.
 
 `test-flag-matrix` records what Linux answers for one flag of one syscall,
 with the flag set and with it clear, one row each in `tests/flag-matrix.tbl`.
-Both answers are asserted, so a row passes only when the flag is what changes
-the result. The qemu lane runs the binary with `strict`, which is what keeps
+Both answers are asserted. Where they differ, the row passes only when the flag
+is what changes the result; a row whose last field is `=` records that Linux
+answers the same either way, and passes only when it does. The qemu lane runs
+the binary with `strict`, which is what keeps
 the recorded answers true; a row it refuses is a wrong row, not a kernel
 difference to skip. Two marks exist for elfuse. `pending` is a divergence still
 to be fixed: its mismatch is reported and not failed, and the lane fails once

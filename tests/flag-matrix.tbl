@@ -269,7 +269,7 @@ mmap | MAP_POPULATE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | 
 mmap | MAP_NORESERVE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 mmap | MAP_STACK | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 # The offset has to be page aligned even when no file is involved.
-pending mmap | MAP_POPULATE@odd-offset | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 1 | err:EINVAL | =
+mmap | MAP_POPULATE@odd-offset | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 1 | err:EINVAL | =
 
 # mmap again, for the protection bits in argument 2.
 mmap | PROT_READ | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | map:noread

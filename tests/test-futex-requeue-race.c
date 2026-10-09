@@ -143,15 +143,18 @@ static const char *race(int op, int leave)
             while (clock_ns(CLOCK_REALTIME) < aim_ns)
                 ;
         } else {
-            if (leave == LEAVE_SIGNAL)
+            if (leave == LEAVE_SIGNAL &&
                 syscall(SYS_tgkill, getpid(), atomic_load(&waiter_tid),
-                        SIGUSR1);
+                        SIGUSR1) != 0)
+                return "could not signal the waiter";
             for (volatile long i = rand_r(&seed) % (MAX_DELAY_SPINS + 1); i > 0;
                  i--)
                 ;
         }
         long long woke_ns = clock_ns(CLOCK_MONOTONIC);
         long woke = syscall(SYS_futex, &word_b, FUTEX_WAKE, 1, NULL, NULL, 0);
+        if (woke != 0 && woke != 1)
+            return "the wake failed";
 
         give_up_ns = woke_ns + GIVE_UP_NS;
         while (atomic_load(&round_done) != r) {

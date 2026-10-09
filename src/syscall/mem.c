@@ -3452,7 +3452,16 @@ int64_t sys_mmap(guest_t *g,
              *    so the memory syscall layer must re-create them with the
              *    correct permissions.
              */
-            guest_update_perms(g, result_off, result_off + length, ext_perms);
+            /* The block is extended read-write because it is shared with
+             * whatever else lands in it, but the range itself gets what was
+             * asked for. A PROT_READ mapping used to keep the block's write
+             * permission until some later mprotect, so a store into it
+             * succeeded where Linux raises SIGSEGV, and /proc/self/maps said
+             * r--p throughout.
+             */
+            int range_perms =
+                (prot & LINUX_PROT_WRITE) ? ext_perms : prot_to_perms(prot);
+            guest_update_perms(g, result_off, result_off + length, range_perms);
             if (ext_end > g->mmap_end)
                 g->mmap_end = ext_end;
         }
@@ -4605,9 +4614,11 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
 
 static bool mprotect_same_prot_fast_path_safe(int prot)
 {
-    /* Non-fixed main-arena mmap initially installs RW PTEs for PROT_READ
-     * mappings, relying on mprotect to tighten them later. Do not trust the
-     * region tracker alone for read-only same-prot requests.
+    /* Non-fixed main-arena mmap used to install RW PTEs for PROT_READ mappings
+     * and rely on mprotect to tighten them. sys_mmap now gives such a range
+     * read-only PTEs itself, but this stays conservative: a read-only same-prot
+     * request still does the PTE work rather than trusting the region tracker
+     * alone.
      */
     return prot == LINUX_PROT_NONE || (prot & LINUX_PROT_WRITE) ||
            (prot & LINUX_PROT_EXEC);

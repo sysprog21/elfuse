@@ -226,8 +226,8 @@ mmap | MAP_NORESERVE | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map |
 mmap | MAP_STACK | 0 4096 PROT_READ F|MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map | =
 
 # mmap again, for the protection bits in argument 2.
-pending mmap | PROT_READ | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | map:noread
-pending mmap | PROT_WRITE | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:writable | map:readonly
+mmap | PROT_READ | 0 65536 F MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:readonly | map:noread
+mmap | PROT_WRITE | 0 65536 F|PROT_READ MAP_PRIVATE|MAP_ANONYMOUS -1 0 | map:writable | map:readonly
 
 # mprotect(addr, length, prot)
 mprotect | PROT_READ | region 4096 F | region:readonly | region:noread

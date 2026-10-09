@@ -356,7 +356,7 @@ INVENTORY = {
         "not-a-wait",
         "Refuses the overlay because an execve is reaping this thread.",
     ),
-    "runtime/forkipc.c::sys_clone": (
+    "runtime/forkipc.c::clone_dispatch": (
         "not-a-wait",
         "Refuses the fork because an execve is reaping this thread.",
     ),

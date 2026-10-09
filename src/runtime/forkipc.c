@@ -84,6 +84,7 @@
  */
 #define LINUX_CLONE_VM 0x00000100
 #define LINUX_CLONE_SIGHAND 0x00000800
+#define LINUX_CLONE_PIDFD 0x00001000
 #define LINUX_CLONE_VFORK 0x00004000
 #define LINUX_CLONE_THREAD 0x00010000
 #define LINUX_CLONE_SETTLS 0x00080000
@@ -1503,13 +1504,39 @@ static int fork_snapshot_shm_via_clonefile(int src_fd)
     return clone_fd;
 }
 
-/* Over the function-size limit on purpose.
- *
- * One transaction. The failure paths unwind state established earlier in the
- * same function (quiesced siblings, promoted overlays, the snapshot fd), so the
- * goto ladder has to see all of it.
+/* Make a pidfd for a child clone just created and store its guest fd number at
+ * gva. Shared by clone, which is given the slot in parent_tid, and clone3,
+ * which has a field of its own for it.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
+static void clone_publish_pidfd(guest_t *g, int64_t child, uint64_t gva)
+{
+    /* A CLONE_VM child has no host pid of its own, so it resolves to -1 and its
+     * pidfd carries no monitor.
+     */
+    int pfd = pidfd_create(g, child, proc_resolve_guest_pid(child));
+    if (pfd < 0)
+        return;
+
+    int32_t pfd32 = (int32_t) pfd;
+    if (guest_write_small(g, gva, &pfd32, sizeof(pfd32)) < 0) {
+        /* GVA invalid; close the newly created pidfd. */
+        fd_entry_t snap;
+        if (fd_snapshot_and_close(pfd, &snap))
+            fd_cleanup_entry(pfd, &snap);
+    }
+}
+
+static int64_t clone_dispatch(hv_vcpu_t vcpu,
+                              guest_t *g,
+                              uint64_t flags,
+                              uint64_t child_stack,
+                              uint64_t stack_map_start,
+                              uint64_t stack_map_end,
+                              uint64_t ptid_gva,
+                              uint64_t tls,
+                              uint64_t ctid_gva,
+                              bool verbose);
+
 int64_t sys_clone(hv_vcpu_t vcpu,
                   guest_t *g,
                   uint64_t flags,
@@ -1520,6 +1547,41 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                   uint64_t tls,
                   uint64_t ctid_gva,
                   bool verbose)
+{
+    /* clone(2) has no argument for the pidfd and returns it through parent_tid,
+     * which is why Linux refuses CLONE_PIDFD beside CLONE_PARENT_SETTID there.
+     * clone3 strips the flag before it calls in and publishes into its own
+     * field, so this never runs twice.
+     */
+    bool want_pidfd = (flags & LINUX_CLONE_PIDFD) != 0;
+    if (want_pidfd && (flags & LINUX_CLONE_PARENT_SETTID))
+        return -LINUX_EINVAL;
+
+    int64_t ret = clone_dispatch(vcpu, g, flags & ~(uint64_t) LINUX_CLONE_PIDFD,
+                                 child_stack, stack_map_start, stack_map_end,
+                                 ptid_gva, tls, ctid_gva, verbose);
+    if (ret > 0 && want_pidfd)
+        clone_publish_pidfd(g, ret, ptid_gva);
+    return ret;
+}
+
+/* Over the function-size limit on purpose.
+ *
+ * One transaction. The failure paths unwind state established earlier in the
+ * same function (quiesced siblings, promoted overlays, the snapshot fd), so the
+ * goto ladder has to see all of it.
+ */
+/* NOLINTNEXTLINE(readability-function-size) */
+static int64_t clone_dispatch(hv_vcpu_t vcpu,
+                              guest_t *g,
+                              uint64_t flags,
+                              uint64_t child_stack,
+                              uint64_t stack_map_start,
+                              uint64_t stack_map_end,
+                              uint64_t ptid_gva,
+                              uint64_t tls,
+                              uint64_t ctid_gva,
+                              bool verbose)
 {
     /* Namespaces are not implemented. CLONE_NEWTIME (0x80) lives in the CSIGNAL
      * low byte and, like CLONE_INTO_CGROUP (bit 33) and set_tid, cannot be
@@ -2080,6 +2142,16 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     log_debug("clone: child pid=%lld (host=%d)", (long long) child_guest_pid,
               child_host_pid);
 
+    /* The thread and CLONE_VM paths store the child's tid for
+     * CLONE_PARENT_SETTID themselves. A fork has to as well: Linux writes it
+     * into the parent's memory once the child exists, and ignores a slot it
+     * cannot write.
+     */
+    if (flags & LINUX_CLONE_PARENT_SETTID) {
+        int32_t tid32 = (int32_t) child_guest_pid;
+        (void) guest_write_small(g, ptid_gva, &tid32, sizeof(tid32));
+    }
+
     free(regions_snapshot);
     if (snapshot_shm_fd >= 0)
         close(snapshot_shm_fd);
@@ -2145,7 +2217,6 @@ struct linux_clone_args {
 #define CLONE_ARGS_SIZE_VER0 64 /* v5.3: first 8 fields (flags..tls) */
 
 /* Unsupported clone3-only flags: reject early rather than silently ignoring. */
-#define LINUX_CLONE_PIDFD 0x00001000
 #define LINUX_CLONE_INTO_CGROUP 0x200000000ULL
 
 int64_t sys_clone3(hv_vcpu_t vcpu,
@@ -2249,21 +2320,8 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
     /* If clone succeeded and CLONE_PIDFD was requested, create a pidfd for the
      * child and write the guest FD number to ca.pidfd.
      */
-    if (ret > 0 && want_pidfd && ca.pidfd != 0) {
-        /* A CLONE_VM child has no host pid of its own, so it resolves to -1 and
-         * its pidfd carries no monitor.
-         */
-        int pfd = pidfd_create(g, ret, proc_resolve_guest_pid(ret));
-        if (pfd >= 0) {
-            int32_t pfd32 = (int32_t) pfd;
-            if (guest_write_small(g, ca.pidfd, &pfd32, sizeof(pfd32)) < 0) {
-                /* GVA invalid; close the newly created pidfd. */
-                fd_entry_t snap;
-                if (fd_snapshot_and_close(pfd, &snap))
-                    fd_cleanup_entry(pfd, &snap);
-            }
-        }
-    }
+    if (ret > 0 && want_pidfd && ca.pidfd != 0)
+        clone_publish_pidfd(g, ret, ca.pidfd);
 
     return ret;
 }

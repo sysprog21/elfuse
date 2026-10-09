@@ -91,7 +91,7 @@ _ROW_PREFIX = re.compile(r"^(?:pending |unsupported:\S+ )?([a-z][a-z0-9_]*) \| "
 def load_flag_matrix_names() -> set[str]:
     names: set[str] = set()
     for line in FLAG_MATRIX.read_text(encoding="utf-8").splitlines():
-        match = _ROW_PREFIX.match(line)
+        match = _ROW_PREFIX.match(line.strip())
         if match:
             names.add(match.group(1))
     return names

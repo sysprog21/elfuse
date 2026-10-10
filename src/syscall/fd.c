@@ -43,9 +43,9 @@
  */
 static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void timerfd_close(int guest_fd);
-static void eventfd_close(int guest_fd);
-static void signalfd_close(int guest_fd);
+static void timerfd_close(int guest_fd, uint64_t generation);
+static void eventfd_close(int guest_fd, uint64_t generation);
+static void signalfd_close(int guest_fd, uint64_t generation);
 
 #define NS_PER_SEC 1000000000LL
 
@@ -76,6 +76,36 @@ static int sfd_alloc_slot(const void *state, size_t count, size_t stride)
     return sfd_find_slot(state, count, stride, -1);
 }
 
+/* What a timerfd or signalfd slot starts with: the guest fd and the generation
+ * fd_alloc stamped on it.
+ */
+typedef struct {
+    int guest_fd;
+    uint64_t gen;
+} sfd_key_t;
+
+/* The slot of the fd that carries @gen, or -1: a dup carries the type's close
+ * and no slot. A lookup by fd number could answer with the slot of a closed fd,
+ * since fd_cleanup_entry runs the type's close after the number is free and
+ * another fd can hold it by then. A caller other than the type's close takes
+ * @gen from the fd table before sfd_lock, which orders after fd_lock. A read
+ * takes it and O_NONBLOCK from one fd_block_state, so the two describe one fd.
+ */
+static int sfd_find_gen(const void *state,
+                        size_t count,
+                        size_t stride,
+                        uint64_t gen)
+{
+    const uint8_t *base = state;
+    for (size_t i = 0; i < count; i++) {
+        sfd_key_t key;
+        memcpy(&key, base + i * stride, sizeof(key));
+        if (key.guest_fd >= 0 && key.gen == gen)
+            return (int) i;
+    }
+    return -1;
+}
+
 /* timerfd emulation via kqueue EVFILT_TIMER
  *
  * Each timerfd_create() creates a kqueue + timer registration. Reads from the
@@ -102,8 +132,9 @@ typedef struct {
  */
 #define LINUX_CLOCK_BOOTTIME 7
 
-static struct {
+static struct timerfd_slot {
     int guest_fd;         /* Guest fd (-1 if unused) */
+    uint64_t gen;         /* fd generation fd_alloc stamped on guest_fd */
     int kq_fd;            /* kqueue fd for this timer */
     uint64_t expirations; /* Accumulated expiration count */
     int64_t interval_ns;  /* Repeat interval (0 = one-shot) */
@@ -113,6 +144,9 @@ static struct {
     bool armed;  /* True if timer is running */
 } timerfd_state[TIMERFD_MAX];
 
+_Static_assert(offsetof(struct timerfd_slot, gen) == offsetof(sfd_key_t, gen),
+               "a timerfd slot must start with sfd_key_t's fields");
+
 void timerfd_init(void)
 {
     for (int i = 0; i < TIMERFD_MAX; i++)
@@ -120,10 +154,10 @@ void timerfd_init(void)
     fd_register_cleanup(FD_TIMERFD, timerfd_close);
 }
 
-static int timerfd_find(int guest_fd)
+static int timerfd_find_gen(uint64_t gen)
 {
-    return sfd_find_slot(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]),
-                         guest_fd);
+    return sfd_find_gen(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]),
+                        gen);
 }
 
 static int timerfd_alloc(void)
@@ -202,7 +236,8 @@ int64_t sys_timerfd_create(int clockid, int flags)
         return linux_errno();
     }
 
-    int gfd = fd_alloc(FD_TIMERFD, kq, timerfd_close);
+    uint64_t gen = 0;
+    int gfd = fd_alloc_from(0, FD_TIMERFD, kq, timerfd_close, &gen);
     if (gfd < 0) {
         close(kq);
         return -LINUX_EMFILE;
@@ -212,12 +247,13 @@ int64_t sys_timerfd_create(int clockid, int flags)
     int slot = timerfd_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
-        fd_retire_published(gfd, kq);
+        fd_retire_published_gen(gfd, kq, gen);
         return -LINUX_ENOMEM;
     }
 
     memset(&timerfd_state[slot], 0, sizeof(timerfd_state[slot]));
     timerfd_state[slot].guest_fd = gfd;
+    timerfd_state[slot].gen = gen;
     timerfd_state[slot].kq_fd = kq;
     timerfd_state[slot].clockid = clockid;
     pthread_mutex_unlock(&sfd_lock);
@@ -225,10 +261,17 @@ int64_t sys_timerfd_create(int clockid, int flags)
     /* Linux opens the timerfd inode O_RDWR (anon_inode_getfd in fs/timerfd.c).
      * Stamp O_RDWR into linux_flags so the F_GETFL branch below can surface the
      * access mode without re-deriving it.
+     *
+     * A close that arrived before the slot was registered found nothing to tear
+     * down. The number no longer carries this generation then: the publish
+     * writes nothing and the slot is retired here.
      */
-    fd_publish_linux_flags(
-        gfd, ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
-                 ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
+    if (!fd_publish_linux_flags_gen(
+            gfd,
+            ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0),
+            gen))
+        timerfd_close(gfd, gen);
     return gfd;
 }
 
@@ -240,8 +283,9 @@ int64_t sys_timerfd_settime(guest_t *g,
 {
     int64_t ret = 0;
 
+    uint64_t gen = fd_current_generation(fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         ret = -LINUX_EBADF;
         goto unlock;
@@ -368,8 +412,9 @@ unlock:
 
 int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva)
 {
+    uint64_t gen = fd_current_generation(fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return -LINUX_EBADF;
@@ -410,10 +455,13 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     if (count < 8)
         return -LINUX_EINVAL;
 
-    bool nonblock = fd_guest_nonblock(guest_fd);
+    fd_block_state_t st = fd_block_state(guest_fd);
+    bool nonblock = st.guest_nonblock;
+    /* A closed slot keeps its generation until the number is reused. */
+    uint64_t gen = st.type == FD_TIMERFD ? st.generation : 0;
 
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(guest_fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return -LINUX_EBADF;
@@ -464,7 +512,7 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             int nev = kevent(kq, NULL, 0, &kev, 1, &collect);
             pthread_mutex_lock(&sfd_lock);
             /* Re-validate: slot may have been freed by timerfd_close() */
-            if (timerfd_state[slot].guest_fd != guest_fd) {
+            if (timerfd_find_gen(gen) != slot) {
                 pthread_mutex_unlock(&sfd_lock);
                 return -LINUX_EBADF;
             }
@@ -521,10 +569,11 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 /* Clean up timerfd state when guest closes the fd. Must hold sfd_lock to
  * prevent racing with concurrent timerfd_read.
  */
-static void timerfd_close(int guest_fd)
+static void timerfd_close(int guest_fd, uint64_t generation)
 {
+    (void) guest_fd;
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(guest_fd);
+    int slot = timerfd_find_gen(generation);
     if (slot >= 0) {
         /* kq_fd is closed by sys_close() as host_fd */
         timerfd_state[slot].guest_fd = -1;
@@ -684,8 +733,9 @@ int64_t sys_eventfd2(unsigned int initval, int flags)
 /* Clean up eventfd state when guest closes the fd. Must hold sfd_lock to
  * prevent racing with concurrent eventfd_write/eventfd_read.
  */
-static void eventfd_close(int guest_fd)
+static void eventfd_close(int guest_fd, uint64_t generation)
 {
+    (void) generation;
     pthread_mutex_lock(&sfd_lock);
     int slot = eventfd_find(guest_fd);
     if (slot >= 0) {
@@ -1029,12 +1079,16 @@ _Static_assert(sizeof(linux_signalfd_siginfo_t) == 128,
 
 /* Per-signalfd state */
 #define SIGNALFD_MAX 16
-static struct {
+static struct signalfd_slot {
     int guest_fd;  /* Guest fd (-1 if unused) */
+    uint64_t gen;  /* fd generation fd_alloc stamped on guest_fd */
     int pipe_rd;   /* Read end for poll/epoll readiness */
     int pipe_wr;   /* Write end for signaling */
     uint64_t mask; /* Signal mask (bitmask of signals to accept) */
 } signalfd_state[SIGNALFD_MAX];
+
+_Static_assert(offsetof(struct signalfd_slot, gen) == offsetof(sfd_key_t, gen),
+               "a signalfd slot must start with sfd_key_t's fields");
 
 void signalfd_init(void)
 {
@@ -1043,10 +1097,10 @@ void signalfd_init(void)
     fd_register_cleanup(FD_SIGNALFD, signalfd_close);
 }
 
-static int signalfd_find(int guest_fd)
+static int signalfd_find_gen(uint64_t gen)
 {
-    return sfd_find_slot(signalfd_state, SIGNALFD_MAX,
-                         sizeof(signalfd_state[0]), guest_fd);
+    return sfd_find_gen(signalfd_state, SIGNALFD_MAX, sizeof(signalfd_state[0]),
+                        gen);
 }
 
 static int signalfd_slot_alloc(void)
@@ -1058,10 +1112,11 @@ static int signalfd_slot_alloc(void)
 /* Clean up signalfd state when guest closes the fd. Must hold sfd_lock to
  * prevent racing with concurrent signalfd_notify.
  */
-static void signalfd_close(int guest_fd)
+static void signalfd_close(int guest_fd, uint64_t generation)
 {
+    (void) guest_fd;
     pthread_mutex_lock(&sfd_lock);
-    int slot = signalfd_find(guest_fd);
+    int slot = signalfd_find_gen(generation);
     if (slot >= 0) {
         close(signalfd_state[slot].pipe_wr);
         /* pipe_rd is closed by sys_close() as host_fd */
@@ -1089,8 +1144,9 @@ int64_t sys_signalfd4(guest_t *g,
 
     /* If fd >= 0, update existing signalfd mask */
     if (fd >= 0) {
+        uint64_t gen = fd_current_generation(fd);
         pthread_mutex_lock(&sfd_lock);
-        int slot = signalfd_find(fd);
+        int slot = signalfd_find_gen(gen);
         if (slot < 0) {
             pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EINVAL;
@@ -1114,7 +1170,8 @@ int64_t sys_signalfd4(guest_t *g,
         return linux_errno();
     }
 
-    int gfd = fd_alloc(FD_SIGNALFD, pipefd[0], signalfd_close);
+    uint64_t gen = 0;
+    int gfd = fd_alloc_from(0, FD_SIGNALFD, pipefd[0], signalfd_close, &gen);
     if (gfd < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
@@ -1125,23 +1182,29 @@ int64_t sys_signalfd4(guest_t *g,
     int slot = signalfd_slot_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
-        fd_retire_published(gfd, pipefd[0]);
+        fd_retire_published_gen(gfd, pipefd[0], gen);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
     }
 
     signalfd_state[slot].guest_fd = gfd;
+    signalfd_state[slot].gen = gen;
     signalfd_state[slot].pipe_rd = pipefd[0];
     signalfd_state[slot].pipe_wr = pipefd[1];
     signalfd_state[slot].mask = mask;
     pthread_mutex_unlock(&sfd_lock);
 
     /* Linux opens the signalfd inode O_RDWR (anon_inode_getfd in
-     * fs/signalfd.c); same reasoning as eventfd for O_NONBLOCK.
+     * fs/signalfd.c); same reasoning as eventfd for O_NONBLOCK. A false return
+     * is the window timerfd_create describes: a close before the slot was
+     * registered.
      */
-    fd_publish_linux_flags(
-        gfd, ((flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
-                 ((flags & LINUX_SFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
+    if (!fd_publish_linux_flags_gen(
+            gfd,
+            ((flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                ((flags & LINUX_SFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0),
+            gen))
+        signalfd_close(gfd, gen);
 
     return gfd;
 }
@@ -1171,6 +1234,7 @@ int64_t signalfd_read(int guest_fd,
                       uint64_t count)
 {
     int nonblock;
+    fd_block_state_t st;
 retry:
     /* Capture slot state under sfd_lock, then release BEFORE calling
      * signal_get_state() which acquires sig_lock(4). Holding sfd_lock(5a) while
@@ -1179,10 +1243,13 @@ retry:
      * Re-read per attempt: a sibling can change the flag while this one is
      * parked, and the block-or-report decision below is made fresh each round.
      */
-    nonblock = fd_guest_nonblock(guest_fd);
+    st = fd_block_state(guest_fd);
+    nonblock = st.guest_nonblock;
+    /* A closed slot keeps its generation until the number is reused. */
+    uint64_t gen = st.type == FD_SIGNALFD ? st.generation : 0;
 
     pthread_mutex_lock(&sfd_lock);
-    int slot = signalfd_find(guest_fd);
+    int slot = signalfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return -LINUX_EBADF;
@@ -1271,7 +1338,7 @@ retry:
 
         /* Re-validate: slot may have been freed by signalfd_close() */
         pthread_mutex_lock(&sfd_lock);
-        int still_valid = (signalfd_state[slot].guest_fd == guest_fd);
+        int still_valid = (signalfd_find_gen(gen) == slot);
         pthread_mutex_unlock(&sfd_lock);
         if (!still_valid) {
             free(heap);
@@ -1416,8 +1483,9 @@ bool eventfd_fdinfo_snapshot(int guest_fd, uint64_t *count_out)
 
 bool signalfd_fdinfo_snapshot(int guest_fd, uint64_t *mask_out)
 {
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = signalfd_find(guest_fd);
+    int slot = signalfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return false;
@@ -1433,8 +1501,9 @@ bool timerfd_fdinfo_snapshot(int guest_fd,
                              int64_t *value_ns_out,
                              int64_t *interval_ns_out)
 {
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&sfd_lock);
-    int slot = timerfd_find(guest_fd);
+    int slot = timerfd_find_gen(gen);
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         return false;

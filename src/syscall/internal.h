@@ -209,7 +209,7 @@ void fdtable_init(void);
  * Returns -1 if table is full. cleanup is set atomically under fd_lock (pass
  * NULL for plain fds).
  */
-int fd_alloc(int type, int host_fd, void (*cleanup)(int));
+int fd_alloc(int type, int host_fd, void (*cleanup)(int, uint64_t));
 
 /* The status bits that belong to the open file description rather than to the
  * fd slot naming it, so a dup carries them to the alias and an alias sweep may
@@ -354,26 +354,26 @@ static inline fd_alias_spec_t fd_alias_carried(bool foreign, bool owned)
 int fd_alloc_alias(const fd_alias_spec_t *spec,
                    int type,
                    int host_fd,
-                   void (*cleanup)(int));
+                   void (*cleanup)(int, uint64_t));
 int fd_alloc_alias_at(const fd_alias_spec_t *spec,
                       int fd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       uint64_t *out_gen);
 int fd_alloc_alias_relaxed(const fd_alias_spec_t *spec,
                            int fixed_fd,
                            int minfd,
                            int type,
                            int host_fd,
-                           void (*cleanup)(int),
+                           void (*cleanup)(int, uint64_t),
                            uint64_t *out_gen);
 int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
                        int fixed_fd,
                        int minfd,
                        int type,
                        int host_fd,
-                       void (*cleanup)(int),
+                       void (*cleanup)(int, uint64_t),
                        void *dir,
                        int linux_flags,
                        uint64_t *out_gen);
@@ -388,7 +388,7 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
  */
 int fd_alloc_dir(int type,
                  int host_fd,
-                 void (*cleanup)(int),
+                 void (*cleanup)(int, uint64_t),
                  void *dir,
                  int linux_flags);
 
@@ -399,14 +399,14 @@ int fd_alloc_dir(int type,
 int fd_alloc_dir_from(int minfd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       void *dir,
                       int linux_flags,
                       uint64_t *out_gen);
 int fd_alloc_dir_at(int fd,
                     int type,
                     int host_fd,
-                    void (*cleanup)(int),
+                    void (*cleanup)(int, uint64_t),
                     void *dir,
                     int linux_flags,
                     uint64_t *out_gen);
@@ -422,7 +422,7 @@ int fd_alloc_dir_at(int fd,
 int fd_alloc_from(int minfd,
                   int type,
                   int host_fd,
-                  void (*cleanup)(int),
+                  void (*cleanup)(int, uint64_t),
                   uint64_t *out_gen);
 
 /* Allocate the lowest available FD >= minfd with a single-thread fast path.
@@ -431,7 +431,7 @@ int fd_alloc_from(int minfd,
 int fd_alloc_from_relaxed(int minfd,
                           int type,
                           int host_fd,
-                          void (*cleanup)(int),
+                          void (*cleanup)(int, uint64_t),
                           uint64_t *out_gen);
 
 /* Allocate a specific FD slot.
@@ -441,7 +441,7 @@ int fd_alloc_from_relaxed(int minfd,
 int fd_alloc_at(int fd,
                 int type,
                 int host_fd,
-                void (*cleanup)(int),
+                void (*cleanup)(int, uint64_t),
                 uint64_t *out_gen);
 
 /* Allocate a specific FD slot with a single-thread fast path. Falls back to
@@ -450,7 +450,7 @@ int fd_alloc_at(int fd,
 int fd_alloc_at_relaxed(int fd,
                         int type,
                         int host_fd,
-                        void (*cleanup)(int),
+                        void (*cleanup)(int, uint64_t),
                         uint64_t *out_gen);
 
 /* Report whether a guest FD slot >= minfd will be free after execve's CLOEXEC
@@ -613,6 +613,15 @@ bool fd_apply_guest_nonblock(int guest_fd, bool on);
  */
 void fd_publish_linux_flags(int guest_fd, int linux_flags);
 
+/* fd_publish_linux_flags for a creator that kept the generation its allocation
+ * returned. The flags are written only while the slot still carries @gen, in
+ * the fd_lock section that checks it, so a slot a sibling closed and
+ * reallocated keeps its own flags.
+ *
+ * Returns whether the flags were written.
+ */
+bool fd_publish_linux_flags_gen(int guest_fd, int linux_flags, uint64_t gen);
+
 /* Republish the EL1 urandom read fast-path bit for this fd from the current
  * fd_table type and access mode. Only readable /dev/urandom descriptors are
  * eligible for the bitmap.
@@ -624,8 +633,8 @@ void fd_refresh_urandom_bitmap(int fd);
  * type so the binding stays consistent without each path re-deriving the
  * dispatch table.
  */
-void fd_register_cleanup(int type, void (*cleanup)(int));
-void (*fd_cleanup_for_type(int type))(int);
+void fd_register_cleanup(int type, void (*cleanup)(int, uint64_t));
+void (*fd_cleanup_for_type(int type))(int, uint64_t);
 
 /* True for fd types whose host backing (kqueue for timerfd/inotify, pipe halves
  * for eventfd/signalfd/netlink/pidfd, epoll instance) cannot be meaningfully
@@ -788,6 +797,13 @@ fd_lifetime_t *fd_mark_closed_unlocked(int fd);
  */
 void fd_retire_published(int fd, int host_fd);
 
+/* fd_retire_published for a caller that kept the generation its allocation
+ * returned: the slot is retired only while it still carries @gen, so a slot a
+ * sibling closed and reallocated is left alone even when the replacement holds
+ * the same host fd number.
+ */
+void fd_retire_published_gen(int fd, int host_fd, uint64_t gen);
+
 /* Atomically snapshot an fd entry and mark it closed.
  *
  * Returns true if the slot was open (snapshot written to *out), false if
@@ -795,6 +811,12 @@ void fd_retire_published(int fd, int host_fd);
  * both snapshot the same open entry and double-close the host fd.
  */
 bool fd_snapshot_and_close(int fd, fd_entry_t *out);
+
+/* fd_snapshot_and_close for a caller that kept the generation its allocation
+ * returned: the slot is closed only while it still carries @gen, so a number a
+ * sibling closed and reallocated stays open.
+ */
+bool fd_snapshot_and_close_gen(int fd, uint64_t gen, fd_entry_t *out);
 
 /* Snapshot and close with a single-thread fast path. Uses the unlocked table
  * update when exactly one guest thread is active, otherwise falls back to

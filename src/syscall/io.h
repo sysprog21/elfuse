@@ -25,7 +25,7 @@
 /* read/write and their positional variants. */
 int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count);
 int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count);
-void urandom_fd_cleanup(int guest_fd);
+void urandom_fd_cleanup(int guest_fd, uint64_t generation);
 void urandom_fd_reset_cache(int guest_fd);
 
 /* Initialize the per-fd urandom cache locks. Must run before any guest thread

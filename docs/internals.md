@@ -513,10 +513,12 @@ Netlink socket state is keyed by guest fd number, and a guest fd number
 outlives its socket: `fd_cleanup_entry()` runs the netlink teardown after
 the number is already back in the fd table's free pool, so a concurrent
 `socket()` can be handed it while the previous slot is still live. Slots
-therefore carry an allocation generation -- lookups answer with the newest
-slot for a number and teardown retires the oldest -- which pairs each
-teardown with the socket that asked for it whatever order the threads
-arrive in.
+therefore carry the fd generation `fd_alloc` stamped on their number: a
+lookup matches the generation the fd table carries for the number at the
+time of the call, so a number that has passed to another fd finds no slot,
+and teardown retires the slot stamped with the generation of the fd being
+closed, which a `dup` of the socket never is. The timerfd, signalfd and
+inotify tables look up and pair a close with its slot the same way.
 
 ### Stack Alignment
 
@@ -906,15 +908,14 @@ then takes the per-entry lock with the table lock released: taking the two
 nested meant a thread blocked on one fd's transfer held the table lock on
 every other thread's behalf, and one transfer with usbdevfs's documented
 "unlimited" `timeout == 0` wedged every usbdevfs fd in the process,
-`close()` included. Teardown runs from the fd-cleanup hook, which is handed
-a bare fd number after the fd-table slot is already free, so a sibling
-thread's open can already hold the same number; among the entries that
-answer to it the closing one is the one with the smaller generation, since
-`fd_alloc` stamps a globally monotonic counter. `fd_alloc` also publishes the
-guest fd before the side table can bind it, so a close landing in that window
-would find no entry to tear down; the open rereads the fd's generation once its
-entry is findable and retires the entry itself if the close has already been
-and gone.
+`close()` included. Teardown runs from the fd-cleanup hook after the fd-table
+slot is already free, so a sibling thread's open can already hold the same
+number; the hook is handed the generation of the slot being closed, and tears
+down the entry bound to that generation and no other. `fd_alloc` also publishes
+the guest fd before the side table can bind it, so a close landing in that
+window would find no entry to tear down; the open rereads the fd's generation
+once its entry is findable and retires the entry itself if the close has
+already been and gone.
 
 That leaves two windows around the bind, and the entry keeps one identity
 across both. Before the bind its `guest_fd` is still -1, so a close finds

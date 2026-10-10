@@ -528,6 +528,16 @@ $(BUILD_DIR)/test-sigsuspend: tests/test-sigsuspend.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -Itests -o $@ $< -lpthread
 
+# test-pidfd-reuse hands a just-closed pidfd number to a sibling thread's open.
+$(BUILD_DIR)/test-pidfd-reuse: tests/test-pidfd-reuse.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -Itests -o $@ $< -lpthread
+
+# test-special-fd-reuse hands a just-closed fd number to a sibling thread too.
+$(BUILD_DIR)/test-special-fd-reuse: tests/test-special-fd-reuse.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -Itests -o $@ $< -lpthread
+
 # test-thread-churn creates >64 threads to force thread-table slot reuse.
 $(BUILD_DIR)/test-thread-churn: tests/test-thread-churn.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

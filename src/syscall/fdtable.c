@@ -277,7 +277,7 @@ static fd_host_probe_t fd_probe_host(int type, int host_fd)
 static inline void fd_init_entry(int fd,
                                  int type,
                                  int host_fd,
-                                 void (*cleanup)(int),
+                                 void (*cleanup)(int, uint64_t),
                                  const fd_host_probe_t *probe)
 {
     fd_bitmap_set_used(fd);
@@ -519,7 +519,7 @@ void fdtable_init(void)
 static int fd_alloc_locked(int minfd,
                            int type,
                            int host_fd,
-                           void (*cleanup)(int),
+                           void (*cleanup)(int, uint64_t),
                            const fd_host_probe_t *probe)
 {
     int fd = fd_bitmap_find_free(minfd);
@@ -545,7 +545,7 @@ static int fd_alloc_locked(int minfd,
  * Returns -1 if table is full or RLIMIT_NOFILE would be exceeded (sets errno to
  * EMFILE).
  */
-int fd_alloc(int type, int host_fd, void (*cleanup)(int))
+int fd_alloc(int type, int host_fd, void (*cleanup)(int, uint64_t))
 {
     fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
@@ -556,7 +556,7 @@ int fd_alloc(int type, int host_fd, void (*cleanup)(int))
 
 int fd_alloc_dir(int type,
                  int host_fd,
-                 void (*cleanup)(int),
+                 void (*cleanup)(int, uint64_t),
                  void *dir,
                  int linux_flags)
 {
@@ -581,7 +581,7 @@ int fd_alloc_dir(int type,
 int fd_alloc_dir_from(int minfd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       void *dir,
                       int linux_flags,
                       uint64_t *out_gen)
@@ -607,7 +607,7 @@ int fd_alloc_dir_from(int minfd,
 int fd_alloc_dir_at(int fd,
                     int type,
                     int host_fd,
-                    void (*cleanup)(int),
+                    void (*cleanup)(int, uint64_t),
                     void *dir,
                     int linux_flags,
                     uint64_t *out_gen)
@@ -645,7 +645,7 @@ int fd_alloc_dir_at(int fd,
 int fd_alloc_from(int minfd,
                   int type,
                   int host_fd,
-                  void (*cleanup)(int),
+                  void (*cleanup)(int, uint64_t),
                   uint64_t *out_gen)
 {
     fd_host_probe_t probe = fd_probe_host(type, host_fd);
@@ -670,7 +670,7 @@ int fd_alloc_from(int minfd,
 int fd_alloc_alias(const fd_alias_spec_t *spec,
                    int type,
                    int host_fd,
-                   void (*cleanup)(int))
+                   void (*cleanup)(int, uint64_t))
 {
     fd_alias_begin(spec);
     return fd_alias_end(fd_alloc(type, host_fd, cleanup));
@@ -680,7 +680,7 @@ int fd_alloc_alias_at(const fd_alias_spec_t *spec,
                       int fd,
                       int type,
                       int host_fd,
-                      void (*cleanup)(int),
+                      void (*cleanup)(int, uint64_t),
                       uint64_t *out_gen)
 {
     fd_alias_begin(spec);
@@ -692,7 +692,7 @@ int fd_alloc_alias_relaxed(const fd_alias_spec_t *spec,
                            int minfd,
                            int type,
                            int host_fd,
-                           void (*cleanup)(int),
+                           void (*cleanup)(int, uint64_t),
                            uint64_t *out_gen)
 {
     fd_alias_begin(spec);
@@ -708,7 +708,7 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
                        int minfd,
                        int type,
                        int host_fd,
-                       void (*cleanup)(int),
+                       void (*cleanup)(int, uint64_t),
                        void *dir,
                        int linux_flags,
                        uint64_t *out_gen)
@@ -724,7 +724,7 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
 int fd_alloc_from_relaxed(int minfd,
                           int type,
                           int host_fd,
-                          void (*cleanup)(int),
+                          void (*cleanup)(int, uint64_t),
                           uint64_t *out_gen)
 {
     if (!thread_is_single_active())
@@ -782,7 +782,7 @@ bool fd_reexec_slot_available(int minfd)
 int fd_alloc_at(int fd,
                 int type,
                 int host_fd,
-                void (*cleanup)(int),
+                void (*cleanup)(int, uint64_t),
                 uint64_t *out_gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -822,7 +822,7 @@ int fd_alloc_at(int fd,
 int fd_alloc_at_relaxed(int fd,
                         int type,
                         int host_fd,
-                        void (*cleanup)(int),
+                        void (*cleanup)(int, uint64_t),
                         uint64_t *out_gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -928,6 +928,17 @@ bool fd_snapshot_and_close(int fd, fd_entry_t *out)
         return false;
     pthread_mutex_lock(&fd_lock);
     bool ok = fd_snapshot_locked(fd, out, true);
+    pthread_mutex_unlock(&fd_lock);
+    return ok;
+}
+
+bool fd_snapshot_and_close_gen(int fd, uint64_t gen, fd_entry_t *out)
+{
+    if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
+        return false;
+    pthread_mutex_lock(&fd_lock);
+    bool ok =
+        fd_table[fd].generation == gen && fd_snapshot_locked(fd, out, true);
     pthread_mutex_unlock(&fd_lock);
     return ok;
 }
@@ -1150,11 +1161,12 @@ fd_lifetime_t *fd_lifetime_pin_locked(int fd)
  * host_fd narrows which slot this retires but does not identify it: if the
  * sibling's replacement happens to reuse the same number, the check passes and
  * this retires the replacement. Distinguishing that needs the allocation
- * generation, which the plain fd_alloc does not hand back. The residue is a
- * guest operating on an fd number it was never given, which linux-wire.h
- * already calls a guest-level bug.
+ * generation, which the plain fd_alloc does not hand back; a caller that holds
+ * it passes it as @gen, and 0 leaves the generation unchecked. The residue for
+ * the unchecked form is a guest operating on an fd number it was never given,
+ * which linux-wire.h already calls a guest-level bug.
  */
-void fd_retire_published(int fd, int host_fd)
+static void fd_retire_slot(int fd, int host_fd, uint64_t gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
         if (host_fd >= 0)
@@ -1166,8 +1178,9 @@ void fd_retire_published(int fd, int host_fd)
      * directory types); retiring one still has to clear the slot.
      */
     pthread_mutex_lock(&fd_lock);
-    bool still_ours =
-        fd_table[fd].type != FD_CLOSED && fd_table[fd].host_fd == host_fd;
+    bool still_ours = fd_table[fd].type != FD_CLOSED &&
+                      fd_table[fd].host_fd == host_fd &&
+                      (gen == 0 || fd_table[fd].generation == gen);
     fd_lifetime_t *lifetime = still_ours ? fd_mark_closed_unlocked(fd) : NULL;
     pthread_mutex_unlock(&fd_lock);
 
@@ -1175,6 +1188,16 @@ void fd_retire_published(int fd, int host_fd)
         fd_lifetime_release(lifetime);
     else if (still_ours && host_fd >= 0)
         close(host_fd);
+}
+
+void fd_retire_published(int fd, int host_fd)
+{
+    fd_retire_slot(fd, host_fd, 0);
+}
+
+void fd_retire_published_gen(int fd, int host_fd, uint64_t gen)
+{
+    fd_retire_slot(fd, host_fd, gen);
 }
 
 /* Snapshot an fd entry under fd_lock.
@@ -1373,22 +1396,35 @@ void fd_publish_linux_flags(int guest_fd, int linux_flags)
     pthread_mutex_unlock(&fd_lock);
 }
 
+bool fd_publish_linux_flags_gen(int guest_fd, int linux_flags, uint64_t gen)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return false;
+    pthread_mutex_lock(&fd_lock);
+    fd_entry_t *e = &fd_table[guest_fd];
+    bool ours = e->type != FD_CLOSED && e->generation == gen;
+    if (ours)
+        e->linux_flags = fd_flags_with_accmode(e->type, linux_flags);
+    pthread_mutex_unlock(&fd_lock);
+    return ours;
+}
+
 /* Sized to cover all FD_* constants in abi.h plus a small headroom. Indexed by
  * type. Each slot defaults to NULL (no per-type cleanup). Modules that own a
  * type call fd_register_cleanup() at init time; dup and fork-restore paths read
  * back the binding via fd_cleanup_for_type().
  */
 #define FD_TYPE_REGISTRY_SIZE 32
-static void (*fd_type_cleanup[FD_TYPE_REGISTRY_SIZE])(int);
+static void (*fd_type_cleanup[FD_TYPE_REGISTRY_SIZE])(int, uint64_t);
 
-void fd_register_cleanup(int type, void (*cleanup)(int))
+void fd_register_cleanup(int type, void (*cleanup)(int, uint64_t))
 {
     if (type < 0 || type >= FD_TYPE_REGISTRY_SIZE)
         return;
     fd_type_cleanup[type] = cleanup;
 }
 
-void (*fd_cleanup_for_type(int type))(int)
+void (*fd_cleanup_for_type(int type))(int, uint64_t)
 {
     if (type < 0 || type >= FD_TYPE_REGISTRY_SIZE)
         return NULL;
@@ -1448,7 +1484,7 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
 
     /* Type-specific teardown via vtable (replaces per-type switch) */
     if (snap->cleanup)
-        snap->cleanup(guest_fd);
+        snap->cleanup(guest_fd, snap->generation);
 
     /* Drop this host fd from both pty side tables. Must happen before
      * close(snap->host_fd): both are keyed by the still-live host fd. The

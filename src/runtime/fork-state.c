@@ -499,7 +499,8 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_mark_closed(gfd);
             continue;
         } else {
-            void (*cleanup)(int) = fd_cleanup_for_type(fd_entries[i].type);
+            void (*cleanup)(int, uint64_t) =
+                fd_cleanup_for_type(fd_entries[i].type);
 
             /* A second slot on a description whose directory stream this loop
              * has already built shares that stream, the way dup/dup2/F_DUPFD

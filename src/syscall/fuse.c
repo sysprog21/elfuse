@@ -1365,8 +1365,10 @@ static int fuse_release_common_locked(fuse_session_t *session,
     return forget_rc;
 }
 
-static void fuse_fd_cleanup(int guest_fd)
+static void fuse_fd_cleanup(int guest_fd, uint64_t generation)
 {
+    (void) generation;
+
     /* Step 1: snapshot the file slot's release-relevant fields and detach the
      * slot from the fd. The slot itself stays alive (refcount > 0) until any
      * in-flight op releases its ref; only then is io_cond destroyed and the

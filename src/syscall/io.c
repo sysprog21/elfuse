@@ -749,8 +749,9 @@ void urandom_fd_reset_cache(int guest_fd)
     pthread_mutex_unlock(&c->lock);
 }
 
-void urandom_fd_cleanup(int guest_fd)
+void urandom_fd_cleanup(int guest_fd, uint64_t generation)
 {
+    (void) generation;
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
         return;
 

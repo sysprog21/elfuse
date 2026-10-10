@@ -657,7 +657,9 @@ typedef struct {
     int32_t fasync_owner_type; /* FASYNC_OWNER_* recipient kind (0 = none) */
     int32_t fasync_owner;      /* pid/pgrp/tid for SIGIO/SIGURG delivery */
     sock_opt_cache_t sock; /* Socket option cache (zeroed for non-sockets) */
-    void (*cleanup)(int guest_fd); /* Type-specific teardown (NULL if none) */
+    void (*cleanup)(
+        int guest_fd,
+        uint64_t generation); /* Type-specific teardown (NULL if none) */
 } fd_entry_t;
 
 /* Inline socket option cache accessors. */

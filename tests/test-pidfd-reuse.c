@@ -92,8 +92,10 @@ int main(void)
     pthread_t thr[THREADS];
     tally_t tally[THREADS] = {0};
     int started = 0;
+    int create_rc = 0;
     for (; started < THREADS; started++) {
-        if (pthread_create(&thr[started], NULL, churn, &tally[started]) != 0)
+        create_rc = pthread_create(&thr[started], NULL, churn, &tally[started]);
+        if (create_rc != 0)
             break;
     }
 
@@ -113,6 +115,8 @@ int main(void)
     printf("test-pidfd-reuse: pidfd close under fd number reuse\n");
 
     TEST("all threads started");
+    /* pthread_create returns its error and leaves errno alone. */
+    errno = create_rc;
     EXPECT_EQ(started, THREADS, "pthread_create failed");
 
     TEST("pidfd_open on a live child");

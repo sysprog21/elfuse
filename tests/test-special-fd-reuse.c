@@ -161,9 +161,11 @@ static void run_kind(const kind_t *kind)
     pthread_t thr[THREADS];
     tally_t tally[THREADS] = {0};
     int started = 0;
+    int create_rc = 0;
     for (; started < THREADS; started++) {
         tally[started].kind = kind;
-        if (pthread_create(&thr[started], NULL, churn, &tally[started]) != 0)
+        create_rc = pthread_create(&thr[started], NULL, churn, &tally[started]);
+        if (create_rc != 0)
             break;
     }
 
@@ -178,6 +180,8 @@ static void run_kind(const kind_t *kind)
     char name[32];
     snprintf(name, sizeof(name), "%s: threads started", kind->name);
     TEST(name);
+    /* pthread_create returns its error and leaves errno alone. */
+    errno = create_rc;
     EXPECT_EQ(started, THREADS, "pthread_create failed");
 
     snprintf(name, sizeof(name), "%s: open", kind->name);

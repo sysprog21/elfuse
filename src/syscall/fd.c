@@ -457,7 +457,8 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
     fd_block_state_t st = fd_block_state(guest_fd);
     bool nonblock = st.guest_nonblock;
-    uint64_t gen = st.generation;
+    /* A closed slot keeps its generation until the number is reused. */
+    uint64_t gen = st.type == FD_TIMERFD ? st.generation : 0;
 
     pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find_gen(gen);
@@ -1244,7 +1245,8 @@ retry:
      */
     st = fd_block_state(guest_fd);
     nonblock = st.guest_nonblock;
-    uint64_t gen = st.generation;
+    /* A closed slot keeps its generation until the number is reused. */
+    uint64_t gen = st.type == FD_SIGNALFD ? st.generation : 0;
 
     pthread_mutex_lock(&sfd_lock);
     int slot = signalfd_find_gen(gen);

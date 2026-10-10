@@ -897,11 +897,12 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 {
     /* Before inotify_lock: fd_block_state takes fd_lock, which orders ahead of
      * this one. The guest's O_NONBLOCK lives in the fd_table shadow because the
-     * host fd behind an inotify fd is elfuse's own pipe.
+     * host fd behind an inotify fd is elfuse's own pipe. A closed slot keeps
+     * its generation until the number is reused, hence the type check.
      */
     fd_block_state_t st = fd_block_state(guest_fd);
     bool nonblock = st.guest_nonblock;
-    uint64_t gen = st.generation;
+    uint64_t gen = st.type == FD_INOTIFY ? st.generation : 0;
 
     pthread_mutex_lock(&inotify_lock);
     int slot = inotify_find_gen(gen);

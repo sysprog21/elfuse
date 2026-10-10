@@ -1863,11 +1863,12 @@ static int64_t netlink_recv_iov(int guest_fd,
                                 int flags)
 {
     /* O_NONBLOCK and the generation from one fd-table snapshot, so the two
-     * describe one fd.
+     * describe one fd. A closed slot keeps its generation until the number is
+     * reused, hence the type check.
      */
     fd_block_state_t st = fd_block_state(guest_fd);
     bool nonblock = (flags & LINUX_MSG_DONTWAIT) || st.guest_nonblock;
-    uint64_t gen = st.generation;
+    uint64_t gen = st.type == FD_NETLINK ? st.generation : 0;
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find_gen(gen);
     if (!ns) {

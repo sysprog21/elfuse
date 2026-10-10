@@ -25,11 +25,18 @@
  *      must only return when a real wake arrives or a signal is
  *      genuinely queued for the thread.
  *
+ *   4. PI waiter against an owner that retakes the lock in guest code: two
+ *      threads take and release one PI lock in a tight loop, entering the
+ *      kernel only on contention. A waiter that parks while the word has no
+ *      FUTEX_WAITERS is never woken, because the owner's next release is a
+ *      guest-side CAS that makes no syscall.
+ *
  * Syscalls exercised: futex(98), clone(220), gettid(178), exit(93)
  */
 
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -252,6 +259,116 @@ static void test_pi_owner_died_recover(void)
     PASS();
 }
 
+/* Test: a PI waiter is woken when the owner retakes the lock in guest code */
+
+#define RELOCK_ITERS 20000
+#define RELOCK_DEADLINE_SEC 2
+
+static volatile uint32_t relock_word __attribute__((aligned(4))) = 0;
+static volatile long relock_count = 0;     /* Guarded by relock_word */
+static volatile int relock_lost_wakes = 0; /* LOCK_PI calls that timed out */
+static char relock_stack_buf[8192] __attribute__((aligned(16)));
+
+/* The protocol glibc and Rosetta both use: take the lock with a guest-side CAS
+ * and enter the kernel only when that fails. The kernel call carries a deadline
+ * so that a waiter nobody wakes reports ETIMEDOUT rather than hanging the
+ * suite; with the lock changing hands every few microseconds, two seconds is
+ * never reached by a waiter that is woken.
+ */
+static long relock_acquire(uint32_t tid)
+{
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n((uint32_t *) &relock_word, &expected, tid,
+                                    0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return 0;
+
+    /* FUTEX_LOCK_PI takes an absolute CLOCK_REALTIME deadline. */
+    struct timespec deadline;
+    raw_syscall6(__NR_clock_gettime, CLOCK_REALTIME, (long) &deadline, 0, 0, 0,
+                 0);
+    deadline.tv_sec += RELOCK_DEADLINE_SEC;
+    return raw_syscall6(__NR_futex, (long) &relock_word,
+                        FUTEX_LOCK_PI | FUTEX_PRIVATE, 0, (long) &deadline, 0,
+                        0);
+}
+
+static void relock_release(uint32_t tid)
+{
+    /* Fails exactly when FUTEX_WAITERS is set, which is the kernel's way of
+     * asking for the syscall.
+     */
+    uint32_t expected = tid;
+    if (__atomic_compare_exchange_n((uint32_t *) &relock_word, &expected, 0, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;
+    raw_futex_unlock_pi((uint32_t *) &relock_word);
+}
+
+/* Runs on both threads. Raw syscalls only: the clone child has no TLS. */
+static void relock_loop(void)
+{
+    uint32_t tid = (uint32_t) raw_gettid();
+
+    for (int i = 0; i < RELOCK_ITERS; i++) {
+        if (relock_acquire(tid) != 0) {
+            __atomic_fetch_add((int *) &relock_lost_wakes, 1, __ATOMIC_SEQ_CST);
+            return;
+        }
+        relock_count = relock_count + 1;
+        relock_release(tid);
+    }
+}
+
+static void test_pi_owner_relock(void)
+{
+    TEST("PI waiter woken across relock");
+
+    relock_word = 0;
+    relock_count = 0;
+    relock_lost_wakes = 0;
+
+    void *stack_top = relock_stack_buf + sizeof(relock_stack_buf);
+    int child_tid_val = 0;
+    long ret = raw_clone(0x7d0f00, stack_top, &child_tid_val, 0,
+                         (int *) &child_tid_val);
+    if (ret < 0) {
+        FAIL("clone failed");
+        return;
+    }
+    if (ret == 0) {
+        relock_loop();
+        raw_exit(0);
+    }
+
+    relock_loop();
+
+    /* The child is at most one deadline behind. */
+    for (int i = 0; i < (RELOCK_DEADLINE_SEC + 3) * 100; i++) {
+        if (__atomic_load_n(&child_tid_val, __ATOMIC_SEQ_CST) == 0)
+            break;
+        usleep(10000);
+    }
+    if (__atomic_load_n(&child_tid_val, __ATOMIC_SEQ_CST) != 0) {
+        FAIL("relock child did not exit");
+        return;
+    }
+
+    int lost = __atomic_load_n((int *) &relock_lost_wakes, __ATOMIC_SEQ_CST);
+    if (lost != 0) {
+        printf("FAIL: %d LOCK_PI waiter(s) timed out on a released lock\n",
+               lost);
+        fails++;
+        return;
+    }
+    if (relock_count != 2L * RELOCK_ITERS) {
+        printf("FAIL: %ld increments under the lock, expected %ld\n",
+               relock_count, 2L * RELOCK_ITERS);
+        fails++;
+        return;
+    }
+    PASS();
+}
+
 /* Test 3: futex_wait without a signal blocks until woken */
 
 /* Sibling that waits ~1.2 s, flips the futex word, and issues FUTEX_WAKE on the
@@ -389,6 +506,7 @@ int main(void)
     test_futex_eintr();
     test_futex_unaligned();
     test_pi_owner_died_recover();
+    test_pi_owner_relock();
     test_pi_dead_owner(); /* Last: uses CLONE_THREAD which may hang on x64 */
 
     SUMMARY("test-futex-pi");

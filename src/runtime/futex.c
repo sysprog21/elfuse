@@ -1872,43 +1872,42 @@ static int64_t futex_lock_pi_inner(guest_t *g,
         if (owner_tid != 0 && !thread_find((int64_t) owner_tid))
             return -LINUX_ESRCH;
 
-        /* Set the WAITERS bit so the owner takes the kernel-mediated unlock
-         * path. Retry the CAS in a loop since the owner may release
-         * concurrently.
+        /* Set FUTEX_WAITERS and enqueue under one hold of the bucket lock.
+         *
+         * The bit is what makes the owner release through FUTEX_UNLOCK_PI: its
+         * guest-side CAS(TID->0) fails while the bit is set. Parking on an
+         * owned word without it is therefore a lost wake, since that CAS
+         * succeeds and makes no syscall. Setting the bit before taking the
+         * lock, and then only checking that the word was still owned, allowed
+         * exactly that: the owner could release and retake the lock in guest
+         * code in between, and the word read as owned with the bit gone.
+         *
+         * Under the lock the two cannot come apart. Once the word is seen (or
+         * made) owned with the bit set, the owner can only release through
+         * FUTEX_UNLOCK_PI, which takes this bucket lock after its release and
+         * so finds the waiter enqueued below.
          */
-        for (;;) {
-            uint32_t cur;
-            if (!futex_word_load(word, &cur))
-                return -LINUX_EFAULT;
-            if (futex_pi_unowned(cur))
-                break; /* Owner released; retry outer loop */
-            if (futex_pi_has_waiters(cur))
-                break; /* Already set by another waiter */
-            uint32_t desired = futex_pi_set_waiters(cur);
-            bool marked;
-            if (!futex_word_cas(word, &cur, desired, &marked))
-                return -LINUX_EFAULT;
-            if (marked)
-                break; /* WAITERS bit set */
-        }
-
-        /* Re-check after WAITERS bit: if lock is now free, retry */
-        uint32_t cur;
-        if (!futex_word_load(word, &cur))
-            return -LINUX_EFAULT;
-        if (futex_pi_unowned(cur))
-            continue;
-
-        /* Enqueue and block */
         pthread_mutex_lock(&b->lock);
 
-        /* Double-check under bucket lock: owner may have released and called
-         * UNLOCK_PI between the current WAITERS set and lock.
-         */
-        if (!futex_word_load(word, &cur)) {
-            pthread_mutex_unlock(&b->lock);
-            return -LINUX_EFAULT;
+        uint32_t cur;
+        for (;;) {
+            if (!futex_word_load(word, &cur)) {
+                pthread_mutex_unlock(&b->lock);
+                return -LINUX_EFAULT;
+            }
+            if (futex_pi_unowned(cur) || futex_pi_has_waiters(cur))
+                break;
+            bool marked;
+            if (!futex_word_cas(word, &cur, futex_pi_set_waiters(cur),
+                                &marked)) {
+                pthread_mutex_unlock(&b->lock);
+                return -LINUX_EFAULT;
+            }
+            if (marked)
+                break;
         }
+
+        /* Owner released first: retry the acquisition. */
         if (futex_pi_unowned(cur)) {
             pthread_mutex_unlock(&b->lock);
             continue;

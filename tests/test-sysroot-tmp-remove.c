@@ -172,8 +172,8 @@ int main(int argc, char **argv)
 
     /* The other half of the contract: a guest's own /tmp file, which the create
      * resolver places in the sysroot, must remain removable. This is the common
-     * case any container workload depends on; a fix that made the host-visible
-     * entry invisible must not have broken it.
+     * case any workload depends on; a fix that made the host-visible entry
+     * invisible must not have broken it.
      */
     TEST("a guest-created /tmp file round-trips");
     snprintf(p, sizeof(p), "%s/made", dir);

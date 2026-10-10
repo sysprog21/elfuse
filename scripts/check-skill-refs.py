@@ -106,7 +106,7 @@ FENCED_PATH_RE = re.compile(
 )
 
 # An inline span holding a slash is a path, so the cross-reference pass does
-# not read cmd/elfuse-container as a missing skill. A bare span stays visible.
+# not read tools/elfuse-gen as a missing skill. A bare span stays visible.
 INLINE_PATH_RE = re.compile(r"`[^`]*/[^`]*`")
 
 DOCPATH_RE = re.compile(r"docs/[a-z0-9-]+\.md")
@@ -500,7 +500,7 @@ SELF_TEST_CASES = [
     ),
     (
         "repo path that looks like a skill name",
-        "The Go `cmd/elfuse-container` CLI.",
+        "The `tools/elfuse-gen` script.",
         None,
     ),
     ("valid include-style path", "Include it as `core/guest.h`.", None),

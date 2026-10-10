@@ -62,9 +62,7 @@ something other than what was asked for.
 `--user UID[:GID]` sets the identity the guest reports through `getuid` and
 `getgid`. It does not change the host process credentials: elfuse translates the
 guest's syscalls, so the number the guest sees is elfuse's to choose. The spec is
-numeric, and a bare `UID` sets the group to the same value. Symbolic names are
-resolved against the image `/etc/passwd` and `/etc/group` one layer up, by
-`elfuse-oci`.
+numeric, and a bare `UID` sets the group to the same value.
 
 `--fakeroot` cannot be combined with a non-root `--user`. Fakeroot starts the guest
 as uid/gid 0, and the setuid permission check grants every id switch on that basis,
@@ -358,53 +356,40 @@ Off by default, and useful when a guest misbehaves rather than in normal use:
 
 ## OCI Images
 
-`build/elfuse-oci` is separate from the C runtime. It pulls images into a local
-OCI image layout and does not unpack them.
-
-### Build
-
-```sh
-make elfuse-oci
-```
-
-The Go command is opt-in. Plain `make`, `make check`, and `make lint` do not
-probe the Go module graph or download Go dependencies. Use `make oci-test` and
-`make oci-lint` explicitly for its test and lint lanes. The C runtime build
-does not require Go.
-
-### Quick Start
+`scripts/elfuse-oci.py` runs OCI images under elfuse;
+[oci-images.md](oci-images.md) describes the store, the sealed volumes, and the
+per-run shadow. It needs crane and umoci (`brew install crane umoci`), and runs
+`build/elfuse` from its checkout, else `elfuse` on `PATH`.
 
 ```sh
-build/elfuse-oci pull debian:stable-slim
+make elfuse
+scripts/elfuse-oci.py run python:3.12-slim python3 -c 'print("hello")'
+scripts/elfuse-oci.py clean
 ```
 
-### Commands
+| Command | Effect |
+|---------|--------|
+| `pull REF` | Seal the `linux/arm64` image of `REF` unless the store holds it |
+| `run [--entrypoint CMD] REF [ARG]...` | Run `REF` under elfuse, pulling it first when the store has no record of it |
+| `clean` | Detach and remove every image, run, and interrupted pull in the store; refuse a non-empty directory that is not a store, and a store in use |
+| `list` | Print each reference in the store with its image digest and size, and each image no reference names as `<none>` |
 
-| Command | Meaning |
-|---------|---------|
-| `pull <ref>` | Fetch one platform of an image into the store |
-| `help`, `version` | Print help or the elfuse-oci version |
+`--entrypoint CMD` replaces the image Entrypoint and drops its Cmd; an empty
+`CMD` leaves only the arguments. Every argument after `REF` goes to the guest.
+The store is `$ELFUSE_OCI_STORE`, by default `~/.local/share/elfuse/oci`; a new
+or empty directory becomes a store.
 
-An abbreviated reference receives the Docker Hub registry, the `library`
-repository when needed, and the `latest` tag when no tag is present. Digest
-references are accepted. Pull options may appear before or after `<ref>`.
+crane reads registry credentials from the Docker configuration
+(`$DOCKER_CONFIG/config.json`, by default `~/.docker/config.json`) when one
+exists, else from Podman's `$REGISTRY_AUTH_FILE` or
+`$XDG_RUNTIME_DIR/containers/auth.json`.
 
-### Flags
+### Running The Smoke Lane Locally
 
-| Option | Commands | Meaning |
-|--------|----------|---------|
-| `--store DIR` | `pull` | Store directory; default `$ELFUSE_OCI_STORE`, then `~/.local/share/elfuse/oci` |
-| `--platform OS/ARCH[/VARIANT]` | `pull` | Target `linux/arm64` or `linux/amd64`; default `linux/arm64` |
-| `--timeout DURATION` | `pull` | Bound the pull and lock wait; zero sets no deadline |
+```sh
+make elfuse
+ELFUSE_OCI_STORE=/tmp/oci-scratch scripts/ci/oci-smoke.sh
+```
 
-### Environment
-
-| Variable | Meaning |
-|----------|---------|
-| `ELFUSE_OCI_STORE` | Default store directory |
-| `DOCKER_CONFIG` | Alternate directory containing Docker `config.json` credentials |
-| `REGISTRY_AUTH_FILE` | Podman-compatible credential file used when Docker config is absent |
-| `XDG_RUNTIME_DIR` | Base directory for Podman's `containers/auth.json` fallback |
-
-Credential helpers and inline entries are handled by go-containerregistry.
-With no matching entry, the pull is anonymous.
+The lane needs macOS with Hypervisor.framework and network access, and ends by
+cleaning the store. Its coverage is in [oci-images.md](oci-images.md#validation).

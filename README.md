@@ -46,8 +46,9 @@ linker resolved against an external sysroot via `--sysroot`.
 
 ## OCI Images
 
-`elfuse-oci` is a separate Go binary that pulls OCI images into a local
-OCI image layout. It does not add container isolation. See
+`scripts/elfuse-oci.py` pulls OCI images with crane, unpacks each once with
+umoci into a read-only case-sensitive volume, and runs it under elfuse with a
+per-run writable shadow. It does not add container isolation. See
 [docs/usage.md](docs/usage.md#oci-images) and
 [docs/oci-images.md](docs/oci-images.md).
 
@@ -158,8 +159,8 @@ The build signs `build/elfuse` before use. Override the signing identity with
 - [docs/testing.md](docs/testing.md): build prerequisites, the
   `make check` flow, the QEMU and Rosetta cross-check matrices, and
   fixture handling.
-- [docs/oci-images.md](docs/oci-images.md): the `elfuse-oci` store,
-  pull behavior, and validation.
+- [docs/oci-images.md](docs/oci-images.md): the OCI image store, sealed
+  volumes, per-run shadows, and validation.
 - [docs/filenames.md](docs/filenames.md): how a guest filename becomes a
   name on disk and back: case folding and normalization on the sysroot
   volume, the escape encoding, and the length limits both systems impose.

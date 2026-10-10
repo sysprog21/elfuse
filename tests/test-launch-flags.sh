@@ -151,8 +151,8 @@ if [ -z "$ENV_DUMP" ] || [ ! -f "$ENV_DUMP" ]; then
     report_skip "environment lanes (no env-dump guest binary)"
 else
 
-    # The `elfuse-oci run` spelling, and the only one that makes the guest's
-    # environment a function of the flags alone.
+    # Only --clear-env makes the guest's environment a function of the flags
+    # alone.
     env_exact "--clear-env alone yields an empty environment" "" --clear-env
 
     # One vector through every branch of the merge at once.
@@ -226,8 +226,8 @@ else
 want index $base_index)"
     fi
 
-    # "--" ends elfuse's own parsing, so an image entrypoint beginning with a
-    # flag reaches the guest as argv instead of steering the launcher.
+    # "--" ends elfuse's own parsing, so a guest command beginning with a flag
+    # reaches the guest as argv instead of steering the launcher.
     status=0
     after_dashdash="$("$ELFUSE" --clear-env -- "$ENV_DUMP" --env A=1 \
         2> "$scratch/guest-env-stderr")" || status=$?

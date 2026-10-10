@@ -112,8 +112,7 @@ int elfuse_launch(const launch_args_t *args)
      * stub exposes the aarch64 shim's register/memory view, which is the wrong
      * architecture for a Rosetta-translated x86_64 guest. main() rejects it up
      * front via a static ELF probe, but enforcing it in elfuse_launch (once
-     * bring-up has set g.is_rosetta) makes every caller inherit the constraint,
-     * including the planned OCI run helper.
+     * bring-up has set g.is_rosetta) makes every caller inherit the constraint.
      */
     if (args->gdb_port > 0 && g.is_rosetta) {
         log_error(LAUNCH_GDB_X86_64_MSG);

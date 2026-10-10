@@ -205,10 +205,9 @@ int chown_overlay_send(int ipc_sock)
 
     size_t n = atomic_load_explicit(&entry_count, memory_order_acquire);
 
-    /* The cap is well above any realistic chown-heavy workload (dpkg, OCI layer
-     * commit). Hitting it indicates a runaway table or a bug, not a legitimate
-     * parent; refuse to truncate-on-success and fail the fork so the caller
-     * sees the problem.
+    /* The cap is well above any realistic chown-heavy workload (dpkg). Hitting
+     * it indicates a runaway table or a bug, not a legitimate parent; refuse to
+     * truncate-on-success and fail the fork so the caller sees the problem.
      */
     if (n > CHOWN_OVERLAY_MAX_ENTRIES) {
         pthread_rwlock_unlock(&overlay_lock);

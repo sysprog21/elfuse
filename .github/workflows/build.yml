@@ -3,6 +3,7 @@
 #   build-macos   : compile + entitlement check on macOS Apple Silicon
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
 #                   including release, ASAN, UBSAN, and TSAN variants
+#   oci-smoke     : OCI front end lane on self-hosted Apple Silicon
 #
 # Runtime and sanitizer tests require Hypervisor.framework, which
 # GitHub-hosted macOS runners do not expose. Those tests run on self-hosted
@@ -125,27 +126,6 @@ jobs:
           path: build/elfuse
           retention-days: 7
           if-no-files-found: warn
-
-  oci-linux:
-    name: elfuse-oci (Linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      - name: Build, lint and test elfuse-oci
-        run: |
-          set -euo pipefail
-          go version
-          make elfuse-oci
-          make oci-lint
-          make oci-test
 
   runtime-macos:
     name: Runtime (${{ matrix.name }})
@@ -429,3 +409,54 @@ jobs:
           else
             echo "No externals/test-fixtures to save"
           fi
+
+  oci-smoke:
+    name: OCI smoke
+    needs: build-macos
+    if: >
+      github.repository == 'sysprog21/elfuse' &&
+      (github.event_name == 'push' || github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'merge_group')
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download prebuilt elfuse binary
+        uses: actions/download-artifact@v7
+        with:
+          name: elfuse-${{ runner.os }}-${{ runner.arch }}
+          path: build
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: false
+
+      - name: Build crane and umoci
+        # go install refuses umoci: its go.mod has a replace directive.
+        env:
+          CRANE_VERSION: v0.22.1
+          UMOCI_VERSION: v0.6.0
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/oci-tools"
+          GOBIN="$bin" go install \
+            "github.com/google/go-containerregistry/cmd/crane@$CRANE_VERSION"
+          umoci="github.com/opencontainers/umoci@$UMOCI_VERSION"
+          go mod download "$umoci"
+          go build -C "$(go env GOMODCACHE)/$umoci" -o "$bin/umoci" ./cmd/umoci
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/crane" version
+          "$bin/umoci" --version
+
+      - name: Run the OCI smoke lane
+        # A downloaded artifact keeps its signature but not its execute bit.
+        # Runners on one host share $HOME, so each gets its own store.
+        run: |
+          set -euo pipefail
+          chmod +x build/elfuse
+          ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-smoke-$RUNNER_NAME" scripts/ci/oci-smoke.sh

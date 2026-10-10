@@ -263,7 +263,7 @@ static void test_pi_owner_died_recover(void)
 /* Test: a PI waiter is woken when the owner retakes the lock in guest code */
 
 #define RELOCK_CONTENDED 2000 /* FUTEX_LOCK_PI acquisitions to collect */
-#define RELOCK_BUDGET_SEC 3   /* Stop collecting after this long */
+#define RELOCK_BUDGET_SEC 10  /* Give up collecting after this long */
 #define RELOCK_DEADLINE_SEC 2 /* On one FUTEX_LOCK_PI call */
 
 static volatile uint32_t relock_word __attribute__((aligned(4))) = 0;
@@ -337,7 +337,9 @@ static void relock_loop(void)
                 RELOCK_CONTENDED)
             break;
 
-        /* The budget bounds a run that cannot contend, such as one CPU. */
+        /* The budget ends a run that cannot contend, such as one CPU; the
+         * caller then fails on the count.
+         */
         if ((iters & 1023) == 0 &&
             (relock_clock(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec > stop_sec))
             break;
@@ -403,14 +405,14 @@ static void test_pi_owner_relock(void)
         return;
     }
 
-    /* Without this the case could pass having only ever taken the lock in guest
-     * code, which exercises nothing in the kernel.
+    /* Fewer means the run could not contend enough to show a lost wake, and a
+     * pass would then say nothing about the kernel path.
      */
     long contended =
         __atomic_load_n((long *) &relock_contended, __ATOMIC_SEQ_CST);
-    if (contended == 0) {
-        printf("FAIL: no FUTEX_LOCK_PI call was needed in %d s\n",
-               RELOCK_BUDGET_SEC);
+    if (contended < RELOCK_CONTENDED) {
+        printf("FAIL: %ld of %d FUTEX_LOCK_PI acquisitions in %d s\n",
+               contended, RELOCK_CONTENDED, RELOCK_BUDGET_SEC);
         fails++;
         return;
     }

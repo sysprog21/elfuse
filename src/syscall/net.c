@@ -581,7 +581,15 @@ int64_t sys_listen(int fd, int backlog)
     if (ref_err < 0)
         return ref_err;
 
-    if (listen(host_ref.fd, backlog) < 0) {
+    /* macOS 27.0 loses the urgent mark of the first urgent byte on about half
+     * of the connections accepted from a listener with backlog 1, so the guest
+     * gets neither SIGURG nor recv(MSG_OOB). Backlog 2 does not show it. Linux
+     * queues backlog + 1 connections (sk_acceptq_is_full) where macOS queues
+     * backlog, so 2 is also the queue length the guest asked for.
+     */
+    int host_backlog = backlog == 1 ? 2 : backlog;
+
+    if (listen(host_ref.fd, host_backlog) < 0) {
         host_fd_ref_close(&host_ref);
         return linux_errno();
     }

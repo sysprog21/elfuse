@@ -249,13 +249,14 @@ int pidfd_create(guest_t *g,
     pthread_mutex_unlock(&pidfd_lock);
 
     /* A close that arrived before the entry was registered found nothing to
-     * tear down. The number no longer carries this generation then, and the
-     * entry is retired here, as usbdev's open does.
+     * tear down. The number no longer carries this generation then, and its
+     * mapping is retired here, as usbdev's open does. A dup taken in the same
+     * window keeps the entry alive, so the monitor below is still started; for
+     * an entry already freed it completes nothing, since pidfd_complete_one
+     * matches on open_gen.
      */
-    if (fd_current_generation(gfd) != gen) {
+    if (fd_current_generation(gfd) != gen)
         pidfd_cleanup(gfd, gen);
-        return gfd;
-    }
 
     /* host_pid <= 0 means the target lives inside this host process -- the
      * caller itself, or a CLONE_VM child, which holds a guest tid but no host

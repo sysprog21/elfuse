@@ -953,13 +953,6 @@ int linux_to_mac_status_flags(int linux_flags);
  */
 int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
 
-/* RLIMIT_NOFILE tracking. */
-
-/* Update the guest RLIMIT_NOFILE soft limit. Called from prlimit64 when
- * resource == RLIMIT_NOFILE. fd_alloc checks this.
- */
-void fd_set_rlimit_nofile(int cur);
-
 /* Borrowed-or-pinned host fd reference.
  *
  * Single-threaded guests borrow the raw host fd directly (no dup, no close).

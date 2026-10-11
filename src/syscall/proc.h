@@ -549,6 +549,9 @@ int proc_set_child_pgid(int64_t guest_pid, int64_t pgid);
  */
 pid_t proc_guest_to_host_pid(int64_t gpid);
 
+/* Whether @gpid is a child in the table that has exited and not been reaped. */
+bool proc_child_exited(int64_t gpid);
+
 /* Look up a host PID in the child process table, falling back to the
  * cross-process registry so the rest of the fork family (grandchildren,
  * siblings' descendants) resolves too.

@@ -587,6 +587,20 @@ pid_t proc_guest_to_host_pid(int64_t gpid)
     return result;
 }
 
+bool proc_child_exited(int64_t gpid)
+{
+    pthread_mutex_lock(&pid_lock);
+    const proc_entry_t *entry = proc_find_guest_entry(gpid);
+    bool known = entry != NULL, exited = entry && entry->exited;
+    pthread_mutex_unlock(&pid_lock);
+
+    /* The entry is marked when the host process has been collected; the child
+     * records its own exit in the lifecycle registry before that.
+     */
+    return exited ||
+           (known && lifecycle_query_exit(gpid, NULL, NULL, NULL, NULL, NULL));
+}
+
 /* Build the path to the cross-process signal-transport file for @host_pid.
  *
  * Files live in the per-user private temp directory macOS provisions (mode

@@ -958,6 +958,12 @@ uint64_t sys_rlimit_cur(int resource)
                                 memory_order_relaxed);
 }
 
+uint64_t sys_rlimit_max(int resource)
+{
+    return atomic_load_explicit(&rlimit_table_load()->slot[resource].max,
+                                memory_order_relaxed);
+}
+
 void sys_rlimit_send_xfsz(void)
 {
     if (!current_thread ||

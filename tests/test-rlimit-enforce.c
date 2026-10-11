@@ -4,9 +4,10 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * RLIMIT_FSIZE at the write, truncate and file-copy boundaries, and RLIMIT_CPU
- * against a loop that makes no syscall. Each limit is lowered in a fork child,
- * so the process that reports the results keeps its own limits.
+ * RLIMIT_FSIZE at the write, truncate and file-copy boundaries, RLIMIT_CPU
+ * against a loop that makes no syscall, and RLIMIT_AS and RLIMIT_DATA where a
+ * mapping or the break would grow past them. Each limit is lowered in a fork
+ * child, so the process that reports the results keeps its own limits.
  */
 
 #include <errno.h>
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/syscall.h>
@@ -385,6 +387,209 @@ static void cpu_child(int report_fd)
         ;
 }
 
+#define MIB ((size_t) 1 << 20)
+
+/* VmSize from /proc/self/status in bytes, which is what RLIMIT_AS bounds. */
+static size_t vm_size(void)
+{
+    char buf[4096];
+    int fd = open("/proc/self/status", O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof(buf) - 1);
+    if (fd >= 0)
+        close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    char *p = strstr(buf, "VmSize:");
+    return p ? (size_t) strtoul(p + 7, NULL, 10) * 1024 : 0;
+}
+
+static int set_soft(int resource, rlim_t cur)
+{
+    struct rlimit rl;
+    if (getrlimit(resource, &rl) < 0)
+        return -1;
+    rl.rlim_cur = cur;
+    return setrlimit(resource, &rl);
+}
+
+static void *map_anon(void *addr, size_t len, int prot, int flags)
+{
+    return mmap(addr, len, prot, flags | MAP_ANONYMOUS, -1, 0);
+}
+
+/* Runs in a child with RLIMIT_AS 24 MiB above what is mapped. The exit status
+ * is the number of the first step that went wrong, 0 if none did.
+ */
+static int as_child(void)
+{
+    size_t base = vm_size();
+    int rw = PROT_READ | PROT_WRITE;
+    if (base == 0 || set_soft(RLIMIT_AS, base + 24 * MIB) < 0)
+        return 100;
+
+    /* 1: a mapping that stays below the limit. */
+    void *a = map_anon(NULL, 16 * MIB, rw, MAP_PRIVATE);
+    if (a == MAP_FAILED)
+        return 1;
+
+    /* 2: one that crosses it, with 8 MiB left. */
+    errno = 0;
+    if (map_anon(NULL, 16 * MIB, rw, MAP_PRIVATE) != MAP_FAILED ||
+        errno != ENOMEM)
+        return 2;
+
+    /* 3: a shared or read-only mapping is address space too. */
+    errno = 0;
+    if (map_anon(NULL, 16 * MIB, PROT_READ, MAP_SHARED) != MAP_FAILED ||
+        errno != ENOMEM)
+        return 3;
+
+    /* 4: MAP_FIXED over the first mapping replaces it and adds nothing. */
+    if (map_anon(a, 16 * MIB, rw, MAP_PRIVATE | MAP_FIXED) != a)
+        return 4;
+
+    /* 5: growing it by mremap crosses the limit. */
+    errno = 0;
+    if (mremap(a, 16 * MIB, 32 * MIB, MREMAP_MAYMOVE) != MAP_FAILED ||
+        errno != ENOMEM)
+        return 5;
+
+    /* 6: what munmap gives back can be mapped again. */
+    if (munmap(a, 16 * MIB) < 0 ||
+        map_anon(NULL, 16 * MIB, rw, MAP_PRIVATE) == MAP_FAILED)
+        return 6;
+
+    /* 7: a bad descriptor is reported before the limit is, for a hinted, a
+     * placed and a fixed request alike.
+     */
+    void *at = (char *) a + 16 * MIB;
+    int fixed = MAP_PRIVATE | MAP_FIXED;
+    errno = 0;
+    if (mmap(NULL, 32 * MIB, PROT_READ, MAP_PRIVATE, -1, 0) != MAP_FAILED ||
+        errno != EBADF)
+        return 7;
+    errno = 0;
+    if (mmap(at, 32 * MIB, PROT_READ, fixed, -1, 0) != MAP_FAILED ||
+        errno != EBADF)
+        return 7;
+    return 0;
+}
+
+/* Bytes /proc/self/maps lists, less the elfuse runtime records ([shim],
+ * [shim-data]) that a Linux process has no mapping for.
+ */
+static size_t maps_size(void)
+{
+    static char buf[64 * 1024];
+    size_t len = 0;
+    ssize_t n = 0;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    while (fd >= 0 && len < sizeof(buf) - 1 &&
+           (n = read(fd, buf + len, sizeof(buf) - 1 - len)) > 0)
+        len += (size_t) n;
+    if (fd >= 0)
+        close(fd);
+    if (fd < 0 || n < 0)
+        return 0;
+    buf[len] = '\0';
+
+    size_t total = 0;
+    for (char *line = buf; *line; line = strchr(line, '\n') + 1) {
+        char *end;
+        unsigned long lo = strtoul(line, &end, 16);
+        unsigned long hi = strtoul(end + 1, NULL, 16);
+        char *nl = strchr(line, '\n');
+        if (!nl)
+            break;
+        *nl = '\0';
+        if (!strstr(line, "[shim"))
+            total += hi - lo;
+        *nl = '\n';
+    }
+    return total;
+}
+
+/* Runs in a child with RLIMIT_AS 1 MiB above what maps lists. The exit status
+ * is the number of the first step that went wrong, 0 if none did.
+ */
+static int as_exact_child(void)
+{
+    size_t base = maps_size();
+    int rw = PROT_READ | PROT_WRITE;
+    if (base == 0 || set_soft(RLIMIT_AS, base + MIB) < 0)
+        return 100;
+
+    /* 1: the last MiB under the limit. */
+    if (map_anon(NULL, MIB, rw, MAP_PRIVATE) == MAP_FAILED)
+        return 1;
+
+    /* 2: another MiB past it. */
+    errno = 0;
+    if (map_anon(NULL, MIB, rw, MAP_PRIVATE) != MAP_FAILED || errno != ENOMEM)
+        return 2;
+    return 0;
+}
+
+/* Runs in a child with RLIMIT_DATA at 24 MiB, far above the data this static
+ * binary starts with. The sizes stay small enough that the break has room to
+ * grow where no limit is set.
+ */
+static int data_child(void)
+{
+    int rw = PROT_READ | PROT_WRITE;
+    if (set_soft(RLIMIT_DATA, 24 * MIB) < 0)
+        return 100;
+
+    /* 1: a break that stays below the limit. */
+    if (sbrk(8 * MIB) == (void *) -1)
+        return 1;
+
+    /* 2: one that crosses it leaves the break where it was. */
+    void *before = sbrk(0);
+    errno = 0;
+    if (sbrk(32 * MIB) != (void *) -1 || errno != ENOMEM || sbrk(0) != before)
+        return 2;
+
+    /* 3: a private writable mapping is data. */
+    errno = 0;
+    if (map_anon(NULL, 32 * MIB, rw, MAP_PRIVATE) != MAP_FAILED ||
+        errno != ENOMEM)
+        return 3;
+
+    /* 4: a read-only or shared mapping of the same size is not. */
+    char *ro = map_anon(NULL, 32 * MIB, PROT_READ, MAP_PRIVATE);
+    char *shared = map_anon(NULL, 32 * MIB, PROT_READ, MAP_SHARED);
+    if (ro == MAP_FAILED || shared == MAP_FAILED)
+        return 4;
+
+    /* 5: making the private one writable turns it into data. */
+    errno = 0;
+    if (mprotect(ro, 32 * MIB, rw) != -1 || errno != ENOMEM)
+        return 5;
+
+    /* 6: a part that fits, and the whole of the shared one, may be. */
+    if (mprotect(ro, 4 * MIB, rw) < 0 || mprotect(shared, 32 * MIB, rw) < 0)
+        return 6;
+    ro[0] = shared[0] = 1;
+
+    /* 7: a range over two mappings stops at the one that does not fit, with the
+     * one below it already writable. The second mprotect below splits one
+     * mapping into the two.
+     */
+    char *two = map_anon(NULL, 36 * MIB, PROT_NONE, MAP_PRIVATE);
+    int zero = open("/dev/zero", O_RDONLY);
+    if (two == MAP_FAILED || zero < 0 ||
+        mprotect(two + 4 * MIB, 32 * MIB, PROT_READ) < 0)
+        return 100;
+    errno = 0;
+    if (mprotect(two, 36 * MIB, rw) != -1 || errno != ENOMEM ||
+        read(zero, two, 1) != 1 || read(zero, two + 4 * MIB, 1) != -1)
+        return 7;
+    close(zero);
+    return 0;
+}
+
 /* Run @child_main in a fork child and report its first failed step. */
 static void expect_child_steps(int (*child_main)(void))
 {
@@ -441,6 +646,15 @@ int main(void)
         EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
                     "the spin loop was not killed");
     }
+
+    TEST("RLIMIT_AS on mmap and mremap");
+    expect_child_steps(as_child);
+
+    TEST("RLIMIT_AS counts only guest mappings");
+    expect_child_steps(as_exact_child);
+
+    TEST("RLIMIT_DATA on brk, mmap and mprotect");
+    expect_child_steps(data_child);
 
     SUMMARY("test-rlimit-enforce");
     return fails ? 1 : 0;

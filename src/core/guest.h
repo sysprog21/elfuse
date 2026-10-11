@@ -851,6 +851,16 @@ static inline bool guest_range_hits_infra(const guest_t *g,
     return start < infra_hi && end > infra_lo;
 }
 
+/* Whether a tracked region is address space a Linux process would have. The
+ * shim and its data sit in the infra reserve, which Linux has no mapping for,
+ * so they count toward neither VmSize nor RLIMIT_AS and RLIMIT_DATA.
+ */
+static inline bool guest_region_in_process_vm(const guest_t *g,
+                                              const guest_region_t *r)
+{
+    return !guest_range_hits_infra(g, r->start, r->end);
+}
+
 /* True iff a single address (PC, hint, etc.) falls inside the infra reserve.
  * Used by rt_sigreturn to reject forged frames that would redirect EL0 PC into
  * EL1 shim or page-table memory. Covers the full reserve, matching

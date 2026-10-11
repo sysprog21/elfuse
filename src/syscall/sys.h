@@ -110,6 +110,9 @@ void sys_rlimit_forget(pid_t host_pid);
  */
 uint64_t sys_rlimit_cur(int resource);
 
+/* Hard limit of @resource, read the same way. */
+uint64_t sys_rlimit_max(int resource);
+
 /* Send SIGXFSZ for a request RLIMIT_FSIZE refused. Linux sends it to the thread
  * that made the request (send_sig to current), so it is queued for the calling
  * thread alone and a sibling that has it unblocked does not take it.

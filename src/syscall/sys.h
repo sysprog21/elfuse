@@ -116,6 +116,12 @@ uint64_t sys_rlimit_cur(int resource);
  */
 void sys_rlimit_send_xfsz(void);
 
+/* Have RLIMIT_CPU looked at again: start the thread that samples process CPU
+ * time against it, or wake it. Called when the limit changes, and from the
+ * preemption thread on SIGUSR2, which is how another process reports a change.
+ */
+void sys_rlimit_cpu_check(void);
+
 /* Format /proc/self/limits content into buf.
  *
  * Returns bytes written (excluding NUL) or -1 on error.

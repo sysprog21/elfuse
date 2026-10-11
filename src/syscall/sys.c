@@ -20,6 +20,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
+#include <time.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -30,6 +32,7 @@
 #include <stdlib.h>
 #include <mach/mach.h>
 
+#include "debug/log.h"
 #include "utils.h"
 
 #include "proved/slice.h"
@@ -39,6 +42,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
+#include "syscall/signal.h"
 #include "syscall/sys.h"
 
 /* System info syscall handlers. */
@@ -671,6 +675,10 @@ static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
 /* How long prlimit64 waits for a live fork-family member to publish. */
 #define RLIMIT_PUBLISH_WAIT_MS 1000
 
+/* Bounds on one sleep of the RLIMIT_CPU sampling thread. */
+#define RLIMIT_CPU_SLEEP_MAX_S 86400
+#define RLIMIT_CPU_SLEEP_MIN_NS 10000000ULL
+
 typedef struct {
     uint32_t magic;
     uint32_t count;
@@ -681,11 +689,31 @@ typedef struct {
 
 static pthread_mutex_t rlimit_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* NOFILE starts at the table size because a fork child installs its inherited
- * descriptors before sys_rlimit_restore runs.
+/* What a slot reads before sys_rlimit_init or sys_rlimit_restore has run:
+ * nothing is limited, and NOFILE is the table size because a fork child
+ * installs its inherited descriptors before sys_rlimit_restore.
  */
+#define RLIMIT_SLOT_UNLIMITED {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY}
 static rlimit_table_t rlimit_private = {
-    .slot = {[LINUX_RLIMIT_NOFILE] = {FD_TABLE_SIZE, FD_TABLE_SIZE}},
+    .slot =
+        {
+            [LINUX_RLIMIT_CPU] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_FSIZE] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_DATA] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_STACK] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_CORE] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_RSS] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_NPROC] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_NOFILE] = {FD_TABLE_SIZE, FD_TABLE_SIZE},
+            [LINUX_RLIMIT_MEMLOCK] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_AS] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_LOCKS] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_SIGPENDING] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_MSGQUEUE] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_NICE] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_RTPRIO] = RLIMIT_SLOT_UNLIMITED,
+            [LINUX_RLIMIT_RTTIME] = RLIMIT_SLOT_UNLIMITED,
+        },
 };
 
 /* Both are written once per process, by rlimit_publish under rlimit_lock. The
@@ -921,6 +949,7 @@ void sys_rlimit_init(void)
     rlimit_publish();
     pthread_mutex_unlock(&rlimit_lock);
     host_rlimit_check_arm();
+    sys_rlimit_cpu_check();
 }
 
 uint64_t sys_rlimit_cur(int resource)
@@ -962,6 +991,114 @@ void sys_rlimit_restore(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT])
     rlimit_publish();
     pthread_mutex_unlock(&rlimit_lock);
     host_rlimit_check_arm();
+    sys_rlimit_cpu_check();
+}
+
+/* RLIMIT_CPU, after check_process_timers (Linux
+ * kernel/time/posix-cpu-timers.c): SIGKILL at the hard limit, SIGXCPU at the
+ * soft limit, and the soft limit then moves up a second so the signal repeats
+ * until the hard limit. Process CPU time is the host's for this process, which
+ * charges a vCPU thread's guest time to it as user time.
+ *
+ * Returns how long the caller may sleep before the next expiry can be due, or 0
+ * when there is nothing to wait for. The caller holds the table's locks.
+ */
+static uint64_t rlimit_cpu_expire(int *sig_out)
+{
+    rlimit_table_t *t = rlimit_table_load();
+    linux_rlimit64_t lim = rlimit_slot_load(t, LINUX_RLIMIT_CPU);
+    uint64_t used_ns = clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID);
+    uint64_t used_s = used_ns / NSEC_PER_SEC;
+
+    *sig_out = 0;
+    if (lim.rlim_cur == LINUX_RLIM_INFINITY)
+        return 0;
+    if (used_s >= lim.rlim_max) {
+        *sig_out = LINUX_SIGKILL;
+        return 0;
+    }
+    if (used_s >= lim.rlim_cur) {
+        *sig_out = LINUX_SIGXCPU;
+        lim.rlim_cur = used_s + 1;
+        rlimit_slot_store(t, LINUX_RLIMIT_CPU, lim);
+    }
+
+    /* CPU time advances at most one second per second on each host CPU, so the
+     * limit cannot be reached sooner than this, and the floor bounds how often
+     * a process close to its limit is sampled.
+     */
+    uint64_t left_s = lim.rlim_cur - used_s;
+    if (left_s > RLIMIT_CPU_SLEEP_MAX_S)
+        left_s = RLIMIT_CPU_SLEEP_MAX_S;
+    uint64_t left_ns = left_s * NSEC_PER_SEC - used_ns % NSEC_PER_SEC;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    uint64_t sleep_ns = left_ns / (uint64_t) (ncpu > 0 ? ncpu : 1);
+    return sleep_ns < RLIMIT_CPU_SLEEP_MIN_NS ? RLIMIT_CPU_SLEEP_MIN_NS
+                                              : sleep_ns;
+}
+
+/* Signaled when the CPU limit may have changed. Waits under rlimit_lock. */
+static pthread_cond_t rlimit_cpu_cond = PTHREAD_COND_INITIALIZER;
+
+/* Samples process CPU time against RLIMIT_CPU. A host CPU-time timer would need
+ * no thread, but with setitimer(ITIMER_PROF) or host RLIMIT_CPU armed
+ * hv_vcpu_run stops making guest progress, so the wait is in wall time.
+ */
+static void *rlimit_cpu_thread_main(void *arg)
+{
+    (void) arg;
+
+    pthread_mutex_lock(&rlimit_lock);
+    for (;;) {
+        int sig;
+        rlimit_flock(rlimit_fd, LOCK_EX);
+        uint64_t sleep_ns = rlimit_cpu_expire(&sig);
+        rlimit_flock(rlimit_fd, LOCK_UN);
+
+        /* rlimit_lock is a leaf (internal.h); signal_queue takes sig_lock. */
+        if (sig) {
+            pthread_mutex_unlock(&rlimit_lock);
+            signal_queue(sig);
+            pthread_mutex_lock(&rlimit_lock);
+        }
+
+        if (sleep_ns == 0) {
+            pthread_cond_wait(&rlimit_cpu_cond, &rlimit_lock);
+        } else {
+            struct timespec ts = {
+                .tv_sec = (time_t) (sleep_ns / NSEC_PER_SEC),
+                .tv_nsec = (long) (sleep_ns % NSEC_PER_SEC),
+            };
+            pthread_cond_timedwait_relative_np(&rlimit_cpu_cond, &rlimit_lock,
+                                               &ts);
+        }
+    }
+    return NULL;
+}
+
+void sys_rlimit_cpu_check(void)
+{
+    /* Relaxed: written under rlimit_lock, and a stale false only sends the
+     * caller through the lock to read it again.
+     */
+    static _Atomic bool started;
+    if (sys_rlimit_cur(LINUX_RLIMIT_CPU) == LINUX_RLIM_INFINITY &&
+        !atomic_load_explicit(&started, memory_order_relaxed))
+        return;
+
+    pthread_mutex_lock(&rlimit_lock);
+    if (atomic_load_explicit(&started, memory_order_relaxed)) {
+        pthread_cond_signal(&rlimit_cpu_cond);
+    } else {
+        pthread_t thr;
+        if (pthread_create(&thr, NULL, rlimit_cpu_thread_main, NULL) == 0) {
+            pthread_detach(thr);
+            atomic_store_explicit(&started, true, memory_order_relaxed);
+        } else {
+            log_error("elfuse: RLIMIT_CPU is not enforced: no sampling thread");
+        }
+    }
+    pthread_mutex_unlock(&rlimit_lock);
 }
 
 /* Read the slot into @old_lim and, when @new_lim is set, replace it under the
@@ -1008,9 +1145,10 @@ static int rlimit_exchange_remote(int64_t guest_pid,
 {
     rlimit_table_t *t = NULL;
     int fd = -1;
+    pid_t host_pid;
 
     for (int tries = 0; !t; tries++) {
-        pid_t host_pid = proc_resolve_guest_pid(guest_pid);
+        host_pid = proc_resolve_guest_pid(guest_pid);
         if (host_pid < 0)
             return LINUX_ESRCH;
         t = rlimit_file_map(host_pid, &fd);
@@ -1043,6 +1181,12 @@ static int rlimit_exchange_remote(int64_t guest_pid,
     rlimit_flock(fd, LOCK_UN);
     munmap(t, sizeof(*t));
     close(fd);
+
+    /* The target arms its own CPU timer; SIGUSR2 has its preemption thread look
+     * at the limit again.
+     */
+    if (!err && new_lim && resource == LINUX_RLIMIT_CPU)
+        kill(host_pid, SIGUSR2);
     return err;
 }
 
@@ -1074,6 +1218,8 @@ int64_t sys_prlimit64(guest_t *g,
         err = rlimit_exchange(rlimit_table_load(), resource, set, &old_lim);
         rlimit_flock(rlimit_fd, LOCK_UN);
         pthread_mutex_unlock(&rlimit_lock);
+        if (!err && set && resource == LINUX_RLIMIT_CPU)
+            sys_rlimit_cpu_check();
     } else {
         err = rlimit_exchange_remote(pid, resource, set, &old_lim);
     }

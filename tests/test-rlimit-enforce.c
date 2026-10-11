@@ -4,9 +4,9 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * RLIMIT_FSIZE at the write, truncate and file-copy boundaries. The limit is
- * lowered in a fork child, so the process that reports the results keeps its
- * own limits.
+ * RLIMIT_FSIZE at the write, truncate and file-copy boundaries, and RLIMIT_CPU
+ * against a loop that makes no syscall. Each limit is lowered in a fork child,
+ * so the process that reports the results keeps its own limits.
  */
 
 #include <errno.h>
@@ -21,6 +21,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -352,6 +353,38 @@ out:
     return step;
 }
 
+static int cpu_report_fd;
+
+static void on_xcpu(int sig)
+{
+    (void) sig;
+    (void) !write(cpu_report_fd, "x", 1);
+}
+
+/* Runs in a child under RLIMIT_CPU = 1 s soft, 2 s hard, and never returns. It
+ * reports 'p' once it has run for a while with the limit set, which a guest
+ * stalled by the limit never does, then loops with no syscall, so only the
+ * limit can end it.
+ */
+static void cpu_child(int report_fd)
+{
+    struct rlimit rl = {.rlim_cur = 1, .rlim_max = 2};
+    struct sigaction sa = {.sa_handler = on_xcpu};
+    struct timespec t0, t;
+
+    cpu_report_fd = report_fd;
+    if (sigaction(SIGXCPU, &sa, NULL) < 0 || setrlimit(RLIMIT_CPU, &rl) < 0)
+        _exit(100);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &t);
+    } while ((t.tv_sec - t0.tv_sec) * 1000000000L + t.tv_nsec - t0.tv_nsec <
+             100000000L);
+    (void) !write(report_fd, "p", 1);
+    for (volatile unsigned long spin = 0;; spin++)
+        ;
+}
+
 /* Run @child_main in a fork child and report its first failed step. */
 static void expect_child_steps(int (*child_main)(void))
 {
@@ -381,6 +414,33 @@ int main(void)
 
     TEST("SIGXFSZ goes to the writing thread");
     expect_child_steps(fsize_thread_child);
+
+    {
+        int report[2], status = -1;
+        char got[8];
+        ssize_t n = -1;
+        pid_t pid = pipe(report) < 0 ? -1 : fork();
+        if (pid == 0) {
+            close(report[0]);
+            cpu_child(report[1]);
+        }
+        if (pid > 0) {
+            close(report[1]);
+            waitpid(pid, &status, 0);
+            n = read(report[0], got, sizeof(got));
+            close(report[0]);
+        }
+
+        TEST("guest runs under a CPU limit");
+        EXPECT_TRUE(n >= 1 && got[0] == 'p', "no progress after setrlimit");
+
+        TEST("SIGXCPU at the soft CPU limit");
+        EXPECT_TRUE(n >= 2 && got[1] == 'x', "the spin loop got no SIGXCPU");
+
+        TEST("SIGKILL at the hard CPU limit");
+        EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+                    "the spin loop was not killed");
+    }
 
     SUMMARY("test-rlimit-enforce");
     return fails ? 1 : 0;

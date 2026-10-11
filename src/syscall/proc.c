@@ -53,6 +53,7 @@
 #include "syscall/proc-pidfd.h"
 #include "syscall/proc-state.h"
 #include "syscall/signal.h"
+#include "syscall/sys.h"
 #include "syscall/wakeup-pipe.h"
 
 #include "debug/crashreport.h"
@@ -3146,6 +3147,11 @@ static void *preempt_thread_main(void *arg)
             pthread_cond_broadcast(&pid_cond);
             pthread_mutex_unlock(&pid_lock);
             wakeup_pipe_signal();
+
+            /* And how prlimit64 in another process reports that it changed this
+             * one's RLIMIT_CPU.
+             */
+            sys_rlimit_cpu_check();
         } else if (sig == SIGALRM) {
             /* sys_wait4's entry is the only other caller, so a guest that takes
              * its last child's status and never waits again strands that

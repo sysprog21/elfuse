@@ -19,7 +19,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4651U /* "ELFQ" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4652U /* "ELFR" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -76,12 +76,11 @@ typedef struct {
     uint32_t shm_is_clone;
     uint32_t _pad2;
 
-    /* Guest-visible NOFILE state is separate from the host capacity reserved by
-     * elfuse. The child restores this after installing inherited FDs so
-     * descriptors above a subsequently lowered soft limit survive fork.
+    /* Guest rlimit table (sys.h), indexed by Linux resource number. The child
+     * restores it after installing inherited FDs so descriptors above a lowered
+     * NOFILE soft limit survive fork.
      */
-    uint64_t nofile_cur;
-    uint64_t nofile_max;
+    linux_rlimit64_t rlimits[LINUX_RLIMIT_COUNT];
 } ipc_header_t;
 
 typedef struct {

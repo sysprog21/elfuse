@@ -12,8 +12,12 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
+
 #include "core/guest.h"
+#include "syscall/linux-wire.h"
 
 /* Guest-visible kernel identity for uname(2) and /proc/version;
  * tests/test-proc.c pins the two surfaces to each other. The release names the
@@ -77,12 +81,27 @@ int64_t sys_prlimit64(guest_t *g,
 uint64_t sys_guest_ram_bytes(void);
 uint64_t sys_guest_ram_free(void);
 
-/* Snapshot/restore the guest-visible RLIMIT_NOFILE across the posix_spawn fork
- * boundary. The host limit is internal capacity and is deliberately not exposed
- * through these helpers.
+/* Guest rlimit table, indexed by Linux resource number. It is guest state:
+ * seeded from the host once, then read and written by prlimit64 with no host
+ * setrlimit behind it. execve keeps the table because it keeps the process.
  */
-void sys_nofile_snapshot(uint64_t *cur, uint64_t *max);
-int sys_nofile_restore(uint64_t cur, uint64_t max);
+
+/* Seed the table from host getrlimit. Called once by the process that boots the
+ * guest.
+ */
+void sys_rlimit_init(void);
+
+/* The fork boundary: the parent snapshots, the child checks the header copy
+ * before trusting it and restores it in place of sys_rlimit_init.
+ */
+void sys_rlimit_snapshot(linux_rlimit64_t out[LINUX_RLIMIT_COUNT]);
+bool sys_rlimit_table_valid(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT]);
+void sys_rlimit_restore(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT]);
+
+/* Soft limit of @resource, LINUX_RLIM_INFINITY when unlimited. Lock-free, for
+ * the sites that enforce a limit.
+ */
+uint64_t sys_rlimit_cur(int resource);
 
 /* Format /proc/self/limits content into buf.
  *

@@ -10,11 +10,14 @@
  * syscall/syscall.c.
  */
 
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -27,6 +30,7 @@
 #include "proved/slice.h"
 
 #include "core/shim-globals.h"
+#include "runtime/thread.h"
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
@@ -71,14 +75,6 @@ static uint64_t cached_page_size = 0;
 static mach_port_t cached_host_port = MACH_PORT_NULL;
 static time_t cached_sysinfo_sec = -1;
 static linux_sysinfo_t cached_sysinfo;
-static pthread_mutex_t rlimit_lock = PTHREAD_MUTEX_INITIALIZER;
-static linux_rlimit64_t cached_linux_rlimits[10];
-static uint8_t cached_linux_rlimit_valid[10];
-static linux_rlimit64_t guest_nofile_limit = {
-    .rlim_cur = FD_TABLE_SIZE,
-    .rlim_max = FD_TABLE_SIZE,
-};
-#define RLIMIT_CACHE_SIZE ((int) (ARRAY_SIZE(cached_linux_rlimits)))
 
 /* The full-size assertion lives with write_rusage_to_guest() in proc.c; this
  * offset check guards the fast memcpy translation done there.
@@ -594,31 +590,32 @@ int64_t sys_sysinfo(guest_t *g, uint64_t info_gva)
 
 /* Resource limits. */
 
-/* Translate Linux RLIMIT_* resource numbers to macOS equivalents. The numbering
- * differs: Linux RLIMIT_NPROC=6 vs macOS RLIMIT_NPROC=7.
+/* Linux RLIMIT_* numbers to the macOS ones, for seeding the guest table from
+ * the host. The numbering differs: Linux RLIMIT_NPROC=6 vs macOS
+ * RLIMIT_NPROC=7.
  */
 static int translate_rlimit_resource(int linux_res)
 {
     switch (linux_res) {
-    case 0:
+    case LINUX_RLIMIT_CPU:
         return RLIMIT_CPU;
-    case 1:
+    case LINUX_RLIMIT_FSIZE:
         return RLIMIT_FSIZE;
-    case 2:
+    case LINUX_RLIMIT_DATA:
         return RLIMIT_DATA;
-    case 3:
+    case LINUX_RLIMIT_STACK:
         return RLIMIT_STACK;
-    case 4:
+    case LINUX_RLIMIT_CORE:
         return RLIMIT_CORE;
-    case 5:
+    case LINUX_RLIMIT_RSS:
         return RLIMIT_RSS;
-    case 6:
+    case LINUX_RLIMIT_NPROC:
         return RLIMIT_NPROC; /* Linux 6 -> macOS 7 */
-    case 7:
+    case LINUX_RLIMIT_NOFILE:
         return RLIMIT_NOFILE; /* Linux 7 -> macOS 8 */
-    case 8:
+    case LINUX_RLIMIT_MEMLOCK:
         return RLIMIT_MEMLOCK; /* Linux 8 -> macOS 6 */
-    case 9:
+    case LINUX_RLIMIT_AS:
         return RLIMIT_AS;
     default:
         return -1;
@@ -629,114 +626,178 @@ static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
 {
     linux_rlimit64_t lim = {0};
 
-    lim.rlim_cur = (rl.rlim_cur == RLIM_INFINITY) ? UINT64_MAX : rl.rlim_cur;
-    lim.rlim_max = (rl.rlim_max == RLIM_INFINITY) ? UINT64_MAX : rl.rlim_max;
+    lim.rlim_cur =
+        (rl.rlim_cur == RLIM_INFINITY) ? LINUX_RLIM_INFINITY : rl.rlim_cur;
+    lim.rlim_max =
+        (rl.rlim_max == RLIM_INFINITY) ? LINUX_RLIM_INFINITY : rl.rlim_max;
 
     /* macOS returns ~8MiB-16KiB for the default stack; round to Linux's
      * conventional 8MiB to keep guest userspace behavior stable.
      */
-    if (resource == 3 /* RLIMIT_STACK */ && lim.rlim_cur > 0 &&
+    if (resource == LINUX_RLIMIT_STACK && lim.rlim_cur > 0 &&
         lim.rlim_cur < 8388608) {
         lim.rlim_cur = 8388608;
+        if (lim.rlim_max < lim.rlim_cur)
+            lim.rlim_max = lim.rlim_cur;
     }
 
     return lim;
 }
 
-static bool rlimit_cache_get(int resource, linux_rlimit64_t *lim)
+/* Guest rlimit table.
+ *
+ * prlimit64 reads and writes these slots and never calls host setrlimit, so a
+ * guest limit cannot constrain elfuse itself, and RSS keeps a slot of its own
+ * although macOS defines RLIMIT_RSS as RLIMIT_AS.
+ *
+ * rlimit_lock serializes the threads that write the table. A site that enforces
+ * a limit loads one soft value through sys_rlimit_cur and takes no lock.
+ */
+typedef struct {
+    struct {
+        _Atomic uint64_t cur, max;
+    } slot[LINUX_RLIMIT_COUNT];
+} rlimit_table_t;
+
+static pthread_mutex_t rlimit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* NOFILE starts at the table size because a fork child installs its inherited
+ * descriptors before sys_rlimit_restore runs.
+ */
+static rlimit_table_t rlimit_private = {
+    .slot = {[LINUX_RLIMIT_NOFILE] = {FD_TABLE_SIZE, FD_TABLE_SIZE}},
+};
+
+/* Relaxed on both sides: writers hold rlimit_lock, and the lock-free reader in
+ * sys_rlimit_cur wants one word with nothing published behind it.
+ */
+static linux_rlimit64_t rlimit_slot_load(const rlimit_table_t *t, int resource)
 {
-    if (!RANGE_CHECK(resource, 0, RLIMIT_CACHE_SIZE) || !lim)
+    return (linux_rlimit64_t) {
+        .rlim_cur =
+            atomic_load_explicit(&t->slot[resource].cur, memory_order_relaxed),
+        .rlim_max =
+            atomic_load_explicit(&t->slot[resource].max, memory_order_relaxed),
+    };
+}
+
+static void rlimit_slot_store(rlimit_table_t *t,
+                              int resource,
+                              linux_rlimit64_t lim)
+{
+    atomic_store_explicit(&t->slot[resource].cur, lim.rlim_cur,
+                          memory_order_relaxed);
+    atomic_store_explicit(&t->slot[resource].max, lim.rlim_max,
+                          memory_order_relaxed);
+}
+
+static bool rlimit_pair_valid(int resource, linux_rlimit64_t lim)
+{
+    if (lim.rlim_cur > lim.rlim_max)
         return false;
-
-    if (thread_is_single_active()) {
-        if (cached_linux_rlimit_valid[resource]) {
-            *lim = cached_linux_rlimits[resource];
-            return true;
-        }
-        return false;
-    }
-
-    pthread_mutex_lock(&rlimit_lock);
-    if (cached_linux_rlimit_valid[resource]) {
-        *lim = cached_linux_rlimits[resource];
-        pthread_mutex_unlock(&rlimit_lock);
-        return true;
-    }
-    pthread_mutex_unlock(&rlimit_lock);
-    return false;
+    return resource != LINUX_RLIMIT_NOFILE || lim.rlim_max <= FD_TABLE_SIZE;
 }
 
-static void rlimit_cache_set(int resource, linux_rlimit64_t lim)
+/* What Linux gives the resources macOS has no counterpart for: INIT_RLIMITS
+ * (include/asm-generic/resource.h) for all but SIGPENDING, which fork_init
+ * (kernel/fork.c) sets to the same value as NPROC.
+ */
+static linux_rlimit64_t rlimit_linux_default(int resource,
+                                             linux_rlimit64_t nproc)
 {
-    if (!RANGE_CHECK(resource, 0, RLIMIT_CACHE_SIZE))
-        return;
-
-    if (thread_is_single_active()) {
-        cached_linux_rlimits[resource] = lim;
-        cached_linux_rlimit_valid[resource] = 1;
-        return;
+    switch (resource) {
+    case LINUX_RLIMIT_SIGPENDING:
+        return nproc;
+    case LINUX_RLIMIT_MSGQUEUE:
+        return (linux_rlimit64_t) {819200, 819200};
+    case LINUX_RLIMIT_NICE:
+    case LINUX_RLIMIT_RTPRIO:
+        return (linux_rlimit64_t) {0, 0};
+    default:
+        return (linux_rlimit64_t) {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
     }
-
-    pthread_mutex_lock(&rlimit_lock);
-    cached_linux_rlimits[resource] = lim;
-    cached_linux_rlimit_valid[resource] = 1;
-    pthread_mutex_unlock(&rlimit_lock);
 }
 
-void sys_nofile_snapshot(uint64_t *cur, uint64_t *max)
+void sys_rlimit_init(void)
 {
-    pthread_mutex_lock(&rlimit_lock);
-    if (cur)
-        *cur = guest_nofile_limit.rlim_cur;
-    if (max)
-        *max = guest_nofile_limit.rlim_max;
-    pthread_mutex_unlock(&rlimit_lock);
-}
-
-int sys_nofile_restore(uint64_t cur, uint64_t max)
-{
-    if (cur > max || max > FD_TABLE_SIZE)
-        return -1;
+    linux_rlimit64_t nproc = {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
 
     pthread_mutex_lock(&rlimit_lock);
-    guest_nofile_limit.rlim_cur = cur;
-    guest_nofile_limit.rlim_max = max;
-    fd_set_rlimit_nofile((int) cur);
-    pthread_mutex_unlock(&rlimit_lock);
-    return 0;
-}
+    for (int r = 0; r < LINUX_RLIMIT_COUNT; r++) {
+        linux_rlimit64_t lim;
+        struct rlimit rl;
+        int host_res = translate_rlimit_resource(r);
 
-static int64_t sys_prlimit64_nofile(guest_t *g,
-                                    uint64_t new_gva,
-                                    uint64_t old_gva)
-{
-    linux_rlimit64_t new_lim = {0};
-    if (new_gva != 0 &&
-        guest_read_small(g, new_gva, &new_lim, sizeof(new_lim)) < 0)
-        return -LINUX_EFAULT;
-
-    pthread_mutex_lock(&rlimit_lock);
-    linux_rlimit64_t old_lim = guest_nofile_limit;
-
-    int error = 0;
-    if (new_gva != 0) {
-        if (new_lim.rlim_cur > new_lim.rlim_max) {
-            error = LINUX_EINVAL;
-        } else if (new_lim.rlim_max > guest_nofile_limit.rlim_max) {
-            /* The guest has no capability path for raising its hard limit. */
-            error = LINUX_EPERM;
-        } else {
-            guest_nofile_limit = new_lim;
-            fd_set_rlimit_nofile((int) new_lim.rlim_cur);
-        }
+        /* The host NOFILE limit is elfuse's own capacity (main.c); the guest
+         * gets the size of its fd table.
+         */
+        if (r == LINUX_RLIMIT_NOFILE)
+            lim = (linux_rlimit64_t) {FD_TABLE_SIZE, FD_TABLE_SIZE};
+        else if (host_res >= 0 && getrlimit(host_res, &rl) == 0)
+            lim = translate_host_rlimit(r, rl);
+        else
+            lim = rlimit_linux_default(r, nproc);
+        if (r == LINUX_RLIMIT_NPROC)
+            nproc = lim;
+        rlimit_slot_store(&rlimit_private, r, lim);
     }
     pthread_mutex_unlock(&rlimit_lock);
+}
 
-    if (error)
-        return -error;
-    if (old_gva != 0 &&
-        guest_write_small(g, old_gva, &old_lim, sizeof(old_lim)) < 0)
-        return -LINUX_EFAULT;
+uint64_t sys_rlimit_cur(int resource)
+{
+    return atomic_load_explicit(&rlimit_private.slot[resource].cur,
+                                memory_order_relaxed);
+}
+
+void sys_rlimit_snapshot(linux_rlimit64_t out[LINUX_RLIMIT_COUNT])
+{
+    pthread_mutex_lock(&rlimit_lock);
+    for (int r = 0; r < LINUX_RLIMIT_COUNT; r++)
+        out[r] = rlimit_slot_load(&rlimit_private, r);
+    pthread_mutex_unlock(&rlimit_lock);
+}
+
+bool sys_rlimit_table_valid(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT])
+{
+    for (int r = 0; r < LINUX_RLIMIT_COUNT; r++)
+        if (!rlimit_pair_valid(r, in[r]))
+            return false;
+    return true;
+}
+
+void sys_rlimit_restore(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT])
+{
+    pthread_mutex_lock(&rlimit_lock);
+    for (int r = 0; r < LINUX_RLIMIT_COUNT; r++)
+        rlimit_slot_store(&rlimit_private, r, in[r]);
+    pthread_mutex_unlock(&rlimit_lock);
+}
+
+/* Read the slot into @old_lim and, when @new_lim is set, replace it under the
+ * rules of do_prlimit (Linux kernel/sys.c). The caller holds rlimit_lock.
+ *
+ * Returns 0 or a positive Linux errno.
+ */
+static int rlimit_exchange(rlimit_table_t *t,
+                           int resource,
+                           const linux_rlimit64_t *new_lim,
+                           linux_rlimit64_t *old_lim)
+{
+    *old_lim = rlimit_slot_load(t, resource);
+    if (!new_lim)
+        return 0;
+    if (new_lim->rlim_cur > new_lim->rlim_max)
+        return LINUX_EINVAL;
+
+    /* Raising a hard limit takes CAP_SYS_RESOURCE. NOFILE has no such path: its
+     * hard limit is the size of the guest fd table.
+     */
+    if (new_lim->rlim_max > old_lim->rlim_max &&
+        (resource == LINUX_RLIMIT_NOFILE || proc_get_euid() != 0))
+        return LINUX_EPERM;
+
+    rlimit_slot_store(t, resource, *new_lim);
     return 0;
 }
 
@@ -746,55 +807,35 @@ int64_t sys_prlimit64(guest_t *g,
                       uint64_t new_gva,
                       uint64_t old_gva)
 {
-    (void) pid; /* Ignore PID; single-process model */
-
-    int mac_res = translate_rlimit_resource(resource);
-    if (mac_res < 0)
+    if (!RANGE_CHECK(resource, 0, LINUX_RLIMIT_COUNT))
         return -LINUX_EINVAL;
-    if (resource == 7 /* RLIMIT_NOFILE */)
-        return sys_prlimit64_nofile(g, new_gva, old_gva);
 
-    /* Get old limits BEFORE setting new ones (Linux prlimit64 atomically
-     * returns old values and sets new ones; approximate by get-then-set).
+    linux_rlimit64_t new_lim, old_lim;
+    if (new_gva != 0 &&
+        guest_read_small(g, new_gva, &new_lim, sizeof(new_lim)) < 0)
+        return -LINUX_EFAULT;
+    const linux_rlimit64_t *set = new_gva ? &new_lim : NULL;
+
+    /* find_task_by_vpid takes any thread id, and limits belong to the thread
+     * group, so a tid of this process names this process. Another process's
+     * table is not reachable from here, so any other pid is ESRCH.
      */
-    linux_rlimit64_t old_lim = {0};
-    if (old_gva != 0) {
-        if (!rlimit_cache_get(resource, &old_lim)) {
-            struct rlimit rl;
-            if (getrlimit(mac_res, &rl) < 0)
-                return linux_errno();
+    if (pid != 0 && pid != proc_get_pid() &&
+        !(pid > 0 && thread_tid_alive(pid)))
+        return -LINUX_ESRCH;
 
-            old_lim = translate_host_rlimit(resource, rl);
-            rlimit_cache_set(resource, old_lim);
-        }
-    }
+    pthread_mutex_lock(&rlimit_lock);
+    int err = rlimit_exchange(&rlimit_private, resource, set, &old_lim);
+    pthread_mutex_unlock(&rlimit_lock);
+    if (err)
+        return -err;
 
-    /* Set new limits if requested */
-    if (new_gva != 0) {
-        linux_rlimit64_t new_lim;
-        if (guest_read_small(g, new_gva, &new_lim, sizeof(new_lim)) < 0)
-            return -LINUX_EFAULT;
-
-        /* Translate Linux RLIM_INFINITY (UINT64_MAX) back to macOS
-         * RLIM_INFINITY (0x7FFFFFFFFFFFFFFF) for setrlimit.
-         */
-        struct rlimit rl;
-        rl.rlim_cur =
-            (new_lim.rlim_cur == UINT64_MAX) ? RLIM_INFINITY : new_lim.rlim_cur;
-        rl.rlim_max =
-            (new_lim.rlim_max == UINT64_MAX) ? RLIM_INFINITY : new_lim.rlim_max;
-        if (setrlimit(mac_res, &rl) < 0)
-            return linux_errno();
-
-        rlimit_cache_set(resource, new_lim);
-    }
-
-    /* Write old limits to guest after set (so guest sees pre-set values) */
-    if (old_gva != 0) {
-        if (guest_write_small(g, old_gva, &old_lim, sizeof(old_lim)) < 0)
-            return -LINUX_EFAULT;
-    }
-
+    /* As in Linux, a new limit stays applied when the old one cannot be written
+     * back.
+     */
+    if (old_gva != 0 &&
+        guest_write_small(g, old_gva, &old_lim, sizeof(old_lim)) < 0)
+        return -LINUX_EFAULT;
     return 0;
 }
 
@@ -803,28 +844,33 @@ int64_t sys_prlimit64(guest_t *g,
  */
 int sys_format_limits(char *buf, size_t bufsz)
 {
-    /* Linux resource names, units, and indices (matching kernel order). */
+    /* Names, units and order of lnames in Linux fs/proc/base.c, indexed by
+     * resource number.
+     */
     static const struct {
         const char *name, *units;
-        int linux_res; /* -1 = not tracked, emit unlimited */
-    } rows[] = {
-        {"Max cpu time", "seconds", 0},
-        {"Max file size", "bytes", 1},
-        {"Max data size", "bytes", 2},
-        {"Max stack size", "bytes", 3},
-        {"Max core file size", "bytes", 4},
-        {"Max resident set", "bytes", 5},
-        {"Max processes", "processes", 6},
-        {"Max open files", "files", 7},
-        {"Max locked memory", "bytes", 8},
-        {"Max address space", "bytes", 9},
-        {"Max file locks", "locks", -1},
-        {"Max pending signals", "signals", -1},
-        {"Max msgqueue size", "bytes", -1},
-        {"Max nice priority", "", -1},
-        {"Max realtime priority", "", -1},
-        {"Max realtime timeout", "us", -1},
+    } rows[LINUX_RLIMIT_COUNT] = {
+        [LINUX_RLIMIT_CPU] = {"Max cpu time", "seconds"},
+        [LINUX_RLIMIT_FSIZE] = {"Max file size", "bytes"},
+        [LINUX_RLIMIT_DATA] = {"Max data size", "bytes"},
+        [LINUX_RLIMIT_STACK] = {"Max stack size", "bytes"},
+        [LINUX_RLIMIT_CORE] = {"Max core file size", "bytes"},
+        [LINUX_RLIMIT_RSS] = {"Max resident set", "bytes"},
+        [LINUX_RLIMIT_NPROC] = {"Max processes", "processes"},
+        [LINUX_RLIMIT_NOFILE] = {"Max open files", "files"},
+        [LINUX_RLIMIT_MEMLOCK] = {"Max locked memory", "bytes"},
+        [LINUX_RLIMIT_AS] = {"Max address space", "bytes"},
+        [LINUX_RLIMIT_LOCKS] = {"Max file locks", "locks"},
+        [LINUX_RLIMIT_SIGPENDING] = {"Max pending signals", "signals"},
+        [LINUX_RLIMIT_MSGQUEUE] = {"Max msgqueue size", "bytes"},
+        [LINUX_RLIMIT_NICE] = {"Max nice priority", ""},
+        [LINUX_RLIMIT_RTPRIO] = {"Max realtime priority", ""},
+        [LINUX_RLIMIT_RTTIME] = {"Max realtime timeout", "us"},
     };
+
+    /* One snapshot, so every row is from the same instant of the table. */
+    linux_rlimit64_t limits[LINUX_RLIMIT_COUNT];
+    sys_rlimit_snapshot(limits);
 
     int off = snprintf(buf, bufsz, "%-26s%-21s%-21s%-10s\n", "Limit",
                        "Soft Limit", "Hard Limit", "Units");
@@ -833,49 +879,20 @@ int sys_format_limits(char *buf, size_t bufsz)
     if ((size_t) off >= bufsz)
         return (int) bufsz - 1;
 
-    for (int i = 0; i < (int) (ARRAY_SIZE(rows)); i++) {
+    for (int i = 0; i < LINUX_RLIMIT_COUNT; i++) {
         char soft[24], hard[24];
-        int res = rows[i].linux_res;
+        linux_rlimit64_t lim = limits[i];
 
-        if (res == 7 /* RLIMIT_NOFILE */) {
-            uint64_t cur, max;
-            sys_nofile_snapshot(&cur, &max);
-            linux_rlimit64_t lim = {.rlim_cur = cur, .rlim_max = max};
+        if (lim.rlim_cur == LINUX_RLIM_INFINITY)
+            snprintf(soft, sizeof(soft), "unlimited");
+        else
             snprintf(soft, sizeof(soft), "%llu",
                      (unsigned long long) lim.rlim_cur);
+        if (lim.rlim_max == LINUX_RLIM_INFINITY)
+            snprintf(hard, sizeof(hard), "unlimited");
+        else
             snprintf(hard, sizeof(hard), "%llu",
                      (unsigned long long) lim.rlim_max);
-        } else if (RANGE_CHECK(res, 0, RLIMIT_CACHE_SIZE)) {
-            linux_rlimit64_t lim;
-            if (!rlimit_cache_get(res, &lim)) {
-                int mac_res = translate_rlimit_resource(res);
-                if (mac_res >= 0) {
-                    struct rlimit rl;
-                    if (getrlimit(mac_res, &rl) == 0) {
-                        lim = translate_host_rlimit(res, rl);
-                    } else {
-                        lim.rlim_cur = UINT64_MAX;
-                        lim.rlim_max = UINT64_MAX;
-                    }
-                } else {
-                    lim.rlim_cur = UINT64_MAX;
-                    lim.rlim_max = UINT64_MAX;
-                }
-            }
-            if (lim.rlim_cur == UINT64_MAX)
-                snprintf(soft, sizeof(soft), "unlimited");
-            else
-                snprintf(soft, sizeof(soft), "%llu",
-                         (unsigned long long) lim.rlim_cur);
-            if (lim.rlim_max == UINT64_MAX)
-                snprintf(hard, sizeof(hard), "unlimited");
-            else
-                snprintf(hard, sizeof(hard), "%llu",
-                         (unsigned long long) lim.rlim_max);
-        } else {
-            snprintf(soft, sizeof(soft), "unlimited");
-            snprintf(hard, sizeof(hard), "unlimited");
-        }
 
         if ((size_t) off >= bufsz)
             break;

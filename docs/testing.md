@@ -504,6 +504,11 @@ interface declares `bInterfaceNumber` 200: every byte is well formed and the
 range is the field's own, but nothing anyone can plug in emits it, so it is the
 only way to reach the paths that index by that number.
 
+`ELFUSE_HOST_RLIMIT_CHECK` points at observation: no other process can read
+the rlimits of an elfuse process, so with the variable set each one records its
+host limits at start and, when one has moved by exit, writes a line to stderr
+and exits 86. `test-rlimit-unchanged-host` runs `test-proc-limits` under it.
+
 The lanes these drive:
 
 | Lane | Property |

@@ -67,6 +67,7 @@ NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-string-builder-host.c \
                 tests/test-wakeup-pipe-host.c \
                 tests/test-stdio-nonblock-host.c \
+                tests/test-rlimit-unchanged-host.c \
                 tests/test-guest-env-host.c \
                 tests/test-usb-desc-host.c \
                 tests/test-usbdev-urb-host.c \

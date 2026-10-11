@@ -249,7 +249,8 @@ endef
 CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
-        test-teardown-live-vcpu-host test-stdio-nonblock-host test-casefold-host \
+        test-teardown-live-vcpu-host test-stdio-nonblock-host \
+        test-rlimit-unchanged-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
@@ -273,6 +274,7 @@ $(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
 $(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
+$(call run-host-unit,test-rlimit-unchanged-host,host rlimits across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)

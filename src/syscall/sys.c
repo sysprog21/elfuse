@@ -831,6 +831,43 @@ void sys_rlimit_forget(pid_t host_pid)
         unlink(path);
 }
 
+/* Test hook, off unless ELFUSE_HOST_RLIMIT_CHECK is set: record every host
+ * limit of this process and fail its exit when one has moved. Only elfuse can
+ * read its own limits, and a guest limit that reached host setrlimit shows
+ * nowhere else. tests/test-rlimit-unchanged-host drives it.
+ */
+#define HOST_RLIMIT_CHECK_EXIT 86
+
+static struct rlimit host_rlimit_start[RLIM_NLIMITS];
+
+static void host_rlimit_check(void)
+{
+    for (int r = 0; r < RLIM_NLIMITS; r++) {
+        struct rlimit now;
+        if (getrlimit(r, &now) < 0 ||
+            (now.rlim_cur == host_rlimit_start[r].rlim_cur &&
+             now.rlim_max == host_rlimit_start[r].rlim_max))
+            continue;
+        fprintf(stderr,
+                "elfuse: host rlimit %d moved during the guest run: "
+                "%llu/%llu -> %llu/%llu\n",
+                r, (unsigned long long) host_rlimit_start[r].rlim_cur,
+                (unsigned long long) host_rlimit_start[r].rlim_max,
+                (unsigned long long) now.rlim_cur,
+                (unsigned long long) now.rlim_max);
+        _exit(HOST_RLIMIT_CHECK_EXIT);
+    }
+}
+
+static void host_rlimit_check_arm(void)
+{
+    if (!getenv("ELFUSE_HOST_RLIMIT_CHECK"))
+        return;
+    for (int r = 0; r < RLIM_NLIMITS; r++)
+        getrlimit(r, &host_rlimit_start[r]);
+    atexit(host_rlimit_check);
+}
+
 static bool rlimit_pair_valid(int resource, linux_rlimit64_t lim)
 {
     if (lim.rlim_cur > lim.rlim_max)
@@ -883,6 +920,7 @@ void sys_rlimit_init(void)
     }
     rlimit_publish();
     pthread_mutex_unlock(&rlimit_lock);
+    host_rlimit_check_arm();
 }
 
 uint64_t sys_rlimit_cur(int resource)
@@ -916,6 +954,7 @@ void sys_rlimit_restore(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT])
         rlimit_slot_store(&rlimit_private, r, in[r]);
     rlimit_publish();
     pthread_mutex_unlock(&rlimit_lock);
+    host_rlimit_check_arm();
 }
 
 /* Read the slot into @old_lim and, when @new_lim is set, replace it under the

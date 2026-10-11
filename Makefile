@@ -345,6 +345,12 @@ $(BUILD_DIR)/test-stdio-nonblock-host: tests/test-stdio-nonblock-host.c | $(BUIL
 	@echo "  CC      $<"
 	$(Q)$(CC) $(CFLAGS) -Itests -o $@ $<
 
+# test-rlimit-unchanged-host launches elfuse with ELFUSE_HOST_RLIMIT_CHECK set
+# and reads what the check reports, so it is a host binary too.
+$(BUILD_DIR)/test-rlimit-unchanged-host: tests/test-rlimit-unchanged-host.c | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Itests -o $@ $<
+
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
 

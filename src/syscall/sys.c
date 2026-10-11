@@ -929,6 +929,13 @@ uint64_t sys_rlimit_cur(int resource)
                                 memory_order_relaxed);
 }
 
+void sys_rlimit_send_xfsz(void)
+{
+    if (!current_thread ||
+        !signal_queue_thread(thread_tid(current_thread), LINUX_SIGXFSZ))
+        signal_queue(LINUX_SIGXFSZ);
+}
+
 void sys_rlimit_snapshot(linux_rlimit64_t out[LINUX_RLIMIT_COUNT])
 {
     pthread_mutex_lock(&rlimit_lock);

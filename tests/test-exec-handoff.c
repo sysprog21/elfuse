@@ -37,6 +37,10 @@
  *    a caller that connected once. Measured before the fix: about 60% of a
  *    connect loop under exec pressure reported EISCONN, against 4000/4000
  *    clean on a real kernel.
+ * 7. A copy waiting to be refused is still waiting afterwards. A splice into a
+ *    file already at RLIMIT_FSIZE waits for a byte before it can refuse it, and
+ *    has moved nothing when the handoff breaks that wait, so the restart must
+ *    put it back rather than report an EINTR no signal explains.
  *
  * Every case execs a path that does not exist, so the handoff fails before its
  * point of no return and the leader stays in the original image to be checked.
@@ -44,7 +48,8 @@
  * Syscalls exercised: execve(221), clone(220), read(63), write(64), pipe2(59),
  *                     wait4(260), rt_sigaction(134), tgkill(131),
  *                     nanosleep(101), futex(98), rt_sigtimedwait(137),
- *                     socket(198), connect(203), accept4(242)
+ *                     socket(198), connect(203), accept4(242), splice(76),
+ *                     prlimit64(261), ftruncate(46), lseek(62), ioctl(29)
  */
 
 #include <arpa/inet.h>
@@ -59,7 +64,10 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -576,6 +584,74 @@ static void expect_connect_survives_handoff(void)
     EXPECT_EQ(bad, 0, "connect reported the host's retry state to the guest");
 }
 
+/* The leader parks in a splice from the empty pipe into a file that is already
+ * at the limit, with no EINTR retry. The worker's byte is what ends the wait,
+ * and Linux refuses it without taking it: EFBIG, and the byte still queued.
+ * SIGXFSZ is ignored so the refusal is all there is to read, and ignored before
+ * the file is sized so a smaller inherited limit fails the setup instead.
+ */
+static void expect_fsize_wait_survives_handoff(void)
+{
+    enum { LIMIT = 4096 };
+    char path[] = "/tmp/elfuse-exec-handoff.XXXXXX";
+    struct rlimit old, cut;
+    pthread_t t;
+    int fd = mkstemp(path);
+
+    signal(SIGXFSZ, SIG_IGN);
+    if (fd < 0 || getrlimit(RLIMIT_FSIZE, &old) < 0 ||
+        ftruncate(fd, LIMIT) < 0 || lseek(fd, LIMIT, SEEK_SET) != LIMIT) {
+        FAIL("file at the size limit could not be set up");
+        signal(SIGXFSZ, SIG_DFL);
+        if (fd >= 0) {
+            close(fd);
+            unlink(path);
+        }
+        return;
+    }
+
+    cut = old;
+    cut.rlim_cur = LIMIT;
+    atomic_store(&worker_fails, 0);
+    atomic_store(&leader_parked, 0);
+
+    ssize_t n = 0;
+    int err = 0, queued = 0;
+    char c = 0;
+    /* pthread_create returns its error rather than setting errno. */
+    int setup = setrlimit(RLIMIT_FSIZE, &cut) < 0
+                    ? errno
+                    : pthread_create(&t, NULL, doomed_exec_worker, NULL);
+    if (setup == 0) {
+        atomic_store(&leader_parked, 1);
+        n = splice(pipe_rd, NULL, fd, NULL, 1, 0);
+        err = errno;
+        pthread_join(t, NULL);
+
+        /* Counted before it is read: a splice that took the byte would leave
+         * this read with nothing to return.
+         */
+        if (ioctl(pipe_rd, FIONREAD, &queued) == 0 && queued == 1)
+            read_byte_retrying(pipe_rd, &c);
+    }
+
+    setrlimit(RLIMIT_FSIZE, &old);
+    signal(SIGXFSZ, SIG_DFL);
+    close(fd);
+    unlink(path);
+
+    errno = setup ? setup : err;
+    if (setup != 0)
+        FAIL("limit or worker could not be set up");
+    else if (n < 0 && err == EINTR)
+        FAIL("leader splice returned EINTR across a sibling execve");
+    else if (n != -1 || err != EFBIG)
+        FAIL("leader splice was not refused with EFBIG");
+    else
+        EXPECT_TRUE(c == 'x' && atomic_load(&worker_fails) == 0,
+                    "refused splice did not leave its byte in the pipe");
+}
+
 int main(void)
 {
     int fds[2];
@@ -612,6 +688,9 @@ int main(void)
 
     TEST("connect under sustained handoff pressure");
     expect_connect_survives_handoff();
+
+    TEST("splice at the file size limit across a handoff");
+    expect_fsize_wait_survives_handoff();
 
     SUMMARY("test-exec-handoff");
     return fails > 0 ? 1 : 0;

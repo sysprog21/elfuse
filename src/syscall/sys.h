@@ -110,6 +110,12 @@ void sys_rlimit_forget(pid_t host_pid);
  */
 uint64_t sys_rlimit_cur(int resource);
 
+/* Send SIGXFSZ for a request RLIMIT_FSIZE refused. Linux sends it to the thread
+ * that made the request (send_sig to current), so it is queued for the calling
+ * thread alone and a sibling that has it unblocked does not take it.
+ */
+void sys_rlimit_send_xfsz(void);
+
 /* Format /proc/self/limits content into buf.
  *
  * Returns bytes written (excluding NUL) or -1 on error.

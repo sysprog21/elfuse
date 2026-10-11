@@ -54,6 +54,8 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "syscall/usbdev.h"
 #include "syscall/poll.h" /* epoll_dup_fd */
 #include "syscall/proc.h"
+#include "syscall/signal.h"
+#include "syscall/sys.h"
 
 /* Linux dirent64 layout. */
 typedef struct {
@@ -3605,6 +3607,31 @@ int64_t sys_faccessat(guest_t *g,
 
 /* truncate. */
 
+/* RLIMIT_FSIZE on a truncate, after inode_newsize_ok (Linux fs/attr.c): growing
+ * a regular file past the soft limit fails with EFBIG and SIGXFSZ, and
+ * shrinking one that is already past it does not.
+ *
+ * The kernel refuses a descriptor that is not open for writing before it looks
+ * at the size (do_sys_ftruncate), so such a descriptor is passed through and
+ * the host call reports it.
+ */
+static int64_t truncate_fsize_check(int host_fd, int64_t length)
+{
+    uint64_t limit = sys_rlimit_cur(LINUX_RLIMIT_FSIZE);
+    if (limit == LINUX_RLIM_INFINITY || length < 0 ||
+        (uint64_t) length <= limit)
+        return 0;
+
+    struct stat st;
+    if (fstat(host_fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size >= length)
+        return 0;
+    int fl = fcntl(host_fd, F_GETFL);
+    if (fl < 0 || (fl & O_ACCMODE) == O_RDONLY)
+        return 0;
+    sys_rlimit_send_xfsz();
+    return -LINUX_EFBIG;
+}
+
 int64_t sys_ftruncate(int fd, int64_t length)
 {
     fd_entry_t snap;
@@ -3636,6 +3663,12 @@ int64_t sys_ftruncate(int fd, int64_t length)
                 return -LINUX_EPERM;
             }
         }
+    }
+
+    int64_t fsz = truncate_fsize_check(host_ref.fd, length);
+    if (fsz < 0) {
+        host_fd_ref_close(&host_ref);
+        return fsz;
     }
 
     if (ftruncate(host_ref.fd, length) < 0) {
@@ -3671,6 +3704,11 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length)
                 return -LINUX_EINVAL;
             return linux_errno();
         }
+        int64_t fsz = truncate_fsize_check(fd, length);
+        if (fsz < 0) {
+            close(fd);
+            return fsz;
+        }
         if (ftruncate(fd, length) < 0) {
             close_keep_errno(fd);
             return linux_errno();
@@ -3679,6 +3717,32 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length)
         return 0;
     }
 
+    /* A request that could pass RLIMIT_FSIZE is checked and carried out on one
+     * descriptor: checked by path, a rename between the two calls would have
+     * the limit looked up on one file and another one grown. Opening for
+     * writing is also the permission check Linux makes first (vfs_truncate). A
+     * path that does not open is left to truncate, which fails the same way.
+     * The exception is a host out of descriptors, where truncate would succeed:
+     * the size from the stat then decides, as the best answer left.
+     */
+    uint64_t limit = sys_rlimit_cur(LINUX_RLIMIT_FSIZE);
+    struct stat st;
+    if (length >= 0 && (uint64_t) length > limit &&
+        stat(tx.host_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        int fd = open(tx.host_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0 && (errno == EMFILE || errno == ENFILE) &&
+            st.st_size < length) {
+            sys_rlimit_send_xfsz();
+            return -LINUX_EFBIG;
+        }
+        if (fd >= 0) {
+            int64_t fsz = truncate_fsize_check(fd, length);
+            if (fsz == 0 && ftruncate(fd, length) < 0)
+                fsz = linux_errno();
+            close(fd);
+            return fsz;
+        }
+    }
     if (truncate(tx.host_path, length) < 0)
         return linux_errno();
     return 0;

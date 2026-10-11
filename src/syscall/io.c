@@ -55,6 +55,7 @@
 #include "syscall/usbdev.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
+#include "syscall/sys.h"
 #include "syscall/wakeup-pipe.h"
 
 #define URANDOM_CACHE_SIZE 4096
@@ -1522,6 +1523,96 @@ static int64_t io_write_result(ssize_t ret)
     return linux_errno();
 }
 
+/* What RLIMIT_FSIZE leaves a write to @host_fd that starts at @pos; with
+ * @append_aware a descriptor opened O_APPEND starts at end of file instead. The
+ * limit is on regular files only.
+ *
+ * The kernel refuses a descriptor that is not open for writing before it looks
+ * at any size (vfs_write, Linux fs/read_write.c), so no limit applies to one
+ * and the host call reports it, as in truncate_fsize_check.
+ *
+ * Returns false when no limit applies, true with @room set otherwise, 0 at or
+ * past the limit.
+ */
+static bool fsize_room(int host_fd,
+                       off_t pos,
+                       bool append_aware,
+                       uint64_t *room)
+{
+    uint64_t limit = sys_rlimit_cur(LINUX_RLIMIT_FSIZE);
+    if (limit == LINUX_RLIM_INFINITY)
+        return false;
+
+    struct stat st;
+    if (fstat(host_fd, &st) < 0 || !S_ISREG(st.st_mode))
+        return false;
+    int fl = fcntl(host_fd, F_GETFL);
+    if (fl < 0 || (fl & O_ACCMODE) == O_RDONLY)
+        return false;
+    if (append_aware && (fl & O_APPEND))
+        pos = st.st_size;
+    if (pos < 0)
+        return false;
+    *room = (uint64_t) pos < limit ? limit - (uint64_t) pos : 0;
+    return true;
+}
+
+/* RLIMIT_FSIZE on a write, after generic_write_check_limits (Linux
+ * mm/filemap.c): a regular-file write that starts at or past the soft limit
+ * fails with EFBIG and SIGXFSZ, and one that crosses it is cut at the limit. A
+ * write of no bytes is done before the limit is looked at (generic_write_checks
+ * returns on a zero count first).
+ *
+ * Returns 0 with @count clamped, or -LINUX_EFBIG.
+ */
+static int64_t fsize_limit_write(int host_fd,
+                                 off_t pos,
+                                 bool append_aware,
+                                 uint64_t *count)
+{
+    uint64_t room;
+    if (*count == 0 || !fsize_room(host_fd, pos, append_aware, &room))
+        return 0;
+    if (room == 0) {
+        sys_rlimit_send_xfsz();
+        return -LINUX_EFBIG;
+    }
+    if (*count > room)
+        *count = room;
+    return 0;
+}
+
+/* fsize_limit_write for a vector: @iov and @iovcnt are cut to the bytes the
+ * limit leaves.
+ */
+static int64_t fsize_limit_writev(int host_fd,
+                                  off_t pos,
+                                  bool append_aware,
+                                  struct iovec *iov,
+                                  int *iovcnt)
+{
+    if (sys_rlimit_cur(LINUX_RLIMIT_FSIZE) == LINUX_RLIM_INFINITY)
+        return 0;
+
+    uint64_t total = 0;
+    for (int i = 0; i < *iovcnt; i++)
+        total += iov[i].iov_len;
+    uint64_t allowed = total;
+    int64_t err = fsize_limit_write(host_fd, pos, append_aware, &allowed);
+    if (err < 0 || allowed == total)
+        return err;
+
+    for (int i = 0; i < *iovcnt; i++) {
+        if (iov[i].iov_len >= allowed) {
+            iov[i].iov_len = allowed;
+            *iovcnt = i + 1;
+            break;
+        }
+        allowed -= iov[i].iov_len;
+    }
+    return 0;
+}
+
 int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
     int type = fd_get_type(fd);
@@ -1581,6 +1672,12 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         if (handled > 0) {
             host_fd_ref_close(&host_ref);
             return intercepted;
+        }
+
+        int64_t fsz = fsize_limit_write(host_ref.fd, offset, true, &count);
+        if (fsz < 0) {
+            host_fd_ref_close(&host_ref);
+            return fsz;
         }
     }
 
@@ -1782,6 +1879,15 @@ int64_t sys_pwrite64(guest_t *g,
     if (handled > 0) {
         host_fd_ref_close(&host_ref);
         return intercepted;
+    }
+
+    /* An O_APPEND descriptor is judged at end of file here too: Linux moves the
+     * position there in generic_write_checks whatever offset pwrite gave.
+     */
+    int64_t fsz = fsize_limit_write(host_ref.fd, offset, true, &count);
+    if (fsz < 0) {
+        host_fd_ref_close(&host_ref);
+        return fsz;
     }
 
     ssize_t ret = pwrite(host_ref.fd, buf, count, offset);
@@ -2259,6 +2365,14 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             host_fd_ref_close(&host_ref);
             return intercepted;
         }
+
+        int64_t fsz = fsize_limit_writev(host_ref.fd, offset, true,
+                                         host_iov.iov, &iovcnt);
+        if (fsz < 0) {
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return fsz;
+        }
     }
 
     ssize_t ret;
@@ -2374,6 +2488,14 @@ int64_t sys_pwritev(guest_t *g,
         return intercepted;
     }
 
+    int64_t fsz =
+        fsize_limit_writev(host_ref.fd, offset, true, host_iov.iov, &iovcnt);
+    if (fsz < 0) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return fsz;
+    }
+
     ssize_t ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, offset);
     int64_t result = io_write_result(ret);
     host_iov_free(&host_iov);
@@ -2400,19 +2522,23 @@ static int64_t sys_pwritev_append(guest_t *g,
     }
 
     ssize_t ret;
-    if (update_file_offset) {
-        if (lseek(host_ref.fd, 0, SEEK_END) < 0) {
-            ret = -1;
-        } else {
-            ret = writev(host_ref.fd, host_iov.iov, iovcnt);
-        }
+    struct stat st;
+    if (fstat(host_ref.fd, &st) < 0) {
+        ret = -1;
     } else {
-        struct stat st;
-        if (fstat(host_ref.fd, &st) < 0) {
-            ret = -1;
-        } else {
-            ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, st.st_size);
+        err = fsize_limit_writev(host_ref.fd, st.st_size, false, host_iov.iov,
+                                 &iovcnt);
+        if (err < 0) {
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return err;
         }
+        if (!update_file_offset)
+            ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, st.st_size);
+        else if (lseek(host_ref.fd, 0, SEEK_END) < 0)
+            ret = -1;
+        else
+            ret = writev(host_ref.fd, host_iov.iov, iovcnt);
     }
 
     int64_t result = io_write_result(ret);
@@ -3546,6 +3672,15 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
         return -LINUX_EOPNOTSUPP;
     }
 
+    /* vfs_fallocate (Linux fs/open.c) refuses a descriptor that is not open for
+     * writing before it looks at any size.
+     */
+    int fl = fcntl(host_ref.fd, F_GETFL);
+    if (fl >= 0 && (fl & O_ACCMODE) == O_RDONLY) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EBADF;
+    }
+
     struct stat st;
     if (fstat(host_ref.fd, &st) < 0) {
         host_fd_ref_close(&host_ref);
@@ -3559,6 +3694,13 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
         return -LINUX_EFBIG; /* Overflow check */
     }
     if (new_size > st.st_size) {
+        /* inode_newsize_ok (Linux fs/attr.c), as a growing truncate. */
+        if (S_ISREG(st.st_mode) &&
+            (uint64_t) new_size > sys_rlimit_cur(LINUX_RLIMIT_FSIZE)) {
+            host_fd_ref_close(&host_ref);
+            sys_rlimit_send_xfsz();
+            return -LINUX_EFBIG;
+        }
         if (ftruncate(host_ref.fd, new_size) < 0) {
             host_fd_ref_close(&host_ref);
             return linux_errno();
@@ -3638,6 +3780,62 @@ static bool io_give_up_unsent(int64_t off_in,
     return rewound || thread_stop_requested();
 }
 
+/* fsize_room for a stream copy: @off_out is the output offset, or negative for
+ * the descriptor's own position.
+ */
+static bool fsize_copy_room(int out_hfd, int64_t off_out, uint64_t *room)
+{
+    if (sys_rlimit_cur(LINUX_RLIMIT_FSIZE) == LINUX_RLIM_INFINITY)
+        return false;
+
+    off_t pos = off_out >= 0 ? (off_t) off_out : lseek(out_hfd, 0, SEEK_CUR);
+    return fsize_room(out_hfd, pos, off_out < 0, room);
+}
+
+/* A stream copy that has filled its output to RLIMIT_FSIZE. Linux hands the
+ * next source bytes to the file's write path (iter_file_splice_write, fs/
+ * splice.c), which fails with EFBIG and SIGXFSZ, so the signal goes out only
+ * when the input has a byte to give. Before that the kernel waits for one
+ * (splice_from_pipe_next): a pipe that is empty and still has a writer blocks,
+ * or answers EAGAIN when it does not block, and one whose writers are gone ends
+ * the copy. Nothing is waited for once bytes have moved.
+ *
+ * Returns 1 after sending SIGXFSZ, 0 when the input has nothing more, or a
+ * negative Linux errno from the wait.
+ */
+static int64_t copy_past_fsize(int in_hfd,
+                               int64_t off_in,
+                               const fd_block_state_t *in_st,
+                               bool nothing_moved)
+{
+    char c;
+    off_t pos = off_in >= 0 ? (off_t) off_in : lseek(in_hfd, 0, SEEK_CUR);
+
+    if (pos >= 0) {
+        if (pread(in_hfd, &c, 1, pos) != 1)
+            return 0;
+        sys_rlimit_send_xfsz();
+        return 1;
+    }
+
+    for (;;) {
+        int queued = 0;
+        if (ioctl(in_hfd, FIONREAD, &queued) == 0 && queued > 0) {
+            sys_rlimit_send_xfsz();
+            return 1;
+        }
+
+        struct pollfd pfd = {.fd = in_hfd, .events = POLLIN};
+        if (!nothing_moved || (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLHUP)))
+            return 0;
+        if (!io_eagain_should_wait(in_st, in_hfd))
+            return -LINUX_EAGAIN;
+        int64_t waited = io_wait_fd_or_interrupted(in_hfd, POLLIN);
+        if (waited < 0)
+            return waited;
+    }
+}
+
 typedef struct {
     int in_gfd, in_hfd;
     int out_gfd, out_hfd;
@@ -3664,6 +3862,20 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
     while (remaining > 0) {
         size_t chunk =
             remaining > IO_COPY_BUF_SIZE ? IO_COPY_BUF_SIZE : remaining;
+        uint64_t room;
+        if (fsize_copy_room(out_hfd, *off_out, &room)) {
+            if (room == 0) {
+                int64_t past =
+                    copy_past_fsize(in_hfd, *off_in, &in_st, total == 0);
+                if (total == 0 && past != 0) {
+                    ret = past > 0 ? -LINUX_EFBIG : past;
+                    goto done;
+                }
+                break;
+            }
+            if (chunk > room)
+                chunk = room;
+        }
         ssize_t nr;
         if (*off_in >= 0) {
             int64_t intercepted = proc_try_chunk_read_intercept(
@@ -3870,6 +4082,21 @@ int64_t sys_copy_file_range(guest_t *g,
         }
     }
 
+    /* generic_copy_file_checks (Linux fs/read_write.c) applies RLIMIT_FSIZE to
+     * the whole request before anything is read: EFBIG and SIGXFSZ at or past
+     * the limit whatever the length, and a length cut at the limit otherwise.
+     */
+    uint64_t room;
+    if (fsize_copy_room(out_ref.fd, off_out, &room)) {
+        if (room == 0) {
+            sys_rlimit_send_xfsz();
+            err = -LINUX_EFBIG;
+            goto out_copy_file_range;
+        }
+        if (len > room)
+            len = room;
+    }
+
     /* Emulate with a pread/pwrite loop. */
     int64_t moved = copy_fd_range(&(copy_ends_t) {.in_gfd = fd_in,
                                                   .in_hfd = in_ref.fd,
@@ -4067,6 +4294,22 @@ int64_t sys_splice(guest_t *g,
     int64_t ret;
     while (total < len) {
         size_t n = (len - total) > chunk ? chunk : (len - total);
+        uint64_t room;
+        if (fsize_copy_room(st.out_hfd, st.off_out, &room)) {
+            if (room == 0) {
+                int64_t past = copy_past_fsize(st.in_hfd, st.off_in, &st.in_st,
+                                               total == 0);
+                if (past > 0) {
+                    f.rw_error = true;
+                    f.saved_errno = EFBIG;
+                } else if (past < 0) {
+                    f.wait_err = past;
+                }
+                break;
+            }
+            if (n > room)
+                n = room;
+        }
         ssize_t r;
         if (st.off_in >= 0) {
             r = pread(st.in_hfd, buf, n, st.off_in);

@@ -719,6 +719,7 @@ run_unit_tests()
         "$bindir/test-process-lifecycle"
     test_check "$runner" "test-cloexec" "PASS" "$bindir/test-cloexec"
     test_rc "$runner" "test-exec-limits" 0 "$bindir/test-exec-limits"
+    test_rc "$runner" "test-rlimit-enforce" 0 "$bindir/test-rlimit-enforce"
     test_rc "$runner" "test-session" 0 "$bindir/test-session"
     test_rc "$runner" "test-pidfd" 0 "$bindir/test-pidfd"
 

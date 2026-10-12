@@ -47,6 +47,7 @@
 #include "syscall/wakeup-pipe.h"
 
 #include "debug/log.h"
+#include "debug/runtime-stats.h"
 #include "debug/syscall-hist.h"
 
 extern char **environ;
@@ -230,6 +231,7 @@ static int host_dc_zva_assert(void)
 int main(int argc, char **argv)
 {
     log_init();
+    runtime_stats_init();
 
     /* Resolve ELFUSE_STARTUP_TRACE before any guest syscall can fire so the
      * histogram captures the very first dynamic-linker openat.

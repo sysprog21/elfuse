@@ -309,6 +309,109 @@ and memory access, and per-thread inspection. Implementation details, including
 the snapshot protocol used to keep Hypervisor.framework register access on the
 owning thread, are documented in [internals.md](internals.md).
 
+## Performance Analysis
+
+`elfuse` can account for where a guest spends its time without an external
+profiler. Set `ELFUSE_RUNTIME_STATS` to turn on a stats coordinator that
+aggregates three sources at exit: shim fast-path counters, vCPU exit reasons,
+and a per-syscall histogram (count, total, average, and max latency). All
+output goes to stderr, so guest stdout stays clean for pipelines.
+
+| `ELFUSE_RUNTIME_STATS` | Output |
+|------------------------|--------|
+| `summary` (the default for any nonempty value other than `json`, `jsonl`, or `0`) | Human-readable tables on exit |
+| `json` | One JSON object per process on exit |
+| `jsonl` | One JSON object per line: a final object plus one per on-demand snapshot |
+
+Quick eyeball of a run:
+
+```sh
+ELFUSE_RUNTIME_STATS=summary build/elfuse ./guest-program 2>stats.txt
+```
+
+The summary prints a `vcpu-exit-stats` block (`exits_total`, `exits_vtimer`,
+`exits_no_signal_cancel`, and `null_exit_share`) and a `syscall histogram`
+sorted by total time, with a trailing line reporting what fraction of wall time
+was spent inside syscalls. A high null-exit share or a syscall dominating total
+time is the first thing to chase.
+
+### On-Demand Snapshots
+
+For a long-running guest, request a snapshot without stopping it by setting
+`ELFUSE_STATS_SIGNAL=USR1` and sending `SIGUSR1` to the `elfuse` process:
+
+```sh
+ELFUSE_RUNTIME_STATS=jsonl ELFUSE_STATS_SIGNAL=USR1 \
+    build/elfuse ./guest-program 2>stats.jsonl &
+sleep 0.1        # let the process claim SIGUSR1
+kill -USR1 $!    # emit a snapshot; repeat as the workload progresses
+```
+
+Each snapshot is one JSON line tagged `"reason":"signal","final":false`. The
+final dump has `"final":true`; its `reason` is `"exit"` for the top-level
+process and `"fork-child-exit"` for fork children, so filter on `"final"`
+rather than the reason string. In `json` (not `jsonl`) mode, snapshots are
+suppressed so each process writes a single JSON object. Each record goes out
+in one `write`, which keeps records from a parent and its fork children whole
+in a file; a pipe only guarantees that for writes up to 512 bytes, so send
+stderr to a file when a forking guest is measured.
+
+Snapshot requests are handled on elfuse's own signal thread and the record is
+written by a separate stats thread, so it arrives even while the guest is
+blocked in a long syscall, and no guest call sees an `EINTR` for it. The `sleep 0.1` matters only for a script that sends the signal
+immediately: elfuse claims `SIGUSR1` early in startup, and one delivered before
+then terminates the process by default. Without `ELFUSE_RUNTIME_STATS` or
+`ELFUSE_SHIM_STATS`, `ELFUSE_STATS_SIGNAL` is ignored and `SIGUSR1` keeps its
+default action.
+
+### Timeline And Flamegraphs
+
+`jsonl` mode plus `scripts/runtime-stats-convert.py` turns a run into viewer
+formats. The `folded`, `speedscope`, and `perfetto` exports diff consecutive
+snapshots per pid, so each interval shows the syscalls that ran during it; `csv`
+emits the raw cumulative rows, one row per snapshot record:
+
+```sh
+# Flamegraph input (Brendan Gregg's flamegraph.pl):
+scripts/runtime-stats-convert.py folded stats.jsonl | flamegraph.pl >stats.svg
+
+# Load in https://www.speedscope.app:
+scripts/runtime-stats-convert.py speedscope stats.jsonl >stats.speedscope.json
+
+# Perfetto UI (https://ui.perfetto.dev):
+scripts/runtime-stats-convert.py perfetto stats.jsonl >stats.perfetto.json
+
+# Cumulative per-snapshot rows for a spreadsheet:
+scripts/runtime-stats-convert.py csv stats.jsonl >stats.csv
+```
+
+The JSON schema (`elfuse-runtime-stats/1`) also carries a `phase` object of
+coarse buckets summed from syscall-family totals: `clone_ns` (clone + clone3),
+`wait_ns` (wait4 + waitid), `host_vfs_ns` (openat + openat2 only, also
+reported as `path.open_ns`), `futex_ns`,
+`mem_ns` (mmap + mprotect + madvise), and `process_lifecycle_ns` (clone + wait).
+They are a quick read on where fork-heavy or lock-heavy guests spend time, not
+independent phase timers; the raw histogram is authoritative.
+
+### Startup Histogram
+
+To profile just the dynamic-linker bring-up storm, use
+`ELFUSE_STARTUP_TRACE=syscalls`, which freezes the histogram at the first
+`execve` instead of recording the whole run. `ELFUSE_STARTUP_TRACE=syscalls-steady`
+keeps recording past `execve` for steady-state workloads. Turning on
+`ELFUSE_RUNTIME_STATS` implies steady-state recording.
+
+Each fork child keeps its own counters from its first instruction and emits its
+own final record, so per-process records add up rather than overlap. Within a
+process the shim counters restart at each `execve`, because they live in the
+shim's data page and a new image gets a fresh one; the syscall histogram and
+vCPU exit counts cover the whole process. The same
+holds for `syscalls-steady` without `ELFUSE_RUNTIME_STATS`: each child dumps its
+own histogram at exit. Enabling stats adds a `clock_gettime` pair
+plus atomic counter updates around each syscall; the disabled path is a
+`pthread_once` guard and one atomic load, so leaving stats off costs
+effectively nothing.
+
 ## Guest Compatibility Model
 
 `elfuse` is designed for Linux user-space workloads, not for booting a Linux
@@ -345,11 +448,16 @@ Off by default, and useful when a guest misbehaves rather than in normal use:
 
 - `ELFUSE_STARTUP_TRACE`: `steps` prints per-step VM bring-up timings,
   `syscalls` prints a per-syscall histogram of startup traffic (frozen at the
-  first `execve`, so steady-state calls do not swamp it), `all` does both.
+  first `execve`, so steady-state calls do not swamp it), `syscalls-steady`
+  records the whole run instead, `all` does `steps` and `syscalls`.
   Comma-separated tokens are accepted, and `1` is a legacy alias for `steps`.
-- `ELFUSE_SHIM_STATS=1`: dump the EL1 shim counter table to stderr at exit, so
-  a syscall that should be served inside the shim but takes the HVC #5 exit is
-  attributed without a rebuild.
+- `ELFUSE_SHIM_STATS=1`: dump the EL1 shim counter table and the vCPU exit
+  counts to stderr at exit, one table per process, so a syscall that should be
+  served inside the shim but takes the HVC #5 exit is attributed without a
+  rebuild. It is the `summary` mode of `ELFUSE_RUNTIME_STATS` without the
+  steady-state histogram.
+- `ELFUSE_RUNTIME_STATS`, `ELFUSE_STATS_SIGNAL`: see
+  [Performance Analysis](#performance-analysis).
 - `ELFUSE_DISABLE_TLBI_RANGE=1`: refuse `FEAT_TLBIRANGE` and fall back to
   per-page and broadcast invalidation, which separates a stale-TLB bug from
   the range-encoding path.

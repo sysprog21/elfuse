@@ -77,6 +77,7 @@
 #include "syscall/wakeup-pipe.h"
 
 #include "debug/log.h"
+#include "debug/runtime-stats.h"
 #include "debug/syscall-hist.h"
 
 /* Linux clone flags. Shared by the fork-child TID-sync emulation below and
@@ -127,11 +128,12 @@ int fork_child_main(int ipc_fd,
         log_set_level(LOG_DEBUG);
 
     /* The startup syscall histogram captures dynamic-linker bring-up of the
-     * top-level guest only; the child resumes from the parent's snapshot, so
-     * its first syscalls would be steady-state traffic that confuses the dump.
-     * Disable before any guest syscall is dispatched.
+     * top-level guest only; the child resumes from the parent's snapshot. A
+     * steady-state histogram is whole-workload accounting, so the child keeps
+     * recording its own share and dumps it at exit.
      */
-    syscall_hist_disable();
+    if (!syscall_hist_steady())
+        syscall_hist_disable();
 
     /* Reset static process/thread/futex state before receiving the parent
      * snapshot so the incoming metadata survives child restore.
@@ -545,12 +547,22 @@ int fork_child_main(int ipc_fd,
      */
     signal_set_state(&sig);
 
+    runtime_stats_attach(&g, 0, NULL);
     log_debug("fork-child: entering vCPU loop");
 
     /* The child resumes from the captured fork frame and returns 0 to EL0. */
     int wait_status = 0;
     int exit_code =
         vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec, &wait_status);
+
+    /* Before proc_process_exit: once the parent can reap this child, whoever
+     * reads the stats stream after the parent exits must already find this
+     * process's record there.
+     */
+    if (runtime_stats_enabled())
+        runtime_stats_dump_final("fork-child-exit");
+    else
+        syscall_hist_dump();
 
     proc_process_exit(wait_status);
 
@@ -560,7 +572,6 @@ int fork_child_main(int ipc_fd,
      * the master and is waiting for exactly this hangup.
      */
     proc_pty_release_process_slaves();
-
     guest_destroy(&g);
     return exit_code;
 }

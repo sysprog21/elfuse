@@ -622,6 +622,9 @@ static int translate_rlimit_resource(int linux_res)
     }
 }
 
+/* MAXSSIZ on arm64 macOS: 64 MiB less one 16 KiB page. */
+#define HOST_STACK_HARD_CAP (64ULL * 1024 * 1024 - 16 * 1024)
+
 static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
 {
     linux_rlimit64_t lim = {0};
@@ -640,6 +643,14 @@ static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
         if (lim.rlim_max < lim.rlim_cur)
             lim.rlim_max = lim.rlim_cur;
     }
+
+    /* macOS also caps the hard stack limit, at MAXSSIZ, where Linux starts a
+     * process with it unlimited. The cap is about host thread stacks and bounds
+     * nothing in the guest, so a host that sits at it reads as unlimited; one
+     * whose user lowered it keeps the lower value.
+     */
+    if (resource == LINUX_RLIMIT_STACK && lim.rlim_max >= HOST_STACK_HARD_CAP)
+        lim.rlim_max = LINUX_RLIM_INFINITY;
 
     return lim;
 }

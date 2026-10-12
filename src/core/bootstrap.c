@@ -32,6 +32,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -102,11 +103,10 @@ static void register_elf_segment_regions(guest_t *g,
     }
 }
 
-/* Publish shim, shim-data, heap, stack-guard, and stack regions to
- * /proc/self/maps view, and invalidate the null page and stack-guard PTEs.
- * Shared by guest_bootstrap_prepare and guest_bootstrap_rosetta_post_reset; the
- * caller registers ELF or rosetta segments separately because those differ
- * between aarch64 and rosetta guests.
+/* Publish shim, shim-data, heap, and stack regions to /proc/self/maps view, and
+ * invalidate the null page PTEs. Shared by guest_bootstrap_prepare and
+ * guest_bootstrap_rosetta_post_reset; the caller registers ELF or rosetta
+ * segments separately because those differ between aarch64 and rosetta guests.
  */
 static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
 {
@@ -129,11 +129,10 @@ static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
                          LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[heap]");
     }
 
-    guest_invalidate_ptes(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE);
-    guest_region_add(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE,
-                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
-                     0, "[stack-guard]");
-    guest_region_add(g, g->stack_base + STACK_GUARD_SIZE, g->stack_top,
+    /* The whole window the image is built in; mem_stack_init_extent cuts it
+     * down to what Linux maps at execve once the stack pointer is known.
+     */
+    guest_region_add(g, g->stack_base, g->stack_top,
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[stack]");
     guest_invalidate_ptes(g, 0, 0x1000);
@@ -646,6 +645,7 @@ int guest_bootstrap_prepare(guest_t *g,
         return -1;
     }
     g->start_stack = boot->stack_pointer;
+    mem_stack_init_extent(g, boot->stack_pointer);
     startup_trace_step("build_linux_stack", t0);
 
     /* rosetta_argv was copied into the guest stack; the host allocation is no
@@ -874,7 +874,7 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
 
     /* Re-publish /proc/self/maps style metadata. Mirrors the bootstrap path so
      * the post-exec view reports rosetta-as-anonymous-mapping plus the heap,
-     * stack, stack-guard, shim, and shim-data.
+     * stack, shim, and shim-data.
      */
     register_elf_segment_regions(g, &rr.rosetta_info, 0,
                                  g->rosetta_guest_base - g->rosetta_va_base,
@@ -907,6 +907,7 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
         return -1;
     }
     g->start_stack = sp;
+    mem_stack_init_extent(g, sp);
     proc_set_auxv(auxv.words, auxv.nwords * sizeof(auxv.words[0]));
 
     *out_entry_point = rr.entry_point;

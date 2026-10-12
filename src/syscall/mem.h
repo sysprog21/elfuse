@@ -21,6 +21,22 @@ typedef struct mmap_fork_anon_shared_txn mmap_fork_anon_shared_txn_t;
 /* brk: set/query program break */
 int64_t sys_brk(guest_t *g, uint64_t addr);
 
+/* Stack growth (see the block comment in mem.c).
+ *
+ * mem_stack_grow serves a guest fault at @off, in region coordinates, with
+ * mmap_lock held, and returns true when the address is now mapped.
+ * mem_stack_grow_for_host serves a host-side access to @gva that found no
+ * translation; it takes mmap_lock itself unless the caller holds it, and
+ * returns true when the caller should translate @gva again.
+ *
+ * mem_stack_init_extent cuts the stack region a new image was built in down to
+ * what Linux maps at execve. @sp is the initial stack pointer. The caller holds
+ * mmap_lock or runs before the guest does.
+ */
+bool mem_stack_grow(guest_t *g, uint64_t off);
+bool mem_stack_grow_for_host(guest_t *g, uint64_t gva);
+void mem_stack_init_extent(guest_t *g, uint64_t sp);
+
 /* mmap: map pages into guest address space */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,

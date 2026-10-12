@@ -21,7 +21,9 @@
  *                          the host built a signal frame and the saved fault
  *                          frame must be dropped.
  *   #10  BRK from EL0      SIGTRAP or ptrace-stop; GPRs in the frame
- *   #11  EL0 fault         SIGSEGV or SIGILL; GPRs in the frame. Returns the
+ *   #11  EL0 fault         SIGSEGV or SIGILL; GPRs in the frame. Also taken
+ *                          for a DC ZVA on a block EL0 cannot write, with
+ *                          ESR_EL1 still that of the trap. Returns the
  *                          same X8 wire code as #5 but only 0/1/3/4, since
  *                          there is no frame to drop; a stray 2 falls through
  *                          to the full flush. The lazy MAP_NORESERVE
@@ -512,7 +514,8 @@ getsid_fast:
  * word differs from expected. It answers EAGAIN once an EL0 read proves the
  * caller will not block, and EFAULT when that read faults
  * (handle_el1_data_abort_recover below). Anything that could need a waiter, and
- * every other shape, bails to the host.
+ * every other shape, bails to the host, and so does a timeout that cannot be
+ * read.
  *
  * The authority this must match is futex_should_block in runtime/futex.c, not
  * the Linux source: reordering the checks there is what would silently make
@@ -624,7 +627,10 @@ futex_uaddr_tag:
      * no window between check and access for a sibling vCPU to unmap into. A
      * translation or permission fault lands in handle_el1_data_abort_recover
      * and returns EFAULT, matching what the host answers for an address it
-     * cannot resolve.
+     * cannot resolve. That includes a page under the stack that nothing has
+     * touched: Linux does not grow the stack for a futex word either
+     * (futex_get_value_locked reads it with page faults off, and the fault-in
+     * that follows does not expand a stack).
      *
      * A host-side SIGBUS (the truncated MAP_SHARED overlay HOST_SIGBUS_GUARD
      * covers) is not a stage-1 fault and does not arrive here. Any FUTEX_WAIT
@@ -660,8 +666,10 @@ futex_uaddr_tag:
 
     /* Timed shape. The timespec is read through the same LDTR the word is, so
      * an unreadable one takes the EL0 permission fault in hardware and
-     * handle_el1_data_abort_recover answers EFAULT, which is what Linux answers
-     * for it and in the same order.
+     * handle_el1_data_abort_recover hands the call to the host. Linux reads the
+     * timeout with copy_from_user, which grows the stack to a page under it,
+     * and only the host can do that; for an address that stays unreadable the
+     * host answers EFAULT, in the order Linux does.
      *
      * Validity is deliberately narrower than the host's. futex.c accepts tv_sec
      * up to INT64_MAX/4; this accepts up to 2^31, about 68 years, and hands
@@ -1276,8 +1284,10 @@ not_svc:
     cbnz x11, restore_and_bad   /* EL1 (M>=4): genuine shim bug */
     b handle_el0_fault           /* EL0 (M=0): forward for signal delivery */
 
-/* handle_el1_data_abort_recover: tag a data abort whose faulting PC sits inside
- * the futex ldtr or the urandom-copy strb region as a recoverable EFAULT.
+/* handle_el1_data_abort_recover: recover from a data abort whose faulting PC
+ * sits inside the futex ldtr or the urandom-copy strb region. The urandom store
+ * and the futex word load answer EFAULT; the futex timeout load forwards the
+ * syscall to the host.
  *
  * Layout invariants exploited here:
  *   - SAVE_GPRS allocated 256 bytes for THIS (inner) entry on top of
@@ -1301,20 +1311,7 @@ handle_el1_data_abort_recover:
     b.lo 4f
     adr x12, futex_load_end
     cmp x11, x12
-    b.lo 5f
-4:
-    /* The timespec loads on the timed shape. Same recovery as the word load
-     * below and for the same reason: they are LDTRs under the same pushed slot,
-     * they hold no lock and no exclusive monitor, and an unreadable timeout is
-     * EFAULT on Linux before the word is looked at.
-     */
-    adr x12, futex_ts_load_start
-    cmp x11, x12
-    b.lo 3f
-    adr x12, futex_ts_load_end
-    cmp x11, x12
-    b.hs 3f
-5:
+    b.hs 4f
 
     /* The futex load holds no lock or exclusive monitor. Its recovery slot is
      * otherwise the same shape as urandom's: discard the nested exception
@@ -1329,6 +1326,25 @@ handle_el1_data_abort_recover:
     mov x0, #-14
     COUNTER_INC CB_FUTEX_EFAULT_HIT
     b svc_restore_eret
+
+4:
+    /* The timespec loads on the timed shape: LDTRs under the same pushed slot,
+     * with no lock and no exclusive monitor held. The slot is dropped the same
+     * way, and the call then goes to the host as if the fast path had bailed on
+     * its shape. A fault here does not mean a bad address: a page just under
+     * the stack has no translation until something touches it.
+     */
+    adr x12, futex_ts_load_start
+    cmp x11, x12
+    b.lo 3f
+    adr x12, futex_ts_load_end
+    cmp x11, x12
+    b.hs 3f
+    add sp, sp, #256
+    ldp x9, x10, [sp], #16
+    msr elr_el1, x9
+    msr spsr_el1, x10
+    b futex_shape_bail
 
 3:
     adr x12, urandom_strb_1byte_start
@@ -1431,6 +1447,19 @@ handle_sysreg_trap:
     lsl x10, x10, #3              /* Byte offset in frame */
     ldr x11, [sp, x10]            /* x11 = VA from Xt */
     and x11, x11, #~63            /* Align down to 64-byte cache line */
+
+    /* The stores below run at EL1, so check first that EL0 may write the block,
+     * which a 64-byte aligned block lets one probe settle. A block EL0 cannot
+     * write is a fault of the DC ZVA itself: the host takes it as a data abort
+     * at that address, grows the stack or materializes the page when that is
+     * what was missing and has the instruction run again, and delivers SIGSEGV
+     * otherwise. Without the probe an unmapped block took an EL1 abort outside
+     * the recovery ranges and halted the VM.
+     */
+    at s1e0w, x11
+    isb
+    mrs x12, par_el1
+    tbnz x12, #0, handle_el0_fault
     /* Zero 64 bytes using four STP pairs */
     stp xzr, xzr, [x11, #0]
     stp xzr, xzr, [x11, #16]

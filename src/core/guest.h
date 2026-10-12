@@ -104,7 +104,11 @@ _Static_assert(sizeof(_Atomic uint64_t) == sizeof(uint64_t) &&
 #define PIE_LOAD_BASE 0x00400000ULL    /* PIE (ET_DYN) executable base (4MiB) */
 #define BRK_BASE_DEFAULT 0x01000000ULL /* Default brk start (16MiB) */
 
-/* 8MiB stack (four 2MiB blocks); unused HVF backing pages consume no RAM. */
+/* The 8MiB window (four 2MiB blocks) a new image's stack is built in and a
+ * default RLIMIT_STACK lets it grow to. The break never enters it. The stack
+ * region itself starts as the argument block plus 128KiB and grows on demand
+ * (mem_stack_grow), past the window when the limit is larger.
+ */
 #define STACK_SIZE 0x00800000ULL
 
 /* Used when brk_start is below 128MiB; otherwise placed above brk. */
@@ -119,7 +123,8 @@ _Static_assert(sizeof(_Atomic uint64_t) == sizeof(uint64_t) &&
  * STACK_TOP_DEFAULT and keeps the layout it had.
  */
 #define BRK_MIN_WINDOW 0x00200000ULL
-#define STACK_GUARD_SIZE 0x00001000ULL /* 4KiB guard at stack bottom */
+/* Lowest part of the window, which build_linux_stack leaves unused. */
+#define STACK_GUARD_SIZE 0x00001000ULL
 
 /* mmap RX region for PROT_EXEC; placed below 8GiB to leave the high mmap region
  * clear for runtimes that demand a specific minimum heap address.
@@ -478,7 +483,7 @@ typedef struct {
     uint64_t elf_load_min;
     uint64_t brk_base;    /* Initial brk (set after ELF load) */
     uint64_t brk_current; /* Current brk position */
-    uint64_t stack_base;  /* Bottom of stack region (dynamic, above brk) */
+    uint64_t stack_base;  /* Bottom of the stack window (dynamic, above brk) */
     uint64_t stack_top;   /* Top of stack (stack grows down from here) */
     uint64_t start_stack; /* Initial userspace SP for /proc/<pid>/stat */
 
@@ -1437,3 +1442,12 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
  * in a noreserve region.
  */
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset);
+
+/* Map exactly the pages of [start, end) with @perms. A 2 MiB block that had no
+ * mapping comes out split, with its pages outside the range left invalid, where
+ * guest_extend_page_tables alone would map the whole block. Caller holds
+ * mmap_lock.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int guest_map_pages(guest_t *g, uint64_t start, uint64_t end, int perms);

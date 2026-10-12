@@ -15,11 +15,11 @@
  * Four neighbor shapes are covered: a mapping in the gap above the heap, one
  * starting exactly on the break, a heap chunk the guest mremapped above it, and
  * the heap grown in place across it. The last two keep the "[heap]" name. Then
- * the stack: g->stack_base is where a grow stops there, and it is the same
- * address the "[stack-guard]" record starts at, so a last check unmaps that
- * record to show the bound is the address and not the record. Linux refuses a
- * break that would run into the next mapping, so every check below passes on a
- * real kernel too.
+ * the stack, which starts small and grows on demand: the break has to stop
+ * short of the room a default 8 MiB stack may still grow into, though no
+ * mapping is there yet to stop it, and a last check grows the stack into that
+ * room. Linux refuses a break that would run into the next mapping and keeps
+ * the two far apart, so every check below passes on a real kernel too.
  *
  * Calls brk(2) directly rather than through sbrk(3): musl's sbrk answers ENOMEM
  * for any non-zero increment without issuing the syscall, which would make this
@@ -72,11 +72,11 @@ static void give_up(const char *name, const char *why, int restored)
     }
 }
 
-/* A check that could not build its shape. Only one of these is ever expected,
- * and only on a real kernel: there is no "[stack-guard]" line to unmap there.
- * Every other way a shape fails to build means something the check relies on
- * stopped working, and the runner matches on "0 failed", so a skip would retire
- * the check without saying so. Fail instead.
+/* A check that could not build its shape. Only one skip is ever expected, and
+ * only on a real kernel: the full-table check has no region table to fill
+ * there. Every other way a shape fails to build means something the check
+ * relies on stopped working, and the runner matches on "0 failed", so a skip
+ * would retire the check without saying so. Fail instead.
  */
 static void cannot_build(const char *name, const char *why, int restored)
 {
@@ -117,33 +117,43 @@ static size_t grow_break(unsigned long *final_brk)
     return cur - start;
 }
 
-/* Where the stack region begins, or 0 if /proc/self/maps names no stack.
- *
- * elfuse publishes a "[stack-guard]" page below "[stack]" and that guard page
- * is the boundary the break must respect, so prefer it where it exists. Linux
- * has only "[stack]", one page further up, which is why the fallback is not an
- * error. Plain strstr would not tell them apart: "[stack]" is a prefix of
- * "[stack-guard]".
+/* Where the stack region begins, or 0 if /proc/self/maps names no stack. @end,
+ * when set, receives where it ends.
  */
-static unsigned long stack_map_start(void)
+static unsigned long stack_map_start(unsigned long *end)
 {
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f)
         return 0;
 
     char line[512];
-    unsigned long stack = 0, guard = 0;
+    unsigned long stack = 0;
     while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, "[stack-guard]")) {
-            guard = strtoul(line, NULL, 16);
-            continue;
-        }
         const char *tag = strstr(line, "[stack]");
-        if (tag && (tag[7] == '\n' || tag[7] == '\0'))
-            stack = strtoul(line, NULL, 16);
+        char *dash = NULL;
+        if (!tag || (tag[7] != '\n' && tag[7] != '\0'))
+            continue;
+        stack = strtoul(line, &dash, 16);
+        if (end)
+            *end = (*dash == '-') ? strtoul(dash + 1, NULL, 16) : 0;
     }
     fclose(f);
-    return guard ? guard : stack;
+    return stack;
+}
+
+/* Whether this is elfuse: only it lists its EL1 shim in /proc/self/maps. */
+static int maps_name_the_shim(void)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return 0;
+
+    char line[512];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f))
+        found = strstr(line, "[shim]") != NULL;
+    fclose(f);
+    return found;
 }
 
 /* A mapping above the heap is a neighbor the break has to stop at, the same way
@@ -185,54 +195,36 @@ static void test_neighbor(const char *name, int adjacent)
     EXPECT_EQ(munmap(p, len), 0, "neighbor left mapped above the break");
 }
 
-/* Extent of the "[stack-guard]" line.
- *
- * Returns 0 where there is none, which is every real kernel, and doubles as the
- * marker that tells elfuse from Linux. The length comes from the line rather
- * than a constant, so a wider guard is unmapped whole instead of split, which
- * would leave the check passing while testing nothing.
+/* The stack is a small mapping near the top of an 8 MiB window it may grow
+ * into, so the mapping itself is not what has to stop the break: a break that
+ * ran up to it would leave a default stack nowhere to grow. Checked twice, by
+ * where the break ended and by growing the stack afterwards.
  */
-static unsigned long guard_map_start(unsigned long *len)
+static void test_stack_room(unsigned long final_brk)
 {
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f)
-        return 0;
+    const unsigned long default_stack = 8ul << 20;
+    unsigned long end = 0, start = stack_map_start(&end);
 
-    char line[512];
-    unsigned long start = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (!strstr(line, "[stack-guard]"))
-            continue;
-        char *dash = NULL;
-        start = strtoul(line, &dash, 16);
-        if (len)
-            *len = (*dash == '-') ? strtoul(dash + 1, NULL, 16) - start : 0;
-        break;
+    TEST("break leaves the stack its room");
+    EXPECT_TRUE(
+        start != 0 && end > default_stack && final_brk <= end - default_stack,
+        "the break ended inside the default stack window");
+
+    /* 6 MiB down, in a child so a refusal is a status and not this test's own
+     * death. Linux keeps a growing stack 1 MiB clear of the mapping below it,
+     * which here is the heap the break just grew.
+     */
+    TEST("stack grows after the break stopped");
+    int status = -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        *(volatile unsigned char *) (end - (6ul << 20)) = CANARY_BYTE;
+        _exit(0);
     }
-    fclose(f);
-    return start;
-}
-
-/* g->stack_base and the "[stack-guard]" record name the same address, so every
- * check above passes whichever of the two is doing the work. Unmapping the
- * record settles it: the grow must still be refused with nothing in the table
- * to refuse it.
- */
-static void test_stack_floor(void)
-{
-    const char *name = "floor holds without the record";
-    unsigned long len = 0, guard = guard_map_start(&len);
-
-    if (!guard || !len) {
-        give_up(name, "no [stack-guard] line", 1);
-        return;
-    }
-    TEST("stack guard unmaps");
-    EXPECT_EQ(munmap((void *) guard, len), 0, "guard would not unmap");
-
-    TEST(name);
-    EXPECT_TRUE(guest_brk(guard + len - 1) <= guard,
-                "brk grew into the stack guard once its record was gone");
+    if (pid > 0)
+        waitpid(pid, &status, 0);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "the stack could not grow into its own window");
 }
 
 /* The heap grown in place past the break, which leaves a record straddling it
@@ -693,10 +685,9 @@ static void test_stale_tracker(char **argv)
 
     /* elfuse-internal: a real kernel has no region table to fill, so the child
      * below would split its mapping to no end and report that the break still
-     * grows, which on Linux is simply correct. The "[stack-guard]" line is the
-     * same marker the floor check uses to tell the two apart.
+     * grows, which on Linux is simply correct.
      */
-    if (!guard_map_start(NULL)) {
+    if (!maps_name_the_shim()) {
         give_up(name, "no region table to fill", 1);
         return;
     }
@@ -809,7 +800,7 @@ int main(int argc, char **argv)
     EXPECT_EQ(bad, 0, "stack clobbered by brk");
 
     TEST("break stops below the stack mapping");
-    unsigned long stack_start = stack_map_start();
+    unsigned long stack_start = stack_map_start(NULL);
     EXPECT_TRUE(stack_start != 0 && final_brk < stack_start,
                 "no stack line in /proc/self/maps, or the break ran into it");
 
@@ -834,8 +825,7 @@ int main(int argc, char **argv)
         EXPECT_TRUE(ok, "large allocation did not hold its contents");
     }
 
-    /* Last, because it unmaps the guard page for good. */
-    test_stack_floor();
+    test_stack_room(final_brk);
 
     printf("\n  brk moved %zu MiB, ended at 0x%lx, %d skipped\n", grown >> 20,
            final_brk, skips);

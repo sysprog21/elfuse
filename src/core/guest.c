@@ -48,6 +48,7 @@
 #include "utils.h"
 #include "runtime/futex.h"  /* futex_interrupt_request */
 #include "runtime/thread.h" /* thread_destroy_all_vcpus */
+#include "syscall/mem.h"    /* mem_stack_grow_for_host */
 #include "syscall/proc.h"   /* proc_request_exit_group */
 #include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
@@ -1637,10 +1638,17 @@ static void *gva_resolve_perm(const guest_t *g,
      * identity-mapped (GVA == GPA == offset), but L2 block descriptors carry
      * permission bits and L3 page tables have per-4KiB permissions after
      * guest_split_block. Skipping the walk would bypass W^X enforcement for all
-     * normal guest addresses.
+     * normal guest addresses. An address just below the stack is not a miss
+     * until the stack has refused to grow to it: Linux grows the stack for a
+     * kernel access the way it does for a guest one, so read(2) into a stack
+     * buffer the guest has not touched yet succeeds. Growing writes page tables
+     * and the region table, which is why the guest is not const there; every
+     * guest_t this is called with is a writable object.
      */
     gva_translation_t first;
-    if (gva_translate_perm(g, gva, required_perms, &first) < 0)
+    if (gva_translate_perm(g, gva, required_perms, &first) < 0 &&
+        (!mem_stack_grow_for_host((guest_t *) g, gva) ||
+         gva_translate_perm(g, gva, required_perms, &first) < 0))
         return NULL;
 
     /* Computed once and clamped once per branch below. Writing *avail twice
@@ -2005,10 +2013,19 @@ int guest_get_used_regions(const guest_t *g,
         n++;
     }
 
-    /* Stack (dynamic position, stored in guest_t) */
+    /* Stack (dynamic position, stored in guest_t): the default reserve, and
+     * whatever a larger RLIMIT_STACK let it grow to below that.
+     */
     if (n < max) {
-        out[n].offset = g->stack_base;
-        out[n].size = g->stack_top - g->stack_base;
+        uint64_t stack_lo = g->stack_base;
+        for (int i = 0; i < g->nregions; i++) {
+            const guest_region_t *r = &g->regions[i];
+            if (r->start < stack_lo && r->end <= g->stack_top &&
+                !strcmp(r->name, "[stack]"))
+                stack_lo = r->start;
+        }
+        out[n].offset = stack_lo;
+        out[n].size = g->stack_top - stack_lo;
         n++;
     }
 
@@ -3704,6 +3721,48 @@ int guest_install_va_pages(guest_t *g,
         tlbi_request_range(changed_lo, changed_hi);
     guest_pt_gen_bump(g);
     return 0;
+}
+
+int guest_map_pages(guest_t *g, uint64_t start, uint64_t end, int perms)
+{
+    if (end <= start)
+        return 0;
+
+    /* Only the two end blocks can be partly covered. One that has no mapping
+     * yet is about to get a whole-block descriptor, so note it before the
+     * extend and cut it back to the range after.
+     */
+    uint64_t head = ALIGN_2MIB_DOWN(start), tail = ALIGN_2MIB_DOWN(end - 1);
+    const uint64_t *head_l2 = find_l2_entry(g, head);
+    const uint64_t *tail_l2 = find_l2_entry(g, tail);
+    bool trim_head = start > head && !(head_l2 && (*head_l2 & PT_VALID));
+    bool trim_tail =
+        end < tail + BLOCK_2MIB && !(tail_l2 && (*tail_l2 & PT_VALID));
+
+    int rc = guest_extend_page_tables(g, start, end, perms);
+    if (rc == 0 && trim_head &&
+        (guest_split_block(g, head) < 0 ||
+         guest_invalidate_ptes(g, head, start) < 0))
+        rc = -1;
+    if (rc == 0 && trim_tail &&
+        (guest_split_block(g, tail) < 0 ||
+         guest_invalidate_ptes(g, end, tail + BLOCK_2MIB) < 0))
+        rc = -1;
+    if (rc == 0)
+        rc = guest_update_perms(g, start, end, perms);
+
+    /* A failure can leave a fresh end block mapped whole, which is the
+     * over-mapping this function exists to prevent. Such a block held nothing
+     * before the call, so it is unmapped whole; clearing a whole block takes no
+     * page-table page and so cannot fail the way a split does.
+     */
+    if (rc < 0) {
+        if (trim_head)
+            (void) guest_invalidate_ptes(g, head, head + BLOCK_2MIB);
+        if (trim_tail)
+            (void) guest_invalidate_ptes(g, tail, tail + BLOCK_2MIB);
+    }
+    return rc;
 }
 
 /* Lazy page materialization for MAP_NORESERVE. */

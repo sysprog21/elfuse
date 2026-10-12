@@ -1255,14 +1255,10 @@ static void exec_publish_maps(guest_t *g, const exec_image_t *img)
         }
     }
 
-    /* Leave the lowest stack page unmapped so downward overflow faults before
-     * corrupting adjacent mappings.
+    /* The whole window the image is built in; mem_stack_init_extent cuts it
+     * down to what Linux maps at execve once the stack pointer is known.
      */
-    guest_invalidate_ptes(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE);
-    guest_region_add(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE,
-                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
-                     0, "[stack-guard]");
-    guest_region_add(g, g->stack_base + STACK_GUARD_SIZE, g->stack_top,
+    guest_region_add(g, g->stack_base, g->stack_top,
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[stack]");
 
@@ -2191,6 +2187,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             exit(128);
         }
         g->start_stack = sp;
+        mem_stack_init_extent(g, sp);
 
         entry_point = (interp_base != 0) ? (interp.info.entry + interp_base)
                                          : (elf_info.entry + elf_load_base);

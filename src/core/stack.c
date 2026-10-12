@@ -186,12 +186,10 @@ uint64_t build_linux_stack(guest_t *g,
     /* Floor for the whole descent: every step below goes through stack_take,
      * whose postcondition is that the pointer never crosses this.
      *
-     * The floor is the first WRITABLE byte, not stack_base: the low
-     * STACK_GUARD_SIZE bytes of the region are the PROT_NONE stack guard (the
-     * [stack-guard] region bootstrap.c and sys_execve both install), and the
-     * writable stack starts above it. Using stack_base would let the descent
-     * walk into the guard and only fail later inside guest_write, with a worse
-     * diagnostic.
+     * The image is built inside the default stack window, [stack_base,
+     * stack_top), which is mapped whole until mem_stack_init_extent cuts it
+     * down. The lowest page of the window is kept out of the build, so the
+     * stack a new image starts on always has a page left to grow into.
      */
     const uint64_t stack_floor = g->stack_base + STACK_GUARD_SIZE;
     if (str_ptr < stack_floor)

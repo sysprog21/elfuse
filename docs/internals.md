@@ -188,8 +188,7 @@ Low, fixed addresses:
 ```
 0x00400000   - varies:       ELF LOAD segments (PIE_LOAD_BASE for ET_DYN)
 0x01000000:                  brk base (16 MiB)
-0x07800000   - 0x07800FFF:   Stack guard page (PROT_NONE, dynamic position)
-0x07801000   - 0x07FFFFFF:   Stack (8 MiB, 4 x 2 MiB blocks, RW, grows down)
+0x07800000   - 0x07FFFFFF:   Default stack window (8 MiB, dynamic position)
 0x10000000   - 0x101FFFFF:   mmap RX region (initial 2 MiB, pre-mapped RX)
 0x10200000   - mmap_limit:   mmap RX growth area
 0x000200000000 - 0x0002001FFFFF: mmap RW region (initial 2 MiB at 8 GiB, RW)
@@ -199,6 +198,8 @@ Low, fixed addresses:
 Within-32-bit values are rendered with 8-digit padding; values that
 extend above 32 bits use 12-digit padding so a reader can tell the
 range class at a glance.
+
+The stack grows on demand, as it does on Linux. `execve` maps the argument block plus up to 128 KiB at the top of the window as the `[stack]` region and leaves everything below it without page-table entries; the extra 128 KiB is cut to what `RLIMIT_STACK` and the 8 MiB window leave, and never below what the argument block already took. The first access to a page under the region, by the guest or by a syscall acting on a guest pointer, grows the region down to that page when the grown size fits `RLIMIT_STACK` and `RLIMIT_AS` and stays 1 MiB clear of an accessible mapping below; otherwise it is a `SIGSEGV`, or `EFAULT` for the syscall. The break never enters the 8 MiB window, so a default stack always has its room, and a mapping whose address `mmap` chooses, an address hint included, stays 1 MiB below the region, as the kernel's `vm_start_gap` keeps it. A larger limit lets the stack grow below the window toward the heap, which bounds it at roughly 110 MiB with the default layout; Linux has no such bound.
 
 High addresses, anchored to `interp_base` (computed from `guest_size`, see
 below). The runtime infrastructure reserve is a 16 MiB region placed at
@@ -356,6 +357,10 @@ from the one the frame was entered with.
 Vectors enter EL1 from EL0 traps and forward them to the host through HVC.
 DC ZVA is emulated inside the shim (it zeroes 64 bytes at the cache-line-
 aligned address from the `Rt` register); HVF traps DC ZVA via `HCR_EL2.TDZ=1`.
+The shim first probes the block for EL0 write access. A block that fails the
+probe is forwarded on HVC #11 as the data abort the instruction would have
+taken, so the host grows the stack or materializes the page and the instruction
+runs again, or the guest gets `SIGSEGV`.
 
 | HVC # | Purpose | Registers |
 |-------|---------|-----------|

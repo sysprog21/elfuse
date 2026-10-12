@@ -53,6 +53,7 @@
 #include "syscall/proc-pidfd.h"
 #include "syscall/proc-state.h"
 #include "syscall/signal.h"
+#include "syscall/mem.h"
 #include "syscall/sys.h"
 #include "syscall/wakeup-pipe.h"
 
@@ -3882,6 +3883,24 @@ static bool vcpu_handle_el0_fault(guest_t *g,
 
     uint32_t fault_ec = (uint32_t) ((esr >> 26) & 0x3F);
 
+    /* A DC ZVA the shim would not emulate because EL0 cannot write the block
+     * (handle_sysreg_trap, src/core/shim.S). It arrives with the ESR of the
+     * trap, EC 0x18 and the DC ZVA encoding in ISS[21:10] and ISS[4:0], and is
+     * the write data abort the instruction would have taken untrapped: the
+     * address is the block in Xt, and the fault status is what the shim's AT
+     * S1E0W probe left in PAR_EL1.FST.
+     */
+    if (fault_ec == 0x18 && ((esr >> 10) & 0xFFF) == 0x4B7 &&
+        (esr & 0x1F) == 0x08) {
+        uint64_t xt = 0, par = 0;
+        hv_vcpu_get_reg(vcpu, HV_REG_X0 + (uint32_t) ((esr >> 5) & 0x1F), &xt);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_PAR_EL1, &par);
+        far_addr = xt & ~63ULL;
+        fault_ec = 0x24;
+        esr =
+            (0x24ULL << 26) | (1ULL << 25) | (1ULL << 6) | ((par >> 1) & 0x3F);
+    }
+
     /* Non-abort EC -> SIGILL. Branch out early so the abort / SIGSEGV path
      * below stays at the case-body indent rather than nested inside an else
      * branch. FAR_EL1 is UNKNOWN for non-abort exceptions, so use ELR_EL1 for
@@ -3940,6 +3959,13 @@ static bool vcpu_handle_el0_fault(guest_t *g,
         uint64_t fault_off = far_addr - g->ipa_base;
         mmap_lock_acquire();
         int mat = guest_materialize_lazy(g, fault_off);
+
+        /* A page under the stack is the other fault that is not an error: the
+         * stack grows to it when RLIMIT_STACK and its neighbors allow, and the
+         * fault stays a SIGSEGV when they do not.
+         */
+        if (mat != 0 && mem_stack_grow(g, fault_off))
+            mat = 0;
         mmap_lock_release();
         if (mat == 0) {
             /* Page materialized; the helpers inside guest_materialize_lazy

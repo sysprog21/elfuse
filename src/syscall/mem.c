@@ -62,6 +62,29 @@ void mmap_lock_release(void)
     pthread_mutex_unlock(&mmap_lock);
 }
 
+/* How long a caller that may hold locks ranked below mmap_lock waits for it. */
+#define MMAP_LOCK_TRY_MS 1000
+
+/* Take mmap_lock from a context that may already hold a lock ranked below it,
+ * where blocking could close a cycle with a holder that wants that lock. Only
+ * trylock is used, so this cannot deadlock; it gives up after MMAP_LOCK_TRY_MS.
+ *
+ * Returns true with the lock held.
+ */
+static bool mmap_lock_try_acquire(void)
+{
+    assert(!mmap_lock_held());
+    for (int waited_us = 0; waited_us < MMAP_LOCK_TRY_MS * 1000;
+         waited_us += 100) {
+        if (pthread_mutex_trylock(&mmap_lock) == 0) {
+            mmap_lock_owned = true;
+            return true;
+        }
+        usleep(100);
+    }
+    return false;
+}
+
 /* Host kernel page size (16 KiB on Apple Silicon, typically 4 KiB on Intel
  * macOS). MAP_FIXED requires addr/length/offset multiples of this, so an
  * overlay onto a guest 4 KiB-aligned IPA is only applicable when the IPA
@@ -691,6 +714,23 @@ static int split_regions_at_boundary(guest_t *g, uint64_t boundary)
     return 0;
 }
 
+/* stack_guard_gap (Linux mm/mmap.c): what a growing stack keeps clear of an
+ * accessible mapping below it, and what the break and a mapping placed by the
+ * gap finder keep clear of the stack.
+ */
+#define STACK_GUARD_GAP (256 * GUEST_PAGE_SIZE)
+
+/* vm_start_gap (Linux include/linux/mm.h): where the space a placed mapping may
+ * use ends in front of @r. A stack claims STACK_GUARD_GAP below its start, so
+ * an address hint cannot put a mapping where the next stack page goes.
+ */
+static uint64_t region_start_gap(const guest_region_t *r)
+{
+    if (strcmp(r->name, "[stack]"))
+        return r->start;
+    return r->start > STACK_GUARD_GAP ? r->start - STACK_GUARD_GAP : 0;
+}
+
 static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
@@ -729,7 +769,8 @@ static uint64_t find_free_gap_inner(const guest_t *g,
          * stream reaches max_addr, later regions cannot affect any candidate
          * gap inside the window.
          */
-        if (g->regions[i].start >= max_addr)
+        uint64_t start = region_start_gap(&g->regions[i]);
+        if (start >= max_addr)
             break;
 
         /* If this region starts far enough after gap_start, the allocator found
@@ -738,7 +779,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
          * valid range.
          */
         if (window_fits(gap_start, length, max_addr) &&
-            g->regions[i].start >= gap_start + length)
+            start >= gap_start + length)
             return gap_start;
 
         /* Region overlaps; advance past it and round to the next aligned
@@ -2721,16 +2762,174 @@ static bool mprotect_exceeds_data(const guest_t *g,
     return false;
 }
 
+/* Stack growth.
+ *
+ * The stack is the region named "[stack]"; the name is what a region has in
+ * place of VM_GROWSDOWN, and it survives a split. The region starts at execve
+ * as the argument block plus STACK_INITIAL_EXPAND and everything below it has
+ * no page-table entry, so the first access to a page under it faults, from the
+ * guest or from a syscall acting on a guest pointer, and the stack grows to
+ * that page if Linux would let it.
+ */
+
+/* What setup_arg_pages (Linux fs/exec.c) maps below the argument strings. */
+#define STACK_INITIAL_EXPAND (128 * 1024ULL)
+
+/* mmap_min_addr: no stack grows into the first 64 KiB. */
+#define STACK_MIN_ADDR 0x10000ULL
+
+/* Take the page-table entries off [@from, @to), a range that belongs to no
+ * region and ends where the stack starts. The window between the break and the
+ * stack is premapped at boot, and a break maps the whole 2 MiB block it ends
+ * in; an address mapped that way is one the stack could move onto with no fault
+ * to grow it or to refuse it.
+ *
+ * Whole blocks go without being split, so a break far from the stack keeps its
+ * block mapping. Within two blocks of the stack that mapping is itself in the
+ * way, and the range is cut back to the page.
+ */
+static void stack_unmap_approach(guest_t *g, uint64_t from, uint64_t to)
+{
+    uint64_t start = ALIGN_UP(from, BLOCK_2MIB);
+    if (to > from && to - from < 2 * BLOCK_2MIB)
+        start = PAGE_ALIGN_UP(from);
+    if (start < to)
+        (void) guest_invalidate_ptes(g, start, to);
+}
+
+/* Grow the stack down to the page holding @off, after expand_downwards and
+ * acct_stack_growth (Linux mm/mmap.c): the address has to lie under a stack
+ * region with nothing between them, STACK_GUARD_GAP above an accessible mapping
+ * below, and the grown region has to fit RLIMIT_STACK and RLIMIT_AS. A stack is
+ * not data, so RLIMIT_DATA does not count it.
+ *
+ * @off is in region coordinates.
+ *
+ * Returns true when the page is now mapped. Caller holds mmap_lock.
+ */
+bool mem_stack_grow(guest_t *g, uint64_t off)
+{
+    if (off < STACK_MIN_ADDR)
+        return false;
+
+    /* A table that has lost records cannot show every mapping under the stack.
+     * The window execve set aside is the one place the break never reaches
+     * (brk_grow_limit), so the stack keeps growing there and stops at its lower
+     * end.
+     */
+    if (g->regions_tracker_stale && off < g->stack_base)
+        return false;
+
+    /* find_vma: the first region that ends above the address takes the fault,
+     * and only a stack that starts above it grows.
+     */
+    int i = guest_region_first_end_above(g, off);
+    if (i >= g->nregions)
+        return false;
+    guest_region_t *r = &g->regions[i];
+    if (off >= r->start || strcmp(r->name, "[stack]"))
+        return false;
+
+    uint64_t page = ALIGN_DOWN(off, GUEST_PAGE_SIZE);
+    uint64_t below_end = 0;
+    if (i > 0) {
+        const guest_region_t *below = &g->regions[i - 1];
+        below_end = below->end;
+        if (page < below_end)
+            return false;
+        if (below->prot != LINUX_PROT_NONE && strcmp(below->name, "[stack]") &&
+            page - below_end < STACK_GUARD_GAP)
+            return false;
+    }
+    if (guest_range_hits_infra(g, page, r->start))
+        return false;
+
+    if (r->end - page > sys_rlimit_cur(LINUX_RLIMIT_STACK) ||
+        !mem_rlimit_allows(g, r->start - page, LINUX_PROT_READ,
+                           LINUX_MAP_PRIVATE, 0, 0))
+        return false;
+
+    /* Whatever used these pages before, a new stack page reads as zero. */
+    memset((uint8_t *) g->host_base + page, 0, r->start - page);
+    if (r->prot != LINUX_PROT_NONE &&
+        guest_map_pages(g, page, r->start, prot_to_perms(r->prot)) < 0)
+        return false;
+    /* The stack is identity-mapped, so its backing address moves with it. */
+    r->gpa_base -= r->start - page;
+    r->start = page;
+    if (i > 0 && page - below_end < 2 * BLOCK_2MIB)
+        stack_unmap_approach(g, below_end, page);
+    return true;
+}
+
+bool mem_stack_grow_for_host(guest_t *g, uint64_t gva)
+{
+    /* Cheap refusal first: this runs for every guest pointer that does not
+     * translate, and almost none of those are under the stack.
+     */
+    uint64_t off = gva - g->ipa_base;
+    if (gva < g->ipa_base || off >= g->stack_top || off < STACK_MIN_ADDR)
+        return false;
+
+    /* Syscall code reads and writes guest memory with locks held that rank
+     * below mmap_lock, so only an SC_LOCKED caller already has it.
+     *
+     * The answer does not depend on who did the growing: a sibling thread may
+     * have grown the stack over @gva between the caller's failed translation
+     * and the lock, or while this thread waited for the lock in vain, and then
+     * the address translates with nothing left to grow here.
+     */
+    if (mmap_lock_held()) {
+        (void) mem_stack_grow(g, off);
+    } else if (mmap_lock_try_acquire()) {
+        (void) mem_stack_grow(g, off);
+        mmap_lock_release();
+    }
+    return true;
+}
+
+void mem_stack_init_extent(guest_t *g, uint64_t sp)
+{
+    /* setup_arg_pages: the pages the argument block took, plus
+     * STACK_INITIAL_EXPAND, held to RLIMIT_STACK, and never less than what is
+     * already written so the image can start.
+     */
+    uint64_t used = g->stack_top - ALIGN_DOWN(sp, GUEST_PAGE_SIZE);
+    uint64_t limit =
+        ALIGN_DOWN(sys_rlimit_cur(LINUX_RLIMIT_STACK), GUEST_PAGE_SIZE);
+    uint64_t size = used + STACK_INITIAL_EXPAND;
+    if (size > limit)
+        size = limit;
+    if (size < used)
+        size = used;
+    if (size > g->stack_top - g->stack_base)
+        size = g->stack_top - g->stack_base;
+
+    uint64_t lo = g->stack_top - size;
+    if (lo > g->stack_base)
+        (void) guest_region_remove(g, g->stack_base, lo);
+
+    /* The trim advanced the record's file offset with its start, which is right
+     * for a file mapping and shows as a nonzero offset on the [stack] line of
+     * /proc/self/maps.
+     */
+    int kept = guest_region_first_end_above(g, lo);
+    if (kept < g->nregions && g->regions[kept].start == lo)
+        g->regions[kept].offset = 0;
+    (void) guest_invalidate_ptes(g, g->stack_base, lo);
+    stack_unmap_approach(g, g->brk_current, g->stack_base);
+}
+
 /* How far the break may grow from its current position.
  *
  * The first tracked mapping above the break is where Linux stops a grow. An
  * unbounded grow can zero the stack or a mapping in the gap above the heap.
  *
  * The answer starts at g->stack_base and only comes down from there. That is
- * not a backstop under the table but the operative bound at the stack: it is
- * the same address the "[stack-guard]" record starts at, so the scan below
- * stops before ever reading that record, and the stack stays bounded whether or
- * not the record is there to say so.
+ * not a backstop under the table but the operative bound at the stack: the
+ * stack region starts small near the top of its 8 MiB window and grows on
+ * demand, so most of the window has no record, and a break allowed up to the
+ * record would leave a default stack nowhere to grow.
  *
  * Below the stack the table is the only account of what is in the way, and a
  * full one loses entries: a munmap split it had no room to record leaves its
@@ -2781,9 +2980,15 @@ static uint64_t brk_grow_limit(const guest_t *g, uint64_t from, int *adjoining)
         heap_piece_is_plain(&g->regions[i - 1]))
         *adjoining = i - 1;
 
-    if (i < g->nregions)
-        limit = brk_limit_region(from, limit, g->regions[i].start,
-                                 g->regions[i].end);
+    if (i < g->nregions) {
+        /* The break stays STACK_GUARD_GAP under the stack, as the stack does
+         * above the break (vm_start_gap, Linux include/linux/mm.h).
+         */
+        uint64_t start = g->regions[i].start;
+        if (!strcmp(g->regions[i].name, "[stack]"))
+            start = start > STACK_GUARD_GAP ? start - STACK_GUARD_GAP : 0;
+        limit = brk_limit_region(from, limit, start, g->regions[i].end);
+    }
     return limit;
 }
 
@@ -2875,6 +3080,32 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
     if (new_off > g->brk_current) {
         memset((uint8_t *) g->host_base + g->brk_current, 0,
                new_off - g->brk_current);
+    }
+
+    /* Keep the stack's approach faulting (stack_unmap_approach): a break that
+     * has come close gives up the rest of the block it just mapped, and one
+     * that shrinks gives up the blocks it no longer reaches.
+     */
+    if (new_off > old_brk) {
+        int above = guest_region_first_end_above(g, new_off);
+        if (above < g->nregions && g->regions[above].start >= new_off &&
+            g->regions[above].start - new_off < 2 * BLOCK_2MIB &&
+            !strcmp(g->regions[above].name, "[stack]"))
+            stack_unmap_approach(g, new_off, g->regions[above].start);
+    } else if (new_off < old_brk) {
+        /* Up to the end of the old break's block, or to the mapping that shares
+         * that block with it. A mapping that straddles the old break keeps the
+         * page the break was in, so the unmapping stops below that page.
+         */
+        uint64_t keep = ALIGN_UP(new_off, BLOCK_2MIB);
+        uint64_t had = ALIGN_UP(old_brk, BLOCK_2MIB);
+        int above = guest_region_first_end_above(g, old_brk);
+        if (above < g->nregions && g->regions[above].start < had)
+            had = g->regions[above].start > old_brk
+                      ? g->regions[above].start
+                      : ALIGN_DOWN(old_brk, GUEST_PAGE_SIZE);
+        if (keep < had)
+            (void) guest_invalidate_ptes(g, keep, had);
     }
 
     g->brk_current = new_off;

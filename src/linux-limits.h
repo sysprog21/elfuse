@@ -31,9 +31,13 @@
 /* execve argument limits.
  *
  * LINUX_MAX_ARG_STRLEN is the kernel's MAX_ARG_STRLEN, 32 pages on a 4 KiB
- * kernel. The other two are elfuse's own caps, chosen so a guest cannot drive
- * an unbounded host allocation; the entry count shares MAX_ARG_STRLEN's value
- * by coincidence, not by derivation, which is why it is named separately.
+ * kernel. LINUX_ARG_MAX and LINUX_ARG_BYTES_CEILING bound what
+ * bprm_stack_limits (fs/exec.c) lets the strings and their pointers take, a
+ * quarter of RLIMIT_STACK held between the two: ARG_MAX, and three quarters of
+ * _STK_LIM, the 8 MiB default stack. ELFUSE_MAX_ARG_STRINGS is elfuse's own
+ * cap, chosen so a guest cannot drive an unbounded host allocation; it shares
+ * MAX_ARG_STRLEN's value by coincidence, not by derivation, which is why it is
+ * named separately.
  *
  * Shared rather than per-file: read_string_array (src/syscall/exec.c) enforces
  * the count while building the arrays, build_linux_stack (src/core/stack.c)
@@ -42,5 +46,6 @@
  * number let a change to one leave the other two disagreeing in silence.
  */
 #define LINUX_MAX_ARG_STRLEN 131072
+#define LINUX_ARG_MAX 131072
+#define LINUX_ARG_BYTES_CEILING (6 * 1024 * 1024)
 #define ELFUSE_MAX_ARG_STRINGS 131072
-#define ELFUSE_MAX_ARG_BYTES (2048 * 1024)

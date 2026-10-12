@@ -313,6 +313,36 @@ static int exec_resolve_interp_host_path(const char *interp_guest_path,
     return 0;
 }
 
+/* What argv and envp may take on the new stack, after bprm_stack_limits (Linux
+ * fs/exec.c): a quarter of RLIMIT_STACK, at most LINUX_ARG_BYTES_CEILING and at
+ * least LINUX_ARG_MAX. The strings and their pointer arrays share it.
+ */
+static size_t exec_arg_limit(void)
+{
+    uint64_t limit = sys_rlimit_cur(LINUX_RLIMIT_STACK) / 4;
+    if (limit > LINUX_ARG_BYTES_CEILING)
+        limit = LINUX_ARG_BYTES_CEILING;
+    if (limit < LINUX_ARG_MAX)
+        limit = LINUX_ARG_MAX;
+    return (size_t) limit;
+}
+
+/* Whether @string_bytes of argument strings and @count pointers fit the new
+ * stack. Linux subtracts the pointers from the limit before it copies a string
+ * (bprm_stack_limits), and fails the copy with E2BIG when the stack cannot grow
+ * to hold it (get_arg_page), which is how RLIMIT_STACK below the strings
+ * themselves is refused.
+ */
+static bool exec_args_fit(size_t string_bytes, size_t count)
+{
+    size_t limit = exec_arg_limit();
+    size_t ptr_bytes = (count ? count : 1) * sizeof(uint64_t);
+    if (limit <= ptr_bytes || string_bytes > limit - ptr_bytes)
+        return false;
+    return PAGE_ALIGN_UP(string_bytes + sizeof(uint64_t)) <=
+           sys_rlimit_cur(LINUX_RLIMIT_STACK);
+}
+
 /* Read a NULL-terminated pointer array from guest memory. Each pointer in the
  * array is a 64-bit GVA pointing to a string.
  * Returns the count of entries (excluding the NULL terminator), or a negative
@@ -329,7 +359,8 @@ static int read_string_array(guest_t *g,
                              char **out_buf,
                              size_t *out_buf_size,
                              char *temp_str,
-                             size_t *running_bytes)
+                             size_t *running_bytes,
+                             size_t max_bytes)
 {
     int count = 0;
     while (true) {
@@ -375,7 +406,7 @@ static int read_string_array(guest_t *g,
 
         size_t len = (size_t) rc;
 
-        if (*running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
+        if (*running_bytes + len + 1 > max_bytes) {
             free(argv);
             free(buf);
             return -2;
@@ -1382,8 +1413,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         goto fail;
     }
 
+    size_t arg_limit = exec_arg_limit();
     int argc = read_string_array(g, argv_gva, &argv, &argv_buf, &argv_buf_size,
-                                 temp_str, &running_bytes);
+                                 temp_str, &running_bytes, arg_limit);
     if (argc < 0) {
         err = (argc == -2) ? -LINUX_E2BIG
                            : ((argc == -3) ? -LINUX_ENOMEM : -LINUX_EFAULT);
@@ -1393,7 +1425,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     int envc = 0;
     if (envp_gva != 0) {
         envc = read_string_array(g, envp_gva, &envp, &envp_buf, &envp_buf_size,
-                                 temp_str, &running_bytes);
+                                 temp_str, &running_bytes, arg_limit);
         if (envc < 0) {
             err = (envc == -2) ? -LINUX_E2BIG
                                : ((envc == -3) ? -LINUX_ENOMEM : -LINUX_EFAULT);
@@ -1415,6 +1447,15 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             goto fail;
         }
         log_debug("execve resolved to \"%s\"", path);
+    }
+
+    /* The filename is the first string Linux copies, so it counts too. It is
+     * sized here, after /proc/self/exe has become the path that is copied.
+     */
+    if (!exec_args_fit(running_bytes + strlen(path) + 1,
+                       (size_t) (argc > 0 ? argc : 1) + (size_t) envc)) {
+        err = -LINUX_E2BIG;
+        goto fail;
     }
 
     if (!host_path) {
@@ -1565,9 +1606,17 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             buf_off = (size_t) (argv[argc - 1] - argv_buf) +
                       strlen(argv[argc - 1]) + 1;
         int prefix_end = ni - (argc > 1 ? argc - 1 : 0);
+
+        /* The rewritten vector drops the original argv[0] (remove_arg_zero in
+         * Linux fs/exec.c), so its bytes and its pointer stop counting before
+         * the strings that replace it are added.
+         */
+        if (argc > 0)
+            running_bytes -= strlen(argv[0]) + 1;
         for (int i = 0; i < prefix_end; i++) {
             size_t len = strlen(new_argv[i]);
-            if (running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
+            if (!exec_args_fit(running_bytes + len + 1 + strlen(path) + 1,
+                               (size_t) ni + (size_t) envc)) {
                 free(new_argv);
                 err = -LINUX_E2BIG;
                 goto fail;

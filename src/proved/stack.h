@@ -15,12 +15,12 @@
  * core/guest.h and syscall/proc.h, which pull in Hypervisor.framework. This
  * header needs nothing but stdint.h, so make verify-stack proves it directly.
  *
- * The descent is already contained today: read_string_array
- * (src/syscall/exec.c) caps combined argv/envp bytes at ELFUSE_MAX_ARG_BYTES
- * and the entry count at ELFUSE_MAX_ARG_STRINGS, against an 8 MiB stack.
- * Routing every step through stack_take makes that containment structural, held
- * by a postcondition here rather than by two caps in another file staying
- * smaller than the stack.
+ * The descent is already contained today: sys_execve (src/syscall/exec.c) caps
+ * the argv/envp bytes and their pointers together at LINUX_ARG_BYTES_CEILING, 6
+ * MiB, and the entry count at ELFUSE_MAX_ARG_STRINGS, against an 8 MiB stack
+ * window. Routing every step through stack_take makes that containment
+ * structural, held by a postcondition here rather than by two caps in another
+ * file staying smaller than the stack.
  */
 
 #pragma once

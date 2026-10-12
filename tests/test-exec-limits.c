@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/resource.h>
 
 int main(int argc, char **argv)
 {
@@ -20,6 +21,22 @@ int main(int argc, char **argv)
     }
 
     extern char **environ;
+
+    /* The 2 MB budget below is a quarter of the stack limit (Linux
+     * bprm_stack_limits), so pin the limit instead of inheriting one: under a
+     * raised limit the "too large" exec succeeds and this binary runs again.
+     * The make that ships with macOS hands its children such a limit.
+     */
+    struct rlimit stack_limit;
+    if (getrlimit(RLIMIT_STACK, &stack_limit) < 0) {
+        perror("getrlimit");
+        return 1;
+    }
+    stack_limit.rlim_cur = 8 * 1024 * 1024;
+    if (setrlimit(RLIMIT_STACK, &stack_limit) < 0) {
+        perror("setrlimit");
+        return 1;
+    }
 
     // 1. Test single string too long (> 128 KB) -> expect E2BIG
     {

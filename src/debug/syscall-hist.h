@@ -10,6 +10,11 @@
  * bring-up tracer). Recording stops at the first successful execve so the dump
  * reflects pre-execve startup; without execve it dumps on guest exit.
  *
+ * ELFUSE_STARTUP_TRACE=syscalls-steady records until guest exit instead. This
+ * is the measurement gate for steady-state performance work: it includes
+ * startup plus the workload, so run a long enough workload for startup to be
+ * noise.
+ *
  * Disabled cost is one branch + one global load per syscall_dispatch entry
  * because syscall_hist_enabled() resolves the env once and caches the result.
  * Enabled cost is two CLOCK_MONOTONIC reads per syscall plus three relaxed
@@ -20,6 +25,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /* Parse ELFUSE_STARTUP_TRACE once; safe to call repeatedly. Must be called
  * before any syscall is dispatched so the enabled flag is stable for the
@@ -31,7 +37,7 @@ void syscall_hist_init(void);
  * timestamp.
  *
  * Returns false after syscall_hist_freeze() so the recording stops cleanly at
- * the first execve.
+ * the first execve. Steady mode never freezes and stays true until the dump.
  */
 bool syscall_hist_enabled(void);
 
@@ -63,8 +69,15 @@ void syscall_hist_freeze(const char *reason);
  */
 void syscall_hist_disable(void);
 
+/* Whether recording runs until guest exit (syscalls-steady, or
+ * ELFUSE_RUNTIME_STATS) rather than freezing at the first execve.
+ */
+bool syscall_hist_steady(void);
+
 /* Emit a human-readable summary to stderr, sorted by total ns descending.
  * Idempotent: subsequent calls are no-ops. Safe to call from cleanup paths that
  * may run more than once.
  */
 void syscall_hist_dump(void);
+void syscall_hist_dump_json(FILE *out, bool consume);
+void syscall_hist_dump_cost_buckets_json(FILE *out);

@@ -57,6 +57,7 @@
 
 #include "debug/crashreport.h"
 #include "debug/gdbstub.h"
+#include "debug/runtime-stats.h"
 
 /* Process state. */
 
@@ -65,6 +66,27 @@ static _Atomic uint64_t wxcount_to_rx = 0; /* RW->RX (exec fault) */
 static _Atomic uint64_t wxcount_to_rw = 0; /* RX->RW (write fault) */
 static _Atomic uint64_t sysreg_write_count =
     0; /* EC=0x18 Dir=0 (DC CVAU, IC IVAU, etc.) */
+
+/* vCPU exit-reason accounting, gated by shim_globals_stats_enabled
+ * (ELFUSE_SHIM_STATS or ELFUSE_RUNTIME_STATS) so unset runs pay nothing on the
+ * hot path. Attributes how many hv_vcpu_run returns did no dispatchable guest
+ * work: VTIMER_ACTIVATED masks and spurious CANCELED/UNKNOWN cancels that reach
+ * the tail with nothing pending. The null-exit share against total returns is
+ * the measurement the hv_vcpu_run_until swap is gated on: a plain hv_vcpu_run
+ * returns even on transparently-handled VMEXITs, whereas
+ * run_until(HV_DEADLINE_FOREVER) reabsorbs them. no_signal_cancel is a
+ * heuristic -- an rseq fixup on the same tail counts here too -- but rseq_gva
+ * is 0 on the compute loops this targets, so the over-count is negligible. A
+ * transparent VMEXIT that HVF surfaces as UNKNOWN with nothing pending hits the
+ * crash path, not this tail, so null_exit_share is a lower bound on what
+ * run_until could reabsorb, not a proof it reabsorbs nothing. Relaxed ordering:
+ * these counters never publish state; a snapshot may read them a few updates
+ * behind, and the exit dump reads them after the run loop has stopped.
+ */
+static _Atomic uint64_t vcpu_exit_total = 0;
+static _Atomic uint64_t vcpu_exit_vtimer = 0;
+static _Atomic uint64_t vcpu_exit_no_signal_cancel = 0;
+
 /* x86_64-via-Rosetta is on by default: the architecture is auto-detected from
  * the ELF header (EM_X86_64), and rosetta is the only viable path for those
  * binaries on Apple Silicon. The --no-rosetta CLI flag (or ELFUSE_NO_ROSETTA=1)
@@ -163,6 +185,55 @@ static void proc_notify_reparent(pid_t host_pid,
                                  int64_t target_guest_pid,
                                  int64_t new_ppid);
 static int64_t proc_wait_autoreap_children(int pid, int options);
+
+void proc_dump_vcpu_exit_stats(void)
+{
+    uint64_t vtimer =
+        atomic_load_explicit(&vcpu_exit_vtimer, memory_order_relaxed);
+    uint64_t nosig =
+        atomic_load_explicit(&vcpu_exit_no_signal_cancel, memory_order_relaxed);
+
+    /* Load total last and clamp the numerator: matches the JSON path so the
+     * ratio stays in [0, 100] even under concurrent vCPU increments.
+     */
+    uint64_t total =
+        atomic_load_explicit(&vcpu_exit_total, memory_order_relaxed);
+    uint64_t nul = vtimer + nosig;
+    if (nul > total)
+        nul = total;
+    double share = total ? (100.0 * (double) nul / (double) total) : 0.0;
+    fprintf(stderr,
+            "vcpu-exit-stats (pid=%lld)\n"
+            "  exits_total            %llu\n"
+            "  exits_vtimer           %llu\n"
+            "  exits_no_signal_cancel %llu\n"
+            "  null_exit_share        %.2f%%\n",
+            (long long) proc_get_pid(), (unsigned long long) total,
+            (unsigned long long) vtimer, (unsigned long long) nosig, share);
+}
+
+void proc_dump_vcpu_exit_stats_json(FILE *out)
+{
+    uint64_t vtimer =
+        atomic_load_explicit(&vcpu_exit_vtimer, memory_order_relaxed);
+    uint64_t nosig =
+        atomic_load_explicit(&vcpu_exit_no_signal_cancel, memory_order_relaxed);
+
+    /* Load total last: makes it most likely to exceed vtimer+nosig even under
+     * concurrent increments. Clamp the numerator so the ratio stays <= 100.
+     */
+    uint64_t total =
+        atomic_load_explicit(&vcpu_exit_total, memory_order_relaxed);
+    uint64_t nul = vtimer + nosig;
+    if (nul > total)
+        nul = total;
+    double share = total ? (100.0 * (double) nul / (double) total) : 0.0;
+    fprintf(out,
+            "{\"exits_total\":%llu,\"exits_vtimer\":%llu,"
+            "\"exits_no_signal_cancel\":%llu,\"null_exit_share\":%.2f}",
+            (unsigned long long) total, (unsigned long long) vtimer,
+            (unsigned long long) nosig, share);
+}
 
 void proc_init(void)
 {
@@ -3102,11 +3173,21 @@ static void *preempt_thread_main(void *arg)
     sigemptyset(&wait_set);
     sigaddset(&wait_set, SIGUSR2);
     sigaddset(&wait_set, SIGALRM);
+    int stats_sig = runtime_stats_signal();
+    if (stats_sig)
+        sigaddset(&wait_set, stats_sig);
 
     for (;;) {
         int sig = 0;
         if (sigwait(&wait_set, &sig) != 0)
             continue;
+        if (stats_sig && sig == stats_sig) {
+            /* A snapshot request touches no guest thread, so nothing is kicked
+             * out of hv_vcpu_run; the dump itself runs on the stats thread.
+             */
+            runtime_stats_request_snapshot();
+            continue;
+        }
         if (sig == SIGUSR2) {
             atomic_store_explicit(&g_external_guest_signal, 1,
                                   memory_order_release);
@@ -3240,6 +3321,8 @@ int proc_preempt_init(void)
     sigemptyset(&block);
     sigaddset(&block, SIGUSR2);
     sigaddset(&block, SIGALRM);
+    if (runtime_stats_signal())
+        sigaddset(&block, runtime_stats_signal());
 
     /* pthread_sigmask returns the error code directly. If the block fails, vCPU
      * threads would inherit an unblocked mask and a signal landing mid-run
@@ -4664,7 +4747,12 @@ static vcpu_action_t vcpu_handle_canceled_exit(guest_t *g,
     if (thread_fork_barrier_check())
         return VCPU_RESUME;
 
-    /* No signal pending; truly unexpected cancelation */
+    /* No signal pending; truly unexpected cancelation. This tail is a null
+     * exit: the run returned but nothing dispatchable was found.
+     */
+    if (shim_globals_stats_enabled())
+        atomic_fetch_add_explicit(&vcpu_exit_no_signal_cancel, 1,
+                                  memory_order_relaxed);
     if (verbose)
         log_debug("%s: vCPU canceled (no signal pending)", prefix);
     return VCPU_RESUME;
@@ -4710,6 +4798,12 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
     uint64_t iter = 0;
     const int is_main = (timeout_sec > 0);
     const char *prefix = is_main ? "elfuse" : "elfuse: worker";
+
+    /* Resolve the exit-stats gate once; with ELFUSE_SHIM_STATS and
+     * ELFUSE_RUNTIME_STATS both unset the increments below cost a single
+     * predictable branch and no atomic traffic.
+     */
+    const bool stats = shim_globals_stats_enabled();
 
     /* Pin vCPU thread to a performance core via QoS class. On Apple Silicon,
      * USER_INTERACTIVE maps to P-cores, avoiding E-core migration that causes
@@ -4810,6 +4904,10 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 2,
                                   memory_order_relaxed);
 
+        if (stats)
+            atomic_fetch_add_explicit(&vcpu_exit_total, 1,
+                                      memory_order_relaxed);
+
         drain_external_guest_signal();
 
         /* Re-check exit_group after waking from hv_vcpu_run */
@@ -4861,6 +4959,9 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
              * mask the vtimer and continue. Without this, a pending vtimer
              * would cause an "unexpected exit reason" crash.
              */
+            if (stats)
+                atomic_fetch_add_explicit(&vcpu_exit_vtimer, 1,
+                                          memory_order_relaxed);
             hv_vcpu_set_vtimer_mask(vcpu, true);
         } else {
             log_error("%s: unexpected exit reason 0x%x", prefix, vexit->reason);

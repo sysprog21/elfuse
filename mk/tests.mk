@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog test-runtime-stats \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -353,6 +353,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 	$(call run-lane,test-sharun,sharun launcher and probe)
+	$(call run-lane,test-runtime-stats,runtime-stats output validation)
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
@@ -1447,6 +1448,14 @@ test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 		exit 1; \
 	fi
 	@bash tests/test-busybox.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
+
+## Validate ELFUSE_RUNTIME_STATS output shapes (json/jsonl/summary + signal)
+test-runtime-stats: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
+	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \
+		printf "$(RED)✗ Busybox not found.$(RESET) Set BUSYBOX_BIN=/path/to/busybox.\n"; \
+		exit 1; \
+	fi
+	@bash tests/test-runtime-stats.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
 
 ## Run the low-stack argv rewrite regression on busybox startup
 test-proctitle-low-stack: $(ELFUSE_BIN) $(BUSYBOX_DEPS)

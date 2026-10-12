@@ -679,12 +679,20 @@ static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
 #define RLIMIT_CPU_SLEEP_MAX_S 86400
 #define RLIMIT_CPU_SLEEP_MIN_NS 10000000ULL
 
+/* Order of rlimit_table_t.ids: the three uids, then the three gids. */
+enum { RLIMIT_ID_UID, RLIMIT_ID_GID = 3, RLIMIT_ID_COUNT = 6 };
+
 typedef struct {
     uint32_t magic;
     uint32_t count;
     struct {
         _Atomic uint64_t cur, max;
     } slot[LINUX_RLIMIT_COUNT];
+
+    /* Real, effective and saved guest ids of the owner, which prlimit64 in
+     * another process compares its own with.
+     */
+    _Atomic uint32_t ids[RLIMIT_ID_COUNT];
 } rlimit_table_t;
 
 static pthread_mutex_t rlimit_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -749,6 +757,17 @@ static void rlimit_slot_store(rlimit_table_t *t,
                           memory_order_relaxed);
     atomic_store_explicit(&t->slot[resource].max, lim.rlim_max,
                           memory_order_relaxed);
+}
+
+/* Copy this process's guest ids into @t. The caller holds the table's locks. */
+static void rlimit_ids_store(rlimit_table_t *t)
+{
+    const uint32_t ids[RLIMIT_ID_COUNT] = {
+        proc_get_uid(), proc_get_euid(), proc_get_suid(),
+        proc_get_gid(), proc_get_egid(), proc_get_sgid(),
+    };
+    for (int i = 0; i < RLIMIT_ID_COUNT; i++)
+        atomic_store_explicit(&t->ids[i], ids[i], memory_order_relaxed);
 }
 
 static void rlimit_flock(int fd, int op)
@@ -838,6 +857,7 @@ static void rlimit_publish(void)
         t->count = LINUX_RLIMIT_COUNT;
         for (int r = 0; r < LINUX_RLIMIT_COUNT; r++)
             rlimit_slot_store(t, r, rlimit_slot_load(&rlimit_private, r));
+        rlimit_ids_store(t);
     }
     if (t == MAP_FAILED || rename(tmp, path) < 0) {
         if (t != MAP_FAILED)
@@ -850,6 +870,15 @@ static void rlimit_publish(void)
     atomic_store_explicit(&rlimit_table, t, memory_order_release);
     rlimit_fd = fd;
     atexit(rlimit_file_unlink);
+}
+
+void sys_rlimit_ids_changed(void)
+{
+    pthread_mutex_lock(&rlimit_lock);
+    rlimit_flock(rlimit_fd, LOCK_EX);
+    rlimit_ids_store(rlimit_table_load());
+    rlimit_flock(rlimit_fd, LOCK_UN);
+    pthread_mutex_unlock(&rlimit_lock);
 }
 
 void sys_rlimit_forget(pid_t host_pid)
@@ -1134,11 +1163,26 @@ static int rlimit_exchange(rlimit_table_t *t,
     return 0;
 }
 
-/* rlimit_exchange on the table of another fork-family member. Linux also
- * compares the caller's credentials with the target's
- * (check_prlimit_permission); one fork family runs as one host user, and the
- * guest ids of another member are not visible from here, so that check is not
- * made.
+/* check_prlimit_permission (Linux kernel/sys.c) against the owner of @t: the
+ * caller's real uid and gid must equal all three of the owner's, or the caller
+ * holds CAP_SYS_RESOURCE, which here is an effective uid of 0. The caller holds
+ * the locks of @t.
+ */
+static bool rlimit_ids_permit(const rlimit_table_t *t)
+{
+    uint32_t uid = proc_get_uid(), gid = proc_get_gid();
+    bool match = true;
+
+    for (int i = 0; i < 3; i++) {
+        match &= atomic_load_explicit(&t->ids[RLIMIT_ID_UID + i],
+                                      memory_order_relaxed) == uid;
+        match &= atomic_load_explicit(&t->ids[RLIMIT_ID_GID + i],
+                                      memory_order_relaxed) == gid;
+    }
+    return match || proc_get_euid() == 0;
+}
+
+/* rlimit_exchange on the table of another fork-family member.
  *
  * A fork child publishes its table once the fork header has been restored,
  * which can be after the parent's clone returned, so a missing file is waited
@@ -1183,7 +1227,9 @@ static int rlimit_exchange_remote(int64_t guest_pid,
     }
 
     rlimit_flock(fd, new_lim ? LOCK_EX : LOCK_SH);
-    int err = rlimit_exchange(t, resource, new_lim, old_lim);
+    int err = rlimit_ids_permit(t)
+                  ? rlimit_exchange(t, resource, new_lim, old_lim)
+                  : LINUX_EPERM;
     rlimit_flock(fd, LOCK_UN);
     munmap(t, sizeof(*t));
     close(fd);

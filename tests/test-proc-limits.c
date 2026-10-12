@@ -9,6 +9,7 @@
  * prlimit64 reads back, crosses fork and execve, and can be reached by pid.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -237,6 +238,61 @@ static void test_rlimit_state(char *self)
         if (pid > 0)
             waitpid(pid, NULL, 0);
         EXPECT_TRUE(pid > 0 && ms < 500, "waited on a child that had exited");
+    }
+
+    /* check_prlimit_permission needs two sets of ids, and only root can make a
+     * second one. The drop takes CAP_SYS_RESOURCE with it.
+     */
+    if (getuid() != 0)
+        return;
+
+    TEST("prlimit64 on other ids is EPERM");
+    {
+        pid_t pid = fork();
+        if (pid == 0) {
+            struct rlimit rl;
+            if (setresgid(1001, 1001, 1001) < 0 ||
+                setresuid(1001, 1001, 1001) < 0)
+                _exit(2);
+            if (prlimit(getpid(), RLIMIT_CPU, NULL, &rl) < 0)
+                _exit(3);
+            _exit(prlimit(getppid(), RLIMIT_CPU, NULL, &rl) == -1 &&
+                          errno == EPERM
+                      ? 0
+                      : 1);
+        }
+        int status = -1;
+        if (pid > 0)
+            waitpid(pid, &status, 0);
+        EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                    "a pid with other ids was reached");
+    }
+
+    /* The child reports once it has dropped its ids, then waits. */
+    TEST("root reaches a pid with other ids");
+    {
+        int ready[2], gate[2];
+        struct rlimit rl;
+        char c;
+        pid_t pid = pipe(ready) < 0 || pipe(gate) < 0 ? -1 : fork();
+        if (pid == 0) {
+            close(gate[1]);
+            if (setresgid(1001, 1001, 1001) < 0 ||
+                setresuid(1001, 1001, 1001) < 0)
+                _exit(2);
+            (void) !write(ready[1], "r", 1);
+            (void) !read(gate[0], &c, 1);
+            _exit(0);
+        }
+        int rc = -1;
+        if (pid > 0) {
+            close(gate[0]);
+            if (read(ready[0], &c, 1) == 1)
+                rc = prlimit(pid, RLIMIT_CPU, NULL, &rl);
+            close(gate[1]);
+            waitpid(pid, NULL, 0);
+        }
+        EXPECT_EQ(rc, 0, "CAP_SYS_RESOURCE did not reach the child");
     }
 }
 

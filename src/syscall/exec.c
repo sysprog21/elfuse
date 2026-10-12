@@ -47,6 +47,7 @@
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
+#include "syscall/sys.h"
 
 
 /* Force HVF to commit the sysreg/GPR writes that sys_execve performs after a
@@ -1851,6 +1852,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         proc_set_fakeroot_enabled(true);
     shim_globals_publish_creds(g, proc_get_uid(), proc_get_euid(),
                                proc_get_gid(), proc_get_egid());
+    sys_rlimit_ids_changed();
     shim_globals_attn_and(g, ~ATTN_BIT_CRED);
 
     if (0) {

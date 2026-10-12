@@ -212,9 +212,11 @@ typedef int64_t (*syscall_handler_t)(guest_t *g,
         guest_t *_g = (g_);                                                \
         shim_globals_attn_or(_g, ATTN_BIT_CRED);                           \
         int64_t _rc = (mutator_);                                          \
-        if (_rc == 0)                                                      \
+        if (_rc == 0) {                                                    \
             shim_globals_publish_creds(_g, proc_get_uid(), proc_get_euid(),\
                                        proc_get_gid(), proc_get_egid());   \
+            sys_rlimit_ids_changed();                                      \
+        }                                                                  \
         shim_globals_attn_and(_g, ~ATTN_BIT_CRED);                         \
         _rc;                                                               \
     })

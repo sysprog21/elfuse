@@ -113,6 +113,11 @@ uint64_t sys_rlimit_cur(int resource);
 /* Hard limit of @resource, read the same way. */
 uint64_t sys_rlimit_max(int resource);
 
+/* Republish the guest ids after they changed, for the credential check
+ * prlimit64 makes from another process.
+ */
+void sys_rlimit_ids_changed(void);
+
 /* Send SIGXFSZ for a request RLIMIT_FSIZE refused. Linux sends it to the thread
  * that made the request (send_sig to current), so it is queued for the calling
  * thread alone and a sibling that has it unblocked does not take it.

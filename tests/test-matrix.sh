@@ -299,6 +299,7 @@ QEMU_SKIP="
     test-mremap-tail-emfile
     test-credentials
     test-credentials-fakeroot
+    test-proc-limits-fakeroot
     test-fakeroot-exec
     test-setuid-exec
     test-setuid-exec-fakeroot
@@ -356,6 +357,9 @@ QEMU_SKIP="
 #   descriptor reserve with file-backed fillers, and verifies that the filler
 #   failure is descriptor-driven before asserting the mremap ENOMEM path; real
 #   Linux has neither emulated table nor reserve.
+# test-proc-limits-fakeroot: reruns test-proc-limits under --fakeroot so the
+#   prlimit64 credential checks, which only root can set up, run in elfuse
+#   too; the reference lane already runs the plain test as genuine root.
 # test-credentials: pins elfuse's restricted "fakeroot" setuid/capset/
 #   getgroups model (deliberately narrower than real root); the qemu
 #   reference lane runs as genuine root, which has unrestricted privilege.
@@ -813,6 +817,7 @@ run_unit_tests()
     test_rc "$runner" "test-procfs" 0 "$bindir/test-procfs"
     test_rc "$runner" "test-procfs-exec" 0 "$bindir/test-procfs-exec"
     test_rc "$runner" "test-proc-limits" 0 "$bindir/test-proc-limits"
+    test_rc "$runner" "test-proc-limits-fakeroot" 0 --fakeroot "$bindir/test-proc-limits"
     test_rc "$runner" "test-proc-fidelity" 0 "$bindir/test-proc-fidelity"
     test_rc "$runner" "test-proc-smap" 0 "$bindir/test-proc-smap"
 

@@ -1620,6 +1620,15 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
     return total;
 }
 
+bool guest_range_any_mapped(const guest_t *g, uint64_t start, uint64_t end)
+{
+    gva_translation_t t;
+    for (uint64_t off = start; off < end; off += GUEST_PAGE_SIZE)
+        if (gva_translate_perm(g, g->ipa_base + off, 0, &t) == 0)
+            return true;
+    return false;
+}
+
 /* Resolve a guest virtual address to a host pointer and available size.
  * Returns NULL if the address is not in any mapping.
  *

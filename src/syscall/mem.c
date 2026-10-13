@@ -2882,6 +2882,13 @@ bool mem_stack_grow(guest_t *g, uint64_t off)
     if (guest_range_hits_infra(g, page, r->start))
         return false;
 
+    /* The scan above saw only the records the table still holds. A mapping that
+     * lost its record keeps its pages, so with a stale table the page tables
+     * are asked too, and the stack does not grow over one.
+     */
+    if (g->regions_tracker_stale && guest_range_any_mapped(g, page, r->start))
+        return false;
+
     if (r->end - page > sys_rlimit_cur(LINUX_RLIMIT_STACK) ||
         !mem_rlimit_allows(g, r->start - page, LINUX_PROT_READ,
                            LINUX_MAP_PRIVATE, 0, 0))

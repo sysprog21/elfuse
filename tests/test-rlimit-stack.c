@@ -370,6 +370,18 @@ static int mode_many(void)
     if (p == MAP_FAILED)
         return 100;
 
+    /* A mapping inside the stack's window, 2 MiB and two pages long. Once the
+     * table is full, unmapping all but its first and last page leaves the last
+     * one with no record under elfuse.
+     */
+    char *fixed = mmap((void *) (hi - 7 * MIB), 2 * MIB + 2 * PAGE,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (fixed == MAP_FAILED)
+        return 100;
+    char *last = fixed + 2 * MIB + PAGE;
+    *last = 42;
+
     /* Every other page becomes a mapping of its own. Under elfuse the break is
      * refused once the table is full, and each split after that logs a line, so
      * stop there.
@@ -385,11 +397,20 @@ static int mode_many(void)
             break;
     }
 
+    if (munmap(fixed + PAGE, 2 * MIB) != 0)
+        return 100;
+
     *(volatile char *) (hi - 2 * MIB) = 1;
     if (stack_range(&now, &hi) < 0 || now != hi - 2 * MIB)
         return 1;
     if (mprotect(p, PAGE, PROT_READ | PROT_WRITE) != 0)
         return 2;
+
+    /* The page under that last page is not the stack's to grow into. */
+    if (syscall(SYS_getrandom, last - PAGE, 1, 0) != -1 || errno != EFAULT)
+        return 3;
+    if (*last != 42)
+        return 4;
     return 0;
 }
 

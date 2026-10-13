@@ -1072,6 +1072,12 @@ int guest_install_va_pages(guest_t *g,
  */
 bool guest_va_block_mapped(const guest_t *g, uint64_t va);
 
+/* Whether any page of [start, end), in region coordinates, has a translation
+ * EL0 can use. This reads the page tables and not the region table, so it also
+ * sees a mapping whose record the table has lost.
+ */
+bool guest_range_any_mapped(const guest_t *g, uint64_t start, uint64_t end);
+
 /* Returns true when the VA range [va, va+size) overlaps the user-VA kbuf alias
  * window [KBUF_USER_VA, KBUF_USER_VA+KBUF_SIZE). Callers that install TTBR0
  * mappings (the future rosetta_finalize, sys_mmap MAP_FIXED touching this

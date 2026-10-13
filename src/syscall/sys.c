@@ -704,6 +704,12 @@ typedef struct {
      * another process compares its own with.
      */
     _Atomic uint32_t ids[RLIMIT_ID_COUNT];
+
+    /* proc_host_start_us of the owner, written once before the file gets its
+     * name. A file left by a dead process does not match whatever runs under
+     * its host pid afterwards.
+     */
+    uint64_t owner_start_us;
 } rlimit_table_t;
 
 static pthread_mutex_t rlimit_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -869,6 +875,8 @@ static void rlimit_publish(void)
         for (int r = 0; r < LINUX_RLIMIT_COUNT; r++)
             rlimit_slot_store(t, r, rlimit_slot_load(&rlimit_private, r));
         rlimit_ids_store(t);
+        if (!proc_host_start_us(getpid(), &t->owner_start_us))
+            t->owner_start_us = 0;
     }
     if (t == MAP_FAILED || rename(tmp, path) < 0) {
         if (t != MAP_FAILED)
@@ -1217,9 +1225,14 @@ static int rlimit_exchange_remote(int64_t guest_pid,
         /* A target that has exited or gone is ESRCH whether or not a file is
          * there: a host process that was killed leaves its file behind, and the
          * child table keeps naming its host pid after the child has been
-         * collected, by which time the pid can belong to something else.
+         * collected, by which time the pid can belong to something else. That
+         * something else passes kill, so the file must also carry the start
+         * time of the process the pid names now.
          */
-        if (proc_child_exited(guest_pid) || kill(host_pid, 0) < 0) {
+        uint64_t live_us;
+        if (proc_child_exited(guest_pid) || kill(host_pid, 0) < 0 ||
+            (t && (!proc_host_start_us(host_pid, &live_us) ||
+                   live_us != t->owner_start_us))) {
             if (t) {
                 munmap(t, sizeof(*t));
                 close(fd);

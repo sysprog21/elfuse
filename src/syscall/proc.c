@@ -1240,7 +1240,7 @@ typedef struct {
  *
  * Returns false once @pid has exited.
  */
-static bool host_start_us(pid_t pid, uint64_t *out)
+bool proc_host_start_us(pid_t pid, uint64_t *out)
 {
     struct proc_bsdinfo info;
     if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) !=
@@ -1266,7 +1266,7 @@ static void registry_parse_cb(char *rec, void *vctx)
     if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
         return;
     uint64_t live_us;
-    if (!host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
+    if (!proc_host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
         return;
     int idx = -1;
     for (int k = 0; k < c->n; k++)
@@ -1312,7 +1312,7 @@ static void registry_find_by_host_cb(char *rec, void *vctx)
     if ((pid_t) hp != c->target)
         return;
     uint64_t live_us;
-    if (!host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
+    if (!proc_host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
         return;
     c->guest_pid = (int64_t) gp;
     c->found = true;
@@ -1369,7 +1369,7 @@ static void proc_registry_publish(pid_t host_pid,
             break;
         }
     uint64_t start_us;
-    if (idx < 0 && host_start_us(host_pid, &start_us)) {
+    if (idx < 0 && proc_host_start_us(host_pid, &start_us)) {
         if (n == REGISTRY_MAX_ENTRIES)
 
             /* No slot for a new live member: group signals (kill(-1),

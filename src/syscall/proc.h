@@ -549,6 +549,13 @@ int proc_set_child_pgid(int64_t guest_pid, int64_t pgid);
  */
 pid_t proc_guest_to_host_pid(int64_t gpid);
 
+/* Start time of host process @pid in microseconds, which with the pid names one
+ * process: a later process that reuses the pid starts later.
+ *
+ * Returns false once @pid has exited.
+ */
+bool proc_host_start_us(pid_t pid, uint64_t *out);
+
 /* Whether @gpid is a child in the table that has exited and not been reaped. */
 bool proc_child_exited(int64_t gpid);
 

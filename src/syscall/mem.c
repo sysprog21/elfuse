@@ -3388,6 +3388,16 @@ int64_t sys_mmap(guest_t *g,
             return -LINUX_ENOMEM;
 
         if (addr >= g->guest_size) {
+            /* The descriptor is judged before the limit, as on the paths below;
+             * sys_mmap_high_va opens it again for the mapping.
+             */
+            if (!(flags & LINUX_MAP_ANONYMOUS)) {
+                host_fd_ref_t probe = HOST_FD_REF_INIT;
+                int64_t ref_err = host_fd_ref_open(fd, &probe);
+                if (ref_err < 0)
+                    return ref_err;
+                host_fd_ref_close(&probe);
+            }
             if (!mem_rlimit_allows(g, length, prot, flags, replace_start,
                                    replace_end))
                 return -LINUX_ENOMEM;

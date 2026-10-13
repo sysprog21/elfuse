@@ -220,7 +220,7 @@ What they do:
   expressible `proved/gva.h` preconditions are checked on every call the suite
   makes. Separate from `make check` because those checks sit on the
   `guest_read` / `guest_write` hot path
-- `make check-locks`: rebuild with `-DELFUSE_LOCK_ASSERT`, which counts the locks each thread holds, and run `make check` on that build. It aborts when a thread waits on `mmap_lock` with a lock ranked below it held, or reads or writes guest memory with one held outside a `mmap_lock_nowait_begin` scope. Run it after adding a lock or a guest access under one
+- `make check-locks`: rebuild with `-DELFUSE_LOCK_ASSERT`, which counts the locks each thread holds, and run `make check` on that build. It aborts when a thread calls `mmap_lock_acquire` while it holds a counted lock or is inside a `mmap_lock_nowait_begin` scope, and when a thread reads or writes guest memory while it holds a counted lock, unless it owns `mmap_lock` or is inside such a scope. Run it after adding a lock or a guest access under one
 - `make lint`: static analysis through `clang-tidy`
 
 ## Quick Iteration

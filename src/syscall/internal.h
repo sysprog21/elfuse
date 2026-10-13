@@ -70,8 +70,10 @@
  *                                     is taken, or inside a
  *                                     mmap_lock_nowait_begin scope (mem.h),
  *                                     where the growth only tries for the lock.
- *                                     The caller picks, by what it holds;
- *                                     nothing decides for it at run time. make
+ *                                     The caller picks, by what it holds, and
+ *                                     mem_stack_grow_for_host follows the scope
+ *                                     it declared; nothing at run time works
+ *                                     out what the caller holds. make
  *                                     check-locks asserts both halves: no lock
  *                                     below is held where a thread waits on
  *                                     mmap_lock, and none is held at a guest

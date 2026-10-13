@@ -1268,10 +1268,10 @@ not_svc:
     cmp x10, #0x3C
     b.eq handle_brk
 
-    /* EC=0x25: the urandom store or futex LDTR can fault after a sibling vCPU
-     * revokes the page.
+    /* EC=0x25: the urandom store, the futex LDTR or a DC ZVA store can fault
+     * after a sibling vCPU revokes the page.
      *
-     * Return EFAULT rather than halting the VM.
+     * Recover rather than halting the VM.
      */
     cmp x10, #0x25
     b.eq handle_el1_data_abort_recover
@@ -1285,9 +1285,10 @@ not_svc:
     b handle_el0_fault           /* EL0 (M=0): forward for signal delivery */
 
 /* handle_el1_data_abort_recover: recover from a data abort whose faulting PC
- * sits inside the futex ldtr or the urandom-copy strb region. The urandom store
- * and the futex word load answer EFAULT; the futex timeout load forwards the
- * syscall to the host.
+ * sits inside the futex ldtr, the urandom-copy strb region or the DC ZVA
+ * stores. The urandom store and the futex word load answer EFAULT; the futex
+ * timeout load forwards the syscall to the host; a DC ZVA store has the guest
+ * run the instruction again.
  *
  * Layout invariants exploited here:
  *   - SAVE_GPRS allocated 256 bytes for THIS (inner) entry on top of
@@ -1301,8 +1302,9 @@ not_svc:
  *     futex range holds no lock and no exclusive monitor, which is the whole
  *     difference between the two tails below.
  *
- * If the fault PC is outside the two futex ldtr ranges and the urandom strb
- * ranges this is a genuine shim bug; fall back to restore_and_bad.
+ * If the fault PC is outside the two futex ldtr ranges, the DC ZVA stores and
+ * the urandom strb ranges this is a genuine shim bug; fall back to
+ * restore_and_bad.
  */
 handle_el1_data_abort_recover:
     mrs x11, elr_el1
@@ -1347,6 +1349,23 @@ handle_el1_data_abort_recover:
     b futex_shape_bail
 
 3:
+    /* The DC ZVA stores: no lock, no exclusive monitor. Drop the nested frame,
+     * restore the trap's return state from the slot and return to the DC ZVA
+     * itself, which traps again and is then refused by its probe.
+     */
+    adr x12, dczva_store_start
+    cmp x11, x12
+    b.lo 5f
+    adr x12, dczva_store_end
+    cmp x11, x12
+    b.hs 5f
+    add sp, sp, #256
+    ldp x9, x10, [sp], #16
+    msr elr_el1, x9
+    msr spsr_el1, x10
+    b restore_eret
+
+5:
     adr x12, urandom_strb_1byte_start
     cmp x11, x12
     b.lo 2f
@@ -1460,11 +1479,23 @@ handle_sysreg_trap:
     isb
     mrs x12, par_el1
     tbnz x12, #0, handle_el0_fault
+
+    /* A sibling vCPU can still revoke the page between the probe and a store.
+     * The slot keeps the trap's return state where the nested abort cannot
+     * overwrite it, and handle_el1_data_abort_recover runs the DC ZVA again, so
+     * the probe above fails and the guest takes the fault.
+     */
+    mrs x12, elr_el1
+    mrs x13, spsr_el1
+    stp x12, x13, [sp, #-16]!
     /* Zero 64 bytes using four STP pairs */
+dczva_store_start:
     stp xzr, xzr, [x11, #0]
     stp xzr, xzr, [x11, #16]
     stp xzr, xzr, [x11, #32]
     stp xzr, xzr, [x11, #48]
+dczva_store_end:
+    add sp, sp, #16
 6:  /* Forward to host for counting, then I-cache maintenance */
 
 5:  /* Pass the source register value to host. Cache maintenance instructions

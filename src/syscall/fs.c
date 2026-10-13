@@ -48,6 +48,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/io.h"  /* io_retry_backoff */
 #include "syscall/net.h" /* absock_unregister_fd */
 #include "syscall/path.h"
@@ -2407,6 +2408,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      * stream -- see the lock field in dir_stream_t.
      */
     pthread_mutex_lock(&ds->lock);
+    mmap_lock_nowait_begin();
 
     int64_t ret;
 
@@ -2670,6 +2672,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     ret = (int64_t) guest_pos;
 
 out:
+    mmap_lock_nowait_end();
     pthread_mutex_unlock(&ds->lock);
     dir_stream_release(ds);
     return ret;

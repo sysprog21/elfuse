@@ -98,6 +98,10 @@ static pthread_mutex_t shm_dir_lock = PTHREAD_MUTEX_INITIALIZER;
  */
 static char proc_tmpdir[128];
 static bool proc_tmpdir_ok;
+
+/* Ranked above mmap_lock, so its pthread calls are parenthesized to stay out of
+ * the count make check-locks keeps (debug/lock-assert.h).
+ */
 static pthread_mutex_t proc_tmpdir_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
@@ -1361,16 +1365,16 @@ static void format_proc_net_addr(char out[33],
  */
 static const char *ensure_proc_tmpdir(const guest_t *g)
 {
-    pthread_mutex_lock(&proc_tmpdir_lock);
+    (pthread_mutex_lock)(&proc_tmpdir_lock);
     if (proc_tmpdir_ok) {
-        pthread_mutex_unlock(&proc_tmpdir_lock);
+        (pthread_mutex_unlock)(&proc_tmpdir_lock);
         return proc_tmpdir;
     }
 
     str_copy_trunc(proc_tmpdir, "/tmp/elfuse-proc-XXXXXX", sizeof(proc_tmpdir));
     if (!mkdtemp(proc_tmpdir)) {
         proc_tmpdir[0] = '\0';
-        pthread_mutex_unlock(&proc_tmpdir_lock);
+        (pthread_mutex_unlock)(&proc_tmpdir_lock);
         return NULL;
     }
 
@@ -1380,7 +1384,7 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
     if (mkdir(pidbuf, 0755) < 0 && errno != EEXIST) {
         rmdir(proc_tmpdir);
         proc_tmpdir[0] = '\0';
-        pthread_mutex_unlock(&proc_tmpdir_lock);
+        (pthread_mutex_unlock)(&proc_tmpdir_lock);
         return NULL;
     }
 
@@ -1419,7 +1423,7 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
 
     atexit(proc_tmpdir_cleanup);
     proc_tmpdir_ok = true;
-    pthread_mutex_unlock(&proc_tmpdir_lock);
+    (pthread_mutex_unlock)(&proc_tmpdir_lock);
     return proc_tmpdir;
 }
 

@@ -2957,7 +2957,10 @@ int64_t sys_waitid(guest_t *g,
                 memcpy(si + SIGINFO_OFF_UID, &uid, 4);
                 memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
 
-                if (guest_write_small(g, infop_gva, si, SIGINFO_SIZE) < 0) {
+                mmap_lock_nowait_begin();
+                int si_rc = guest_write_small(g, infop_gva, si, SIGINFO_SIZE);
+                mmap_lock_nowait_end();
+                if (si_rc < 0) {
                     pthread_mutex_unlock(&pid_lock);
                     return -LINUX_EFAULT;
                 }

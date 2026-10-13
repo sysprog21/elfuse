@@ -1,6 +1,6 @@
 # Frama-C WP proofs
 
-.PHONY: verify check-contracts verify-mutants check-char-signedness \
+.PHONY: verify check-contracts check-locks verify-mutants check-char-signedness \
         check-stub-constants check-stub-shadow print-verify-targets \
         print-verify-profiles
 
@@ -751,6 +751,18 @@ verify:
 # elfuse" would silently relink them: a default-looking binary carrying the
 # checks on its hot path. A separate tree also means no -B is needed, since it
 # starts empty.
+## Rebuild with the held-lock count live, then run the suite
+#
+# src/debug/lock-assert.h is force-included, so every pthread mutex and rwlock
+# site in the tree is counted with no change to it. Separate from "make check"
+# and built into its own directory for the reasons check-contracts gives below:
+# the count sits on every lock and every guest access.
+check-locks:
+	@echo "  LOCKS   nothing below mmap_lock held where a thread waits on it"
+	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/locks \
+	    EXTRA_CFLAGS="-DELFUSE_LOCK_ASSERT -include $(CURDIR)/src/debug/lock-assert.h $(EXTRA_CFLAGS)" \
+	    check
+
 check-contracts:
 	@echo "  CONTRACT proved/gva.h call-site preconditions (5 of 9 clauses)"
 	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/contracts \

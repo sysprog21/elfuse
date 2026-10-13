@@ -66,6 +66,7 @@
 #include "proved/fuse.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/path.h"
 #include "runtime/thread.h" /* thread_stop_requested */
 #include "syscall/proc.h"
@@ -2544,7 +2545,10 @@ int64_t fuse_dev_read(int guest_fd,
         host_fd_ref_close(&notify_ref);
         return -LINUX_EINVAL;
     }
-    if (guest_write(g, buf_gva, req->frame, frame_len) < 0) {
+    mmap_lock_nowait_begin();
+    int frame_rc = guest_write(g, buf_gva, req->frame, frame_len);
+    mmap_lock_nowait_end();
+    if (frame_rc < 0) {
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);

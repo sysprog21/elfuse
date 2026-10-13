@@ -1645,6 +1645,9 @@ static void *gva_resolve_perm(const guest_t *g,
      * and the region table, which is why the guest is not const there; every
      * guest_t this is called with is a writable object.
      */
+#ifdef ELFUSE_LOCK_ASSERT
+    mmap_lock_assert_guest_access();
+#endif
     gva_translation_t first;
     if (gva_translate_perm(g, gva, required_perms, &first) < 0 &&
         (!mem_stack_grow_for_host((guest_t *) g, gva) ||

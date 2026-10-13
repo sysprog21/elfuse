@@ -16,6 +16,8 @@
  * 6. X7 survives delivery and rt_sigreturn (aarch64: the host uses X7 on the
  *    HVC #5 return to ask the shim for a ptrace detour, and the tails that
  *    rebuild EL0 state never restore it from the saved frame)
+ * 7. A bad old-value pointer to rt_sigaction or rt_sigprocmask is EFAULT with
+ *    the new action or mask already in place, as in Linux
  */
 
 #include <errno.h>
@@ -25,6 +27,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
 
 static volatile sig_atomic_t handler_called = 0;
@@ -287,6 +290,42 @@ int main(void)
         }
     }
 #endif
+
+    /* Test 7: raw syscalls, because libc copies the old value out itself and
+     * would fault in user space instead of returning EFAULT.
+     */
+    printf("test-signal: 7. bad old pointer keeps the new state... ");
+    {
+        struct {
+            unsigned long handler, flags, restorer, mask;
+        } kact = {(unsigned long) sigusr1_handler, 0, 0, 0};
+        unsigned long set = 1UL << (SIGUSR2 - 1);
+        void *bad = (void *) 8;
+        errno = 0;
+        long a = syscall(SYS_rt_sigaction, SIGUSR2, &kact, bad, 8);
+        int a_errno = errno;
+        errno = 0;
+        long m = syscall(SYS_rt_sigprocmask, SIG_BLOCK, &set, bad, 8);
+        int m_errno = errno;
+
+        struct sigaction now;
+        sigset_t cur;
+        sigaction(SIGUSR2, NULL, &now);
+        sigprocmask(SIG_BLOCK, NULL, &cur);
+        if (a == -1 && a_errno == EFAULT && m == -1 && m_errno == EFAULT &&
+            now.sa_handler == sigusr1_handler && sigismember(&cur, SIGUSR2)) {
+            printf("PASS\n");
+        } else {
+            printf("FAIL (a=%ld/%d m=%ld/%d installed=%d blocked=%d)\n", a,
+                   a_errno, m, m_errno, now.sa_handler == sigusr1_handler,
+                   sigismember(&cur, SIGUSR2));
+            failures++;
+        }
+        signal(SIGUSR2, SIG_DFL);
+        sigemptyset(&cur);
+        sigaddset(&cur, SIGUSR2);
+        sigprocmask(SIG_UNBLOCK, &cur, NULL);
+    }
 
     if (failures == 0) {
         printf("test-signal: all tests passed -- PASS\n");

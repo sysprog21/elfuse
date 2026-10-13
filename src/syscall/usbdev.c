@@ -146,6 +146,7 @@
 #include "debug/log.h"
 #include "runtime/usb-sysfs.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/io.h"
 #include "syscall/linux-wire.h"
 #include "syscall/proc.h"
@@ -2724,6 +2725,11 @@ static usbdev_t *usbdev_acquire_snap(int fd, const fd_entry_t *snap)
         usbdev_unref(u);
         return NULL;
     }
+
+    /* The entry lock is held until usbdev_release, across every guest copy the
+     * ioctl or read makes.
+     */
+    mmap_lock_nowait_begin();
     return u;
 }
 
@@ -2745,6 +2751,7 @@ static usbdev_t *usbdev_acquire(int fd)
  */
 static void usbdev_release(usbdev_t *u)
 {
+    mmap_lock_nowait_end();
     pthread_mutex_unlock(&u->lock);
     usbdev_flush_disc_peers(u);
     usbdev_unref(u);

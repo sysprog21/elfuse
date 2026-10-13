@@ -37,6 +37,25 @@ bool mem_stack_grow(guest_t *g, uint64_t off);
 bool mem_stack_grow_for_host(guest_t *g, uint64_t gva);
 void mem_stack_init_extent(guest_t *g, uint64_t sp);
 
+/* A host read or write of guest memory can grow the stack, which takes
+ * mmap_lock, so it ranks where mmap_lock does in the order in internal.h. A
+ * caller that touches guest memory while it holds a lock ranked below mmap_lock
+ * says so by bracketing the access with these: inside the scope the growth only
+ * tries for mmap_lock, and an address it could not grow to reads as unmapped.
+ * Every other access waits for the lock. Scopes nest.
+ */
+void mmap_lock_nowait_begin(void);
+void mmap_lock_nowait_end(void);
+
+#ifdef ELFUSE_LOCK_ASSERT
+/* make check-locks: the thread holds no counted lock and is in no nowait scope,
+ * so it may block on mmap_lock; and a guest access is either under mmap_lock,
+ * inside a nowait scope, or made with no counted lock held.
+ */
+bool mmap_lock_may_block(void);
+void mmap_lock_assert_guest_access(void);
+#endif
+
 /* mmap: map pages into guest address space */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,

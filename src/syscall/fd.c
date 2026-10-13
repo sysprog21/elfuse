@@ -32,6 +32,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/fd.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/io.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -241,6 +242,7 @@ int64_t sys_timerfd_settime(guest_t *g,
     int64_t ret = 0;
 
     pthread_mutex_lock(&sfd_lock);
+    mmap_lock_nowait_begin();
     int slot = timerfd_find(fd);
     if (slot < 0) {
         ret = -LINUX_EBADF;
@@ -362,6 +364,7 @@ int64_t sys_timerfd_settime(guest_t *g,
     }
 
 unlock:
+    mmap_lock_nowait_end();
     pthread_mutex_unlock(&sfd_lock);
     return ret;
 }

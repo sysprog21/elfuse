@@ -1549,26 +1549,20 @@ int64_t signal_rt_sigaction(guest_t *g,
 
     int idx = signum - 1;
 
+    /* Linux order (kernel/signal.c): the new action is read before sig_lock and
+     * the old one written after it, so neither copy runs under a lock ranked
+     * below mmap_lock, and an oldact fault leaves the new action installed.
+     */
+    linux_sigaction_t act, oldact;
+    if (act_gva && guest_read_small(g, act_gva, &act, sizeof(act)) < 0)
+        return -LINUX_EFAULT;
+
     bool reap_exited_sigchld = false;
     pthread_mutex_lock(&sig_lock);
-
-    /* Return old action if requested */
-    if (oldact_gva) {
-        if (guest_write_small(g, oldact_gva, &sig_state.actions[idx],
-                              sizeof(linux_sigaction_t)) < 0) {
-            pthread_mutex_unlock(&sig_lock);
-            return -LINUX_EFAULT;
-        }
-    }
+    oldact = sig_state.actions[idx];
 
     /* Install new action if provided */
     if (act_gva) {
-        linux_sigaction_t act;
-        if (guest_read_small(g, act_gva, &act, sizeof(act)) < 0) {
-            pthread_mutex_unlock(&sig_lock);
-            return -LINUX_EFAULT;
-        }
-
         log_debug(
             "rt_sigaction(%d): handler=0x%llx flags=0x%llx "
             "restorer=0x%llx mask=0x%llx%s%s%s%s",
@@ -1596,6 +1590,9 @@ int64_t signal_rt_sigaction(guest_t *g,
     pthread_mutex_unlock(&sig_lock);
     if (reap_exited_sigchld)
         proc_autoreap_exited_children();
+    if (oldact_gva &&
+        guest_write_small(g, oldact_gva, &oldact, sizeof(oldact)) < 0)
+        return -LINUX_EFAULT;
     return 0;
 }
 
@@ -1610,29 +1607,20 @@ int64_t signal_rt_sigprocmask(guest_t *g,
     if (sigsetsize != 8)
         return -LINUX_EINVAL;
 
+    /* Linux order (kernel/signal.c): the new set is read before sig_lock and
+     * the old one written after it, so neither copy runs under a lock ranked
+     * below mmap_lock, and an oldset fault leaves the new mask applied.
+     */
+    uint64_t set = 0;
+    if (set_gva && guest_read_small(g, set_gva, &set, sizeof(set)) < 0)
+        return -LINUX_EFAULT;
+
     pthread_mutex_lock(&sig_lock);
     _Atomic uint64_t *blocked = thread_blocked_ptr();
-
-    /* Return old mask if requested. Load the value out first: handing
-     * guest_write_small the _Atomic object copies its representation rather
-     * than performing an atomic read of it.
-     */
-    if (oldset_gva) {
-        uint64_t old_mask = atomic_load_explicit(blocked, memory_order_relaxed);
-        if (guest_write_small(g, oldset_gva, &old_mask, sizeof(old_mask)) < 0) {
-            pthread_mutex_unlock(&sig_lock);
-            return -LINUX_EFAULT;
-        }
-    }
+    uint64_t old_mask = atomic_load_explicit(blocked, memory_order_relaxed);
 
     /* Apply new mask if provided */
     if (set_gva) {
-        uint64_t set;
-        if (guest_read_small(g, set_gva, &set, sizeof(set)) < 0) {
-            pthread_mutex_unlock(&sig_lock);
-            return -LINUX_EFAULT;
-        }
-
         /* Never allow blocking SIGKILL or SIGSTOP */
         uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
 
@@ -1678,6 +1666,9 @@ int64_t signal_rt_sigprocmask(guest_t *g,
     }
 
     pthread_mutex_unlock(&sig_lock);
+    if (oldset_gva &&
+        guest_write_small(g, oldset_gva, &old_mask, sizeof(old_mask)) < 0)
+        return -LINUX_EFAULT;
     return 0;
 }
 
@@ -2403,6 +2394,31 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      */
     syscall_restart_cancel(vcpu);
 
+    /* The frame is built and written with sig_lock dropped, as Linux get_signal
+     * hands setup_rt_frame a copy of the action and releases siglock: the frame
+     * write and the rseq abort touch guest memory, which may grow the stack and
+     * so wait for mmap_lock, and sig_lock ranks below it. SA_RESETHAND takes
+     * effect before the lock is let go, also as in get_signal, so a sibling
+     * taking the same signal meanwhile sees SIG_DFL. The sigsuspend saved mask
+     * is consumed here because it is only touched under sig_lock (thread.h).
+     *
+     * If delivering from sigsuspend, the frame carries the ORIGINAL blocked
+     * mask so rt_sigreturn restores it (not the temporary sigsuspend mask).
+     */
+    linux_sigaction_t ka = *act;
+    if (act->sa_flags & LINUX_SA_RESETHAND) {
+        act->sa_handler = LINUX_SIG_DFL;
+        act->sa_flags &= ~LINUX_SA_SIGINFO;
+    }
+    uint64_t frame_mask;
+    if (*valid_ptr) {
+        frame_mask = *saved_ptr;
+        *valid_ptr = false;
+    } else {
+        frame_mask = atomic_load_explicit(blocked, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&sig_lock);
+
     /* 1. Save current vCPU state.
      *
      * ELR_EL1/SPSR_EL1 hold the interrupted EL0 return state only while the
@@ -2457,7 +2473,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
             hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, saved_pc);
         if (rseq_rc == -1) {
             *exit_code = 128 + 11; /* SIGSEGV */
-            pthread_mutex_unlock(&sig_lock);
             return -1;
         }
     }
@@ -2497,16 +2512,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     frame.uc.uc_flags = cookie;
     frame.uc.uc_link = 0;
 
-    /* If delivering from sigsuspend, store the ORIGINAL blocked mask so
-     * rt_sigreturn restores it (not the temporary sigsuspend mask).
-     */
-    if (*valid_ptr) {
-        frame.uc.uc_sigmask = *saved_ptr;
-        *valid_ptr = false;
-    } else {
-        frame.uc.uc_sigmask =
-            atomic_load_explicit(blocked, memory_order_relaxed);
-    }
+    frame.uc.uc_sigmask = frame_mask;
 
     /* sigcontext: save all registers. fault_address: for synchronous faults
      * (BRK, segfault), set to the faulting address; for asynchronous signals,
@@ -2548,7 +2554,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      */
     uint64_t signal_sp = saved_sp;
     bool use_altstack = false;
-    if (thr && (act->sa_flags & LINUX_SA_ONSTACK) &&
+    if (thr && (ka.sa_flags & LINUX_SA_ONSTACK) &&
         !(thr->altstack_flags & LINUX_SS_DISABLE) && !thr->on_altstack) {
         /* Place frame at top of altstack (stack grows down) */
         signal_sp = thr->altstack_sp + thr->altstack_size;
@@ -2571,7 +2577,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
             (unsigned long long) (use_altstack && thr ? thr->altstack_sp : 0),
             signum);
         *exit_code = 128 + signum;
-        pthread_mutex_unlock(&sig_lock);
         return -1;
     }
 
@@ -2597,13 +2602,13 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         if (pushed_cookie)
             sigreturn_cookie_depth--;
         *exit_code = 128 + signum;
-        pthread_mutex_unlock(&sig_lock);
         return -1;
     }
+    pthread_mutex_lock(&sig_lock);
 
     /* 4. Redirect vCPU to signal handler */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, frame_sp);
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, act->sa_handler);
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, ka.sa_handler);
     /* SPSR_EL1: EL0t (user mode) */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0);
 
@@ -2613,7 +2618,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * unwinds back to EL0 through the shim ERET.
      */
     if (el0_preempt) {
-        hv_vcpu_set_reg(vcpu, HV_REG_PC, act->sa_handler);
+        hv_vcpu_set_reg(vcpu, HV_REG_PC, ka.sa_handler);
         hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0); /* EL0t */
     }
 
@@ -2629,7 +2634,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      */
     hv_vcpu_set_reg(vcpu, HV_REG_X30, VDSO_BASE + VDSO_OFF_SIGRET);
 
-    if (act->sa_flags & LINUX_SA_SIGINFO) {
+    if (ka.sa_flags & LINUX_SA_SIGINFO) {
         /* X1 = pointer to siginfo, X2 = pointer to ucontext */
         uint64_t siginfo_addr = frame_sp;
         uint64_t ucontext_addr = frame_sp + sizeof(linux_siginfo_t);
@@ -2645,9 +2650,9 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * two can never overlap.
      */
     uint64_t new_blocked = atomic_load_explicit(blocked, memory_order_relaxed);
-    if (!(act->sa_flags & LINUX_SA_NODEFER))
+    if (!(ka.sa_flags & LINUX_SA_NODEFER))
         new_blocked |= sig_bit(signum);
-    new_blocked |= act->sa_mask;
+    new_blocked |= ka.sa_mask;
     /* Never block SIGKILL/SIGSTOP */
     new_blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
     atomic_store_explicit(blocked, new_blocked, memory_order_release);
@@ -2655,12 +2660,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     /* 6. Track per-thread altstack usage */
     if (use_altstack && thr)
         thr->on_altstack = true;
-
-    /* 7. Reset to SIG_DFL if SA_RESETHAND is set */
-    if (act->sa_flags & LINUX_SA_RESETHAND) {
-        act->sa_handler = LINUX_SIG_DFL;
-        act->sa_flags &= ~LINUX_SA_SIGINFO;
-    }
 
     /* If delivery happens while returning from the syscall HVC path, the shim
      * still has the interrupted syscall frame on its EL1 stack. Tell it to drop

@@ -36,6 +36,7 @@
 #include "runtime/thread.h"
 
 #include "syscall/linux-wire.h"
+#include "syscall/mem.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
@@ -451,7 +452,10 @@ static int64_t futex_should_block(const guest_t *g,
                                   uint64_t uaddr,
                                   uint32_t expected)
 {
+    /* Every caller holds the bucket lock. */
+    mmap_lock_nowait_begin();
     uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
+    mmap_lock_nowait_end();
     if (!word)
         return -LINUX_EFAULT;
 
@@ -1356,7 +1360,9 @@ static int64_t futex_wake_op(guest_t *g,
     }
 
     /* Atomically modify *uaddr2 */
+    mmap_lock_nowait_begin();
     uint32_t *word2 = (uint32_t *) guest_ptr_w(g, uaddr2);
+    mmap_lock_nowait_end();
     if (!word2) {
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);

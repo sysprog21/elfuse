@@ -43,6 +43,29 @@ static pthread_mutex_t mmap_lock =
 
 static _Thread_local bool mmap_lock_owned;
 
+/* The pthread calls on mmap_lock are parenthesized so that make check-locks,
+ * which counts the locks ranked below it, does not count mmap_lock itself
+ * (debug/lock-assert.h).
+ */
+
+/* Depth of the scopes in which this thread holds a lock ranked below mmap_lock
+ * while it reads or writes guest memory (mmap_lock_nowait_begin).
+ */
+static _Thread_local unsigned mmap_lock_nowait_depth;
+
+#ifdef ELFUSE_LOCK_ASSERT
+bool mmap_lock_may_block(void)
+{
+    return lock_assert_held == 0 && mmap_lock_nowait_depth == 0;
+}
+
+void mmap_lock_assert_guest_access(void)
+{
+    assert(mmap_lock_owned || mmap_lock_nowait_depth != 0 ||
+           lock_assert_held == 0);
+}
+#endif
+
 bool mmap_lock_held(void)
 {
     return mmap_lock_owned;
@@ -51,7 +74,10 @@ bool mmap_lock_held(void)
 void mmap_lock_acquire(void)
 {
     assert(!mmap_lock_held());
-    pthread_mutex_lock(&mmap_lock);
+#ifdef ELFUSE_LOCK_ASSERT
+    assert(mmap_lock_may_block());
+#endif
+    (pthread_mutex_lock)(&mmap_lock);
     mmap_lock_owned = true;
 }
 
@@ -59,14 +85,25 @@ void mmap_lock_release(void)
 {
     assert(mmap_lock_held());
     mmap_lock_owned = false;
-    pthread_mutex_unlock(&mmap_lock);
+    (pthread_mutex_unlock)(&mmap_lock);
 }
 
-/* How long a caller that may hold locks ranked below mmap_lock waits for it. */
+void mmap_lock_nowait_begin(void)
+{
+    mmap_lock_nowait_depth++;
+}
+
+void mmap_lock_nowait_end(void)
+{
+    assert(mmap_lock_nowait_depth != 0);
+    mmap_lock_nowait_depth--;
+}
+
+/* How long a caller inside a nowait scope keeps trying for mmap_lock. */
 #define MMAP_LOCK_TRY_MS 1000
 
-/* Take mmap_lock from a context that may already hold a lock ranked below it,
- * where blocking could close a cycle with a holder that wants that lock. Only
+/* The non-blocking form, for a caller that holds a lock ranked below mmap_lock:
+ * blocking there could close a cycle with a holder that wants that lock. Only
  * trylock is used, so this cannot deadlock; it gives up after MMAP_LOCK_TRY_MS.
  *
  * Returns true with the lock held.
@@ -76,7 +113,8 @@ static bool mmap_lock_try_acquire(void)
     assert(!mmap_lock_held());
     for (int waited_us = 0; waited_us < MMAP_LOCK_TRY_MS * 1000;
          waited_us += 100) {
-        if (pthread_mutex_trylock(&mmap_lock) == 0) {
+        int rc = (pthread_mutex_trylock) (&mmap_lock);
+        if (rc == 0) {
             mmap_lock_owned = true;
             return true;
         }
@@ -2871,16 +2909,22 @@ bool mem_stack_grow_for_host(guest_t *g, uint64_t gva)
     if (gva < g->ipa_base || off >= g->stack_top || off < STACK_MIN_ADDR)
         return false;
 
-    /* Syscall code reads and writes guest memory with locks held that rank
-     * below mmap_lock, so only an SC_LOCKED caller already has it.
+    /* An SC_LOCKED caller already has mmap_lock. Any other caller waits for it,
+     * unless it declared a lock ranked below mmap_lock with
+     * mmap_lock_nowait_begin: that one may only try, and gives up on a holder
+     * that keeps the lock.
      *
      * The answer does not depend on who did the growing: a sibling thread may
      * have grown the stack over @gva between the caller's failed translation
-     * and the lock, or while this thread waited for the lock in vain, and then
+     * and the lock, or while this thread tried for the lock in vain, and then
      * the address translates with nothing left to grow here.
      */
     if (mmap_lock_held()) {
         (void) mem_stack_grow(g, off);
+    } else if (mmap_lock_nowait_depth == 0) {
+        mmap_lock_acquire();
+        (void) mem_stack_grow(g, off);
+        mmap_lock_release();
     } else if (mmap_lock_try_acquire()) {
         (void) mem_stack_grow(g, off);
         mmap_lock_release();

@@ -5,8 +5,13 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Tests: register, unregister, double-register, unregister-without-register,
- *        invalid length, invalid flags, signature mismatch on unregister
+ *        invalid length, invalid flags, signature mismatch on unregister, and a
+ *        signal delivered while registered (signal delivery reads the rseq area
+ *        to abort a critical section, the access make check-locks checks)
  */
+
+#include <signal.h>
+#include <unistd.h>
 
 #include "test-harness.h"
 #include "raw-syscall.h"
@@ -21,6 +26,14 @@ struct rseq {
     unsigned int flags;
     unsigned int padding[3];
 } __attribute__((aligned(32)));
+
+static volatile sig_atomic_t got_usr1;
+
+static void on_usr1(int sig)
+{
+    (void) sig;
+    got_usr1 = 1;
+}
 
 int main(void)
 {
@@ -80,6 +93,14 @@ int main(void)
     {
         long rc = raw_syscall4(__NR_rseq, (long) &rs, sizeof(rs), 0, sig);
         EXPECT_TRUE(rc == 0, "re-register failed");
+    }
+
+    TEST("signal delivered while registered");
+    {
+        signal(SIGUSR1, on_usr1);
+        kill(getpid(), SIGUSR1);
+        EXPECT_TRUE(got_usr1, "handler did not run");
+        signal(SIGUSR1, SIG_DFL);
     }
 
     /* Unregister with wrong signature returns -EINVAL */

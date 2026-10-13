@@ -61,7 +61,21 @@
  *                                     mmap_lock's "1" means first among the
  *                                     locks a syscall path takes, not that
  *                                     nothing precedes it
- *   mmap_lock    (syscall/mem.c):     mmap/brk allocators + page tables
+ *   mmap_lock    (syscall/mem.c):     mmap/brk allocators + page tables. A
+ *                                     host read or write of guest memory ranks
+ *                                     here too: it takes this lock to grow the
+ *                                     stack when the address lies under it
+ *                                     (mem_stack_grow_for_host). So guest
+ *                                     memory is touched before any lock below
+ *                                     is taken, or inside a
+ *                                     mmap_lock_nowait_begin scope (mem.h),
+ *                                     where the growth only tries for the lock.
+ *                                     The caller picks, by what it holds;
+ *                                     nothing decides for it at run time. make
+ *                                     check-locks asserts both halves: no lock
+ *                                     below is held where a thread waits on
+ *                                     mmap_lock, and none is held at a guest
+ *                                     access outside such a scope
  *   pt_lock      (core/guest.c):      page table pool allocator
  *   pty_keepalive_lock (runtime/procemu-pty.c): pty master keepalive table;
  *                                     holds fd_lock beneath it in

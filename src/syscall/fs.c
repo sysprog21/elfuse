@@ -2997,12 +2997,75 @@ int64_t sys_lseek(int fd, int64_t offset, int whence)
 
 /* path operations. */
 
+static int host_fd_live_entry(int host_fd,
+                              const struct stat *fd_st,
+                              char *buf,
+                              const char **leaf);
+
+/* readlinkat with an empty name reads the link dirfd itself is open on, which
+ * only an O_PATH|O_NOFOLLOW descriptor can be. readlinkat has no AT_EMPTY_PATH:
+ * the empty name alone asks for this, and anything that is not a link is
+ * ENOENT.
+ *
+ * Returns the length of the target in link, or a negative Linux errno.
+ */
+static int64_t readlink_empty_path(int dirfd, char *link, size_t linksz)
+{
+    if (dirfd == LINUX_AT_FDCWD)
+        return -LINUX_ENOENT;
+
+    fd_entry_t snap;
+    if (!fd_snapshot(dirfd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type != FD_PATH)
+        return -LINUX_ENOENT;
+
+    /* macOS reads a link only by name, so the link goes through the entry that
+     * names the descriptor's file, found the way linkat_empty_path finds it. A
+     * link with no name left is ENOENT.
+     */
+    host_fd_ref_t ref;
+    int64_t ref_err = host_fd_ref_open(dirfd, &ref);
+    if (ref_err < 0)
+        return ref_err;
+    int64_t rc = -LINUX_ENOENT;
+    struct stat st;
+    char host_path[LINUX_PATH_MAX];
+    const char *leaf;
+    if (fstat(ref.fd, &st) < 0) {
+        rc = linux_errno();
+    } else if (S_ISLNK(st.st_mode)) {
+        int entry_dir = host_fd_live_entry(ref.fd, &st, host_path, &leaf);
+        if (entry_dir >= 0) {
+            ssize_t n = readlinkat(entry_dir, leaf, link, linksz);
+            rc = n < 0 ? linux_errno() : (int64_t) n;
+            close_keep_errno(entry_dir);
+        }
+    }
+    host_fd_ref_close(&ref);
+    return rc;
+}
+
 int64_t sys_readlinkat(guest_t *g,
                        int dirfd,
                        uint64_t path_gva,
                        uint64_t buf_gva,
                        uint64_t bufsiz)
 {
+    char link[LINUX_PATH_MAX];
+    char first;
+    if (guest_read_small(g, path_gva, &first, sizeof(first)) < 0)
+        return -LINUX_EFAULT;
+    if (first == '\0') {
+        int64_t n = readlink_empty_path(dirfd, link, sizeof(link));
+        if (n < 0)
+            return n;
+        size_t copy_len = (size_t) n < bufsiz ? (size_t) n : bufsiz;
+        if (guest_write(g, buf_gva, link, copy_len) < 0)
+            return -LINUX_EFAULT;
+        return (int64_t) copy_len;
+    }
+
     char path[LINUX_PATH_MAX];
     path_translation_t tx;
     int64_t rc =
@@ -3011,7 +3074,6 @@ int64_t sys_readlinkat(guest_t *g,
         return rc;
 
     /* Intercept /proc paths (e.g. /proc/self/exe, /proc/self/fd/N) */
-    char link[LINUX_PATH_MAX];
     int intercepted =
         proc_intercept_readlink(tx.intercept_path, link, sizeof(link));
     if (intercepted >= 0) {

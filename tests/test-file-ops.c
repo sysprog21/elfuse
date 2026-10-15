@@ -173,6 +173,32 @@ int main(void)
                      EBADF, "expected EBADF for invalid dirfd");
     }
 
+    /* An empty name reads the link an O_PATH|O_NOFOLLOW descriptor is open on,
+     * and is ENOENT on anything that is not a link.
+     */
+    TEST("readlinkat empty path on O_PATH symlink fd");
+    {
+        char buf[256];
+        int fd = open(symlink_path, O_PATH | O_NOFOLLOW);
+        ssize_t len =
+            fd < 0 ? -1 : syscall(SYS_readlinkat, fd, "", buf, sizeof(buf));
+        if (fd >= 0)
+            close(fd);
+        EXPECT_TRUE(len == (ssize_t) strlen(testfile) &&
+                        !memcmp(buf, testfile, (size_t) len),
+                    "readlinkat empty path mismatch");
+    }
+
+    TEST("readlinkat empty path on a regular file");
+    {
+        char buf[16];
+        int fd = open(testfile, O_RDONLY);
+        EXPECT_ERRNO(syscall(SYS_readlinkat, fd, "", buf, sizeof(buf)), ENOENT,
+                     "expected ENOENT for a descriptor that is not a link");
+        if (fd >= 0)
+            close(fd);
+    }
+
     /* A descriptor on a synthetic file answers by the file's own mode, as its
      * path does. Which answer that is depends on who runs the test (root may
      * write a 0444 file), so the two are compared rather than fixed.

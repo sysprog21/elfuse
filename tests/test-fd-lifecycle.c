@@ -72,8 +72,8 @@ static void test_memfd_accepts_valid_linux_flags(void)
 }
 
 /* An MFD_HUGETLB memfd is a hugetlbfs file, the one kind of file Linux lets
- * MAP_HUGETLB name. Without a huge page pool the mapping can still fail with
- * ENOMEM, so only EINVAL is wrong.
+ * MAP_HUGETLB name. Without a huge page pool the mapping fails with ENOMEM, so
+ * that answer and success are the two right ones.
  */
 static void test_memfd_hugetlb_maps_hugetlb(void)
 {
@@ -97,8 +97,8 @@ static void test_memfd_hugetlb_maps_hugetlb(void)
 
     if (seals != 0)
         FAIL("F_GET_SEALS reported bits that are not seals");
-    else if (map_errno == EINVAL)
-        FAIL("mmap refused MAP_HUGETLB with EINVAL");
+    else if (map_errno != 0 && map_errno != ENOMEM)
+        FAIL("mmap refused MAP_HUGETLB on a hugetlb memfd");
     else
         PASS();
 }

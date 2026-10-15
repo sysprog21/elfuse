@@ -121,6 +121,13 @@ static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
     guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
                      LINUX_PROT_NONE, LINUX_MAP_PRIVATE, 0, "[shim-data]");
 
+    /* The vDSO page, which Linux lists as [vdso]. Tracking it also keeps a
+     * hinted mmap from being placed over it.
+     */
+    guest_region_add(g, VDSO_BASE, VDSO_BASE + VDSO_SIZE,
+                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
+                     "[vdso]");
+
     if (g->brk_base < g->brk_current) {
         guest_region_add(g, g->brk_base, g->brk_current,
                          LINUX_PROT_READ | LINUX_PROT_WRITE,

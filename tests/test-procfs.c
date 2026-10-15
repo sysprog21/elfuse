@@ -10,7 +10,7 @@
  *   2. /proc/self/environ contains at least one entry
  *   3. /proc/self/cmdline is non-empty
  *   4. /proc/self/maps contains [heap] and [stack], every offset is
- *      page-aligned, and the lines add up to VmSize
+ *      page-aligned, the lines add up to VmSize, and [vdso] is listed
  *   5. /proc/self/status contains correct PID
  *
  * Syscalls: openat(56), read(63), close(57), getpid(172)
@@ -240,6 +240,10 @@ int main(void)
             fails++;
         }
     }
+
+    TEST("procfs: /proc/self/maps lists [vdso]");
+    n = raw_read_file_nul("/proc/self/maps", buf, sizeof(buf));
+    EXPECT_TRUE(n > 0 && strstr(buf, "[vdso]"), "no [vdso] line");
 
     TEST("procfs: /proc/self/status has correct PID");
     {

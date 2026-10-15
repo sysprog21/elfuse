@@ -1206,6 +1206,13 @@ static void exec_publish_maps(guest_t *g, const exec_image_t *img)
     guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
                      LINUX_PROT_NONE, LINUX_MAP_PRIVATE, 0, "[shim-data]");
 
+    /* The vDSO page, which Linux lists as [vdso]. Tracking it also keeps a
+     * hinted mmap from being placed over it.
+     */
+    guest_region_add(g, VDSO_BASE, VDSO_BASE + VDSO_SIZE,
+                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
+                     "[vdso]");
+
     /* Same two lists, same order, same spans as exec_install_address_space.
      * interp->display_path was resolved before guest_reset, so naming the
      * interpreter here needs no filesystem lookup past the point of no return.

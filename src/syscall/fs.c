@@ -3916,14 +3916,15 @@ static int64_t access_empty_path_fd(int dirfd, int mode, int flags)
 
     /* A stamped descriptor stands for a synthetic file, whose mode is the
      * intercept's and not that of the host fd behind it; the path-based branch
-     * of sys_faccessat judges such a file the same way.
+     * of sys_faccessat judges such a file the same way. A synthetic file can
+     * leave its tree while the descriptor stays open, /proc/self/fdinfo/N once
+     * N is closed, and Linux still answers for the open file; the host fd
+     * behind it is all that is left to answer for it here.
      */
     if (snap.proc_path[0] != '\0') {
         struct stat intercepted_st;
         int intercepted =
             proc_intercept_stat_at(snap.proc_path, &intercepted_st, false);
-        if (intercepted == -1)
-            return linux_errno();
         if (intercepted == 0) {
             if (path_check_intercept_access(&intercepted_st, mode, flags) < 0)
                 return linux_errno();

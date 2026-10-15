@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -218,6 +219,22 @@ int main(void)
             close(fd);
         EXPECT_TRUE(by_fd == by_path && fd_errno == path_errno,
                     "descriptor and path answers differ");
+    }
+
+    /* The open file still answers once its name has left /proc. */
+    TEST("faccessat2 AT_EMPTY_PATH on O_PATH fdinfo after its fd closes");
+    {
+        char fdinfo[64];
+        int n = dup(1);
+        snprintf(fdinfo, sizeof(fdinfo), "/proc/self/fdinfo/%d", n);
+        int fd = n < 0 ? -1 : open(fdinfo, O_PATH);
+        if (n >= 0)
+            close(n);
+        long rc =
+            fd < 0 ? -2 : syscall(SYS_faccessat2, fd, "", R_OK, AT_EMPTY_PATH);
+        if (fd >= 0)
+            close(fd);
+        EXPECT_TRUE(rc == 0, "faccessat2 on the open fdinfo failed");
     }
 
     /* Test hardlink */

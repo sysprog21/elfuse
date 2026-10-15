@@ -2260,6 +2260,24 @@ int guest_region_add_ex_gpa(guest_t *g,
                                          0);
 }
 
+int guest_region_add_elf_segment(guest_t *g,
+                                 uint64_t start,
+                                 uint64_t end,
+                                 uint64_t gpa_base,
+                                 int prot,
+                                 uint64_t offset,
+                                 const char *name)
+{
+    uint64_t lead = start & (GUEST_PAGE_SIZE - 1);
+    start -= lead;
+    end = PAGE_ALIGN_UP(end);
+    if (guest_region_remove(g, start, end) < 0)
+        return -1;
+    return guest_region_add_ex_gpa(
+        g, start, end, gpa_base - lead, prot, LINUX_MAP_PRIVATE,
+        offset >= lead ? offset - lead : 0, name, -1);
+}
+
 static uint64_t allocate_vma_id(guest_t *g)
 {
     uint64_t candidate = g->next_vma_id;

@@ -851,6 +851,16 @@ static inline bool guest_range_hits_infra(const guest_t *g,
     return start < infra_hi && end > infra_lo;
 }
 
+/* Whether a tracked region is address space a Linux process would have. The
+ * shim and its data sit in the infra reserve, which Linux has no mapping for,
+ * so they do not count toward VmSize.
+ */
+static inline bool guest_region_in_process_vm(const guest_t *g,
+                                              const guest_region_t *r)
+{
+    return !guest_range_hits_infra(g, r->start, r->end);
+}
+
 /* True iff a single address (PC, hint, etc.) falls inside the infra reserve.
  * Used by rt_sigreturn to reject forged frames that would redirect EL0 PC into
  * EL1 shim or page-table memory. Covers the full reserve, matching
@@ -1295,6 +1305,20 @@ int guest_region_add_ex_gpa(guest_t *g,
                             uint64_t offset,
                             const char *name,
                             int backing_fd);
+
+/* Track one PT_LOAD segment, [@start, @end) as p_vaddr and p_vaddr + p_memsz,
+ * the way Linux maps it (elf_map, fs/binfmt_elf.c): from the page holding
+ * @start to the page past @end, with @gpa_base and @offset moved back by the
+ * same amount. A page two segments share goes to the later one, as the later
+ * MAP_FIXED takes it in Linux.
+ */
+int guest_region_add_elf_segment(guest_t *g,
+                                 uint64_t start,
+                                 uint64_t end,
+                                 uint64_t gpa_base,
+                                 int prot,
+                                 uint64_t offset,
+                                 const char *name);
 
 /* Like guest_region_add_ex, but consumes owned_backing_fd on success or
  * failure. inherited_at_fork identifies bytes copied from the latest fork

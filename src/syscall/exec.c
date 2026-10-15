@@ -1215,11 +1215,11 @@ static void exec_publish_maps(guest_t *g, const exec_image_t *img)
     const char *names[] = {path, interp->display_path};
     for (size_t l = 0; l < ARRAY_SIZE(lists); l++) {
         for (int i = 0; i < lists[l]->num_segments; i++) {
-            guest_region_add(g, exec_seg_start(lists[l], i, bases[l]),
-                             exec_seg_end(lists[l], i, bases[l]),
-                             elf_pf_to_prot(lists[l]->segments[i].flags),
-                             LINUX_MAP_PRIVATE, lists[l]->segments[i].offset,
-                             names[l]);
+            uint64_t seg_start = exec_seg_start(lists[l], i, bases[l]);
+            guest_region_add_elf_segment(
+                g, seg_start, exec_seg_end(lists[l], i, bases[l]), seg_start,
+                elf_pf_to_prot(lists[l]->segments[i].flags),
+                lists[l]->segments[i].offset, names[l]);
         }
     }
 

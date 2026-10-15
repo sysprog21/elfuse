@@ -94,10 +94,9 @@ static void register_elf_segment_regions(guest_t *g,
         uint64_t seg_start = info->segments[i].gpa + va_load_base;
         uint64_t seg_end = seg_start + info->segments[i].memsz;
         uint64_t seg_gpa = info->segments[i].gpa + gpa_load_base;
-        guest_region_add_ex_gpa(g, seg_start, seg_end, seg_gpa,
-                                elf_pf_to_prot(info->segments[i].flags),
-                                LINUX_MAP_PRIVATE, info->segments[i].offset,
-                                path, -1);
+        guest_region_add_elf_segment(g, seg_start, seg_end, seg_gpa,
+                                     elf_pf_to_prot(info->segments[i].flags),
+                                     info->segments[i].offset, path);
     }
 }
 

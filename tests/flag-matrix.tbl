@@ -317,10 +317,9 @@ mprotect | PROT_GROWSDOWN | region 4096 F|PROT_READ | err:EINVAL | region:readon
 # On the stack the bit extends the change down to the mapping's low end.
 mprotect | PROT_GROWSDOWN@stack | stackpage 65536 F|PROT_READ | stack:lowreadonly | stack:lowwritable
 mprotect | 0x10000000@unknown | region 4096 F|PROT_READ | err:EINVAL | region:readonly
-# arm64 admits PROT_BTI and PROT_MTE only on a CPU with the feature. The qemu
-# guest is shown BTI where the host has it, and elfuse's guest is shown neither
-# (ID_AA64PFR1_EL1 reads 0), so elfuse answers as a kernel on a CPU without BTI.
-unsupported:err:EINVAL mprotect | 0x10@prot-bti | region 4096 F|PROT_READ | region:readonly | =
+# arm64 admits PROT_MTE only on a CPU with MTE, and neither qemu CPU the lane
+# picks nor elfuse's guest has it. PROT_BTI has no row: Linux's answer follows
+# whether the qemu CPU has BTI, which differs between the HVF and TCG lanes.
 mprotect | 0x20@prot-mte | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 mprotect | PROT_GROWSUP | region 4096 F|PROT_READ | err:EINVAL | region:readonly
 

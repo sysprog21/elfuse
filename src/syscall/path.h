@@ -277,7 +277,7 @@ int path_translate_dirent_name(bool dir_holds_escapes,
 
 /* Rebase a relative path against a host directory fd into the guest-visible
  * absolute spelling (F_GETPATH and sysroot strip, with the components folded up
- * to a usbfs node).
+ * to a name under /dev/bus other than /dev/bus/usb).
  *
  * Returns 1 with out filled, 0 when no mapping exists. See path.c for the
  * chase() rationale.

@@ -4036,9 +4036,19 @@ static bool vcpu_handle_el0_fault(guest_t *g,
 
     /* Real SIGSEGV. Permission faults (xFSC[5:2] == 0x3) map to SEGV_ACCERR;
      * address size, translation, and access-flag faults map to SEGV_MAPERR for
-     * Linux.
+     * Linux. A translation fault on a page the live PT now maps is also
+     * SEGV_ACCERR: another vCPU mapped it while this one waited for mmap_lock,
+     * without the access this one needs, and Linux reports a mapped page that
+     * denies the access as ACCERR.
      */
-    int si_code = (fsc_type == 0x03) ? LINUX_SEGV_ACCERR : LINUX_SEGV_MAPERR;
+    bool mapped_now = false;
+    if (fsc_type == 0x01) {
+        mmap_lock_acquire();
+        mapped_now = guest_ptr_avail(g, far_addr, NULL, 0) != NULL;
+        mmap_lock_release();
+    }
+    int si_code = (fsc_type == 0x03 || mapped_now) ? LINUX_SEGV_ACCERR
+                                                   : LINUX_SEGV_MAPERR;
     signal_set_fault_info(si_code, far_addr, esr);
     int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGSEGV, exit_code);
 

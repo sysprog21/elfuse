@@ -1242,35 +1242,38 @@ static bool usb_dev_names_node(const char *folded)
     return kind == USB_PATH_DEV_NODE || kind == USB_PATH_DEV_NODE_SUB;
 }
 
-/* Whether @folded names a directory the layer serves. Caller holds usb_lock
- * after ensure_usb_tree().
+/* Whether @folded names a directory the layer serves, with its kind in *@kind.
+ * Caller holds usb_lock after ensure_usb_tree().
  */
-static bool usb_dev_names_dir(const char *folded)
+static bool usb_dev_names_dir(const char *folded, usb_path_kind_t *kind)
 {
     int bus = 0;
-    usb_path_kind_t kind = usb_dev_kind(folded, &bus);
-    return kind == USB_PATH_DEV_USB ||
-           (kind == USB_PATH_DEV_BUSNUM && bus_exists(bus));
+    *kind = usb_dev_kind(folded, &bus);
+    return *kind == USB_PATH_DEV_USB ||
+           (*kind == USB_PATH_DEV_BUSNUM && bus_exists(bus));
 }
 
 /* Fold '.' and '..' in a /sys- or, with @dev, a /dev/bus-relative suffix,
  * lexically; a name that folds above its root is not this layer's. On /sys the
- * fold decides only that, and usb_sys_resolve_suffix builds the served path.
- * With @dev a '..' after a usbfs node stops the fold and the rest is kept as
- * written, since Linux applies '..' only to a directory. A trailing slash
- * survives, so an attribute used as a directory reports ENOTDIR.
+ * fold decides only that, and usb_sys_resolve_suffix builds the served path. A
+ * trailing slash survives, so an attribute used as a directory reports ENOTDIR.
  *
- * Returns 1 with @out filled, 0 when the walk climbs above the root, -1 when
- * the result does not fit. With @rest, under usb_lock after ensure_usb_tree(),
- * a '..' pops only a directory usb_dev_names_dir accepts, and *@rest is left on
- * what follows a climbing '..', or NULL when a '..' meets any other name.
- * Without @rest no lock is held, and any other name is popped unchecked.
+ * Returns 1 with @out filled, 0 when the fold stops at a '..' it leaves out of
+ * @out, -1 when the result does not fit. Without @rest no lock is held and a
+ * '..' pops the name before it unchecked, except that with @dev one after a
+ * usbfs node is kept with the rest as written, since Linux applies '..' only to
+ * a directory; only a climb above the root returns 0. With @rest and @kind,
+ * under usb_lock after ensure_usb_tree(), a '..' pops only a directory
+ * usb_dev_names_dir accepts, and any other stops the fold with *@rest on it,
+ * the name before it in @out, and that name's kind in *@kind: USB_PATH_DEV_BUS
+ * for a climb above the root.
  */
 static int usb_suffix_normalize(const char *suffix,
                                 bool dev,
                                 char *out,
                                 size_t outsz,
-                                const char **rest)
+                                const char **rest,
+                                usb_path_kind_t *kind)
 {
     size_t len = 0;
     size_t marks[64];
@@ -1288,15 +1291,18 @@ static int usb_suffix_normalize(const char *suffix,
             continue;
         if (seglen == 2 && seg[0] == '.' && seg[1] == '.') {
             if (depth == 0) {
-                if (rest)
-                    *rest = p;
+                if (rest) {
+                    *rest = seg;
+                    *kind = USB_PATH_DEV_BUS;
+                }
                 return 0; /* above the root */
             }
-            if (rest && !usb_dev_names_dir(out)) {
-                *rest = NULL;
-                return 0;
-            }
-            if (dev && usb_dev_names_node(out)) {
+            if (rest) {
+                if (!usb_dev_names_dir(out, kind)) {
+                    *rest = seg;
+                    return 0;
+                }
+            } else if (dev && usb_dev_names_node(out)) {
                 size_t rlen = strlen(seg); /* this '..' and all after it */
                 if (len + 1 + rlen + 1 > outsz)
                     return -1;
@@ -1530,7 +1536,7 @@ static usb_path_kind_t classify_and_normalize(const char *path,
     if (path_prefix_match(path, "/dev/bus", 8)) {
         char folded[LINUX_PATH_MAX];
         int frc = usb_suffix_normalize(skip_slashes(path + 8), true, folded,
-                                       sizeof(folded), NULL);
+                                       sizeof(folded), NULL, NULL);
         if (frc < 0) {
             *err_out = ENAMETOOLONG;
             return USB_PATH_NONE;
@@ -1551,7 +1557,7 @@ static usb_path_kind_t classify_and_normalize(const char *path,
         return USB_PATH_NONE; /* another bus's /dev/bus subtree; not ours */
     if (kind != USB_PATH_SYS)
         return kind;
-    int rc = usb_suffix_normalize(*sfx_out, false, norm, normsz, NULL);
+    int rc = usb_suffix_normalize(*sfx_out, false, norm, normsz, NULL, NULL);
     if (rc < 0) {
         *err_out = ENAMETOOLONG;
         return USB_PATH_NONE;
@@ -2295,12 +2301,14 @@ out:
     return rc;
 }
 
-bool usb_sysfs_names_node(const char *guest_path)
+bool usb_sysfs_stops_fold(const char *guest_path)
 {
+    if (!path_prefix_match(guest_path, "/dev/bus", 8))
+        return false;
     int bus = 0, dev = 0;
     const char *sfx = "";
-    return path_prefix_match(guest_path, "/dev/bus/usb", 12) &&
-           classify_path(guest_path, &bus, &dev, &sfx) == USB_PATH_DEV_NODE;
+    usb_path_kind_t kind = classify_path(guest_path, &bus, &dev, &sfx);
+    return kind != USB_PATH_DEV_BUS && kind != USB_PATH_DEV_USB;
 }
 
 bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz)
@@ -2313,23 +2321,49 @@ bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz)
                                   &cerr) == USB_PATH_DEV_NODE;
 }
 
-bool usb_sysfs_resolve_dev_climb(const char *guest_path,
-                                 char *out,
-                                 size_t outsz)
+dev_climb_t usb_sysfs_resolve_dev_climb(const char *guest_path,
+                                        char *out,
+                                        size_t outsz,
+                                        const char **dotdot)
 {
     if (!path_prefix_match(guest_path, "/dev/bus", 8) ||
         !strstr(guest_path, ".."))
-        return false;
+        return DEV_CLIMB_NONE;
     char folded[LINUX_PATH_MAX];
     const char *rest = NULL;
+    usb_path_kind_t kind = USB_PATH_NONE;
+    int frc = -1;
     pthread_mutex_lock(&usb_lock);
-    bool climbs = ensure_usb_tree() == 0 &&
-                  usb_suffix_normalize(skip_slashes(guest_path + 8), true,
-                                       folded, sizeof(folded), &rest) == 0 &&
-                  rest;
+    if (ensure_usb_tree() == 0)
+        frc = usb_suffix_normalize(skip_slashes(guest_path + 8), true, folded,
+                                   sizeof(folded), &rest, &kind);
     pthread_mutex_unlock(&usb_lock);
-    if (!climbs)
-        return false;
+    if (frc != 0)
+        return DEV_CLIMB_NONE;
+
+    switch (kind) {
+    case USB_PATH_DEV_FOREIGN: {
+        /* A name outside /dev/bus/usb is the backing's. */
+        int n = snprintf(out, outsz, "/dev/bus/%s", folded);
+        if (n < 0 || (size_t) n >= outsz)
+            return DEV_CLIMB_NONE;
+        *dotdot = rest;
+        return DEV_CLIMB_BACKING_DOTDOT;
+    }
+    case USB_PATH_DEV_BUSNUM:
+    case USB_PATH_DEV_ABSENT:
+        errno = ENOENT;
+        return DEV_CLIMB_ERROR;
+    case USB_PATH_NONE:
+    case USB_PATH_DEV_USB:
+    case USB_PATH_DEV_NODE:
+    case USB_PATH_DEV_NODE_SUB:
+    case USB_PATH_SYS:
+        return DEV_CLIMB_NONE;
+    case USB_PATH_DEV_BUS:
+        rest = skip_slashes(rest + 2);
+        break;
+    }
 
     /* A further '..' climbs /dev, and one past it stays at the root as on
      * Linux; left in the name, it reaches the backing as /dev/.., where no
@@ -2347,7 +2381,7 @@ bool usb_sysfs_resolve_dev_climb(const char *guest_path,
      * sysroot where Linux gives ENOTEMPTY and EBUSY for a final '..'.
      */
     int n = snprintf(out, outsz, "%s/%s", dir, *rest ? rest : ".");
-    return n > 0 && (size_t) n < outsz;
+    return n > 0 && (size_t) n < outsz ? DEV_CLIMB_REWRITTEN : DEV_CLIMB_NONE;
 }
 
 bool usb_sysfs_dir_unions_backing(const char *guest_path)

@@ -30,6 +30,7 @@
  *
  *   docker run --rm -v "$PWD:/w" -w /w gcc:14 sh -c \
  *     'mkdir -p /dev/bus/usb/001 /dev/bus/other && : > /dev/bus/other/f && \
+ *      ln -s /etc /dev/bus/lnk && ln -s loop /dev/bus/loop && \
  *      mknod /dev/bus/usb/001/001 c 189 0 && \
  *      gcc -D MATRIX_STANDALONE -o /tmp/m tests/test-usb-sysfs-matrix.c && \
  *      MATRIX_RECORD=1 /tmp/m'
@@ -100,14 +101,23 @@ enum {
     COL_CLIMB,       /* a '..' out of /dev/bus over its own directories */
     COL_CLIMB_FILE,  /* a '..' out of /dev/bus after the backing's file */
     COL_NODE_DOTDOT, /* the usb node followed by '..' */
+    COL_SHADOW_DOTDOT,  /* a '..' out of /dev/bus/usb after the backing's bus */
+    COL_FOLD_IN_DOTDOT, /* COL_FOLD_IN with a '..' after a bus as well */
+    COL_FOLD_IN_FILE,   /* a '..' after the backing's file, then a bus */
+    COL_FOLD_IN_ABSENT, /* a '..' after a foreign bus, then a missing bus */
+    COL_FOLD_IN_LINK,   /* a '..' after the backing's link to /etc */
+    COL_FOLD_IN_LOOP,   /* a '..' after a link to itself */
     COL_COUNT,
 };
 
 static const char *col_name[COL_COUNT] = {
-    "synth-dir",   "back-sys",  "back-dev",    "subsys",       "escape",
-    "escape-syn",  "usb-node",  "absent",      "long-sys",     "sys-root",
-    "dev-bus",     "shadow",    "subsys-out",  "dev-fold-out", "dev-fold-in",
-    "sys-fold-in", "dev-climb", "dev-climb-f", "node-dotdot",
+    "synth-dir",      "back-sys",     "back-dev",       "subsys",
+    "escape",         "escape-syn",   "usb-node",       "absent",
+    "long-sys",       "sys-root",     "dev-bus",        "shadow",
+    "subsys-out",     "dev-fold-out", "dev-fold-in",    "sys-fold-in",
+    "dev-climb",      "dev-climb-f",  "node-dotdot",    "shadow-dotdot",
+    "fold-in-dotdot", "fold-in-file", "fold-in-absent", "fold-in-link",
+    "fold-in-loop",
 };
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
@@ -181,6 +191,18 @@ static const char *col_path(int c)
         return "/dev/bus/other/f/../../../null";
     case COL_NODE_DOTDOT:
         return "/dev/bus/usb/001/001/..";
+    case COL_SHADOW_DOTDOT:
+        return "/dev/bus/usb/099/../../other/f";
+    case COL_FOLD_IN_DOTDOT:
+        return "/dev/bus/other/../usb/001/../001/001";
+    case COL_FOLD_IN_FILE:
+        return "/dev/bus/other/f/../../usb/099/../001/001";
+    case COL_FOLD_IN_ABSENT:
+        return "/dev/bus/other/../usb/099/../001/001";
+    case COL_FOLD_IN_LINK:
+        return "/dev/bus/lnk/../usb/001/001";
+    case COL_FOLD_IN_LOOP:
+        return "/dev/bus/loop/../usb/001/001";
     default:
         return "/dev/bus";
     }
@@ -232,6 +254,23 @@ static const char *col_path(int c)
 
 /* COL_NODE_DOTDOT puts a '..' after COL_NODE's character device, which Linux
  * answers ENOTDIR for and a lexical fold would turn into the bus directory.
+ */
+
+/* COL_SHADOW_DOTDOT walks through COL_SHADOW's bus directory and out to
+ * COL_BACK_DEV's file. Linux fails the walk at 099, a bus no device has; the
+ * directory the sysroot fixture plants there must not let it through.
+ */
+
+/* COL_FOLD_IN_DOTDOT is COL_FOLD_IN's node with a '..' after bus 001 as well.
+ * Linux applies both, so the '..' the backing applies must hand bus 001 back to
+ * the layer.
+ */
+
+/* The '..' after a name outside /dev/bus/usb is the backing's. COL_FOLD_IN_FILE
+ * puts COL_BACK_DEV's file before a bus no device has, and Linux fails the walk
+ * at the file. COL_FOLD_IN_ABSENT pops the foreign bus and fails at bus 099.
+ * COL_FOLD_IN_LINK and COL_FOLD_IN_LOOP follow sysroot links, to /etc and to
+ * themselves, which a lexical pop would miss.
  */
 
 /* Names that must be listed by the union directories, one comma-free name per

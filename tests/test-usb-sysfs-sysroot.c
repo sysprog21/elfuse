@@ -6,15 +6,16 @@
  *
  * Code under test: the /sys ours/not-ours split in src/runtime/usb-sysfs.c, the
  * /sys + /dev/bus arms of sys_fchdir (src/syscall/fs.c) and
- * resolve_proc_cwd_path (src/syscall/path.c), and the /dev/bus climb rewrite in
- * usb_sysfs_resolve_dev_climb and path_translate_at.
+ * resolve_proc_cwd_path (src/syscall/path.c), the /dev/bus climb rewrite in
+ * usb_sysfs_resolve_dev_climb and path_translate_at, and the backing '..' in
+ * path_backing_dotdot.
  *
  * Run under --sysroot over a tree that carries a real /sys skeleton
  * (/sys/class/net/eth0/address, /sys/kernel/mm/transparent_hugepage/enabled,
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Three regressions are pinned here.
+ * Four regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -34,6 +35,12 @@
  * F3: a '..' out of /dev/bus that ends the name must not let rmdir or rename
  * act on the sysroot's /dev, which the lane leaves empty, and one that lands in
  * /sys must reach the sysroot's files there.
+ *
+ * F4: a '..' after a sysroot /dev/bus directory fails with EACCES unless the
+ * guest's IDs and groups may search it or the guest is root. F3 needs /dev
+ * empty, so the lane adds directories at modes 000, 010 and 100 and runs the
+ * guest with the argument search as uid 4242, then with search root under
+ * --fakeroot.
  */
 
 #include <dirent.h>
@@ -83,9 +90,104 @@ static bool dir_has_entry(const char *dir, const char *name)
     return found;
 }
 
-int main(void)
+/* may_lookup in fs/namei.c asks for search permission on the directory before
+ * each component, a '..' included, and generic_permission lets root search any
+ * directory.
+ */
+static void expect_search(int rc,
+                          const struct stat *st,
+                          const struct stat *want,
+                          bool allowed,
+                          const char *msg)
+{
+    if (!allowed)
+        EXPECT_ERRNO(rc, EACCES, msg);
+    else
+        EXPECT_TRUE(
+            rc == 0 && st->st_dev == want->st_dev && st->st_ino == want->st_ino,
+            msg);
+}
+
+static void check_dotdot_search(bool root)
+{
+    struct stat node, bus, st;
+
+    TEST("the guest is root only in the root run");
+    EXPECT_TRUE((geteuid() == 0) == root, "geteuid()");
+
+    TEST("/dev/bus/usb/001/001 is a char device");
+    EXPECT_TRUE(stat("/dev/bus/usb/001/001", &node) == 0 &&
+                    S_ISCHR(node.st_mode) && stat("/dev/bus", &bus) == 0,
+                "stat(\"/dev/bus/usb/001/001\")");
+
+    TEST("/dev/bus/other/../usb/001/001 is EACCES, the node for root");
+    expect_search(stat("/dev/bus/other/../usb/001/001", &st), &st, &node, root,
+                  "stat(\"/dev/bus/other/../usb/001/001\")");
+
+    TEST("/dev/bus/other/.. is EACCES, /dev/bus for root");
+    expect_search(stat("/dev/bus/other/..", &st), &st, &bus, root,
+                  "stat(\"/dev/bus/other/..\")");
+
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    TEST("\"other/../usb/001/001\" against a /dev/bus dirfd likewise");
+    if (dfd < 0) {
+        FAIL("open /dev/bus");
+    } else {
+        expect_search(fstatat(dfd, "other/../usb/001/001", &st, 0), &st, &node,
+                      root, "fstatat(/dev/bus, \"other/../usb/001/001\")");
+        close(dfd);
+    }
+
+    TEST("\"other/../usb/001/001\" in a /dev/bus cwd likewise");
+    if (chdir("/dev/bus") != 0)
+        FAIL("chdir /dev/bus");
+    else
+        expect_search(stat("other/../usb/001/001", &st), &st, &node, root,
+                      "stat(\"other/../usb/001/001\")");
+
+    /* grp's group is the host user's, which getgroups reports to a guest that
+     * is not root, and its owner, the host user, has no x bit there.
+     */
+    TEST("/dev/bus/grp/../usb/001/001 is the node at mode 010");
+    expect_search(stat("/dev/bus/grp/../usb/001/001", &st), &st, &node, true,
+                  "stat(\"/dev/bus/grp/../usb/001/001\")");
+    if (!root)
+        return;
+
+    /* Linux judges a lookup by the fsuid, which follows the euid. */
+    TEST("/dev/bus/own/../usb/001/001 is EACCES with euid 4242");
+    if (seteuid(4242) != 0) {
+        FAIL("seteuid(4242)");
+    } else {
+        expect_search(stat("/dev/bus/own/../usb/001/001", &st), &st, &node,
+                      false, "stat(\"/dev/bus/own/../usb/001/001\")");
+        if (seteuid(0) != 0)
+            FAIL("seteuid(0)");
+    }
+
+    /* The search is judged by the owner stat reports after a chown. */
+    TEST("/dev/bus/own/../usb/001/001 is the node once own is 4242's");
+    if (chown("/dev/bus/own", 4242, 4242) != 0 || seteuid(4242) != 0) {
+        FAIL("chown or seteuid");
+    } else {
+        expect_search(stat("/dev/bus/own/../usb/001/001", &st), &st, &node,
+                      true, "stat(\"/dev/bus/own/../usb/001/001\")");
+        if (seteuid(0) != 0)
+            FAIL("seteuid(0)");
+    }
+}
+
+int main(int argc, char **argv)
 {
     char buf[256];
+
+    if (argc > 1 && !strcmp(argv[1], "search")) {
+        bool root = argc > 2 && !strcmp(argv[2], "root");
+        check_dotdot_search(root);
+        SUMMARY(root ? "test-usb-sysfs-sysroot search root"
+                     : "test-usb-sysfs-sysroot search");
+        return fails ? 1 : 0;
+    }
 
     printf(
         "test-usb-sysfs-sysroot: /sys fall-through and fchdir containment\n");

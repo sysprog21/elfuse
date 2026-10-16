@@ -1722,6 +1722,24 @@ static int64_t fcntl_flock_wait(guest_t *g,
     }
 }
 
+/* memfd_add_seals: F_SEAL_EXEC on a file that is still executable also freezes
+ * its contents and size.
+ *
+ * Returns 0 or a negative Linux errno.
+ */
+static int64_t seal_exec_implied(int host_fd, int *seals)
+{
+    if (!(*seals & LINUX_F_SEAL_EXEC))
+        return 0;
+    struct stat st;
+    if (fstat(host_fd, &st) < 0)
+        return linux_errno();
+    if (st.st_mode & 0111)
+        *seals |= LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW | LINUX_F_SEAL_WRITE |
+                  LINUX_F_SEAL_FUTURE_WRITE;
+    return 0;
+}
+
 int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -2103,6 +2121,11 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
                           LINUX_F_SEAL_FUTURE_WRITE | LINUX_F_SEAL_EXEC)) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
+        }
+        int64_t exec_err = seal_exec_implied(host_ref.fd, &new_seals);
+        if (exec_err < 0) {
+            host_fd_ref_close(&host_ref);
+            return exec_err;
         }
         fd_set_seals_for_aliases(fd, host_ref.fd, cur | new_seals);
         host_fd_ref_close(&host_ref);

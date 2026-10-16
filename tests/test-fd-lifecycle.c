@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -47,6 +48,10 @@
 
 #ifndef F_SEAL_WRITE
 #define F_SEAL_WRITE 0x0008
+#endif
+
+#ifndef F_SEAL_EXEC
+#define F_SEAL_EXEC 0x0020
 #endif
 
 int passes = 0, fails = 0;
@@ -99,6 +104,55 @@ static void test_memfd_hugetlb_maps_hugetlb(void)
         FAIL("F_GET_SEALS reported bits that are not seals");
     else if (map_errno != 0 && map_errno != ENOMEM)
         FAIL("mmap refused MAP_HUGETLB on a hugetlb memfd");
+    else
+        PASS();
+}
+
+/* F_SEAL_EXEC on a memfd that still has an execute bit also adds
+ * SHRINK|GROW|WRITE|FUTURE_WRITE (mm/memfd.c, memfd_add_seals).
+ */
+static void test_memfd_seal_exec_freezes_exec_file(void)
+{
+    TEST("F_SEAL_EXEC freezes an executable memfd");
+
+    int fd = create_memfd();
+    if (fd < 0) {
+        FAIL("memfd_create failed");
+        return;
+    }
+
+    char c = 'x';
+    int rc = fcntl(fd, F_ADD_SEALS, F_SEAL_EXEC);
+    int seals = fcntl(fd, F_GET_SEALS);
+    errno = 0;
+    ssize_t w = write(fd, &c, 1);
+    int w_errno = errno;
+    close(fd);
+
+    if (rc < 0 || seals != 0x3e)
+        FAIL("seals are not EXEC|FUTURE_WRITE|WRITE|GROW|SHRINK");
+    else if (w != -1 || w_errno != EPERM)
+        FAIL("write to the frozen memfd did not fail with EPERM");
+    else
+        PASS();
+}
+
+static void test_memfd_seal_exec_alone_without_exec_bits(void)
+{
+    TEST("F_SEAL_EXEC adds nothing else on a 0666 memfd");
+
+    int fd = create_memfd();
+    if (fd < 0) {
+        FAIL("memfd_create failed");
+        return;
+    }
+
+    int rc = fchmod(fd, 0666) < 0 ? -1 : fcntl(fd, F_ADD_SEALS, F_SEAL_EXEC);
+    int seals = fcntl(fd, F_GET_SEALS);
+    close(fd);
+
+    if (rc < 0 || seals != F_SEAL_EXEC)
+        FAIL("seals are not F_SEAL_EXEC alone");
     else
         PASS();
 }
@@ -345,6 +399,8 @@ int main(void)
     test_memfd_seals_cleared_on_reuse();
     test_memfd_accepts_valid_linux_flags();
     test_memfd_hugetlb_maps_hugetlb();
+    test_memfd_seal_exec_freezes_exec_file();
+    test_memfd_seal_exec_alone_without_exec_bits();
     test_rlimit_nofile_reports_emfile();
     test_dup3_above_rlimit_fails();
     test_nofile_hides_host_reserve();

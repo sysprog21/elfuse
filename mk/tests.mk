@@ -1794,6 +1794,9 @@ test-path-fold: $(ELFUSE_BIN) $(TEST_DIR)/test-path-fold
 test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 
+# test-usb-sysfs-sysroot runs the guest a second time with a /dev/bus directory
+# at mode 000 for the search check, except as root, which may search it, and
+# its trap gives the mode back so the scratch tree can be removed.
 ## The /sys ours/not-ours split and the fchdir/cwd containment need a populated
 ## /sys behind the synthetic USB view, so this lane stages a sysroot skeleton
 ## (a net address, a THP knob, a node list) and runs the guest against it with
@@ -1802,7 +1805,7 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
 	sysroot="$$tmpdir/sysroot"; \
-	trap 'rm -rf "$$tmpdir"' EXIT; \
+	trap 'chmod -R u+rwX "$$tmpdir" 2>/dev/null; rm -rf "$$tmpdir"' EXIT; \
 	mkdir -p "$$sysroot/sys/class/net/eth0" \
 		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
 		"$$sysroot/sys/devices/system/node" "$$sysroot/dev"; \
@@ -1811,14 +1814,23 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
 	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
-		$(TEST_DIR)/test-usb-sysfs-sysroot
+		$(TEST_DIR)/test-usb-sysfs-sysroot; \
+	mkdir -p "$$sysroot/dev/bus/other"; \
+	chmod 000 "$$sysroot/dev/bus/other"; \
+	if [ "$$(id -u)" != 0 ]; then \
+		ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+			$(TEST_DIR)/test-usb-sysfs-sysroot search; \
+	else \
+		echo "test-usb-sysfs-sysroot search: SKIP (root may search mode 000)"; \
+	fi
 
 ## Every entry point that can name something under /sys or /dev/bus, against
 ## every class of name those trees can hold. The layer synthesizes one subtree
 ## on each side and the rest belongs to the sysroot, so the sysroot has to carry
-## the other side of each column: a /sys skeleton, a foreign /dev/bus, an /etc
-## file for the '..' chain that leaves the tree, and one name planted inside
-## /dev/bus/usb, which the layer owns and the backing must not reach into.
+## the other side of each column: a /sys skeleton, a foreign /dev/bus with a
+## file, a link to /etc and a link to itself, an /etc file for the '..' chain
+## that leaves the tree, and one name planted inside /dev/bus/usb, which the
+## layer owns and the backing must not reach into.
 ## Nothing is planted under the sysroot's /sys/bus: a Linux rootfs image carries
 ## an empty /sys, and its not having a `bus` is the shape the escape-syn column
 ## records. Expected values are the
@@ -1839,6 +1851,8 @@ test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
 	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
 	: > "$$sysroot/sys/fs/cgroup/g"; \
 	: > "$$sysroot/dev/bus/other/f"; \
+	ln -s /etc "$$sysroot/dev/bus/lnk"; \
+	ln -s loop "$$sysroot/dev/bus/loop"; \
 	: > "$$sysroot/dev/bus/usb/099/001"; \
 	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \

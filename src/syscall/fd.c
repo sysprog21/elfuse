@@ -82,25 +82,12 @@ static int sfd_alloc_slot(const void *state, size_t count, size_t stride)
  * timerfd return an 8-byte counter of expirations.
  */
 
-/* Linux itimerspec for timerfd_settime/gettime */
-typedef struct {
-    int64_t it_interval_sec, it_interval_nsec, it_value_sec, it_value_nsec;
-} linux_itimerspec_t;
-
 /* Per-timerfd state (stored alongside the FD_TIMERFD entry) */
 #define TIMERFD_MAX 32
 #define LINUX_TFD_NONBLOCK LINUX_O_NONBLOCK
 #define LINUX_TFD_CLOEXEC LINUX_O_CLOEXEC
 #define LINUX_TFD_TIMER_ABSTIME 1
 #define LINUX_TFD_TIMER_CANCEL_ON_SET 2
-#define LINUX_CLOCK_REALTIME 0
-#define LINUX_CLOCK_MONOTONIC 1
-
-/* Linux CLOCK_BOOTTIME counts time including suspend; macOS has no equivalent.
- * timerfd_settime treats non-REALTIME slots as MONOTONIC for ABSTIME
- * conversion, which matches translate_clockid() in time.c.
- */
-#define LINUX_CLOCK_BOOTTIME 7
 
 static struct {
     int guest_fd;         /* Guest fd (-1 if unused) */
@@ -1318,10 +1305,15 @@ retry:
         memset(&info, 0, sizeof(info));
         info.ssi_signo = (uint32_t) pending[i].signum;
         info.ssi_code = pending[i].si_code;
-        info.ssi_pid = (uint32_t) pending[i].si_pid;
-        info.ssi_uid = pending[i].si_uid;
         info.ssi_int = pending[i].si_int;
         info.ssi_ptr = pending[i].si_ptr;
+        if (info.ssi_code == LINUX_SI_TIMER) {
+            info.ssi_tid = (uint32_t) pending[i].si_pid;
+            info.ssi_overrun = pending[i].si_uid;
+        } else {
+            info.ssi_pid = (uint32_t) pending[i].si_pid;
+            info.ssi_uid = pending[i].si_uid;
+        }
 
         uint64_t off = i * sizeof(linux_signalfd_siginfo_t);
         if (guest_write_small(g, buf_gva + off, &info, sizeof(info)) < 0) {

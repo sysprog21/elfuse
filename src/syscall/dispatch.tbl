@@ -124,6 +124,11 @@ SYS_rt_tgsigqueueinfo sc_rt_tgsigqueueinfo 1
 SYS_nanosleep sc_nanosleep 1
 SYS_getitimer sc_getitimer 1
 SYS_setitimer sc_setitimer 1
+SYS_timer_create sc_timer_create 0
+SYS_timer_gettime sc_timer_gettime 0
+SYS_timer_getoverrun sc_timer_getoverrun 0
+SYS_timer_settime sc_timer_settime 1
+SYS_timer_delete sc_timer_delete 0
 SYS_clock_gettime sc_clock_gettime 0
 SYS_clock_getres sc_clock_getres 0
 SYS_clock_nanosleep sc_clock_nanosleep 1

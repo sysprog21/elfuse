@@ -71,6 +71,7 @@
 #include "syscall/fd.h"   /* signalfd_notify */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
 #include "proved/sigframe.h"
+#include "proved/timespec.h"
 #include "syscall/signal.h"
 #include "syscall/time.h" /* linux_timespec_valid, linux_timespec_to_ns_sat */
 #include "syscall/wakeup-pipe.h"
@@ -248,6 +249,59 @@ static guest_itimer_t guest_itimer;      /* ITIMER_REAL -> SIGALRM */
 static guest_itimer_t guest_itimer_virt; /* ITIMER_VIRTUAL -> SIGVTALRM */
 static guest_itimer_t guest_itimer_prof; /* ITIMER_PROF -> SIGPROF */
 
+/* Bounded per-process storage; Linux does not inherit POSIX timers at fork. */
+#define POSIX_TIMER_MAX 64
+typedef enum {
+    POSIX_TIMER_NONE,
+    POSIX_TIMER_WAITING,
+    POSIX_TIMER_QUEUED,
+} posix_timer_notification_t;
+
+typedef struct {
+    int32_t id, guest_clockid;
+    int signum;
+    int overruns, last_overrun;
+    clockid_t host_clock;
+    uint64_t value;
+    int64_t expiry_ns, interval_ns;
+    bool used;
+    posix_timer_notification_t notification;
+} guest_posix_timer_t;
+
+/* sig_lock protects slots, IDs and queue positions. Release stores to the
+ * polling hint pair with acquire loads in posix_timer_check and
+ * signal_attention_needed; slot access still requires sig_lock.
+ */
+static guest_posix_timer_t posix_timers[POSIX_TIMER_MAX];
+/* Keep IDs unique so a deleted timer's queued signal cannot name a new timer.
+ */
+static int posix_next_id;
+static int posix_timer_next_slot[LINUX_NSIG];
+static _Atomic bool posix_timers_need_poll;
+
+static guest_posix_timer_t *posix_timer_find_locked(int id)
+{
+    for (int i = 0; i < POSIX_TIMER_MAX; i++) {
+        if (posix_timers[i].used && posix_timers[i].id == id)
+            return &posix_timers[i];
+    }
+    return NULL;
+}
+
+static void posix_timer_dequeued_locked(signal_rt_info_t *info)
+{
+    if (info->si_code != LINUX_SI_TIMER)
+        return;
+    guest_posix_timer_t *timer = posix_timer_find_locked(info->si_pid);
+    if (!timer)
+        return;
+    /* Linux's timer ID and overrun share the siginfo pid/uid union slots. */
+    info->si_uid = (uint32_t) timer->overruns;
+    timer->last_overrun = timer->overruns;
+    timer->overruns = 0;
+    timer->notification = POSIX_TIMER_NONE;
+}
+
 /* Default disposition table. Index 0 unused (signals are 1-based). */
 static const sig_disposition_t default_dispositions[LINUX_NSIG + 1] = {
     [0] = SIG_DISP_IGN, /* Invalid signal 0 */
@@ -373,8 +427,10 @@ static bool signal_rt_dequeue_locked(signal_pending_t *p,
         return false;
     }
 
+    signal_rt_info_t info = p->rt_info[idx][p->rt_head[idx]];
+    posix_timer_dequeued_locked(&info);
     if (out)
-        *out = p->rt_info[idx][p->rt_head[idx]];
+        *out = info;
     p->rt_head[idx] = (uint8_t) ((p->rt_head[idx] + 1) % RT_SIGQUEUE_MAX);
     p->rt_queue[idx]--;
     if (p->rt_queue[idx] == 0) {
@@ -425,6 +481,46 @@ static void shared_claim_release_locked(int signum)
 {
     shared_claimed &= ~sig_bit(signum);
     shared_claim_owner[signum - 1] = NULL;
+}
+
+/* A negative ID removes all POSIX timer signals at exec. Keep other entries
+ * in order, including user signals with the same signal number.
+ */
+static void posix_timer_discard_pending_locked(signal_pending_t *p, int id)
+{
+    for (uint64_t bits = pending_load(&p->pending); bits; bits &= bits - 1) {
+        int signum = bit_ctz64(bits) + 1;
+        if (signum < LINUX_SIGRTMIN) {
+            int idx = signum - 1;
+            const signal_rt_info_t *info = &p->std_info[idx];
+            if (!p->std_info_valid[idx] || info->si_code != LINUX_SI_TIMER ||
+                (id >= 0 && info->si_pid != id))
+                continue;
+            p->std_info_valid[idx] = false;
+            pending_clear(&p->pending, sig_bit(signum));
+        } else {
+            int idx = signum - LINUX_SIGRTMIN;
+            int kept = 0;
+            for (int n = 0; n < p->rt_queue[idx]; n++) {
+                int slot = (p->rt_head[idx] + n) % RT_SIGQUEUE_MAX;
+                signal_rt_info_t info = p->rt_info[idx][slot];
+                if (info.si_code == LINUX_SI_TIMER &&
+                    (id < 0 || info.si_pid == id))
+                    continue;
+                int dest = (p->rt_head[idx] + kept++) % RT_SIGQUEUE_MAX;
+                p->rt_info[idx][dest] = info;
+            }
+            if (kept == p->rt_queue[idx])
+                continue;
+            p->rt_queue[idx] = kept;
+            if (!kept) {
+                p->rt_head[idx] = 0;
+                pending_clear(&p->pending, sig_bit(signum));
+            }
+        }
+        if (p == &sig_state.shared)
+            shared_claim_release_locked(signum);
+    }
 }
 
 /* The shared set as the current thread may take it. */
@@ -575,9 +671,16 @@ void signal_reset_for_exec(void)
     thread_entry_t *t = current_thread;
 
     pthread_mutex_lock(&sig_lock);
+    posix_timer_discard_pending_locked(&sig_state.shared, -1);
+    if (t)
+        posix_timer_discard_pending_locked(&t->tpending, -1);
+    refresh_pending_hint_locked();
+    memset(posix_timers, 0, sizeof(posix_timers));
+    memset(posix_timer_next_slot, 0, sizeof(posix_timer_next_slot));
+    atomic_store_explicit(&posix_timers_need_poll, false, memory_order_release);
     for (int i = 0; i < LINUX_NSIG; i++) {
         /* POSIX: handlers reset to SIG_DFL, except SIG_IGN stays SIG_IGN.
-         * Pending signals and signal mask are preserved across exec.
+         * Non-timer pending signals and the signal mask survive exec.
          */
         if (sig_state.actions[i].sa_handler != LINUX_SIG_IGN) {
             sig_state.actions[i].sa_handler = LINUX_SIG_DFL;
@@ -806,13 +909,13 @@ bool signal_attention_needed(void)
     if (hint != 0 && thread_signal_deliverable(hint))
         return true;
 
-    /* Active guest itimers: even if no signal is queued YET, the timer can fire
-     * at any moment, and signal_check_timer needs an HVC #5 epilogue to notice
-     * it. Keep attention raised while any timer is armed.
+    /* signal_check_timer needs an HVC #5 epilogue to see expired timers or
+     * retry POSIX notifications waiting for queue space.
      */
     if (atomic_load_explicit(&guest_itimer.active, memory_order_acquire) ||
         atomic_load_explicit(&guest_itimer_virt.active, memory_order_acquire) ||
-        atomic_load_explicit(&guest_itimer_prof.active, memory_order_acquire))
+        atomic_load_explicit(&guest_itimer_prof.active, memory_order_acquire) ||
+        atomic_load_explicit(&posix_timers_need_poll, memory_order_acquire))
         return true;
     return false;
 }
@@ -1153,6 +1256,7 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
                 current.si_int != want->si_int ||
                 current.si_ptr != want->si_ptr)
                 break;
+            posix_timer_dequeued_locked(&current);
             sp->std_info_valid[signum - 1] = false;
             pending_clear(&sp->pending, bit);
         }
@@ -1389,6 +1493,276 @@ void signal_get_itimer(struct timeval *value, struct timeval *interval)
     pthread_mutex_unlock(&sig_lock);
 }
 
+static int64_t posix_timer_now(clockid_t clockid)
+{
+    struct timespec now;
+    clock_gettime(clockid, &now);
+    return timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
+}
+
+static void posix_timer_refresh_poll_hint_locked(void)
+{
+    bool needs_poll = false;
+    for (int i = 0; i < POSIX_TIMER_MAX; i++) {
+        const guest_posix_timer_t *timer = &posix_timers[i];
+        needs_poll |=
+            timer->used && timer->signum &&
+            (timer->expiry_ns || timer->notification == POSIX_TIMER_WAITING);
+    }
+    atomic_store_explicit(&posix_timers_need_poll, needs_poll,
+                          memory_order_release);
+}
+
+/* Count expired periods, then disarm or advance past now. */
+static uint64_t posix_timer_advance_locked(guest_posix_timer_t *timer)
+{
+    if (!timer->used || !timer->expiry_ns)
+        return 0;
+    int64_t now = posix_timer_now(timer->host_clock);
+    if (now < timer->expiry_ns)
+        return 0;
+    if (!timer->interval_ns) {
+        timer->expiry_ns = 0;
+        return 1;
+    }
+
+    int64_t elapsed = now - timer->expiry_ns;
+    uint64_t count = 1 + (uint64_t) (elapsed / timer->interval_ns);
+    int64_t step = timer->interval_ns - elapsed % timer->interval_ns;
+    if (__builtin_add_overflow(now, step, &timer->expiry_ns))
+        timer->expiry_ns = INT64_MAX;
+    return count;
+}
+
+static void posix_timer_value_locked(guest_posix_timer_t *timer,
+                                     linux_itimerspec_t *value)
+{
+    /* Silent timers have no delivery work, so advance them only on query. */
+    if (!timer->signum)
+        posix_timer_advance_locked(timer);
+    int64_t now = posix_timer_now(timer->host_clock);
+    int64_t remaining = timer->expiry_ns > now ? timer->expiry_ns - now : 0;
+    *value = (linux_itimerspec_t) {
+        .it_interval_sec = timer->interval_ns / NSEC_PER_SEC,
+        .it_interval_nsec = timer->interval_ns % NSEC_PER_SEC,
+        .it_value_sec = remaining / NSEC_PER_SEC,
+        .it_value_nsec = remaining % NSEC_PER_SEC,
+    };
+}
+
+/* signalfd peeks before consuming, so its queued copy needs current overruns.
+ */
+static void posix_timer_update_pending_locked(const guest_posix_timer_t *timer)
+{
+    signal_pending_t *shared = &sig_state.shared;
+    if (timer->signum < LINUX_SIGRTMIN) {
+        signal_rt_info_t *info = &shared->std_info[timer->signum - 1];
+        if (info->si_code == LINUX_SI_TIMER && info->si_pid == timer->id)
+            info->si_uid = (uint32_t) timer->overruns;
+        return;
+    }
+
+    int idx = timer->signum - LINUX_SIGRTMIN;
+    for (int n = 0; n < shared->rt_queue[idx]; n++) {
+        int slot = (shared->rt_head[idx] + n) % RT_SIGQUEUE_MAX;
+        signal_rt_info_t *info = &shared->rt_info[idx][slot];
+        if (info->si_code == LINUX_SI_TIMER && info->si_pid == timer->id)
+            info->si_uid = (uint32_t) timer->overruns;
+    }
+}
+
+static bool posix_timer_enqueue_waiting_locked(int signum)
+{
+    bool queued = false;
+    int start = posix_timer_next_slot[signum - 1];
+    /* Resume after the last queued timer so fast periodic timers cannot
+     * keep taking queue space from another timer on the same signal.
+     */
+    for (int offset = 0; offset < POSIX_TIMER_MAX; offset++) {
+        int i = (start + offset) % POSIX_TIMER_MAX;
+        guest_posix_timer_t *timer = &posix_timers[i];
+        if (!timer->used || timer->signum != signum ||
+            timer->notification != POSIX_TIMER_WAITING)
+            continue;
+        /* Each timer retains its notification until the shared queue has room,
+         * including when another timer holds the same standard signal.
+         */
+        if (signum < LINUX_SIGRTMIN &&
+            (pending_load(&sig_state.shared.pending) & sig_bit(signum)))
+            break;
+        if (signum >= LINUX_SIGRTMIN &&
+            sig_state.shared.rt_queue[signum - LINUX_SIGRTMIN] >=
+                RT_SIGQUEUE_MAX)
+            break;
+        signal_rt_info_t info = {
+            .signum = timer->signum,
+            .si_code = LINUX_SI_TIMER,
+            .si_pid = timer->id,
+            .si_uid = (uint32_t) timer->overruns,
+            .si_int = (int32_t) timer->value,
+            .si_ptr = timer->value,
+        };
+        signal_enqueue_locked(&sig_state.shared, timer->signum, &info);
+        timer->notification = POSIX_TIMER_QUEUED;
+        posix_timer_next_slot[signum - 1] = (i + 1) % POSIX_TIMER_MAX;
+        queued = true;
+    }
+    return queued;
+}
+
+static void posix_timer_check(void)
+{
+    if (!atomic_load_explicit(&posix_timers_need_poll, memory_order_acquire))
+        return;
+    uint64_t waiting = 0, notify = 0;
+    pthread_mutex_lock(&sig_lock);
+    for (int i = 0; i < POSIX_TIMER_MAX; i++) {
+        guest_posix_timer_t *timer = &posix_timers[i];
+        if (!timer->used || !timer->signum)
+            continue;
+        uint64_t count = posix_timer_advance_locked(timer);
+        if (count) {
+            uint64_t missed = count;
+            if (timer->notification == POSIX_TIMER_NONE) {
+                timer->notification = POSIX_TIMER_WAITING;
+                missed--;
+            }
+            timer->overruns = missed > (uint64_t) (INT32_MAX - timer->overruns)
+                                  ? INT32_MAX
+                                  : timer->overruns + (int) missed;
+        }
+        if (timer->notification == POSIX_TIMER_QUEUED)
+            posix_timer_update_pending_locked(timer);
+        else if (timer->notification == POSIX_TIMER_WAITING)
+            waiting |= sig_bit(timer->signum);
+    }
+    for (uint64_t pending = waiting; pending; pending &= pending - 1) {
+        int signum = bit_ctz64(pending) + 1;
+        if (posix_timer_enqueue_waiting_locked(signum))
+            notify |= sig_bit(signum);
+    }
+    posix_timer_refresh_poll_hint_locked();
+    refresh_pending_hint_locked();
+    pthread_mutex_unlock(&sig_lock);
+    for (uint64_t pending = notify; pending; pending &= pending - 1)
+        signalfd_notify(bit_ctz64(pending) + 1);
+    if (notify)
+        attention_raise();
+}
+
+int signal_posix_timer_create(int clockid,
+                              int notify,
+                              int signum,
+                              uint64_t value,
+                              bool default_event)
+{
+    if (clockid != LINUX_CLOCK_REALTIME && clockid != LINUX_CLOCK_MONOTONIC &&
+        clockid != LINUX_CLOCK_BOOTTIME)
+        return -LINUX_EINVAL;
+    if (notify == LINUX_SIGEV_THREAD_ID)
+        return -LINUX_ENOSYS;
+    if (notify != LINUX_SIGEV_SIGNAL && notify != LINUX_SIGEV_NONE)
+        return -LINUX_EINVAL;
+    if (notify == LINUX_SIGEV_SIGNAL && !RANGE_CHECK(signum, 1, LINUX_NSIG))
+        return -LINUX_EINVAL;
+    int ret = -LINUX_EAGAIN;
+    pthread_mutex_lock(&sig_lock);
+    for (int i = 0; i < POSIX_TIMER_MAX && posix_next_id < INT32_MAX; i++) {
+        if (posix_timers[i].used)
+            continue;
+        ret = posix_next_id++;
+        posix_timers[i] = (guest_posix_timer_t) {
+            .id = ret,
+            .guest_clockid = clockid,
+            .host_clock = CLOCK_MONOTONIC,
+            .signum = notify == LINUX_SIGEV_SIGNAL ? signum : 0,
+            .value = default_event ? (uint64_t) ret : value,
+            .used = true,
+        };
+        break;
+    }
+    pthread_mutex_unlock(&sig_lock);
+    return ret;
+}
+
+int signal_posix_timer_get(int id, linux_itimerspec_t *value)
+{
+    posix_timer_check();
+    pthread_mutex_lock(&sig_lock);
+    guest_posix_timer_t *timer = posix_timer_find_locked(id);
+    if (timer)
+        posix_timer_value_locked(timer, value);
+    pthread_mutex_unlock(&sig_lock);
+    return timer ? 0 : -LINUX_EINVAL;
+}
+
+int signal_posix_timer_set(int id,
+                           int flags,
+                           const linux_itimerspec_t *value,
+                           linux_itimerspec_t *old)
+{
+    posix_timer_check();
+    pthread_mutex_lock(&sig_lock);
+    guest_posix_timer_t *timer = posix_timer_find_locked(id);
+    if (!timer) {
+        pthread_mutex_unlock(&sig_lock);
+        return -LINUX_EINVAL;
+    }
+    posix_timer_value_locked(timer, old);
+    /* Queue removal and rearming share sig_lock, so an old notification
+     * cannot consume the new arm's overrun state.
+     */
+    posix_timer_discard_pending_locked(&sig_state.shared, id);
+    timer->notification = POSIX_TIMER_NONE;
+    timer->overruns = 0;
+    timer->last_overrun = 0;
+    bool absolute = (flags & LINUX_TIMER_ABSTIME) != 0;
+    /* Relative realtime timers must ignore wall-clock adjustments. */
+    timer->host_clock = absolute && timer->guest_clockid == LINUX_CLOCK_REALTIME
+                            ? CLOCK_REALTIME
+                            : CLOCK_MONOTONIC;
+    int64_t value_ns =
+        timespec_to_ns_sat(value->it_value_sec, value->it_value_nsec);
+    timer->expiry_ns = value_ns;
+    if (value_ns && !absolute &&
+        __builtin_add_overflow(posix_timer_now(timer->host_clock), value_ns,
+                               &timer->expiry_ns))
+        timer->expiry_ns = INT64_MAX;
+    timer->interval_ns = value_ns ? timespec_to_ns_sat(value->it_interval_sec,
+                                                       value->it_interval_nsec)
+                                  : 0;
+    bool notify = value_ns && timer->signum;
+    posix_timer_refresh_poll_hint_locked();
+    refresh_pending_hint_locked();
+    pthread_mutex_unlock(&sig_lock);
+    if (notify)
+        attention_raise();
+    return 0;
+}
+
+int signal_posix_timer_delete(int id)
+{
+    pthread_mutex_lock(&sig_lock);
+    guest_posix_timer_t *timer = posix_timer_find_locked(id);
+    if (timer) {
+        posix_timer_discard_pending_locked(&sig_state.shared, id);
+        memset(timer, 0, sizeof(*timer));
+    }
+    posix_timer_refresh_poll_hint_locked();
+    refresh_pending_hint_locked();
+    pthread_mutex_unlock(&sig_lock);
+    return timer ? 0 : -LINUX_EINVAL;
+}
+
+int signal_posix_timer_overrun(int id)
+{
+    pthread_mutex_lock(&sig_lock);
+    guest_posix_timer_t *timer = posix_timer_find_locked(id);
+    int ret = timer ? timer->last_overrun : -LINUX_EINVAL;
+    pthread_mutex_unlock(&sig_lock);
+    return ret;
+}
+
 /* Check a single timer; if expired, re-arm or deactivate, return signal to
  * queue. Must be called with sig_lock held.
  *
@@ -1427,6 +1801,7 @@ static bool check_one_timer(guest_itimer_t *timer, const struct timeval *now)
  */
 static void signal_check_timers(bool cpu_timers)
 {
+    posix_timer_check();
     if (!atomic_load_explicit(&guest_itimer.active, memory_order_acquire) &&
         (!cpu_timers || (!atomic_load_explicit(&guest_itimer_virt.active,
                                                memory_order_acquire) &&
@@ -1742,6 +2117,7 @@ static int signal_claim_waking_locked(uint64_t blocked)
 
 bool signal_claim_interruption(void)
 {
+    posix_timer_check();
     /* Same lock-free fast path as signal_pending(). */
     uint64_t hint =
         atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
@@ -1924,6 +2300,7 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
         signal_rt_dequeue_locked(src, signum, info_out);
     } else {
         *info_out = signal_standard_peek_locked(src, signum);
+        posix_timer_dequeued_locked(info_out);
         src->std_info_valid[signum - 1] = false;
         pending_clear(&src->pending, sig_bit(signum));
     }
@@ -1976,6 +2353,7 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
 
     while (1) {
         signal_rt_info_t info;
+        posix_timer_check();
         int signum = sigtimedwait_try_dequeue(mask, &info);
         if (signum > 0) {
             /* Populate guest siginfo_t if the caller wants it. */
@@ -2793,6 +3171,7 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
         signal_rt_dequeue_locked(src, signum, &rt_info);
     } else {
         rt_info = signal_standard_peek_locked(src, signum);
+        posix_timer_dequeued_locked(&rt_info);
         src->std_info_valid[signum - 1] = false;
         pending_clear(&src->pending, sig_bit(signum));
     }

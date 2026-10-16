@@ -97,6 +97,70 @@ static struct timespec ns_to_host_timespec(int64_t ns)
     };
 }
 
+/* Linux aarch64 sigevent. Thread notification fields are unsupported. */
+typedef struct {
+    uint64_t value;
+    int32_t signum, notify;
+    int32_t reserved[12];
+} linux_sigevent_t;
+
+_Static_assert(sizeof(linux_sigevent_t) == 64,
+               "Linux sigevent must be 64 bytes");
+
+int64_t sys_timer_create(guest_t *g,
+                         int clockid,
+                         uint64_t event_gva,
+                         uint64_t id_gva)
+{
+    linux_sigevent_t event = {
+        .signum = LINUX_SIGALRM,
+        .notify = LINUX_SIGEV_SIGNAL,
+    };
+    if (event_gva && guest_read(g, event_gva, &event, sizeof(event)) < 0)
+        return -LINUX_EFAULT;
+    int32_t id = signal_posix_timer_create(clockid, event.notify, event.signum,
+                                           event.value, event_gva == 0);
+    if (id < 0)
+        return id;
+    if (guest_write_small(g, id_gva, &id, sizeof(id)) < 0) {
+        signal_posix_timer_delete(id);
+        return -LINUX_EFAULT;
+    }
+    return 0;
+}
+
+int64_t sys_timer_gettime(guest_t *g, int id, uint64_t value_gva)
+{
+    linux_itimerspec_t value;
+    int ret = signal_posix_timer_get(id, &value);
+    if (ret < 0)
+        return ret;
+    if (guest_write(g, value_gva, &value, sizeof(value)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
+int64_t sys_timer_settime(guest_t *g,
+                          int id,
+                          int flags,
+                          uint64_t value_gva,
+                          uint64_t old_gva)
+{
+    linux_itimerspec_t value, old;
+    if (guest_read(g, value_gva, &value, sizeof(value)) < 0)
+        return -LINUX_EFAULT;
+    if ((flags & ~LINUX_TIMER_ABSTIME) ||
+        !timespec_valid(value.it_value_sec, value.it_value_nsec) ||
+        !timespec_valid(value.it_interval_sec, value.it_interval_nsec))
+        return -LINUX_EINVAL;
+    int ret = signal_posix_timer_set(id, flags, &value, &old);
+    if (ret < 0)
+        return ret;
+    if (old_gva && guest_write(g, old_gva, &old, sizeof(old)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
 static int write_remaining_sleep(guest_t *g,
                                  uint64_t rem_gva,
                                  int64_t remaining_ns)

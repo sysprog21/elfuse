@@ -29,6 +29,7 @@
 
 #define CLONE_PIDFD 0x00001000
 #define CLONE_VM 0x00000100
+#define CLONE_PARENT_SETTID 0x00100000
 #define __NR_nanosleep 101
 #define SIGCHLD 17
 
@@ -45,6 +46,26 @@ struct linux_pollfd {
     int fd;
     short events, revents;
 };
+
+static void test_clone_failure(uint64_t output, long error)
+{
+    struct clone_args ca = {
+        .flags = CLONE_PIDFD,
+        .pidfd = output,
+        .exit_signal = SIGCHLD,
+    };
+    long child = raw_syscall2(__NR_clone3, (long) &ca, sizeof(ca));
+    if (child == 0) {
+        raw_syscall1(__NR_exit, 42);
+        __builtin_unreachable();
+    }
+    if (child > 0)
+        raw_syscall4(__NR_wait4, child, 0, 0, 0);
+    EXPECT_EQ(child, error, "wrong clone3 error");
+    TEST("failed clone leaves no child");
+    EXPECT_RAW_ERRNO(raw_syscall4(__NR_wait4, -1, 0, 1, 0), -ECHILD,
+                     "failed clone left a child");
+}
 
 int main(void)
 {
@@ -95,7 +116,31 @@ int main(void)
         EXPECT_TRUE(r == -38 /* LINUX_ENOSYS */, "expected -ENOSYS");
     }
 
-    /* clone3 with CLONE_PIDFD */
+    TEST("clone3 rejects null pidfd output");
+    test_clone_failure(0, -EFAULT);
+    TEST("clone3 rejects unmapped pidfd output");
+    test_clone_failure(UINT64_MAX - 4095, -EFAULT);
+
+    /* Fill elfuse's bounded pidfd table before clone creates its child. */
+    {
+        long fds[32];
+        int count = 0;
+        while (count < 32) {
+            long fd = raw_syscall2(__NR_pidfd_open, pid, 0);
+            if (fd < 0)
+                break;
+            fds[count++] = fd;
+        }
+        TEST("failed clones release pidfds");
+        EXPECT_EQ(count, 32, "failed clone leaked a pidfd");
+        int32_t output = -1;
+        TEST("clone3 cancels on pidfd allocation failure");
+        test_clone_failure((uint64_t) &output, -EMFILE);
+        for (int i = 0; i < count; i++)
+            raw_syscall1(__NR_close, fds[i]);
+    }
+
+    /* clone3 with separate CLONE_PIDFD and CLONE_PARENT_SETTID outputs. */
     TEST("clone3 CLONE_PIDFD");
     {
         /* Allocate stack for child */
@@ -107,9 +152,11 @@ int main(void)
         }
 
         int32_t child_pidfd = -1;
+        int32_t parent_tid = -1;
         struct clone_args ca = {0};
-        ca.flags = CLONE_PIDFD;
+        ca.flags = CLONE_PIDFD | CLONE_PARENT_SETTID;
         ca.pidfd = (uint64_t) &child_pidfd;
+        ca.parent_tid = (uint64_t) &parent_tid;
         ca.exit_signal = SIGCHLD;
         ca.stack = (uint64_t) stack;
         ca.stack_size = 65536;
@@ -126,6 +173,8 @@ int main(void)
         }
 
         EXPECT_TRUE(child_pidfd >= 0, "pidfd not written");
+        TEST("clone3 writes a separate parent TID");
+        EXPECT_EQ(parent_tid, child, "parent TID not written");
 
         /* Poll the pidfd for child exit (with 1s timeout) */
         TEST("poll pidfd for exit");

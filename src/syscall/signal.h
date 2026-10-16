@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include "core/guest.h"
+#include "syscall/linux-wire.h"
 #include "linux-limits.h"
 
 /* Linux signal numbers (1-based, matching kernel). */
@@ -117,6 +118,7 @@ typedef struct {
 
 /* si_code values */
 #define LINUX_SI_USER 0
+#define LINUX_SI_TIMER (-2)
 
 /* si_code values for SIGTRAP */
 #define LINUX_TRAP_BRKPT 1 /* Process breakpoint (BRK instruction) */
@@ -709,3 +711,20 @@ void signal_check_timer(void);
  * host call spends none.
  */
 void signal_check_timer_real(void);
+
+/* Process-wide POSIX timers with REALTIME/MONOTONIC clocks and
+ * SIGEV_SIGNAL/SIGEV_NONE notification. BOOTTIME uses monotonic time, as in
+ * translate_clockid. These helpers acquire sig_lock.
+ */
+int signal_posix_timer_create(int clockid,
+                              int notify,
+                              int signum,
+                              uint64_t value,
+                              bool default_event);
+int signal_posix_timer_get(int id, linux_itimerspec_t *value);
+int signal_posix_timer_set(int id,
+                           int flags,
+                           const linux_itimerspec_t *value,
+                           linux_itimerspec_t *old);
+int signal_posix_timer_delete(int id);
+int signal_posix_timer_overrun(int id);

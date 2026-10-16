@@ -97,6 +97,11 @@
 #define SYS_getitimer 102
 #define SYS_setitimer 103
 #define SYS_nanosleep 101
+#define SYS_timer_create 107
+#define SYS_timer_gettime 108
+#define SYS_timer_getoverrun 109
+#define SYS_timer_settime 110
+#define SYS_timer_delete 111
 #define SYS_clock_gettime 113
 #define SYS_clock_getres 114
 #define SYS_clock_nanosleep 115

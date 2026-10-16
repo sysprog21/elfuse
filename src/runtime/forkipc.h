@@ -39,6 +39,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                   uint64_t stack_map_start,
                   uint64_t stack_map_end,
                   uint64_t ptid_gva,
+                  uint64_t pidfd_gva,
                   uint64_t tls,
                   uint64_t ctid_gva,
                   bool verbose);

@@ -113,6 +113,8 @@ test-stress                    # diff=skip
 test-mprotect-mt               # diff=skip
 
 [section] Signal + thread tests
+test-posix-timers
+test-posix-timers elfuse
 test-signal-thread
 test-signal-in-shim           # diff=skip
 test-shim-sigreturn-x8

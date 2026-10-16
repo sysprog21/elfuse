@@ -165,6 +165,7 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
         close(pfd[1]);
         return -LINUX_EMFILE;
     }
+    fd_publish_linux_flags(gfd, LINUX_O_CLOEXEC);
 
     pthread_mutex_lock(&pidfd_lock);
     pidfd_entry_t *entry = pidfd_find_free_entry();

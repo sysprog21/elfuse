@@ -44,3 +44,13 @@ int64_t sys_setitimer(guest_t *g,
                       uint64_t new_gva,
                       uint64_t old_gva);
 int64_t sys_getitimer(guest_t *g, int which, uint64_t val_gva);
+int64_t sys_timer_create(guest_t *g,
+                         int clockid,
+                         uint64_t event_gva,
+                         uint64_t id_gva);
+int64_t sys_timer_gettime(guest_t *g, int id, uint64_t value_gva);
+int64_t sys_timer_settime(guest_t *g,
+                          int id,
+                          int flags,
+                          uint64_t value_gva,
+                          uint64_t old_gva);

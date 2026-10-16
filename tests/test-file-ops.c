@@ -200,6 +200,41 @@ int main(void)
             close(fd);
     }
 
+    /* Acting on a descriptor needs search permission on its parent, not read
+     * permission.
+     */
+    TEST("linkat and readlinkat on a descriptor in a 0311 directory");
+    {
+        char dir[256], file[256], link[256], linked[256], buf[256];
+        snprintf(dir, sizeof(dir), "%s/noread", tmpdir);
+        snprintf(file, sizeof(file), "%s/f", dir);
+        snprintf(link, sizeof(link), "%s/l", dir);
+        snprintf(linked, sizeof(linked), "%s/linked", tmpdir);
+        int ffd = -1, lfd = -1;
+        if (mkdir(dir, 0755) == 0 && create_test_file(file, "x") == 0 &&
+            symlink("f", link) == 0) {
+            ffd = open(file, O_RDONLY);
+            lfd = open(link, O_PATH | O_NOFOLLOW);
+        }
+        bool ready = ffd >= 0 && lfd >= 0 && chmod(dir, 0311) == 0;
+        long lrc = ready ? syscall(SYS_linkat, ffd, "", AT_FDCWD, linked,
+                                   AT_EMPTY_PATH)
+                         : -2;
+        long n =
+            ready ? syscall(SYS_readlinkat, lfd, "", buf, sizeof(buf)) : -2;
+        chmod(dir, 0755);
+        EXPECT_TRUE(lrc == 0 && n == 1 && buf[0] == 'f',
+                    "descriptor call failed without read permission");
+        if (ffd >= 0)
+            close(ffd);
+        if (lfd >= 0)
+            close(lfd);
+        unlink(linked);
+        unlink(link);
+        unlink(file);
+        rmdir(dir);
+    }
+
     /* A descriptor on a synthetic file answers by the file's own mode, as its
      * path does. Which answer that is depends on who runs the test (root may
      * write a 0444 file), so the two are compared rather than fixed.

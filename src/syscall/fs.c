@@ -3659,10 +3659,11 @@ static int64_t linkat_symlink_fallback(host_fd_t old_dirfd,
  * would let a directory on the way be exchanged for a symlink, which the host
  * follows out of the tree the guest is held in, or for another directory, which
  * makes the call act on a file the descriptor does not name. So the directory
- * is opened with O_NOFOLLOW_ANY and held, the entry is compared with the
- * descriptor's file, and the caller acts on that one entry without following
- * it. What a rename can still do after the comparison is put another entry of
- * the same directory under the name.
+ * is opened with O_NOFOLLOW_ANY and held, for search only because Linux needs
+ * no read permission on it here, the entry is compared with the descriptor's
+ * file, and the caller acts on that one entry without following it. What a
+ * rename can still do after the comparison is put another entry of the same
+ * directory under the name.
  */
 static int host_fd_live_entry(int host_fd,
                               const struct stat *fd_st,
@@ -3679,10 +3680,10 @@ static int host_fd_live_entry(int host_fd,
     /* The entry's directory is everything before the last slash, or "/". */
     int dir_fd;
     if (slash == buf) {
-        dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        dir_fd = open("/", O_SEARCH | O_CLOEXEC);
     } else {
         *slash = '\0';
-        dir_fd = open(buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY);
+        dir_fd = open(buf, O_SEARCH | O_CLOEXEC | O_NOFOLLOW_ANY);
     }
     if (dir_fd < 0)
         return -1;

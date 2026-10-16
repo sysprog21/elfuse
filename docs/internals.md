@@ -711,8 +711,9 @@ the backing file and sends the snapshot fd over `SCM_RIGHTS`:
 - Parent stays on `MAP_SHARED` and does NOT remap -- HVF caches the host
   VA->PA mapping from `hv_vm_map`, and a `MAP_FIXED` remap does not
   update Stage-2, so a remapping parent would observe stale pages.
-- Child maps the snapshot fd `MAP_PRIVATE`, producing an instant CoW
-  clone with zero data copy.
+- Child maps the snapshot fd `MAP_SHARED` and keeps it as its own backing
+  file, so its writes land in the clone and it can clone that in turn for
+  its own forks. No data is copied.
 - The IPC header sets `has_shm = 1` and `num_regions = 0`, skipping memory
   serialization entirely.
 - Child calls `guest_init_from_shm()` instead of `guest_init()`, and must
@@ -726,10 +727,27 @@ the backing file and sends the snapshot fd over `SCM_RIGHTS`:
 This path is roughly 50x faster than the legacy IPC copy path on large
 guest memories.
 
-The CoW path is disabled when hosting Rosetta because HVF caches the host
-VA->PA mapping from `hv_vm_map`, and Rosetta's translated code touches
-the parent's slab in ways the snapshot model cannot intercept. Rosetta
-forks fall back to the legacy IPC copy path.
+If `fclonefileat` fails, a native guest sends its live backing fd instead.
+The child maps the parent's file `MAP_PRIVATE`, so any page it has not
+written still reads the parent's current bytes, and the parent sets
+`g->shm_exported`.
+
+The host diagnostic switch `ELFUSE_DISABLE_FORK_CLONEFILE=1` bypasses the
+clone attempt so `test-slab-exit-fork` can exercise the live-fd fallback on
+APFS. Other values leave the clone attempt enabled.
+
+On normal teardown, `guest_destroy` truncates the backing file before its
+last close: the file is unlinked, but that close would still write every
+dirty page back to disk. It skips the truncate when `shm_exported` is set, because
+truncating a file another process maps privately stalls the host while the
+kernel exhausts memory.
+
+If a worker vCPU remains live past the join cap, `guest_destroy` returns
+before the truncate and leaves resource cleanup to process exit.
+
+Rosetta also attempts the APFS clone, but falls back to region copy when
+cloning fails or is disabled. The live-fd fallback could expose partially
+updated translator state from the parent's slab to the child.
 
 macOS rejects `MAP_PRIVATE` on `shm_open` fds (`EINVAL`), so the backing
 file is created via `mkstemp` + `unlink`.

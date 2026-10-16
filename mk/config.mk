@@ -63,6 +63,7 @@ NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-casefold-walk-host.c \
                 tests/test-absock-names-host.c \
                 tests/probe-volume-naming.c \
+                tests/probe-disk-writes.c \
                 tests/test-dynamic-array-host.c \
                 tests/test-string-builder-host.c \
                 tests/test-wakeup-pipe-host.c \

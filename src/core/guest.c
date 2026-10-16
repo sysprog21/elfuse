@@ -871,8 +871,19 @@ void guest_destroy(guest_t *g)
     }
     g->nregions = 0;
     g->npreannounced = 0;
-    /* Close the shm fd if guest memory owns one (parent with shm backing) */
+
+    /* The backing file is unlinked, yet this last close still writes its dirty
+     * pages back to disk; truncating first discards them. Not when a fork child
+     * was handed the file itself: it reads every page it has not written from
+     * here, and truncating under that private mapping stalls the host while the
+     * kernel exhausts memory.
+     */
     if (g->shm_fd >= 0) {
+        if (g->shm_exported)
+            log_debug(
+                "guest_destroy: a fork child maps the slab, not truncated");
+        else if (ftruncate(g->shm_fd, 0) != 0)
+            log_debug("guest_destroy: slab truncate: %s", strerror(errno));
         close(g->shm_fd);
         g->shm_fd = -1;
     }

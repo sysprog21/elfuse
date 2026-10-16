@@ -269,6 +269,11 @@ $(BUILD_DIR)/probe-volume-naming: $(BUILD_DIR)/probe-volume-naming.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the disk-write probe test-slab-exit-writes measures with (native macOS)
+$(BUILD_DIR)/probe-disk-writes: $(BUILD_DIR)/probe-disk-writes.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the filename codec host test (native macOS binary)
 # casefold.o is a leaf translation unit with no syscall-layer dependencies, so
 # the test links exactly the code under test and nothing else.

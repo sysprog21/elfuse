@@ -34,6 +34,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-inotify-names test-sysroot-exec-names \
         test-sysroot-interp-fallback test-sysroot-interp-cased \
         test-sysroot-absock-names test-absock-cleanup test-registry-stale-pid \
+        test-slab-exit-writes test-slab-exit-fork \
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
@@ -350,6 +351,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-fuse-alpine,Alpine sysroot FUSE validation)
 	$(call run-lane,test-timeout-disable,timeout=0 validation)
 	$(call run-lane,test-launch-flags,launch flags)
+	$(call run-lane,test-slab-exit-writes,exit discards dirty guest memory)
+	$(call run-lane,test-slab-exit-fork,fork children and the exit truncate)
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 	$(call run-lane,test-sharun,sharun launcher and probe)
@@ -727,6 +730,94 @@ test-absock-cleanup: $(ELFUSE_BIN) $(BUILD_DIR)/test-absock-cleanup
 		exit 1; \
 	fi; \
 	$(ASSERT_NO_ABSOCK_LEAK)
+
+# Run one lane step with its output in $$tmpdir/NAME.log, failing the lane
+# with that log when the step fails.
+define SLAB_STEP
+step() { name=$$1; shift; "$$@" > "$$tmpdir/$$name.log" 2>&1 || { printf "FAIL: %s\n" "$$name"; cat "$$tmpdir/$$name.log"; exit 1; }; }
+endef
+
+SLAB_GUEST_DEPS :=
+ifndef GUEST_TEST_BINARIES
+SLAB_GUEST_DEPS := $(TEST_DIR)/test-slab-exit
+endif
+
+define SLAB_GUEST
+guest="$(TEST_DIR)/test-slab-exit"; \
+if [ -n "$(GUEST_TEST_BINARIES)" ] && [ ! -x "$$guest" ]; then \
+	printf "$(YELLOW)SKIP$(RESET) test-slab-exit unavailable in prebuilt bundle\n"; \
+	exit 0; \
+fi
+endef
+
+# guest_destroy truncates the slab file so that exit writes none of the
+# guest's dirty memory back. The probe records the kernel's block-write count
+# from the zombie. A control that writes and fsyncs 32 MiB must register at
+# least 24 MiB, or the counter measures nothing here and the lane skips; a run
+# that dirties 256 MiB must then stay under 32 MiB.
+## exit discards dirty guest memory
+test-slab-exit-writes: $(ELFUSE_BIN) $(SLAB_GUEST_DEPS) \
+		$(BUILD_DIR)/probe-disk-writes
+	@$(SYSROOT_SCRATCH); \
+	$(SLAB_STEP); \
+	$(SLAB_GUEST); \
+	probe=$(BUILD_DIR)/probe-disk-writes; \
+	step control $$probe "$$tmpdir/n" $(ELFUSE_BIN) "$$guest" \
+	    write 32 "$$tmpdir/file"; \
+	n=$$(cat "$$tmpdir/n"); \
+	if [ "$$n" -lt $$((24 << 20)) ]; then \
+		printf "$(YELLOW)SKIP$(RESET) disk counter saw %s bytes of a 32 MiB fsync\n" \
+		    "$$n"; \
+		exit 0; \
+	fi; \
+	printf "  %-30s " "256 MiB dirty at exit"; \
+	step dirty $$probe "$$tmpdir/n" $(ELFUSE_BIN) "$$guest" dirty 256; \
+	n=$$(cat "$$tmpdir/n"); \
+	if [ "$$n" -ge $$((32 << 20)) ]; then \
+		printf "FAIL: %s bytes written\n" "$$n"; exit 1; \
+	fi; \
+	printf "OK (%s bytes written)\n" "$$n"
+
+# The truncate is safe only while no other process maps the slab file.
+# orphan has a child read its memory after its parent exited. The parent
+# must skip truncation for the live-fd fallback, but not for an APFS clone.
+# Force the fallback too, since an APFS clone cannot exercise that guard.
+## fork children and the exit truncate
+test-slab-exit-fork: $(ELFUSE_BIN) $(SLAB_GUEST_DEPS)
+	@$(SYSROOT_SCRATCH); \
+	$(SLAB_STEP); \
+	$(SLAB_GUEST); \
+	for mode in normal fallback; do \
+		disable_clone=0; \
+		if [ "$$mode" = fallback ]; then disable_clone=1; fi; \
+		dir="$$tmpdir/$$mode"; \
+		mkdir "$$dir"; \
+		printf "  %-30s " "child outlives parent ($$mode)"; \
+		step "$$mode" env ELFUSE_DISABLE_FORK_CLONEFILE=$$disable_clone \
+		    $(ELFUSE_BIN) --verbose "$$guest" orphan "$$dir"; \
+		touch "$$dir/go"; \
+		i=0; \
+		while [ ! -s "$$dir/result" ] && [ $$i -lt 300 ]; do \
+			sleep 0.1; i=$$((i + 1)); \
+		done; \
+		result=$$(cat "$$dir/result" 2>/dev/null || true); \
+		if [ -z "$$result" ]; then \
+			printf "FAIL: no result\n"; exit 1; \
+		fi; \
+		if [ "$$result" != ok ]; then \
+			printf "FAIL: %s\n" "$$result"; exit 1; \
+		fi; \
+		if grep -q 'live shm fd as fallback' "$$tmpdir/$$mode.log"; then \
+			if ! grep -q 'maps the slab, not truncated' "$$tmpdir/$$mode.log"; then \
+				printf "FAIL: truncate not skipped for live slab\n"; exit 1; \
+			fi; \
+		elif [ "$$mode" = fallback ]; then \
+			printf "FAIL: forced fallback not taken\n"; exit 1; \
+		elif grep -q 'maps the slab, not truncated' "$$tmpdir/$$mode.log"; then \
+			printf "FAIL: truncate skipped after a clone\n"; exit 1; \
+		fi; \
+		printf "OK\n"; \
+	done
 
 # An exited member's registry record outlives it, and macOS can hand its host
 # pid to another elfuse process. The recipe plants such a record, host pid of

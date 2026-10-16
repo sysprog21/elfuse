@@ -3487,7 +3487,11 @@ int64_t sys_mmap(guest_t *g,
              */
             int range_perms =
                 (prot & LINUX_PROT_WRITE) ? ext_perms : prot_to_perms(prot);
-            guest_update_perms(g, result_off, result_off + length, range_perms);
+            if (guest_update_perms(g, result_off, result_off + length,
+                                   range_perms) < 0) {
+                mmap_fresh_dispose(&fresh);
+                return -LINUX_ENOMEM;
+            }
             if (ext_end > g->mmap_end)
                 g->mmap_end = ext_end;
         }

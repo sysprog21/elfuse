@@ -3489,6 +3489,11 @@ int64_t sys_mmap(guest_t *g,
                 (prot & LINUX_PROT_WRITE) ? ext_perms : prot_to_perms(prot);
             if (guest_update_perms(g, result_off, result_off + length,
                                    range_perms) < 0) {
+                /* A split can fail after earlier blocks were rewritten. */
+                (void) rollback_fresh_mmap_allocation(
+                    g, result_off, length, false, 0, 0, saved_mmap_next,
+                    saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
+                    saved_rw_gap_hint, saved_rx_gap_hint);
                 mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }

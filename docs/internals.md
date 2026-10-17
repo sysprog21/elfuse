@@ -1683,12 +1683,8 @@ path is built by `usb_sys_resolve_suffix`, which resolves symlinks and applies
 each `..` to what the previous component resolved to, as Linux does, so
 `<dev>/subsystem/..` names `/sys/bus`. On `/dev/bus` a `..` after a usbfs node
 is not applied, since Linux applies `..` only to a directory, and the name
-answers `ENOTDIR` once the node exists. A `..` after any other name is applied
-without checking that the name exists, so `/dev/bus/usb/099/../001/001` is
-served where Linux answers `ENOENT`. A relative name is folded the same way up
-to a usbfs node, so `099/../../../null` from a `/dev/bus/usb` cwd skips the
-check the climb rewrite makes for the absolute spelling. Deciding ownership on
-the unfolded spelling splits the two halves apart in both directions:
+answers `ENOTDIR` once the node exists. Deciding ownership on the unfolded
+spelling splits the two halves apart in both directions:
 `/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
 and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
 A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
@@ -1702,6 +1698,20 @@ reaches the `/proc` intercept. When the climb ends the name, the rewrite ends
 in `.`, as in `/dev/.`, so `rmdir` and `rename` fail rather than act on the
 directory reached, with `EINVAL` on a sysroot where Linux gives `ENOTEMPTY` and
 `EBUSY` for a final `..`.
+
+Every name under `/dev/bus/usb` is the layer's, so a `..` after a bus no device
+has, or after a malformed bus or device number, fails the walk with `ENOENT`, as
+Linux fails it at the missing name. The path layer refuses
+`/dev/bus/usb/099/../001/001` in the same step that rewrites a climb, before any
+intercept sees it, and a relative name is folded only up to a usbfs node or such
+a name, so `099/../001/001` from a `/dev/bus/usb` cwd is refused the same way. A
+`..` after a name shaped like a node for a device that does not exist is left to
+the intercepts, which answer `ENOENT`. A `..` after a `USB_PATH_DEV_FOREIGN`
+name is applied without checking that the backing has it, so
+`/dev/bus/nosuch/../usb/001/001` is served where Linux answers `ENOENT`. In an
+absolute name the rest is then folded unchecked as well, so
+`/dev/bus/other/../usb/099/../001/001` is served too, while the same name
+relative to a `/dev/bus` cwd is `ENOENT`.
 
 ### Filesystem Identity Of A Descriptor
 

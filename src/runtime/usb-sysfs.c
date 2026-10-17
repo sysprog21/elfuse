@@ -1263,8 +1263,9 @@ static bool usb_dev_names_dir(const char *folded)
  * Returns 1 with @out filled, 0 when the walk climbs above the root, -1 when
  * the result does not fit. With @rest, under usb_lock after ensure_usb_tree(),
  * a '..' pops only a directory usb_dev_names_dir accepts, and *@rest is left on
- * what follows a climbing '..', or NULL when a '..' meets any other name.
- * Without @rest no lock is held, and any other name is popped unchecked.
+ * what follows a climbing '..'; a '..' that meets any other name returns 0 with
+ * *@rest NULL and that name in @out. Without @rest no lock is held, and any
+ * other name is popped unchecked.
  */
 static int usb_suffix_normalize(const char *suffix,
                                 bool dev,
@@ -2295,12 +2296,21 @@ out:
     return rc;
 }
 
-bool usb_sysfs_names_node(const char *guest_path)
+bool usb_sysfs_stops_fold(const char *guest_path)
 {
+    if (!path_prefix_match(guest_path, "/dev/bus/usb", 12))
+        return false;
     int bus = 0, dev = 0;
     const char *sfx = "";
-    return path_prefix_match(guest_path, "/dev/bus/usb", 12) &&
-           classify_path(guest_path, &bus, &dev, &sfx) == USB_PATH_DEV_NODE;
+    usb_path_kind_t kind = classify_path(guest_path, &bus, &dev, &sfx);
+    if (kind == USB_PATH_DEV_USB)
+        return false;
+    if (kind != USB_PATH_DEV_BUSNUM)
+        return true;
+    pthread_mutex_lock(&usb_lock);
+    bool served = ensure_usb_tree() == 0 && bus_exists(bus);
+    pthread_mutex_unlock(&usb_lock);
+    return !served;
 }
 
 bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz)
@@ -2313,23 +2323,31 @@ bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz)
                                   &cerr) == USB_PATH_DEV_NODE;
 }
 
-bool usb_sysfs_resolve_dev_climb(const char *guest_path,
-                                 char *out,
-                                 size_t outsz)
+int usb_sysfs_resolve_dev_climb(const char *guest_path, char *out, size_t outsz)
 {
     if (!path_prefix_match(guest_path, "/dev/bus", 8) ||
         !strstr(guest_path, ".."))
-        return false;
+        return 0;
     char folded[LINUX_PATH_MAX];
     const char *rest = NULL;
+    int frc = -1;
     pthread_mutex_lock(&usb_lock);
-    bool climbs = ensure_usb_tree() == 0 &&
-                  usb_suffix_normalize(skip_slashes(guest_path + 8), true,
-                                       folded, sizeof(folded), &rest) == 0 &&
-                  rest;
+    if (ensure_usb_tree() == 0)
+        frc = usb_suffix_normalize(skip_slashes(guest_path + 8), true, folded,
+                                   sizeof(folded), &rest);
     pthread_mutex_unlock(&usb_lock);
-    if (!climbs)
-        return false;
+    if (frc != 0)
+        return 0;
+
+    /* The '..' met a name that is not a directory the layer serves. */
+    if (!rest) {
+        int bus = 0;
+        usb_path_kind_t kind = usb_dev_kind(folded, &bus);
+        if (kind != USB_PATH_DEV_BUSNUM && kind != USB_PATH_DEV_ABSENT)
+            return 0;
+        errno = ENOENT;
+        return -1;
+    }
 
     /* A further '..' climbs /dev, and one past it stays at the root as on
      * Linux; left in the name, it reaches the backing as /dev/.., where no
@@ -2347,7 +2365,7 @@ bool usb_sysfs_resolve_dev_climb(const char *guest_path,
      * sysroot where Linux gives ENOTEMPTY and EBUSY for a final '..'.
      */
     int n = snprintf(out, outsz, "%s/%s", dir, *rest ? rest : ".");
-    return n > 0 && (size_t) n < outsz;
+    return n > 0 && (size_t) n < outsz ? 1 : 0;
 }
 
 bool usb_sysfs_dir_unions_backing(const char *guest_path)

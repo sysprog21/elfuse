@@ -677,14 +677,19 @@ int path_translate_at(guest_fd_t dirfd,
     }
 
     /* usb_sysfs_resolve_dev_climb rewrites a /dev/bus name whose '..' climbs
-     * out of it. What follows can climb out again, as in
-     * /dev/bus/../bus/../null, and each pass shortens the name. A climb can
-     * land in /sys, so this runs before the /sys rewrite below.
+     * out of it, and fails one whose '..' follows a bus no device has or a name
+     * under /dev/bus/usb that is not a bus or device number. What follows a
+     * climb can climb out again, as in /dev/bus/../bus/../null, and each pass
+     * shortens the name. A climb can land in /sys, so this runs before the /sys
+     * rewrite below.
      */
     while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
         char resolved[LINUX_PATH_MAX];
-        if (!usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
-                                         sizeof(resolved)))
+        int crc = usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
+                                              sizeof(resolved));
+        if (crc < 0)
+            return -1;
+        if (crc == 0)
             break;
         str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
         tx->guest_path = tx->guest_buf;
@@ -1398,10 +1403,11 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
 }
 
 /* Rebuild @path against the guest directory @base as an absolute guest path,
- * folding its components. Once the walk reaches a usbfs node the rest is joined
- * as written from the slash after it: Linux applies '..' only to a directory,
- * and the USB layer answers ENOTDIR for a '..', a name or a trailing slash
- * after a node.
+ * folding its components. Once the walk reaches a usbfs node, or a name under
+ * /dev/bus/usb that does not exist, the rest is joined as written from the
+ * slash after it: Linux applies '..' only to a directory that exists, and the
+ * USB layer answers ENOTDIR for a '..', a name or a trailing slash after a
+ * node, and ENOENT for a '..' after a missing name.
  *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */
@@ -1418,7 +1424,7 @@ static int path_rebuild_under(const char *base,
     if (proc_seed_absolute_path(base, out, outsz, marks, ARRAY_SIZE(marks),
                                 &depth) < 0)
         goto toolong;
-    while (*p && !usb_sysfs_names_node(out)) {
+    while (*p && !usb_sysfs_stops_fold(out)) {
         p += strspn(p, "/");
         size_t n = strcspn(p, "/");
         if (n == 0)
@@ -1500,9 +1506,15 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
     if (!path || path[0] == '\0' || path[0] == '/')
         return 0;
 
+    /* The cwd is copied out of the view: path_rebuild_under can take usb_lock,
+     * and cwd_lock holds only fuse_lock beneath it.
+     */
     proc_cwd_view_t view;
     if (proc_acquire_cwd_view(&view) < 0)
         return 0;
+    char base[LINUX_PATH_MAX];
+    str_copy_trunc(base, view.path, sizeof(base));
+    proc_release_cwd_view(&view);
 
     /* /dev/pts and the synthetic USB trees join /proc here: all are served from
      * host directories whose contents are not what the guest names, so a
@@ -1511,13 +1523,10 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * set by fchdir() onto a synthetic USB directory would resolve relative
      * names straight against the scratch tree.
      */
-    int rc = 0;
-    if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
-        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8))
-        rc = path_rebuild_under(view.path, path, out, outsz) < 0 ? -1 : 1;
-
-    proc_release_cwd_view(&view);
-    return rc;
+    if (!strncmp(base, "/proc", 5) || !strncmp(base, "/dev/pts", 8) ||
+        !strncmp(base, "/sys", 4) || !strncmp(base, "/dev/bus", 8))
+        return path_rebuild_under(base, path, out, outsz) < 0 ? -1 : 1;
+    return 0;
 }
 
 int resolve_proc_at_path(guest_fd_t dirfd,

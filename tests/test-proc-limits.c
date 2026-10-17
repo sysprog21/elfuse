@@ -1,17 +1,21 @@
 /*
- * Test /proc/self/limits synthetic file
+ * Test guest rlimit state and the /proc/self/limits synthetic file
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
  * Verifies that /proc/self/limits is readable and contains expected rows
- * matching prlimit64 values.
+ * matching prlimit64 values, and that a limit set through setrlimit or
+ * prlimit64 reads back and crosses fork and execve.
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 
 #include "test-harness.h"
 #include "raw-syscall.h"
@@ -27,11 +31,234 @@
 
 int passes = 0, fails = 0;
 
-int main(void)
+/* One soft value per limit that no other limit uses, so a slot that aliases
+ * another reads back wrong. Each is far above what this test consumes. NICE and
+ * RTPRIO start with a hard limit of 0, which only root can raise, so they get
+ * their own values in the runs that are root and stay 0 in the one that is not.
+ */
+static const struct {
+    int resource;
+    const char *name;
+    rlim_t cur;
+} tracked[] = {
+    {RLIMIT_CPU, "RLIMIT_CPU round trip", 100000},
+    {RLIMIT_FSIZE, "RLIMIT_FSIZE round trip", (rlim_t) 1 << 40},
+    {RLIMIT_DATA, "RLIMIT_DATA round trip", (rlim_t) 1 << 41},
+    {RLIMIT_STACK, "RLIMIT_STACK round trip", (rlim_t) 16 << 20},
+    {RLIMIT_RSS, "RLIMIT_RSS round trip", (rlim_t) 1 << 42},
+    {RLIMIT_MEMLOCK, "RLIMIT_MEMLOCK round trip", (rlim_t) 1 << 36},
+    {RLIMIT_AS, "RLIMIT_AS round trip", (rlim_t) 1 << 43},
+    {RLIMIT_LOCKS, "RLIMIT_LOCKS round trip", 1234567},
+    {RLIMIT_SIGPENDING, "RLIMIT_SIGPENDING round trip", 97},
+    {RLIMIT_MSGQUEUE, "RLIMIT_MSGQUEUE round trip", 4096},
+    {RLIMIT_NICE, "RLIMIT_NICE round trip", 13},
+    {RLIMIT_RTPRIO, "RLIMIT_RTPRIO round trip", 14},
+    {RLIMIT_RTTIME, "RLIMIT_RTTIME round trip", 7654321},
+};
+#define N_TRACKED ((int) (sizeof(tracked) / sizeof(tracked[0])))
+
+/* The soft value tracked[i] is set to: its own, or the hard limit if lower. The
+ * hard limits are settled before the first child is made, so every process in
+ * this test agrees.
+ */
+static rlim_t tracked_cur(int i)
+{
+    struct rlimit rl;
+    if (getrlimit(tracked[i].resource, &rl) < 0)
+        return 0;
+    return tracked[i].cur > rl.rlim_max ? rl.rlim_max : tracked[i].cur;
+}
+
+/* Number of tracked limits whose soft value is not the one this test set. */
+static int tracked_mismatches(void)
+{
+    int bad = 0;
+    for (int i = 0; i < N_TRACKED; i++) {
+        struct rlimit rl;
+        if (getrlimit(tracked[i].resource, &rl) < 0 ||
+            rl.rlim_cur != tracked_cur(i))
+            bad++;
+    }
+    return bad;
+}
+
+/* Run @child_main in a fork child and return its exit status, or -1. */
+static int run_child(int (*child_main)(void *), void *arg)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0)
+        _exit(child_main(arg));
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
+static int child_reads_limits(void *arg)
+{
+    (void) arg;
+    return tracked_mismatches();
+}
+
+static int child_execs_self(void *arg)
+{
+    char *argv[] = {arg, "after-exec", NULL};
+    execv(argv[0], argv);
+    return 127;
+}
+
+static void test_rlimit_state(char *self)
+{
+    /* Give NICE and RTPRIO room for a value of their own where that is allowed.
+     */
+    if (getuid() == 0) {
+        struct rlimit room = {.rlim_cur = 0, .rlim_max = 40};
+        setrlimit(RLIMIT_NICE, &room);
+        setrlimit(RLIMIT_RTPRIO, &room);
+    }
+
+    for (int i = 0; i < N_TRACKED; i++) {
+        struct rlimit rl, got = {0};
+        TEST(tracked[i].name);
+        rlim_t want = tracked_cur(i);
+        if (getrlimit(tracked[i].resource, &rl) < 0) {
+            FAIL("getrlimit failed");
+            continue;
+        }
+        rl.rlim_cur = want;
+        if (setrlimit(tracked[i].resource, &rl) < 0 ||
+            getrlimit(tracked[i].resource, &got) < 0)
+            FAIL("setrlimit then getrlimit failed");
+        else
+            EXPECT_TRUE(got.rlim_cur == want && got.rlim_max == rl.rlim_max,
+                        "read-back differs from the value set");
+    }
+
+    /* macOS defines RLIMIT_RSS as RLIMIT_AS; the guest's two must not merge. */
+    TEST("RSS and AS stay independent");
+    {
+        struct rlimit rss, as;
+        if (getrlimit(RLIMIT_RSS, &rss) < 0 || getrlimit(RLIMIT_AS, &as) < 0)
+            FAIL("getrlimit failed");
+        else
+            EXPECT_TRUE(rss.rlim_cur == (rlim_t) 1 << 42 &&
+                            as.rlim_cur == (rlim_t) 1 << 43,
+                        "RSS and AS read back the same slot");
+    }
+
+    TEST("fork child reads parent limits");
+    EXPECT_EQ(run_child(child_reads_limits, NULL), 0,
+              "child saw different limits");
+
+    TEST("execve keeps limits");
+    EXPECT_EQ(run_child(child_execs_self, self), 0,
+              "image after execve saw different limits");
+
+    TEST("prlimit64 on own pid");
+    {
+        struct rlimit rl = {0};
+        if (prlimit(getpid(), RLIMIT_AS, NULL, &rl) < 0)
+            FAIL("prlimit64 failed");
+        else
+            EXPECT_TRUE(rl.rlim_cur == (rlim_t) 1 << 43, "wrong soft limit");
+    }
+
+    TEST("prlimit64 on a dead pid is ESRCH");
+    {
+        struct rlimit rl;
+        EXPECT_ERRNO(prlimit(999999, RLIMIT_AS, NULL, &rl), ESRCH,
+                     "expected ESRCH");
+    }
+
+    TEST("soft above hard is EINVAL");
+    {
+        struct rlimit rl = {.rlim_cur = 2, .rlim_max = 1};
+        EXPECT_ERRNO(setrlimit(RLIMIT_CPU, &rl), EINVAL, "expected EINVAL");
+    }
+}
+
+/* Read the soft and hard columns of the /proc/self/limits row named @name.
+ * "unlimited" reads as RLIM_INFINITY.
+ *
+ * Returns 0, or -1 if the row is missing.
+ */
+static int limits_row(const char *name, struct rlimit *out)
+{
+    char buf[4096], soft[32], hard[32];
+    int fd = open("/proc/self/limits", O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof(buf) - 1);
+    if (fd >= 0)
+        close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+
+    const char *row = strstr(buf, name);
+    if (!row || sscanf(row + strlen(name), "%31s %31s", soft, hard) != 2)
+        return -1;
+    out->rlim_cur =
+        strcmp(soft, "unlimited") ? strtoull(soft, NULL, 10) : RLIM_INFINITY;
+    out->rlim_max =
+        strcmp(hard, "unlimited") ? strtoull(hard, NULL, 10) : RLIM_INFINITY;
+    return 0;
+}
+
+/* test_rlimit_state left these limits at different soft values; each row must
+ * show its own, the one getrlimit returns in this same run.
+ */
+static void test_limits_rows(void)
+{
+    static const struct {
+        int resource;
+        const char *row, *name;
+    } checked[] = {
+        {RLIMIT_AS, "Max address space", "address space row is RLIMIT_AS"},
+        {RLIMIT_RSS, "Max resident set", "resident set row is RLIMIT_RSS"},
+        {RLIMIT_FSIZE, "Max file size", "file size row is RLIMIT_FSIZE"},
+        {RLIMIT_CPU, "Max cpu time", "cpu time row is RLIMIT_CPU"},
+        {RLIMIT_LOCKS, "Max file locks", "file locks row is RLIMIT_LOCKS"},
+        {RLIMIT_RTTIME, "Max realtime timeout",
+         "realtime timeout row is RLIMIT_RTTIME"},
+    };
+    enum { N_CHECKED = sizeof(checked) / sizeof(checked[0]) };
+    rlim_t soft[N_CHECKED] = {0};
+
+    for (int i = 0; i < N_CHECKED; i++) {
+        struct rlimit want = {0}, row = {0};
+        TEST(checked[i].name);
+        if (getrlimit(checked[i].resource, &want) < 0 ||
+            limits_row(checked[i].row, &row) < 0) {
+            FAIL("getrlimit or the row is missing");
+            continue;
+        }
+        soft[i] = row.rlim_cur;
+        EXPECT_TRUE(
+            row.rlim_cur == want.rlim_cur && row.rlim_max == want.rlim_max,
+            "row differs from getrlimit");
+    }
+
+    TEST("the rows are distinct");
+    {
+        int distinct = 1;
+        for (int i = 0; i < N_CHECKED; i++)
+            for (int j = i + 1; j < N_CHECKED; j++)
+                if (soft[i] == soft[j])
+                    distinct = 0;
+        EXPECT_TRUE(distinct, "two rows print the same soft limit");
+    }
+}
+
+int main(int argc, char **argv)
 {
     char buf[4096];
 
-    printf("test-proc-limits: /proc/self/limits synthetic file\n");
+    /* The image test_rlimit_state execs into: report what survived. */
+    if (argc > 1 && !strcmp(argv[1], "after-exec"))
+        return tracked_mismatches();
+
+    printf("test-proc-limits: guest rlimits and /proc/self/limits\n");
 
     /* Open /proc/self/limits */
     TEST("open /proc/self/limits");
@@ -121,6 +348,9 @@ int main(void)
     }
 
 done:
+    test_rlimit_state(argv[0]);
+    test_limits_rows();
+
     SUMMARY("test-proc-limits");
     return fails ? 1 : 0;
 }

@@ -35,6 +35,7 @@
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
+#include "syscall/sys.h"
 
 #include "debug/log.h"
 
@@ -583,6 +584,7 @@ int guest_bootstrap_prepare(guest_t *g,
     t0 = startup_trace_now_ns();
     syscall_init();
     proc_init();
+    sys_rlimit_init();
 
     {
         char self_path[LINUX_PATH_MAX];

@@ -32,6 +32,7 @@
 #include "syscall/asyncio.h"
 #include "syscall/internal.h"
 #include "syscall/poll.h"
+#include "syscall/sys.h"
 
 /* Protects the FD table (fd_alloc, fd_alloc_at, fd_alloc_from, sys_close). File
  * descriptor operations from concurrent threads must be serialized.
@@ -57,19 +58,13 @@ struct fd_lifetime {
     void *dir;
 };
 
-/* RLIMIT_NOFILE tracking. Guest-side soft limit for RLIMIT_NOFILE. fd_alloc
- * checks this. Default matches typical Linux default (1024). Updated by
- * prlimit64.
+/* Guest RLIMIT_NOFILE soft limit, which every allocation below checks. The slot
+ * is clamped because it bounds an index into fd_table.
  */
-static _Atomic int rlimit_nofile_cur = FD_TABLE_SIZE;
-
-void fd_set_rlimit_nofile(int cur)
+static int rlimit_nofile_cur(void)
 {
-    if (cur > FD_TABLE_SIZE)
-        cur = FD_TABLE_SIZE;
-    if (cur < 0)
-        cur = 0;
-    rlimit_nofile_cur = cur;
+    uint64_t cur = sys_rlimit_cur(LINUX_RLIMIT_NOFILE);
+    return cur > FD_TABLE_SIZE ? FD_TABLE_SIZE : (int) cur;
 }
 
 /* Bitmap for O(1) lowest-free-FD allocation. A set bit means the FD is free
@@ -523,7 +518,7 @@ static int fd_alloc_locked(int minfd,
                            const fd_host_probe_t *probe)
 {
     int fd = fd_bitmap_find_free(minfd);
-    if (fd >= 0 && fd >= rlimit_nofile_cur)
+    if (fd >= 0 && fd >= rlimit_nofile_cur())
         fd = -1; /* RLIMIT_NOFILE exceeded */
     if (fd < 0) {
         /* No slot, so nothing is published and the probe's O_NONBLOCK has to
@@ -614,7 +609,7 @@ int fd_alloc_dir_at(int fd,
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
-    if (fd >= rlimit_nofile_cur)
+    if (fd >= rlimit_nofile_cur())
         return -1;
 
     fd_entry_t old = {.type = FD_CLOSED};
@@ -759,7 +754,7 @@ bool fd_reexec_slot_available(int minfd)
     if (minfd < 0)
         minfd = 0;
     pthread_mutex_lock(&fd_lock);
-    int limit = rlimit_nofile_cur;
+    int limit = rlimit_nofile_cur();
     if (limit > FD_TABLE_SIZE)
         limit = FD_TABLE_SIZE;
     bool available = false;
@@ -787,7 +782,7 @@ int fd_alloc_at(int fd,
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
-    if (fd >= rlimit_nofile_cur)
+    if (fd >= rlimit_nofile_cur())
         return -1;
 
     /* Snapshot old slot state under fd_lock, then replace atomically. Cleanup
@@ -827,7 +822,7 @@ int fd_alloc_at_relaxed(int fd,
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
-    if (fd >= rlimit_nofile_cur)
+    if (fd >= rlimit_nofile_cur())
         return -1;
     if (!thread_is_single_active())
         return fd_alloc_at(fd, type, host_fd, cleanup, out_gen);

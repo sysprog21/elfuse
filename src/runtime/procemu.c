@@ -2576,7 +2576,7 @@ static int intercept_open_dispatch(const guest_t *g,
             threads);
     }
 
-    /* /proc/self/limits -> resource limits from prlimit64 cache */
+    /* /proc/self/limits -> the guest rlimit table */
     if (!strcmp(path, "/proc/self/limits")) {
         char buf[2048];
         int len = sys_format_limits(buf, sizeof(buf));

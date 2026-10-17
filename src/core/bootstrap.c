@@ -94,10 +94,9 @@ static void register_elf_segment_regions(guest_t *g,
         uint64_t seg_start = info->segments[i].gpa + va_load_base;
         uint64_t seg_end = seg_start + info->segments[i].memsz;
         uint64_t seg_gpa = info->segments[i].gpa + gpa_load_base;
-        guest_region_add_ex_gpa(g, seg_start, seg_end, seg_gpa,
-                                elf_pf_to_prot(info->segments[i].flags),
-                                LINUX_MAP_PRIVATE, info->segments[i].offset,
-                                path, -1);
+        guest_region_add_elf_segment(g, seg_start, seg_end, seg_gpa,
+                                     elf_pf_to_prot(info->segments[i].flags),
+                                     info->segments[i].offset, path);
     }
 }
 
@@ -121,6 +120,13 @@ static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
      */
     guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
                      LINUX_PROT_NONE, LINUX_MAP_PRIVATE, 0, "[shim-data]");
+
+    /* The vDSO page, which Linux lists as [vdso]. Tracking it also keeps a
+     * hinted mmap from being placed over it.
+     */
+    guest_region_add(g, VDSO_BASE, VDSO_BASE + VDSO_SIZE,
+                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
+                     "[vdso]");
 
     if (g->brk_base < g->brk_current) {
         guest_region_add(g, g->brk_base, g->brk_current,

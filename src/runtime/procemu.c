@@ -2537,10 +2537,13 @@ static int intercept_open_dispatch(const guest_t *g,
 
     /* /proc/self/status -> synthetic process status */
     if (!strcmp(path, "/proc/self/status")) {
-        /* Compute VmSize from region tracking (total virtual memory) */
+        /* VmSize is total_vm, which leaves out [shim] and [shim-data]. */
         uint64_t vm_size_kb = 0;
-        for (int i = 0; i < g->nregions; i++)
-            vm_size_kb += (g->regions[i].end - g->regions[i].start);
+        for (int i = 0; i < g->nregions; i++) {
+            const guest_region_t *r = &g->regions[i];
+            if (guest_region_in_process_vm(g, r))
+                vm_size_kb += r->end - r->start;
+        }
         vm_size_kb /= 1024;
 
         /* VmRSS: approximate as non-PROT_NONE regions (HVF cannot query actual

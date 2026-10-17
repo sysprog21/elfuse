@@ -9,7 +9,8 @@
  *   1. /proc/self/auxv returns valid auxv with AT_PAGESZ=4096
  *   2. /proc/self/environ contains at least one entry
  *   3. /proc/self/cmdline is non-empty
- *   4. /proc/self/maps contains [heap] and [stack]
+ *   4. /proc/self/maps contains [heap] and [stack], every offset is
+ *      page-aligned, the lines add up to VmSize, and [vdso] is listed
  *   5. /proc/self/status contains correct PID
  *
  * Syscalls: openat(56), read(63), close(57), getpid(172)
@@ -18,6 +19,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 
@@ -65,6 +67,33 @@ static bool parse_proc_stat_field_u64(const char *buf,
         field++;
     }
     return false;
+}
+
+/* Walk the maps text in @buf: add each line's size to @total, leaving out the
+ * elfuse runtime records ([shim], [shim-data]) a Linux process does not have,
+ * and report whether every file offset is page-aligned.
+ */
+static bool maps_walk(char *buf, uint64_t *total)
+{
+    bool aligned = true;
+    *total = 0;
+    for (char *line = buf; *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        char *p;
+        uint64_t lo = strtoull(line, &p, 16);
+        uint64_t hi = strtoull(p + 1, &p, 16);
+        uint64_t off = strtoull(p + 6, NULL, 16); /* past " rwxp " */
+        if (!strstr(line, "[shim"))
+            *total += hi - lo;
+        aligned &= (off & 0xfff) == 0;
+        if (!nl)
+            break;
+        *nl = '\n';
+        line = nl + 1;
+    }
+    return aligned;
 }
 
 static bool parse_stack_range(const char *buf, uint64_t *start, uint64_t *end)
@@ -193,6 +222,28 @@ int main(void)
             }
         }
     }
+
+    TEST("procfs: maps offsets page-aligned, lines add up to VmSize");
+    {
+        uint64_t maps_total = 0;
+        n = raw_read_file_nul("/proc/self/maps", buf, sizeof(buf));
+        bool aligned = n > 0 && maps_walk(buf, &maps_total);
+        n = raw_read_file_nul("/proc/self/status", buf, sizeof(buf));
+        char *vm = n > 0 ? strstr(buf, "VmSize:") : NULL;
+        uint64_t vm_kb = vm ? strtoull(vm + 7, NULL, 10) : 0;
+        if (aligned && vm_kb * 1024 == maps_total) {
+            PASS();
+        } else {
+            printf("FAIL: aligned %d, VmSize %llu kB, maps %llu kB\n", aligned,
+                   (unsigned long long) vm_kb,
+                   (unsigned long long) (maps_total / 1024));
+            fails++;
+        }
+    }
+
+    TEST("procfs: /proc/self/maps lists [vdso]");
+    n = raw_read_file_nul("/proc/self/maps", buf, sizeof(buf));
+    EXPECT_TRUE(n > 0 && strstr(buf, "[vdso]"), "no [vdso] line");
 
     TEST("procfs: /proc/self/status has correct PID");
     {

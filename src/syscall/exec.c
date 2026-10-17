@@ -1206,6 +1206,13 @@ static void exec_publish_maps(guest_t *g, const exec_image_t *img)
     guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
                      LINUX_PROT_NONE, LINUX_MAP_PRIVATE, 0, "[shim-data]");
 
+    /* The vDSO page, which Linux lists as [vdso]. Tracking it also keeps a
+     * hinted mmap from being placed over it.
+     */
+    guest_region_add(g, VDSO_BASE, VDSO_BASE + VDSO_SIZE,
+                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
+                     "[vdso]");
+
     /* Same two lists, same order, same spans as exec_install_address_space.
      * interp->display_path was resolved before guest_reset, so naming the
      * interpreter here needs no filesystem lookup past the point of no return.
@@ -1215,11 +1222,11 @@ static void exec_publish_maps(guest_t *g, const exec_image_t *img)
     const char *names[] = {path, interp->display_path};
     for (size_t l = 0; l < ARRAY_SIZE(lists); l++) {
         for (int i = 0; i < lists[l]->num_segments; i++) {
-            guest_region_add(g, exec_seg_start(lists[l], i, bases[l]),
-                             exec_seg_end(lists[l], i, bases[l]),
-                             elf_pf_to_prot(lists[l]->segments[i].flags),
-                             LINUX_MAP_PRIVATE, lists[l]->segments[i].offset,
-                             names[l]);
+            uint64_t seg_start = exec_seg_start(lists[l], i, bases[l]);
+            guest_region_add_elf_segment(
+                g, seg_start, exec_seg_end(lists[l], i, bases[l]), seg_start,
+                elf_pf_to_prot(lists[l]->segments[i].flags),
+                lists[l]->segments[i].offset, names[l]);
         }
     }
 

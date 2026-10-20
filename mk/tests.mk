@@ -1491,6 +1491,11 @@ test-proctitle-low-stack: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 	fi
 	@bash tests/test-proctitle-low-stack.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
 
+## Diagnostics for the test-rlimit-seed CI crash (draft PR only)
+diag-rlimit-seed: $(ELFUSE_BIN) $(BUSYBOX_DEPS) $(TEST_DIR)/test-proc-limits
+	@bash .ci/diag-rlimit-seed.sh $(ELFUSE_BIN) $(BUSYBOX_BIN) \
+		$(TEST_DIR)/test-proc-limits
+
 ## Check guest rlimits seeded from host limits a shell set
 test-rlimit-seed: $(ELFUSE_BIN) $(BUSYBOX_DEPS) $(TEST_DIR)/test-proc-limits
 	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \

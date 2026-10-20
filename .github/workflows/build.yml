@@ -371,6 +371,29 @@ jobs:
         run: |
           make EXTRA_CFLAGS="$EXTRA_CFLAGS" test-multi-vcpu
 
+      - name: Diagnose the test-rlimit-seed crash
+        if: matrix.name == 'Release'
+        continue-on-error: true
+        run: |
+          mkdir -p build/diag-reports
+          touch build/diag-start
+          make EXTRA_CFLAGS="$EXTRA_CFLAGS" diag-rlimit-seed 2>&1 \
+            | tee build/diag-reports/diag-rlimit-seed.txt
+          # Only crash reports this step produced, for the processes it ran.
+          find ~/Library/Logs/DiagnosticReports -type f -newer build/diag-start \
+            \( -name 'elfuse*' -o -name 'bash*' -o -name 'busybox*' \) \
+            -exec cp {} build/diag-reports/ \;
+          ls -la build/diag-reports
+
+      - name: Upload diagnostic reports
+        if: matrix.name == 'Release' && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rlimit-seed-diag-${{ runner.os }}-${{ runner.arch }}
+          path: build/diag-reports
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: make check
         # Release runs the full check suite; sanitizer legs run check-sanitizer,
         # a representative internal-implementation subset (the release lane plus

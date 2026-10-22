@@ -393,3 +393,14 @@ ELFUSE_OCI_STORE=/tmp/oci-scratch scripts/ci/oci-smoke.sh
 
 The lane needs macOS with Hypervisor.framework and network access, and ends by
 cleaning the store. Its coverage is in [oci-images.md](oci-images.md#validation).
+
+### Running The Runtime Lanes Locally
+
+```sh
+make elfuse
+ELFUSE_OCI_STORE=/tmp/oci-scratch scripts/ci/oci-runtime.sh python  # or node, go, jvm, c, redis
+```
+
+The node and redis lanes also need `nc`, and the node lane `curl`. Unlike the
+smoke lane, a runtime lane leaves its images in the store, so a later run skips
+the pull.

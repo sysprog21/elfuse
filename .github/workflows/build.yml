@@ -4,6 +4,7 @@
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
 #                   including release, ASAN, UBSAN, and TSAN variants
 #   oci-smoke     : OCI front end lane on self-hosted Apple Silicon
+#   oci-runtime   : elfuse runtime lanes on OCI images, self-hosted
 #
 # Runtime and sanitizer tests require Hypervisor.framework, which
 # GitHub-hosted macOS runners do not expose. Those tests run on self-hosted
@@ -460,3 +461,76 @@ jobs:
           set -euo pipefail
           chmod +x build/elfuse
           ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-smoke-$RUNNER_NAME" scripts/ci/oci-smoke.sh
+
+  oci-runtime:
+    name: OCI runtime (${{ matrix.key }})
+    needs: build-macos
+    if: >
+      github.repository == 'sysprog21/elfuse' &&
+      (github.event_name == 'push' || github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'merge_group')
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { key: python, timeout: 30 }
+          - { key: node, timeout: 30 }
+          - { key: go, timeout: 30 }
+          - { key: jvm, timeout: 45 }
+          - { key: c, timeout: 45 }
+          - { key: redis, timeout: 30 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download prebuilt elfuse binary
+        uses: actions/download-artifact@v7
+        with:
+          name: elfuse-${{ runner.os }}-${{ runner.arch }}
+          path: build
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: false
+
+      - name: Build crane and umoci
+        # go install refuses umoci: its go.mod has a replace directive.
+        env:
+          CRANE_VERSION: v0.22.1
+          UMOCI_VERSION: v0.6.0
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/oci-tools"
+          GOBIN="$bin" go install \
+            "github.com/google/go-containerregistry/cmd/crane@$CRANE_VERSION"
+          umoci="github.com/opencontainers/umoci@$UMOCI_VERSION"
+          go mod download "$umoci"
+          go build -C "$(go env GOMODCACHE)/$umoci" -o "$bin/umoci" ./cmd/umoci
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/crane" version
+          "$bin/umoci" --version
+
+      - name: Run the ${{ matrix.key }} lane
+        # A downloaded artifact keeps its signature but not its execute bit.
+        # Runners on one host share $HOME, so each gets its own stores. A store
+        # is kept between runs and named for the scripts that build and pin its
+        # images, so a change to either starts a fresh store and removes the rest.
+        env:
+          STORE_HASH: ${{ hashFiles('scripts/elfuse-oci.py', 'scripts/ci/oci-runtime.sh') }}
+        run: |
+          set -euo pipefail
+          chmod +x build/elfuse
+          stores="$HOME/.cache/elfuse-ci/oci-runtime/${{ matrix.key }}-$RUNNER_NAME"
+          store="$stores/$STORE_HASH"
+          for old in "$stores"/*; do
+            if [ -d "$old" ] && [ "$old" != "$store" ]; then
+              ELFUSE_OCI_STORE="$old" scripts/elfuse-oci.py clean > /dev/null
+              rm -rf "$old"
+            fi
+          done
+          ELFUSE_OCI_STORE="$store" scripts/ci/oci-runtime.sh ${{ matrix.key }}

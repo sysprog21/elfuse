@@ -19,6 +19,9 @@
 _QR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 _QR_FIX="${_QR_DIR}/externals/test-fixtures"
 
+# shellcheck source=tests/lib/qemu-ssh.sh
+source "${_QR_DIR}/tests/lib/qemu-ssh.sh"
+
 QEMU_BIN="${QEMU_BIN:-qemu-system-aarch64}"
 QEMU_PORT="${QEMU_PORT:-2222}"
 QEMU_MEM="${QEMU_MEM:-2048}"
@@ -38,6 +41,7 @@ QEMU_SHARE_PATH="${QEMU_SHARE_PATH:-${_QR_DIR}}"
 
 _QR_PIDFILE=""
 _QR_LOG=""
+_QR_ERR=""
 _QR_CTL=""
 
 # Fixture path inside the VM (always /mnt/host/<relative>).
@@ -98,6 +102,20 @@ qemu_pick_cpu()
     esac
 }
 
+# qemu_stop removes the rundir, so what explains a failed start prints first.
+qemu_fail_start()
+{
+    echo "qemu-runner: $1" >&2
+    local f
+    for f in "$_QR_ERR" "$_QR_LOG"; do
+        if [ -s "$f" ]; then
+            echo "qemu-runner: tail of ${f##*/}:" >&2
+            tail -n 20 "$f" >&2
+        fi
+    done
+    qemu_stop
+}
+
 qemu_start()
 {
     qemu_ensure_fixtures || return 1
@@ -119,6 +137,7 @@ qemu_start()
     rundir="$(mktemp -d -t elfuse-qemu.XXXXXX)"
     _QR_PIDFILE="${rundir}/qemu.pid"
     _QR_LOG="${rundir}/qemu-serial.log"
+    _QR_ERR="${rundir}/qemu.log"
     _QR_CTL="${rundir}/ssh-ctl"
 
     QEMU_PORT="$(qemu_pick_port)"
@@ -135,7 +154,7 @@ qemu_start()
         -nographic -display none -no-reboot -monitor none \
         -serial "file:${_QR_LOG}" \
         -pidfile "$_QR_PIDFILE" \
-        > /dev/null 2>&1 &
+        > "$_QR_ERR" 2>&1 &
     disown
 
     # Wait for ssh port to come up.
@@ -147,8 +166,7 @@ qemu_start()
         sleep 1
     done
     if ! (echo > /dev/tcp/127.0.0.1/"$QEMU_PORT") 2> /dev/null; then
-        echo "qemu-runner: VM did not boot within ${QEMU_BOOT_TIMEOUT}s" >&2
-        qemu_stop
+        qemu_fail_start "VM did not boot within ${QEMU_BOOT_TIMEOUT}s"
         return 1
     fi
 
@@ -165,7 +183,10 @@ qemu_start()
     # a dedicated tmpfs, as any regular system has, so paths under /tmp map to a
     # resolvable st_dev. Guarded so a repeated qemu_start against a running VM
     # does not stack mounts.
-    _qemu_ssh_raw 'grep -q " /tmp tmpfs " /proc/mounts || mount -t tmpfs tmpfs /tmp'
+    if ! _qemu_ssh_raw 'grep -q " /tmp tmpfs " /proc/mounts || mount -t tmpfs tmpfs /tmp'; then
+        qemu_fail_start "could not prepare /tmp in the guest"
+        return 1
+    fi
 }
 
 # Each call opens a fresh ssh connection. Avoids ControlMaster pitfalls (master
@@ -174,16 +195,8 @@ qemu_start()
 # the suite's tolerance.
 _qemu_ssh_raw()
 {
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        -o BatchMode=yes \
-        -o ConnectTimeout=10 \
-        -o ServerAliveInterval=10 \
-        -o ServerAliveCountMax=6 \
-        -i "$QEMU_SSH_KEY" \
-        -p "$QEMU_PORT" \
-        root@127.0.0.1 "$@"
+    qemu_ssh_opts
+    ssh "${QEMU_SSH_OPTS[@]}" root@127.0.0.1 "$@"
 }
 
 # Run a command in the VM. Any argument that is an absolute path under the host
@@ -210,6 +223,14 @@ qemu_stop()
     if [ -n "$_QR_PIDFILE" ] && [ -s "$_QR_PIDFILE" ]; then
         local pid
         pid=$(cat "$_QR_PIDFILE" 2> /dev/null)
+
+        # A state file outlives its VM, so the pid it names may since have been
+        # recycled. qemu_start gives qemu this pidfile, and mktemp makes the
+        # path unique, so the argv is what proves the process is ours.
+        case " $(ps -o command= -p "${pid:-0}" 2> /dev/null) " in
+            *" -pidfile $_QR_PIDFILE "*) ;;
+            *) pid="" ;;
+        esac
         if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then
             kill "$pid" 2> /dev/null
             # give qemu time to exit cleanly; force-kill if it lingers
@@ -218,7 +239,15 @@ qemu_stop()
                 kill -0 "$pid" 2> /dev/null || break
                 sleep 1
             done
-            kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null
+            if kill -0 "$pid" 2> /dev/null; then
+                kill -9 "$pid" 2> /dev/null
+                sleep 1
+                # Keep the pidfile and state so a later stop can retry.
+                if kill -0 "$pid" 2> /dev/null; then
+                    echo "qemu-runner: pid $pid survived SIGKILL" >&2
+                    return 1
+                fi
+            fi
         fi
     fi
     if [ -n "$_QR_PIDFILE" ]; then
@@ -226,33 +255,69 @@ qemu_stop()
     fi
     _QR_PIDFILE=""
     _QR_LOG=""
+    _QR_ERR=""
     _QR_CTL=""
 }
 
-# When sourced, register a cleanup trap that does not clobber the caller's
-# existing trap chain. When executed directly, the EXIT trap fires on script
-# exit.
-trap 'qemu_stop' EXIT
+qemu_write_state()
+{
+    mkdir -p "$(dirname "$1")" || return 1
+    printf 'port=%s\nkey=%s\npidfile=%s\n' \
+        "$QEMU_PORT" "$QEMU_SSH_KEY" "$_QR_PIDFILE" > "$1.tmp" && mv -f "$1.tmp" "$1"
+}
 
-# CLI driver: when run directly, support 'qemu-runner.sh start|exec|stop'.
+qemu_read_state()
+{
+    [ -s "$1" ] || {
+        echo "qemu-runner: no state file $1" >&2
+        return 1
+    }
+    _QR_PIDFILE="$(sed -n 's/^pidfile=//p' "$1")"
+
+    # Restrict cleanup to the directory shape created by mktemp: ^/ rejects a
+    # relative path and [^/] a ".." run directory, both of which a case
+    # pattern's * admits.
+    if [[ ! "$_QR_PIDFILE" =~ ^/.*/elfuse-qemu\.[^/]+/qemu\.pid$ ]]; then
+        echo "qemu-runner: $1 names no qemu-runner pidfile: $_QR_PIDFILE; remove the file once the VM is gone" >&2
+        return 1
+    fi
+}
+
 if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
     cmd="${1:-help}"
     shift || true
+    state_file=""
+    if [ "$cmd" != exec ] && [ "${1:-}" = "--state-file" ]; then
+        state_file="${2:?--state-file needs a path}"
+        shift 2
+    fi
     case "$cmd" in
         start)
-            qemu_start
+            if [ -n "$state_file" ] && [ -e "$state_file" ]; then
+                echo "qemu-runner: $state_file names a live VM; run stop first" >&2
+                exit 1
+            fi
+            trap 'qemu_stop' EXIT
+            qemu_start || exit 1
+            if [ -n "$state_file" ]; then
+                qemu_write_state "$state_file" || exit 1
+                trap - EXIT
+            fi
             echo "PORT=$QEMU_PORT KEY=$QEMU_SSH_KEY"
             ;;
         exec)
+            trap 'qemu_stop' EXIT
             qemu_start
             qemu_exec "$@"
             ;;
         stop)
-            qemu_stop
+            [ -z "$state_file" ] || qemu_read_state "$state_file" || exit 1
+            qemu_stop || exit 1
+            [ -z "$state_file" ] || rm -f "$state_file"
             ;;
         *)
             cat << EOF
-Usage: $0 <start|exec ARGS...|stop>
+Usage: $0 <start [--state-file PATH]|exec ARGS...|stop [--state-file PATH]>
 
 Boots qemu-system-aarch64 with the test fixtures and exposes ssh.
 The host repo is shared into the VM at /mnt/host (read-only).

@@ -413,6 +413,12 @@ $(BUILD_DIR)/test-usbdev-ioctl-departed: tests/test-usbdev-ioctl-departed.c \
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -I$(BUILD_DIR) -o $@ $<
 
+# test-rlimit-fsize starts a second thread to show SIGXFSZ is sent to the thread
+# that wrote.
+$(BUILD_DIR)/test-rlimit-fsize: tests/test-rlimit-fsize.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-usbdev-ioctl churns open/read/close on one usbdevfs node from four
 # threads, so a close and a sibling's open contend for the same fd number.
 $(BUILD_DIR)/test-usbdev-ioctl: tests/test-usbdev-ioctl.c | $(BUILD_DIR)

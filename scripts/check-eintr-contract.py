@@ -127,6 +127,12 @@ INVENTORY = {
         "restartable",
         "Polled retry helper; reports before the operation it guards runs.",
     ),
+    "syscall/io.c::copy_past_fsize": (
+        "restartable",
+        "Waits for a byte in an empty pipe before the write path can refuse "
+        "it, and only while the copy has moved nothing. It reads nothing "
+        "itself, so a restart re-runs the call over the same input.",
+    ),
     "syscall/io.c::io_wait_fd_or_interrupted": (
         "restartable",
         "Reports readiness or EINTR without transferring anything itself. It "

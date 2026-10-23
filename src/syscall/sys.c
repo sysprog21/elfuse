@@ -34,6 +34,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
+#include "syscall/signal.h"
 #include "syscall/sys.h"
 
 /* System info syscall handlers. */
@@ -814,6 +815,13 @@ uint64_t sys_rlimit_cur(int resource)
 {
     return atomic_load_explicit(&rlimit_private.slot[resource].cur,
                                 memory_order_relaxed);
+}
+
+void sys_rlimit_send_xfsz(void)
+{
+    if (!current_thread ||
+        !signal_queue_thread(thread_tid(current_thread), LINUX_SIGXFSZ))
+        signal_queue(LINUX_SIGXFSZ);
 }
 
 void sys_rlimit_snapshot(linux_rlimit64_t out[LINUX_RLIMIT_COUNT])

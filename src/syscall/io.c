@@ -1766,6 +1766,57 @@ int64_t sys_pread64(guest_t *g,
     return ret < 0 ? linux_errno() : ret;
 }
 
+/* pwrite and pwritev on an O_APPEND descriptor write at end of file on Linux,
+ * since generic_write_checks moves the position there, and leave the
+ * descriptor's own position alone. macOS writes at the offset given, so such a
+ * write is found here, @appends set, and the current end of file returned. A
+ * negative offset is left for the host call to refuse, as ksys_pwrite64 does
+ * before it looks at the flags. Only a regular file, by the type pinned with
+ * the descriptor (inherited stdio may be one), pays for the flag lookup: the
+ * guest's O_APPEND is not shadowed, since F_SETFL on a regular file goes to the
+ * host description, which a forked child shares.
+ */
+static int64_t io_append_offset(int host_fd,
+                                int type,
+                                int64_t offset,
+                                bool *appends)
+{
+    *appends = false;
+    if (offset < 0 || (type != FD_REGULAR && type != FD_STDIO))
+        return offset;
+    int fl = fcntl(host_fd, F_GETFL);
+    struct stat st;
+    if (fl < 0 || !(fl & O_APPEND) || fstat(host_fd, &st) < 0 ||
+        !S_ISREG(st.st_mode))
+        return offset;
+    *appends = true;
+    return st.st_size;
+}
+
+/* A positioned write that io_append_offset found appending goes through the
+ * host's own O_APPEND write, which finds end of file and writes there under one
+ * vnode lock, as Linux does under the inode lock. A pwrite at a looked-up end
+ * of file would let another process appending to the file land on the same
+ * bytes. The descriptor's position is put back after, so it moves only for a
+ * sibling that reads it between the two calls.
+ */
+static ssize_t io_pwritev_at(int host_fd,
+                             const struct iovec *iov,
+                             int iovcnt,
+                             int64_t pos,
+                             bool appends)
+{
+    if (!appends)
+        return pwritev(host_fd, iov, iovcnt, pos);
+    off_t saved = lseek(host_fd, 0, SEEK_CUR);
+    ssize_t ret = writev(host_fd, iov, iovcnt);
+    int saved_errno = errno;
+    if (saved >= 0)
+        (void) lseek(host_fd, saved, SEEK_SET);
+    errno = saved_errno;
+    return ret;
+}
+
 int64_t sys_pwrite64(guest_t *g,
                      int fd,
                      uint64_t buf_gva,
@@ -1781,7 +1832,8 @@ int64_t sys_pwrite64(guest_t *g,
     if (fd_get_type(fd) == FD_USBDEV)
         return offset < 0 ? -LINUX_EINVAL : usbdev_write_refused(fd);
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
+    fd_block_state_t pin_st;
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &pin_st);
     if (err < 0)
         return err;
 
@@ -1810,7 +1862,10 @@ int64_t sys_pwrite64(guest_t *g,
         return intercepted;
     }
 
-    ssize_t ret = pwrite(host_ref.fd, buf, count, offset);
+    bool appends;
+    int64_t pos = io_append_offset(host_ref.fd, pin_st.type, offset, &appends);
+    struct iovec iov = {.iov_base = buf, .iov_len = count};
+    ssize_t ret = io_pwritev_at(host_ref.fd, &iov, 1, pos, appends);
     host_fd_ref_close(&host_ref);
     return io_write_result(ret);
 }
@@ -2387,7 +2442,8 @@ int64_t sys_pwritev(guest_t *g,
     }
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
+    fd_block_state_t pin_st;
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &pin_st);
     if (err < 0)
         return err;
 
@@ -2406,7 +2462,10 @@ int64_t sys_pwritev(guest_t *g,
         return intercepted;
     }
 
-    ssize_t ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, offset);
+    bool appends;
+    int64_t pos = io_append_offset(host_ref.fd, pin_st.type, offset, &appends);
+    ssize_t ret =
+        io_pwritev_at(host_ref.fd, host_iov.iov, iovcnt, pos, appends);
     int64_t result = io_write_result(ret);
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);

@@ -2690,6 +2690,16 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 host_fd_ref_close(&host_ref);
                 goto slow_path;
             }
+
+            /* sys_write is where RLIMIT_FSIZE is applied, to regular files
+             * only; inherited stdio may be one.
+             */
+            if (nr == SYS_write &&
+                (fast_st.type == FD_REGULAR || fast_st.type == FD_STDIO) &&
+                sys_rlimit_cur(LINUX_RLIMIT_FSIZE) != LINUX_RLIM_INFINITY) {
+                host_fd_ref_close(&host_ref);
+                goto slow_path;
+            }
             uint64_t count = x2;
             if (count == 0) {
                 host_fd_ref_close(&host_ref);

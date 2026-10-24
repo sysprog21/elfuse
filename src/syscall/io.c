@@ -56,6 +56,7 @@
 #include "syscall/usbdev.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
+#include "syscall/sys.h"
 #include "syscall/wakeup-pipe.h"
 
 #define URANDOM_CACHE_SIZE 4096
@@ -407,6 +408,8 @@ static bool io_foreign_should_block(int host_fd, short events)
  */
 static bool io_eagain_should_wait(const fd_block_state_t *st, int host_fd)
 {
+    if (st->call_nonblock)
+        return false;
     if (st->nonblock_owned)
         return !st->guest_nonblock;
     return sock_op_should_block(st, host_fd, 0);
@@ -508,6 +511,20 @@ int64_t io_xfer(int fd,
     bool nb_transfer = st.nonblock_owned;
     bool wait_first = false;
     if (!nb_transfer) {
+        /* A per-call nonblocking request on a description elfuse does not own
+         * cannot reach the host transfer, which would block, so readiness is
+         * asked first instead.
+         */
+        if (st.call_nonblock) {
+            struct pollfd pfd = {.fd = host_fd, .events = events};
+            if (poll(&pfd, 1, 0) <= 0) {
+                errno = EAGAIN;
+                *out = -1;
+                return 0;
+            }
+            *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
+            return 0;
+        }
         if (!io_foreign_should_block(host_fd, events)) {
             *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
             return 0;
@@ -1532,6 +1549,100 @@ static int64_t io_write_result(ssize_t ret)
     return linux_errno();
 }
 
+/* What RLIMIT_FSIZE leaves a write to @host_fd that starts at @pos; with
+ * @append_aware a descriptor opened O_APPEND starts at end of file instead. The
+ * limit is on regular files only.
+ *
+ * The kernel refuses a descriptor that is not open for writing before it looks
+ * at any size (vfs_write, Linux fs/read_write.c), so no limit applies to one
+ * and the host call reports it, as in truncate_fsize_check.
+ *
+ * Returns false when no limit applies, true with @room set otherwise, 0 at or
+ * past the limit.
+ */
+static bool fsize_room(int host_fd,
+                       off_t pos,
+                       bool append_aware,
+                       uint64_t *room)
+{
+    uint64_t limit = sys_rlimit_cur(LINUX_RLIMIT_FSIZE);
+    if (limit == LINUX_RLIM_INFINITY)
+        return false;
+
+    struct stat st;
+    if (fstat(host_fd, &st) < 0 || !S_ISREG(st.st_mode))
+        return false;
+    int fl = fcntl(host_fd, F_GETFL);
+    if (fl < 0 || (fl & O_ACCMODE) == O_RDONLY)
+        return false;
+
+    /* ksys_pwrite64 refuses a negative offset before generic_write_checks moves
+     * an O_APPEND write to end of file, so the host call reports it.
+     */
+    if (pos < 0)
+        return false;
+    if (append_aware && (fl & O_APPEND))
+        pos = st.st_size;
+    *room = (uint64_t) pos < limit ? limit - (uint64_t) pos : 0;
+    return true;
+}
+
+/* RLIMIT_FSIZE on a write, after generic_write_check_limits (Linux
+ * mm/filemap.c): a regular-file write that starts at or past the soft limit
+ * fails with EFBIG and SIGXFSZ, and one that crosses it is cut at the limit. A
+ * write of no bytes is done before the limit is looked at (generic_write_checks
+ * returns on a zero count first).
+ *
+ * Returns 0 with @count clamped, or -LINUX_EFBIG.
+ */
+static int64_t fsize_limit_write(int host_fd,
+                                 off_t pos,
+                                 bool append_aware,
+                                 uint64_t *count)
+{
+    uint64_t room;
+    if (*count == 0 || !fsize_room(host_fd, pos, append_aware, &room))
+        return 0;
+    if (room == 0) {
+        sys_rlimit_send_xfsz();
+        return -LINUX_EFBIG;
+    }
+    if (*count > room)
+        *count = room;
+    return 0;
+}
+
+/* fsize_limit_write for a vector: @iov and @iovcnt are cut to the bytes the
+ * limit leaves.
+ */
+static int64_t fsize_limit_writev(int host_fd,
+                                  off_t pos,
+                                  bool append_aware,
+                                  struct iovec *iov,
+                                  int *iovcnt)
+{
+    if (sys_rlimit_cur(LINUX_RLIMIT_FSIZE) == LINUX_RLIM_INFINITY)
+        return 0;
+
+    uint64_t total = 0;
+    for (int i = 0; i < *iovcnt; i++)
+        total += iov[i].iov_len;
+    uint64_t allowed = total;
+    int64_t err = fsize_limit_write(host_fd, pos, append_aware, &allowed);
+    if (err < 0 || allowed == total)
+        return err;
+
+    for (int i = 0; i < *iovcnt; i++) {
+        if (iov[i].iov_len >= allowed) {
+            iov[i].iov_len = allowed;
+            *iovcnt = i + 1;
+            break;
+        }
+        allowed -= iov[i].iov_len;
+    }
+    return 0;
+}
+
 int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
     int type = fd_get_type(fd);
@@ -1591,6 +1702,12 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         if (handled > 0) {
             host_fd_ref_close(&host_ref);
             return intercepted;
+        }
+
+        int64_t fsz = fsize_limit_write(host_ref.fd, offset, true, &count);
+        if (fsz < 0) {
+            host_fd_ref_close(&host_ref);
+            return fsz;
         }
     }
 
@@ -1750,6 +1867,72 @@ int64_t sys_pread64(guest_t *g,
     return ret < 0 ? linux_errno() : ret;
 }
 
+/* pwrite and pwritev on an O_APPEND descriptor write at end of file on Linux,
+ * since generic_write_checks moves the position there, and leave the
+ * descriptor's own position alone. macOS writes at the offset given, so such a
+ * write is found here, @appends set, and the current end of file returned. A
+ * negative offset is left for the host call to refuse, as ksys_pwrite64 does
+ * before it looks at the flags. Only a regular file, by the type pinned with
+ * the descriptor (inherited stdio may be one), pays for the flag lookup: the
+ * guest's O_APPEND is not shadowed, since F_SETFL on a regular file goes to the
+ * host description, which a forked child shares.
+ */
+static int64_t io_append_offset(int host_fd,
+                                int type,
+                                int64_t offset,
+                                bool *appends)
+{
+    *appends = false;
+    if (offset < 0 || (type != FD_REGULAR && type != FD_STDIO))
+        return offset;
+    int fl = fcntl(host_fd, F_GETFL);
+    struct stat st;
+    if (fl < 0 || !(fl & O_APPEND) || fstat(host_fd, &st) < 0 ||
+        !S_ISREG(st.st_mode))
+        return offset;
+    *appends = true;
+    return st.st_size;
+}
+
+/* A positioned write that io_append_offset found appending goes through the
+ * host's own O_APPEND write, which finds end of file and writes there under one
+ * vnode lock, as Linux does under the inode lock. A pwrite at a looked-up end
+ * of file would let another process appending to the file land on the same
+ * bytes. The descriptor's position is put back after, so it moves only for a
+ * sibling that reads it between the two calls.
+ */
+static ssize_t io_pwritev_at(int host_fd,
+                             const struct iovec *iov,
+                             int iovcnt,
+                             int64_t pos,
+                             bool appends)
+{
+    if (!appends)
+        return pwritev(host_fd, iov, iovcnt, pos);
+    off_t saved = lseek(host_fd, 0, SEEK_CUR);
+    ssize_t ret = writev(host_fd, iov, iovcnt);
+    int saved_errno = errno;
+    if (saved >= 0)
+        (void) lseek(host_fd, saved, SEEK_SET);
+    errno = saved_errno;
+    return ret;
+}
+
+/* rw_verify_area (Linux fs/read_write.c) refuses a positioned write whose end,
+ * offset plus count, does not fit in loff_t, with EINVAL ahead of any size
+ * check. A descriptor not open for writing, or one that cannot seek, is left to
+ * the host call, which answers EBADF or ESPIPE first, as vfs_write and
+ * ksys_pwrite64 do.
+ */
+static bool io_write_range_wraps(int host_fd, int64_t offset, uint64_t count)
+{
+    if (offset < 0 || count <= (uint64_t) (INT64_MAX - offset))
+        return false;
+    int fl = fcntl(host_fd, F_GETFL);
+    return fl >= 0 && (fl & O_ACCMODE) != O_RDONLY &&
+           lseek(host_fd, 0, SEEK_CUR) >= 0;
+}
+
 int64_t sys_pwrite64(guest_t *g,
                      int fd,
                      uint64_t buf_gva,
@@ -1765,13 +1948,18 @@ int64_t sys_pwrite64(guest_t *g,
     if (fd_get_type(fd) == FD_USBDEV)
         return offset < 0 ? -LINUX_EINVAL : usbdev_write_refused(fd);
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
+    fd_block_state_t pin_st;
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &pin_st);
     if (err < 0)
         return err;
 
     /* Linux: pwrite(fd, NULL, 0, off) returns 0, not EFAULT */
     if (count == 0)
         return io_return_zero(&host_ref);
+    if (io_write_range_wraps(host_ref.fd, offset, count)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EINVAL;
+    }
 
     uint64_t avail = 0;
     void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_R, count);
@@ -1794,7 +1982,19 @@ int64_t sys_pwrite64(guest_t *g,
         return intercepted;
     }
 
-    ssize_t ret = pwrite(host_ref.fd, buf, count, offset);
+    /* The limit is measured where the bytes land, which for an O_APPEND
+     * descriptor is end of file (io_append_offset).
+     */
+    bool appends;
+    int64_t pos = io_append_offset(host_ref.fd, pin_st.type, offset, &appends);
+    int64_t fsz = fsize_limit_write(host_ref.fd, pos, false, &count);
+    if (fsz < 0) {
+        host_fd_ref_close(&host_ref);
+        return fsz;
+    }
+
+    struct iovec iov = {.iov_base = buf, .iov_len = count};
+    ssize_t ret = io_pwritev_at(host_ref.fd, &iov, 1, pos, appends);
     host_fd_ref_close(&host_ref);
     return io_write_result(ret);
 }
@@ -2275,6 +2475,14 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             host_fd_ref_close(&host_ref);
             return intercepted;
         }
+
+        int64_t fsz = fsize_limit_writev(host_ref.fd, offset, true,
+                                         host_iov.iov, &iovcnt);
+        if (fsz < 0) {
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return fsz;
+        }
     }
 
     ssize_t ret;
@@ -2371,7 +2579,8 @@ int64_t sys_pwritev(guest_t *g,
     }
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
+    fd_block_state_t pin_st;
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &pin_st);
     if (err < 0)
         return err;
 
@@ -2382,6 +2591,15 @@ int64_t sys_pwritev(guest_t *g,
         return err;
     }
 
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; i++)
+        total += host_iov.iov[i].iov_len;
+    if (io_write_range_wraps(host_ref.fd, offset, total)) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EINVAL;
+    }
+
     int64_t intercepted = proc_try_writev_intercept(
         fd, host_ref.fd, host_iov.iov, iovcnt, offset, 1);
     if (intercepted != INT64_MIN) {
@@ -2390,7 +2608,18 @@ int64_t sys_pwritev(guest_t *g,
         return intercepted;
     }
 
-    ssize_t ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, offset);
+    bool appends;
+    int64_t pos = io_append_offset(host_ref.fd, pin_st.type, offset, &appends);
+    int64_t fsz =
+        fsize_limit_writev(host_ref.fd, pos, false, host_iov.iov, &iovcnt);
+    if (fsz < 0) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return fsz;
+    }
+
+    ssize_t ret =
+        io_pwritev_at(host_ref.fd, host_iov.iov, iovcnt, pos, appends);
     int64_t result = io_write_result(ret);
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
@@ -2416,19 +2645,23 @@ static int64_t sys_pwritev_append(guest_t *g,
     }
 
     ssize_t ret;
-    if (update_file_offset) {
-        if (lseek(host_ref.fd, 0, SEEK_END) < 0) {
-            ret = -1;
-        } else {
-            ret = writev(host_ref.fd, host_iov.iov, iovcnt);
-        }
+    struct stat st;
+    if (fstat(host_ref.fd, &st) < 0) {
+        ret = -1;
     } else {
-        struct stat st;
-        if (fstat(host_ref.fd, &st) < 0) {
-            ret = -1;
-        } else {
-            ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, st.st_size);
+        err = fsize_limit_writev(host_ref.fd, st.st_size, false, host_iov.iov,
+                                 &iovcnt);
+        if (err < 0) {
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return err;
         }
+        if (!update_file_offset)
+            ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, st.st_size);
+        else if (lseek(host_ref.fd, 0, SEEK_END) < 0)
+            ret = -1;
+        else
+            ret = writev(host_ref.fd, host_iov.iov, iovcnt);
     }
 
     int64_t result = io_write_result(ret);
@@ -3575,6 +3808,17 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
         return -LINUX_EFBIG; /* Overflow check */
     }
     if (new_size > st.st_size) {
+        /* inode_newsize_ok (Linux fs/attr.c), as a growing truncate. A
+         * descriptor not open for writing is left to the host call, which
+         * refuses it before any size is looked at, as vfs_fallocate does.
+         */
+        int fl = fcntl(host_ref.fd, F_GETFL);
+        if (S_ISREG(st.st_mode) && fl >= 0 && (fl & O_ACCMODE) != O_RDONLY &&
+            (uint64_t) new_size > sys_rlimit_cur(LINUX_RLIMIT_FSIZE)) {
+            host_fd_ref_close(&host_ref);
+            sys_rlimit_send_xfsz();
+            return -LINUX_EFBIG;
+        }
         if (ftruncate(host_ref.fd, new_size) < 0) {
             host_fd_ref_close(&host_ref);
             return linux_errno();
@@ -3654,6 +3898,70 @@ static bool io_give_up_unsent(int64_t off_in,
     return rewound || thread_stop_requested();
 }
 
+/* fsize_room for a stream copy: @off_out is the output offset, or negative for
+ * the descriptor's own position.
+ */
+static bool fsize_copy_room(int out_hfd, int64_t off_out, uint64_t *room)
+{
+    if (sys_rlimit_cur(LINUX_RLIMIT_FSIZE) == LINUX_RLIM_INFINITY)
+        return false;
+
+    off_t pos = off_out >= 0 ? (off_t) off_out : lseek(out_hfd, 0, SEEK_CUR);
+    return fsize_room(out_hfd, pos, off_out < 0, room);
+}
+
+/* A stream copy that has filled its output to RLIMIT_FSIZE. Linux hands the
+ * next source bytes to the file's write path (iter_file_splice_write, fs/
+ * splice.c), which fails with EFBIG and SIGXFSZ, so the signal goes out only
+ * when the input has a byte to give. Before that the kernel waits for one
+ * (splice_from_pipe_next): a pipe that is empty and still has a writer blocks,
+ * or answers EAGAIN when it does not block, and one whose writers are gone ends
+ * the copy. Nothing is waited for once bytes have moved.
+ *
+ * Returns 1 after sending SIGXFSZ, 0 when the input has nothing more, or a
+ * negative Linux errno from the read or the wait.
+ */
+static int64_t copy_past_fsize(int in_hfd,
+                               int64_t off_in,
+                               const fd_block_state_t *in_st,
+                               bool nothing_moved)
+{
+    char c;
+    off_t pos = off_in >= 0 ? (off_t) off_in : lseek(in_hfd, 0, SEEK_CUR);
+
+    if (pos >= 0) {
+        ssize_t nr = pread(in_hfd, &c, 1, pos);
+        if (nr <= 0)
+            return nr < 0 ? linux_errno() : 0;
+        sys_rlimit_send_xfsz();
+        return 1;
+    }
+
+    /* A pipe's write end never turns readable while its read end is open, so
+     * the wait below would never end. do_splice and do_sendfile refuse an input
+     * not open for reading with EBADF before they look at anything else.
+     */
+    int in_fl = fcntl(in_hfd, F_GETFL);
+    if (in_fl >= 0 && (in_fl & O_ACCMODE) == O_WRONLY)
+        return -LINUX_EBADF;
+    for (;;) {
+        int queued = 0;
+        if (ioctl(in_hfd, FIONREAD, &queued) == 0 && queued > 0) {
+            sys_rlimit_send_xfsz();
+            return 1;
+        }
+
+        struct pollfd pfd = {.fd = in_hfd, .events = POLLIN};
+        if (!nothing_moved || (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLHUP)))
+            return 0;
+        if (!io_eagain_should_wait(in_st, in_hfd))
+            return -LINUX_EAGAIN;
+        int64_t waited = io_wait_fd_or_interrupted(in_hfd, POLLIN);
+        if (waited < 0)
+            return waited;
+    }
+}
+
 typedef struct {
     int in_gfd, in_hfd;
     int out_gfd, out_hfd;
@@ -3680,6 +3988,20 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
     while (remaining > 0) {
         size_t chunk =
             remaining > IO_COPY_BUF_SIZE ? IO_COPY_BUF_SIZE : remaining;
+        uint64_t room;
+        if (fsize_copy_room(out_hfd, *off_out, &room)) {
+            if (room == 0) {
+                int64_t past =
+                    copy_past_fsize(in_hfd, *off_in, &in_st, total == 0);
+                if (total == 0 && past != 0) {
+                    ret = past > 0 ? -LINUX_EFBIG : past;
+                    goto done;
+                }
+                break;
+            }
+            if (chunk > room)
+                chunk = room;
+        }
         ssize_t nr;
         if (*off_in >= 0) {
             int64_t intercepted = proc_try_chunk_read_intercept(
@@ -3784,6 +4106,35 @@ done:
     return ret;
 }
 
+/* do_sendfile and do_splice (Linux fs/read_write.c, fs/splice.c) refuse an
+ * input not open for reading with EBADF. do_sendfile then checks the input
+ * offset before it looks at the output, which is why the two ends are checked
+ * apart.
+ */
+static int64_t splice_in_check(int in_hfd)
+{
+    int fl = fcntl(in_hfd, F_GETFL);
+    return fl >= 0 && (fl & O_ACCMODE) == O_WRONLY ? -LINUX_EBADF : 0;
+}
+
+/* An output not open for writing is EBADF. After that, do_splice_direct and the
+ * pipe-to-file branch of do_splice refuse an output opened O_APPEND with
+ * EINVAL, before anything moves. A pipe output is not checked for O_APPEND.
+ */
+static int64_t splice_out_check(int out_hfd)
+{
+    int fl = fcntl(out_hfd, F_GETFL);
+    if (fl < 0)
+        return 0;
+    if ((fl & O_ACCMODE) == O_RDONLY)
+        return -LINUX_EBADF;
+
+    struct stat st;
+    if ((fl & O_APPEND) && fstat(out_hfd, &st) == 0 && !S_ISFIFO(st.st_mode))
+        return -LINUX_EINVAL;
+    return 0;
+}
+
 int64_t sys_sendfile(guest_t *g,
                      int out_fd,
                      int in_fd,
@@ -3810,11 +4161,17 @@ int64_t sys_sendfile(guest_t *g,
             err = -LINUX_EFAULT;
             goto out_sendfile;
         }
-        if (offset < 0) {
-            err = -LINUX_EINVAL;
-            goto out_sendfile;
-        }
     }
+    err = splice_in_check(in_ref.fd);
+    if (err < 0)
+        goto out_sendfile;
+    if (offset_gva != 0 && offset < 0) {
+        err = -LINUX_EINVAL;
+        goto out_sendfile;
+    }
+    err = splice_out_check(out_ref.fd);
+    if (err < 0)
+        goto out_sendfile;
 
     /* sendfile has no output offset, so out always uses write(). */
     int64_t off_out = -1;
@@ -3846,6 +4203,46 @@ out_sendfile:
     if (err != 0)
         return err;
     return (int64_t) total;
+}
+
+/* generic_file_rw_checks (Linux fs/read_write.c), which copy_file_range runs
+ * before it looks at offsets, lengths or limits: both ends regular files, the
+ * input open for reading, and the output open for writing without O_APPEND.
+ */
+static int64_t copy_file_rw_checks(int in_hfd, int out_hfd)
+{
+    struct stat in_st, out_st;
+    if (fstat(in_hfd, &in_st) < 0 || fstat(out_hfd, &out_st) < 0)
+        return linux_errno();
+    if (S_ISDIR(in_st.st_mode) || S_ISDIR(out_st.st_mode))
+        return -LINUX_EISDIR;
+    if (!S_ISREG(in_st.st_mode) || !S_ISREG(out_st.st_mode))
+        return -LINUX_EINVAL;
+
+    int in_fl = fcntl(in_hfd, F_GETFL);
+    int out_fl = fcntl(out_hfd, F_GETFL);
+    if (in_fl < 0 || out_fl < 0)
+        return linux_errno();
+    if ((in_fl & O_ACCMODE) == O_WRONLY || (out_fl & O_ACCMODE) == O_RDONLY ||
+        (out_fl & O_APPEND))
+        return -LINUX_EBADF;
+    return 0;
+}
+
+/* generic_copy_file_checks (Linux fs/read_write.c) refuses a range whose end
+ * wraps, testing pos + count < pos as an unsigned sum, so a negative offset
+ * passed by pointer wraps too. The position is that offset when the guest
+ * passed one, else the descriptor's own.
+ */
+static bool copy_range_wraps(int host_fd,
+                             bool has_off,
+                             int64_t off,
+                             uint64_t len)
+{
+    int64_t pos = has_off ? off : lseek(host_fd, 0, SEEK_CUR);
+    if (!has_off && pos < 0)
+        return false;
+    return (uint64_t) pos + len < (uint64_t) pos;
 }
 
 int64_t sys_copy_file_range(guest_t *g,
@@ -3884,6 +4281,38 @@ int64_t sys_copy_file_range(guest_t *g,
             err = -LINUX_EFAULT;
             goto out_copy_file_range;
         }
+    }
+
+    err = copy_file_rw_checks(in_ref.fd, out_ref.fd);
+    if (err < 0)
+        goto out_copy_file_range;
+    if (copy_range_wraps(in_ref.fd, off_in_gva != 0, off_in, len) ||
+        copy_range_wraps(out_ref.fd, off_out_gva != 0, off_out, len)) {
+        err = -LINUX_EOVERFLOW;
+        goto out_copy_file_range;
+    }
+
+    /* A negative offset that does not wrap reaches rw_verify_area, which
+     * refuses it. Below, a negative offset means "none given".
+     */
+    if ((off_in_gva != 0 && off_in < 0) || (off_out_gva != 0 && off_out < 0)) {
+        err = -LINUX_EINVAL;
+        goto out_copy_file_range;
+    }
+
+    /* generic_copy_file_checks (Linux fs/read_write.c) applies RLIMIT_FSIZE to
+     * the whole request before anything is read: EFBIG and SIGXFSZ at or past
+     * the limit whatever the length, and a length cut at the limit otherwise.
+     */
+    uint64_t room;
+    if (fsize_copy_room(out_ref.fd, off_out, &room)) {
+        if (room == 0) {
+            sys_rlimit_send_xfsz();
+            err = -LINUX_EFBIG;
+            goto out_copy_file_range;
+        }
+        if (len > room)
+            len = room;
     }
 
     /* Emulate with a pread/pwrite loop. */
@@ -4021,6 +4450,44 @@ static size_t splice_drain_chunk(splice_state_t *st,
     return written;
 }
 
+#define LINUX_SPLICE_F_NONBLOCK 0x02
+
+/* Whether SPLICE_F_NONBLOCK reaches this input on Linux: a pipe takes it in
+ * splice_from_pipe_next and an AF_UNIX stream socket in
+ * unix_stream_splice_read. tcp_splice_read and the other inputs follow the
+ * descriptor's own O_NONBLOCK.
+ */
+static bool splice_flag_reaches_input(int host_fd)
+{
+    struct stat sb;
+    if (fstat(host_fd, &sb) < 0)
+        return false;
+    if (S_ISFIFO(sb.st_mode))
+        return true;
+    if (!S_ISSOCK(sb.st_mode))
+        return false;
+
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    int type = 0;
+    socklen_t tl = sizeof(type);
+    return getsockname(host_fd, (struct sockaddr *) &ss, &sl) == 0 &&
+           ss.ss_family == AF_UNIX &&
+           getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &type, &tl) == 0 &&
+           type == SOCK_STREAM;
+}
+
+/* The O_NONBLOCK the guest sees on a descriptor: the shadow on an owned fd, the
+ * host flag otherwise.
+ */
+static bool splice_end_nonblock(const fd_block_state_t *st, int host_fd)
+{
+    if (st->nonblock_owned)
+        return st->guest_nonblock;
+    int fl = fcntl(host_fd, F_GETFL);
+    return fl >= 0 && (fl & O_NONBLOCK);
+}
+
 int64_t sys_splice(guest_t *g,
                    int fd_in,
                    uint64_t off_in_gva,
@@ -4029,7 +4496,12 @@ int64_t sys_splice(guest_t *g,
                    size_t len,
                    unsigned int flags)
 {
-    (void) flags;
+    /* The splice syscall returns 0 for a zero length before it looks at either
+     * descriptor.
+     */
+    if (len == 0)
+        return 0;
+
     host_fd_ref_t in_ref, out_ref;
     fd_block_state_t in_st, out_st;
     int64_t err = host_fd_ref_open_io_state(fd_in, &in_ref, NULL, &in_st);
@@ -4058,6 +4530,15 @@ int64_t sys_splice(guest_t *g,
         }
     }
 
+    err = splice_in_check(in_ref.fd);
+    if (err == 0)
+        err = splice_out_check(out_ref.fd);
+    if (err < 0) {
+        host_fd_ref_close(&out_ref);
+        host_fd_ref_close(&in_ref);
+        return err;
+    }
+
     /* Emulate with a read/write loop over a heap buffer. splice fully drains
      * each read chunk rather than stopping on a short write, which is why it
      * does not share copy_fd_range; splice_drain_chunk is that drain.
@@ -4078,11 +4559,80 @@ int64_t sys_splice(guest_t *g,
                          .off_out = off_out,
                          .in_st = in_st,
                          .out_st = out_st};
+
+    /* SPLICE_F_NONBLOCK makes a pipe end nonblocking for this one call,
+     * whatever O_NONBLOCK it carries (splice_from_pipe_next and wait_for_space,
+     * Linux fs/splice.c), and an AF_UNIX stream input as well. do_splice also
+     * raises the flag itself when a pipe end is O_NONBLOCK: the input for
+     * pipe-to-file, the output for file-to-pipe, either for pipe-to-pipe. The
+     * output is never made nonblocking here: a chunk is read before it is
+     * written, and a pipe or socket input cannot take back what a nonblocking
+     * write then failed to place. A pipe output is asked for room before each
+     * read instead.
+     */
+    struct stat in_sb, out_sb;
+    bool in_fifo = fstat(st.in_hfd, &in_sb) == 0 && S_ISFIFO(in_sb.st_mode);
+    bool out_fifo = fstat(st.out_hfd, &out_sb) == 0 && S_ISFIFO(out_sb.st_mode);
+    bool nonblock = (flags & LINUX_SPLICE_F_NONBLOCK) ||
+                    (in_fifo && splice_end_nonblock(&st.in_st, st.in_hfd)) ||
+                    (out_fifo && splice_end_nonblock(&st.out_st, st.out_hfd));
+    st.in_st.call_nonblock = nonblock && splice_flag_reaches_input(st.in_hfd);
+    bool gate_out = nonblock && st.off_out < 0 && out_fifo;
     splice_fail_t f = {0};
     size_t total = 0;
     int64_t ret;
     while (total < len) {
         size_t n = (len - total) > chunk ? chunk : (len - total);
+        uint64_t fsize_room;
+        if (fsize_copy_room(st.out_hfd, st.off_out, &fsize_room)) {
+            if (fsize_room == 0) {
+                int64_t past = copy_past_fsize(st.in_hfd, st.off_in, &st.in_st,
+                                               total == 0);
+                if (past > 0) {
+                    f.rw_error = true;
+                    f.saved_errno = EFBIG;
+                } else if (past < 0) {
+                    f.wait_err = past;
+                }
+                break;
+            }
+            if (n > fsize_room)
+                n = fsize_room;
+        }
+
+        /* A chunk is read before it is written, so it is capped at the room the
+         * output pipe has now, and the write lands without blocking. On macOS a
+         * ready pipe has at least PIPE_BUF bytes free, and fstat reports the
+         * buffer size and the bytes queued, whose difference it takes whole
+         * (measured, the buffer growing on demand included).
+         */
+        if (gate_out) {
+            /* A pipe whose reader is gone polls POLLHUP without POLLOUT on
+             * macOS; wait_for_space answers it with EPIPE and SIGPIPE before
+             * anything is read.
+             */
+            struct pollfd pfd = {.fd = st.out_hfd, .events = POLLOUT};
+            int pr = poll(&pfd, 1, 0);
+            if (pr > 0 && (pfd.revents & (POLLHUP | POLLERR))) {
+                if (total == 0)
+                    signal_queue(LINUX_SIGPIPE);
+                f.rw_error = true; /* reported only if nothing moved */
+                f.saved_errno = EPIPE;
+                break;
+            }
+            if (pr <= 0 || !(pfd.revents & POLLOUT)) {
+                f.rw_error = true;
+                f.saved_errno = EAGAIN;
+                break;
+            }
+            struct stat sb;
+            size_t room = PIPE_BUF;
+            if (fstat(st.out_hfd, &sb) == 0 && sb.st_blksize > sb.st_size &&
+                (size_t) (sb.st_blksize - sb.st_size) > room)
+                room = (size_t) (sb.st_blksize - sb.st_size);
+            if (n > room)
+                n = room;
+        }
         ssize_t r;
         if (st.off_in >= 0) {
             r = pread(st.in_hfd, buf, n, st.off_in);

@@ -13,10 +13,14 @@
  *                     lseek(62), close(57), unlink(35)
  */
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -287,6 +291,126 @@ static void test_pwritev2_append(void)
     EXPECT_TRUE(nr == 6 && !memcmp(buf, "baseXY", 6), "append data mismatch");
 }
 
+/* pwrite and pwritev on an O_APPEND descriptor append whatever offset they are
+ * given, and leave the descriptor's position where it was.
+ */
+static void test_pwrite_o_append(void)
+{
+    TEST("pwrite/pwritev on O_APPEND append");
+
+    char path[] = "/tmp/elfuse-pwrite-append-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0 || write(fd, "abc", 3) != 3) {
+        FAIL("setup");
+        return;
+    }
+    close(fd);
+    fd = open(path, O_WRONLY | O_APPEND);
+
+    struct iovec wv[2] = {
+        {.iov_base = (void *) "Y", .iov_len = 1},
+        {.iov_base = (void *) "Z", .iov_len = 1},
+    };
+    struct stat st;
+    char got[8] = {0};
+    int ok = fd >= 0 && pwrite(fd, "X", 1, 10000) == 1 &&
+             pwritev(fd, wv, 2, 20000) == 2 && fstat(fd, &st) == 0 &&
+             st.st_size == 6 && lseek(fd, 0, SEEK_CUR) == 0;
+    if (fd >= 0)
+        close(fd);
+    fd = open(path, O_RDONLY);
+    ok = ok && fd >= 0 && read(fd, got, sizeof(got)) == 6 &&
+         memcmp(got, "abcXYZ", 6) == 0;
+    if (fd >= 0)
+        close(fd);
+    unlink(path);
+
+    EXPECT_TRUE(ok, "O_APPEND pwrite did not append");
+}
+
+/* Two processes appending with pwrite to one O_APPEND file lose no record:
+ * Linux finds end of file and writes there under one inode lock.
+ */
+static void test_pwrite_o_append_race(void)
+{
+    TEST("pwrite O_APPEND from two processes");
+
+    enum { RECS = 20000, REC = 8 };
+    char path[] = "/tmp/elfuse-pwrite-race-XXXXXX";
+    int fd = mkstemp(path);
+    int go[2];
+    if (fd < 0 || pipe(go) != 0) {
+        FAIL("setup");
+        return;
+    }
+    close(fd);
+
+    /* The child says when it is ready, so both write at the same time. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        int cfd = open(path, O_WRONLY | O_APPEND);
+        if (cfd < 0 || write(go[1], "r", 1) != 1)
+            _exit(1);
+        for (int i = 0; i < RECS; i++)
+            if (pwrite(cfd, "childrec", REC, 0) != REC)
+                _exit(1);
+        _exit(0);
+    }
+    close(go[1]);
+    char c;
+    fd = open(path, O_WRONLY | O_APPEND);
+    int ok = pid > 0 && fd >= 0 && read(go[0], &c, 1) == 1;
+    for (int i = 0; ok && i < RECS; i++)
+        ok = pwrite(fd, "parentrc", REC, 0) == REC;
+    int status = 0;
+    ok = pid > 0 && waitpid(pid, &status, 0) == pid && ok &&
+         WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    struct stat st;
+    ok = ok && fstat(fd, &st) == 0 && st.st_size == 2 * RECS * REC;
+    if (fd >= 0)
+        close(fd);
+    close(go[0]);
+    unlink(path);
+
+    EXPECT_TRUE(ok, "a record was overwritten");
+}
+
+/* A positioned write whose end does not fit in off_t is EINVAL, for pwrite and
+ * for pwritev, before the file is looked at.
+ */
+static void test_pwrite_range_wrap(void)
+{
+    TEST("pwrite/pwritev range wrap EINVAL");
+
+    char path[] = "/tmp/elfuse-pwrite-wrap-XXXXXX";
+    int fd = mkstemp(path);
+    int pfd[2];
+    if (fd < 0 || pipe(pfd) != 0) {
+        FAIL("setup");
+        return;
+    }
+
+    struct iovec wv[2] = {
+        {.iov_base = (void *) "X", .iov_len = 1},
+        {.iov_base = (void *) "Y", .iov_len = 1},
+    };
+    errno = 0;
+    int ok = pwrite(fd, "X", 1, INT64_MAX) == -1 && errno == EINVAL;
+    errno = 0;
+    ok = ok && pwritev(fd, wv, 2, INT64_MAX - 1) == -1 && errno == EINVAL;
+    /* A pipe cannot seek, which ksys_pwrite64 reports before the range. */
+    errno = 0;
+    ok = ok && pwrite(pfd[1], "X", 1, INT64_MAX) == -1 && errno == ESPIPE;
+    errno = 0;
+    ok = ok && pwritev(pfd[1], wv, 2, INT64_MAX - 1) == -1 && errno == ESPIPE;
+    close(pfd[0]);
+    close(pfd[1]);
+    close(fd);
+    unlink(path);
+
+    EXPECT_TRUE(ok, "range wrap not EINVAL, or pipe not ESPIPE");
+}
+
 /* Test 8: zero iovcnt returns 0 without moving the append file offset. Linux
  * reference (verified under qemu-system-aarch64): import_iovec() yields an
  * empty iterator, do_iter_write returns 0 before the offset is touched, so
@@ -462,6 +586,9 @@ int main(void)
     test_empty_iovec_access_checks();
     test_many_iovecs();
     test_pwritev2_append();
+    test_pwrite_o_append();
+    test_pwrite_o_append_race();
+    test_pwrite_range_wrap();
     test_pwritev2_append_zero_iovcnt();
     test_zero_iovcnt_validation();
 

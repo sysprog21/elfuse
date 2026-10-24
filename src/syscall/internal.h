@@ -550,6 +550,9 @@ int fd_get_type(int guest_fd);
  * guest asked for, which on an owned fd is the only place it is recorded. seals
  * rides along so a write path can reject a sealed memfd from the state it
  * pinned, rather than from a second lookup that may describe another file.
+ * call_nonblock is never read from the table: a caller sets it on its own copy
+ * when the syscall itself asks for a nonblocking transfer (SPLICE_F_NONBLOCK),
+ * whatever mode the description carries.
  */
 typedef struct {
     int type;
@@ -558,6 +561,7 @@ typedef struct {
     bool can_block;
     bool nonblock_owned;
     bool guest_nonblock;
+    bool call_nonblock;
 } fd_block_state_t;
 
 fd_block_state_t fd_block_state(int guest_fd);

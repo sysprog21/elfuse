@@ -34,6 +34,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
+#include "syscall/signal.h"
 #include "syscall/sys.h"
 
 /* System info syscall handlers. */
@@ -794,6 +795,19 @@ void sys_rlimit_init(void)
         rlimit_slot_store(&rlimit_private, r, lim);
     }
     pthread_mutex_unlock(&rlimit_lock);
+
+    /* The guest's RLIMIT_FSIZE is enforced from the table just seeded, so the
+     * host soft limit only stands in the way of a guest that raises its own:
+     * lift it to the host hard limit. A guest that raises past the hard limit
+     * still meets the host's, which the ignored SIGXFSZ (main.c) turns into
+     * EFBIG. This runs before the check below records the host limits, which
+     * stay fixed from here on.
+     */
+    struct rlimit fsz;
+    if (getrlimit(RLIMIT_FSIZE, &fsz) == 0 && fsz.rlim_cur < fsz.rlim_max) {
+        fsz.rlim_cur = fsz.rlim_max;
+        (void) setrlimit(RLIMIT_FSIZE, &fsz);
+    }
     host_rlimit_check_arm();
 }
 
@@ -801,6 +815,13 @@ uint64_t sys_rlimit_cur(int resource)
 {
     return atomic_load_explicit(&rlimit_private.slot[resource].cur,
                                 memory_order_relaxed);
+}
+
+void sys_rlimit_send_xfsz(void)
+{
+    if (!current_thread ||
+        !signal_queue_thread(thread_tid(current_thread), LINUX_SIGXFSZ))
+        signal_queue(LINUX_SIGXFSZ);
 }
 
 void sys_rlimit_snapshot(linux_rlimit64_t out[LINUX_RLIMIT_COUNT])

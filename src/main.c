@@ -543,6 +543,16 @@ int main(int argc, char **argv)
      */
     signal(SIGPIPE, SIG_IGN);
 
+    /* A host write past this process's own RLIMIT_FSIZE raises SIGXFSZ, whose
+     * default action kills elfuse. The guest's limit lives in the guest table
+     * and never reaches the host, and sys_rlimit_init lifts the host soft limit
+     * to the hard one, so a host limit is only reached by guest_init sizing the
+     * slab file, or by a guest that raised its own limit past the host hard
+     * limit. Ignoring it turns either into EFBIG: the guest sees a failed
+     * write, and guest_init falls back to an anonymous slab.
+     */
+    signal(SIGXFSZ, SIG_IGN);
+
     /* Block the vCPU-preemption signals and start the sigwait thread before any
      * vCPU thread exists, so both the normal path and the fork-child path below
      * inherit the block on every thread they spawn.

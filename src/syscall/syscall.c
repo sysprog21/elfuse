@@ -68,6 +68,7 @@
 #include "syscall/sys.h"
 #include "syscall/usbdev.h"
 #include "syscall/sysvipc.h"
+#include "syscall/syscall_names.h"
 #include "proved/timespec.h"
 
 #include "syscall/time.h"
@@ -357,11 +358,6 @@ SC_FORWARD(sc_nanosleep,        sys_nanosleep(g, x0, x1))
 SC_FORWARD(sc_clock_nanosleep,  sys_clock_nanosleep(g, (int) x0, (int) x1, x2, x3))
 SC_FORWARD(sc_gettimeofday,     sys_gettimeofday(g, x0, x1))
 SC_FORWARD(sc_setitimer,        sys_setitimer(g, (int) x0, x1, x2))
-SC_FORWARD(sc_timer_create,     sys_timer_create(g, (int) x0, x1, x2))
-SC_FORWARD(sc_timer_gettime,    sys_timer_gettime(g, (int) x0, x1))
-SC_FORWARD(sc_timer_getoverrun, signal_posix_timer_overrun((int) x0))
-SC_FORWARD(sc_timer_settime,    sys_timer_settime(g, (int) x0, (int) x1, x2, x3))
-SC_FORWARD(sc_timer_delete,    signal_posix_timer_delete((int) x0))
 SC_FORWARD(sc_getitimer,        sys_getitimer(g, (int) x0, x1))
 SC_FORWARD(sc_times,            sys_times(g, x0))
 
@@ -2309,7 +2305,7 @@ static int64_t sc_clone(guest_t *g,
         (unsigned long long) x0, (unsigned long long) x1,
         (unsigned long long) x2, (unsigned long long) x3,
         (unsigned long long) x4);
-    return sys_clone(current_thread->vcpu, g, x0, x1, 0, 0, x2, x2, x3, x4,
+    return sys_clone(current_thread->vcpu, g, x0, x1, 0, 0, x2, x3, x4,
                      verbose);
 }
 
@@ -2802,9 +2798,22 @@ slow_path:
     if (verbose) {
         uint64_t elr = 0;
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
+        const char *name = NULL;
+        if (x8 <= SC_MAX_SYSCALL_NUM) {
+            name = syscall_names[x8];
+        }
+
+        char nr_str[64];
+        if (name) {
+            snprintf(nr_str, sizeof(nr_str), "%s(%llu)", name,
+                     (unsigned long long) x8);
+        } else {
+            snprintf(nr_str, sizeof(nr_str), "%llu", (unsigned long long) x8);
+        }
         log_debug(
-            "syscall %llu@0x%llx(0x%llx, 0x%llx, 0x%llx, 0x%llx, "
+            "syscall %s@0x%llx(0x%llx, 0x%llx, 0x%llx, 0x%llx, "
             "0x%llx, 0x%llx)",
+            nr_str,
             (unsigned long long) x8,
             (unsigned long long) (elr >= 4 ? elr - 4 : elr),
             (unsigned long long) x0, (unsigned long long) x1,

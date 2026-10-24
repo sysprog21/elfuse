@@ -70,6 +70,33 @@ else
     report_fail "test-proc-limits under a host AS limit"
 fi
 
+# A host RLIMIT_FSIZE limits elfuse's own writes too. Under 4 KiB, soft or hard,
+# elfuse still boots rather than being killed by a host SIGXFSZ, and a guest
+# that raises its soft limit above the host's soft limit writes past it, since
+# elfuse lifts its own soft limit to the hard one.
+if bash -c 'ulimit -S -f 4 && exec "$0" "$1" true' "$ELFUSE" "$BB"; then
+    report_pass "boots under a host file size limit"
+else
+    report_fail "boots under a host file size limit (exit $?)"
+fi
+if bash -c 'ulimit -f 4 && exec "$0" "$1" true' "$ELFUSE" "$BB"; then
+    report_pass "boots under a host hard file size limit"
+else
+    report_fail "boots under a host hard file size limit (exit $?)"
+fi
+
+XFSZ_FILE="$(mktemp "${TMPDIR:-/tmp}/elfuse-rlimit-seed.XXXXXX")"
+trap 'rm -f "$XFSZ_FILE"' EXIT
+# shellcheck disable=SC2016  # Expanded by the guest shell.
+got="$(bash -c 'ulimit -S -f 4 && exec "$0" "$1" sh -c \
+    "ulimit -S -f unlimited && $1 dd if=/dev/zero of=$2 bs=1024 count=8 2>&1"' \
+    "$ELFUSE" "$BB" "$XFSZ_FILE")" && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [ "$(wc -c < "$XFSZ_FILE" | tr -d ' ')" = 8192 ]; then
+    report_pass "a guest write past the host soft file size limit lands"
+else
+    report_fail "a guest write past the host soft file size limit lands (exit $rc: $got)"
+fi
+
 report_summary
 # shellcheck disable=SC2154  # fail is incremented in tests/lib/report.sh
 [ "$fail" -eq 0 ] || exit 1

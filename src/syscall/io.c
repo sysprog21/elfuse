@@ -407,6 +407,8 @@ static bool io_foreign_should_block(int host_fd, short events)
  */
 static bool io_eagain_should_wait(const fd_block_state_t *st, int host_fd)
 {
+    if (st->call_nonblock)
+        return false;
     if (st->nonblock_owned)
         return !st->guest_nonblock;
     return sock_op_should_block(st, host_fd, 0);
@@ -508,6 +510,20 @@ int64_t io_xfer(int fd,
     bool nb_transfer = st.nonblock_owned;
     bool wait_first = false;
     if (!nb_transfer) {
+        /* A per-call nonblocking request on a description elfuse does not own
+         * cannot reach the host transfer, which would block, so readiness is
+         * asked first instead.
+         */
+        if (st.call_nonblock) {
+            struct pollfd pfd = {.fd = host_fd, .events = events};
+            if (poll(&pfd, 1, 0) <= 0) {
+                errno = EAGAIN;
+                *out = -1;
+                return 0;
+            }
+            *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
+            return 0;
+        }
         if (!io_foreign_should_block(host_fd, events)) {
             *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
             return 0;
@@ -4113,6 +4129,44 @@ static size_t splice_drain_chunk(splice_state_t *st,
     return written;
 }
 
+#define LINUX_SPLICE_F_NONBLOCK 0x02
+
+/* Whether SPLICE_F_NONBLOCK reaches this input on Linux: a pipe takes it in
+ * splice_from_pipe_next and an AF_UNIX stream socket in
+ * unix_stream_splice_read. tcp_splice_read and the other inputs follow the
+ * descriptor's own O_NONBLOCK.
+ */
+static bool splice_flag_reaches_input(int host_fd)
+{
+    struct stat sb;
+    if (fstat(host_fd, &sb) < 0)
+        return false;
+    if (S_ISFIFO(sb.st_mode))
+        return true;
+    if (!S_ISSOCK(sb.st_mode))
+        return false;
+
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    int type = 0;
+    socklen_t tl = sizeof(type);
+    return getsockname(host_fd, (struct sockaddr *) &ss, &sl) == 0 &&
+           ss.ss_family == AF_UNIX &&
+           getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &type, &tl) == 0 &&
+           type == SOCK_STREAM;
+}
+
+/* The O_NONBLOCK the guest sees on a descriptor: the shadow on an owned fd, the
+ * host flag otherwise.
+ */
+static bool splice_end_nonblock(const fd_block_state_t *st, int host_fd)
+{
+    if (st->nonblock_owned)
+        return st->guest_nonblock;
+    int fl = fcntl(host_fd, F_GETFL);
+    return fl >= 0 && (fl & O_NONBLOCK);
+}
+
 int64_t sys_splice(guest_t *g,
                    int fd_in,
                    uint64_t off_in_gva,
@@ -4127,7 +4181,6 @@ int64_t sys_splice(guest_t *g,
     if (len == 0)
         return 0;
 
-    (void) flags;
     host_fd_ref_t in_ref, out_ref;
     fd_block_state_t in_st, out_st;
     int64_t err = host_fd_ref_open_io_state(fd_in, &in_ref, NULL, &in_st);
@@ -4185,11 +4238,64 @@ int64_t sys_splice(guest_t *g,
                          .off_out = off_out,
                          .in_st = in_st,
                          .out_st = out_st};
+
+    /* SPLICE_F_NONBLOCK makes a pipe end nonblocking for this one call,
+     * whatever O_NONBLOCK it carries (splice_from_pipe_next and wait_for_space,
+     * Linux fs/splice.c), and an AF_UNIX stream input as well. do_splice also
+     * raises the flag itself when a pipe end is O_NONBLOCK: the input for
+     * pipe-to-file, the output for file-to-pipe, either for pipe-to-pipe. The
+     * output is never made nonblocking here: a chunk is read before it is
+     * written, and a pipe or socket input cannot take back what a nonblocking
+     * write then failed to place. A pipe output is asked for room before each
+     * read instead.
+     */
+    struct stat in_sb, out_sb;
+    bool in_fifo = fstat(st.in_hfd, &in_sb) == 0 && S_ISFIFO(in_sb.st_mode);
+    bool out_fifo = fstat(st.out_hfd, &out_sb) == 0 && S_ISFIFO(out_sb.st_mode);
+    bool nonblock = (flags & LINUX_SPLICE_F_NONBLOCK) ||
+                    (in_fifo && splice_end_nonblock(&st.in_st, st.in_hfd)) ||
+                    (out_fifo && splice_end_nonblock(&st.out_st, st.out_hfd));
+    st.in_st.call_nonblock = nonblock && splice_flag_reaches_input(st.in_hfd);
+    bool gate_out = nonblock && st.off_out < 0 && out_fifo;
     splice_fail_t f = {0};
     size_t total = 0;
     int64_t ret;
     while (total < len) {
         size_t n = (len - total) > chunk ? chunk : (len - total);
+
+        /* A chunk is read before it is written, so it is capped at the room the
+         * output pipe has now, and the write lands without blocking. On macOS a
+         * ready pipe has at least PIPE_BUF bytes free, and fstat reports the
+         * buffer size and the bytes queued, whose difference it takes whole
+         * (measured, the buffer growing on demand included).
+         */
+        if (gate_out) {
+            /* A pipe whose reader is gone polls POLLHUP without POLLOUT on
+             * macOS; wait_for_space answers it with EPIPE and SIGPIPE before
+             * anything is read.
+             */
+            struct pollfd pfd = {.fd = st.out_hfd, .events = POLLOUT};
+            int pr = poll(&pfd, 1, 0);
+            if (pr > 0 && (pfd.revents & (POLLHUP | POLLERR))) {
+                if (total == 0)
+                    signal_queue(LINUX_SIGPIPE);
+                f.rw_error = true; /* reported only if nothing moved */
+                f.saved_errno = EPIPE;
+                break;
+            }
+            if (pr <= 0 || !(pfd.revents & POLLOUT)) {
+                f.rw_error = true;
+                f.saved_errno = EAGAIN;
+                break;
+            }
+            struct stat sb;
+            size_t room = PIPE_BUF;
+            if (fstat(st.out_hfd, &sb) == 0 && sb.st_blksize > sb.st_size &&
+                (size_t) (sb.st_blksize - sb.st_size) > room)
+                room = (size_t) (sb.st_blksize - sb.st_size);
+            if (n > room)
+                n = room;
+        }
         ssize_t r;
         if (st.off_in >= 0) {
             r = pread(st.in_hfd, buf, n, st.off_in);

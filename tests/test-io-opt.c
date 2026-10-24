@@ -14,14 +14,70 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 
 #include "test-harness.h"
 
-int main(void)
+/* splice(@in, NULL, a pipe, NULL, 5, SPLICE_F_NONBLOCK) on a blocking socket
+ * whose peer @peer sends those 5 bytes from a child after 300 ms.
+ *
+ * Returns the splice result, with errno set when it is -1.
+ */
+static ssize_t splice_late_socket(int in, int peer)
+{
+    int pfd[2];
+    if (pipe(pfd) != 0)
+        return -2;
+    pid_t pid = fork();
+    if (pid == 0) {
+        usleep(300000);
+        _exit(send(peer, "hello", 5, 0) == 5 ? 0 : 1);
+    }
+    alarm(5);
+    ssize_t rc = splice(in, NULL, pfd[1], NULL, 5, SPLICE_F_NONBLOCK);
+    int saved = errno;
+    alarm(0);
+    if (pid > 0)
+        waitpid(pid, NULL, 0);
+    close(pfd[0]);
+    close(pfd[1]);
+    errno = saved;
+    return rc;
+}
+
+/* SPLICE_F_NONBLOCK on fd 0, which tests/test-matrix.sh holds open as an empty
+ * pipe the guest did not create.
+ */
+static int splice_stdin_nonblock(void)
+{
+    char path[] = "/tmp/elfuse-io-opt-stdin-XXXXXX";
+    int out = mkstemp(path);
+    if (out < 0)
+        return 1;
+    unlink(path);
+    alarm(5);
+    ssize_t rc = splice(0, NULL, out, NULL, 16, SPLICE_F_NONBLOCK);
+    alarm(0);
+    if (rc != -1 || errno != EAGAIN)
+        return 1;
+    printf("stdin splice: EAGAIN\n");
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     int passes = 0, fails = 0;
+
+    if (argc > 1 && strcmp(argv[1], "stdin") == 0)
+        return splice_stdin_nonblock();
 
     char tmpdir[] = "/tmp/elfuse-io-opt-XXXXXX";
     if (!mkdtemp(tmpdir)) {
@@ -350,6 +406,222 @@ int main(void)
             if (fds[i] >= 0)
                 close(fds[i]);
         unlink(cfr_dst);
+    }
+
+    /* SPLICE_F_NONBLOCK answers EAGAIN on an empty pipe whose writer is still
+     * open, even when the pipe itself is blocking.
+     */
+    TEST("splice SPLICE_F_NONBLOCK on empty pipe");
+    {
+        int pfd[2] = {-1, -1};
+        int out = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (out < 0 || pipe(pfd) != 0) {
+            FAIL("setup failed");
+        } else {
+            alarm(5);
+            ssize_t rc = splice(pfd[0], NULL, out, NULL, 16, SPLICE_F_NONBLOCK);
+            alarm(0);
+            EXPECT_TRUE(rc == -1 && errno == EAGAIN, "not EAGAIN");
+        }
+        if (pfd[0] >= 0) {
+            close(pfd[0]);
+            close(pfd[1]);
+        }
+        if (out >= 0)
+            close(out);
+        unlink(cfr_dst);
+    }
+
+    /* With the output pipe full, SPLICE_F_NONBLOCK answers EAGAIN before it
+     * reads anything; once a reader frees some room, it moves only what fits.
+     * Either way every byte is in one pipe or the other.
+     */
+    TEST("splice SPLICE_F_NONBLOCK into a full pipe loses nothing");
+    {
+        enum { IN_BYTES = 8192 };
+        static char fill[4096];
+        int a[2] = {-1, -1}, b[2] = {-1, -1};
+        int ok = pipe(a) == 0 && pipe(b) == 0 &&
+                 write(a[1], fill, sizeof(fill)) == sizeof(fill) &&
+                 write(a[1], fill, sizeof(fill)) == sizeof(fill) &&
+                 fcntl(b[1], F_SETFL, O_NONBLOCK) == 0;
+        while (ok && write(b[1], fill, sizeof(fill)) > 0)
+            ;
+        while (ok && write(b[1], fill, 1) > 0)
+            ;
+        ok = ok && fcntl(b[1], F_SETFL, 0) == 0;
+        const char *why = "setup failed";
+        ssize_t moved = 0;
+        int left = -1;
+
+        if (ok) {
+            why = "full output not EAGAIN";
+            ok = splice(a[0], NULL, b[1], NULL, IN_BYTES, SPLICE_F_NONBLOCK) ==
+                     -1 &&
+                 errno == EAGAIN;
+        }
+        if (ok) {
+            why = "input consumed on EAGAIN";
+            ok = ioctl(a[0], FIONREAD, &left) == 0 && left == IN_BYTES;
+        }
+        if (ok) {
+            why = "nothing moved after the reader freed room";
+            ok = read(b[0], fill, sizeof(fill)) == sizeof(fill);
+            moved = splice(a[0], NULL, b[1], NULL, IN_BYTES, SPLICE_F_NONBLOCK);
+            ok = ok && moved > 0;
+        }
+        if (ok) {
+            why = "bytes lost";
+            ok = ioctl(a[0], FIONREAD, &left) == 0 && moved + left == IN_BYTES;
+        }
+        if (ok)
+            PASS();
+        else
+            FAIL(why);
+
+        int fds[] = {a[0], a[1], b[0], b[1]};
+        for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+            if (fds[i] >= 0)
+                close(fds[i]);
+    }
+
+    /* SPLICE_F_NONBLOCK reaches an AF_UNIX stream input
+     * (unix_stream_splice_read), but a TCP input follows its own O_NONBLOCK
+     * (tcp_splice_read) and waits for data.
+     */
+    TEST("splice SPLICE_F_NONBLOCK on socket inputs");
+    {
+        int sv[2] = {-1, -1};
+        int ls = socket(AF_INET, SOCK_STREAM, 0);
+        int cli = socket(AF_INET, SOCK_STREAM, 0);
+        int srv = -1;
+        struct sockaddr_in sa = {.sin_family = AF_INET,
+                                 .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        socklen_t sl = sizeof(sa);
+        int ok = socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && ls >= 0 &&
+                 cli >= 0 && bind(ls, (struct sockaddr *) &sa, sl) == 0 &&
+                 listen(ls, 1) == 0 &&
+                 getsockname(ls, (struct sockaddr *) &sa, &sl) == 0 &&
+                 connect(cli, (struct sockaddr *) &sa, sl) == 0 &&
+                 (srv = accept(ls, NULL, NULL)) >= 0;
+        const char *why = "setup failed";
+
+        if (ok) {
+            why = "AF_UNIX input not EAGAIN";
+            ok = splice_late_socket(sv[0], sv[1]) == -1 && errno == EAGAIN;
+        }
+        if (ok) {
+            why = "TCP input did not wait for data";
+            ok = splice_late_socket(srv, cli) == 5;
+        }
+        if (ok)
+            PASS();
+        else
+            FAIL(why);
+
+        int fds[] = {sv[0], sv[1], ls, cli, srv};
+        for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+            if (fds[i] >= 0)
+                close(fds[i]);
+    }
+
+    /* do_splice raises SPLICE_F_NONBLOCK itself when a pipe end is O_NONBLOCK,
+     * so a full O_NONBLOCK output answers EAGAIN before anything is read, and
+     * an empty AF_UNIX input does not wait.
+     */
+    TEST("splice follows a pipe end's O_NONBLOCK");
+    {
+        int sv[2] = {-1, -1}, a[2] = {-1, -1}, b[2] = {-1, -1};
+        int ok = socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && pipe(a) == 0 &&
+                 pipe(b) == 0 && write(sv[1], "0123456789", 10) == 10 &&
+                 write(a[1], "xyz", 3) == 3 &&
+                 fcntl(b[1], F_SETFL, O_NONBLOCK) == 0;
+        static char fill[4096];
+        while (ok && write(b[1], fill, sizeof(fill)) > 0)
+            ;
+        while (ok && write(b[1], fill, 1) > 0)
+            ;
+        const char *why = "setup failed";
+        int left = -1;
+
+        if (ok) {
+            why = "AF_UNIX input to a full pipe not EAGAIN, or bytes lost";
+            ok = splice(sv[0], NULL, b[1], NULL, 10, 0) == -1 &&
+                 errno == EAGAIN && ioctl(sv[0], FIONREAD, &left) == 0 &&
+                 left == 10;
+        }
+        if (ok) {
+            why = "pipe input to a full pipe not EAGAIN, or bytes lost";
+            ok = splice(a[0], NULL, b[1], NULL, 3, 0) == -1 &&
+                 errno == EAGAIN && ioctl(a[0], FIONREAD, &left) == 0 &&
+                 left == 3;
+        }
+        if (ok) {
+            char drain[4096];
+            while (read(sv[0], drain, sizeof(drain)) == sizeof(drain))
+                ;
+            ok = read(b[0], drain, sizeof(drain)) == sizeof(drain);
+            why = "empty AF_UNIX input waited";
+            alarm(5);
+            ok = ok && splice(sv[0], NULL, b[1], NULL, 10, 0) == -1 &&
+                 errno == EAGAIN;
+            alarm(0);
+        }
+        if (ok)
+            PASS();
+        else
+            FAIL(why);
+
+        int fds[] = {sv[0], sv[1], a[0], a[1], b[0], b[1]};
+        for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+            if (fds[i] >= 0)
+                close(fds[i]);
+    }
+
+    /* An output pipe whose reader is gone fails with EPIPE and SIGPIPE before
+     * the input is read (wait_for_space).
+     */
+    TEST("splice SPLICE_F_NONBLOCK into a pipe with no reader");
+    {
+        int sv[2] = {-1, -1}, p[2] = {-1, -1};
+        int ok = socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && pipe(p) == 0 &&
+                 write(sv[1], "0123456789", 10) == 10;
+        if (ok) {
+            close(p[0]);
+            p[0] = -1;
+        }
+        sigset_t pipe_set, old;
+        sigemptyset(&pipe_set);
+        sigaddset(&pipe_set, SIGPIPE);
+        sigprocmask(SIG_BLOCK, &pipe_set, &old);
+        int left = -1, sig = 0;
+        struct timespec now = {0};
+        const char *why = "setup failed";
+
+        if (ok) {
+            why = "not EPIPE";
+            ok = splice(sv[0], NULL, p[1], NULL, 10, SPLICE_F_NONBLOCK) == -1 &&
+                 errno == EPIPE;
+        }
+        if (ok) {
+            why = "input consumed";
+            ok = ioctl(sv[0], FIONREAD, &left) == 0 && left == 10;
+        }
+        if (ok) {
+            why = "no SIGPIPE";
+            sig = sigtimedwait(&pipe_set, NULL, &now);
+            ok = sig == SIGPIPE;
+        }
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        if (ok)
+            PASS();
+        else
+            FAIL(why);
+
+        int fds[] = {sv[0], sv[1], p[0], p[1]};
+        for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+            if (fds[i] >= 0)
+                close(fds[i]);
     }
 
     /* Cleanup. The other three fixtures are unlinked by the blocks that make

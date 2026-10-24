@@ -630,6 +630,29 @@ test_pipe()
 
     local output rc
     if output=$(printf '%s' "$input" | $runner "$@"); then rc=0; else rc=$?; fi
+    pipe_report "$label" "$pattern" "$rc" "$output"
+}
+
+# test_held_stdin <runner> <label> <regex> <cmd...>: like test_pipe, but fd 0 is
+# an empty pipe whose writer stays open while the guest runs, a description the
+# guest did not create.
+test_held_stdin()
+{
+    local runner="$1" label="$2" pattern="$3"
+    shift 3
+
+    maybe_qemu_skip "$runner" "$label" && return
+
+    local output rc
+    if output=$($runner "$@" < <(sleep 30)); then rc=0; else rc=$?; fi
+    pipe_report "$label" "$pattern" "$rc" "$output"
+}
+
+# pipe_report <label> <regex> <rc> <output>: the verdict shared by test_pipe and
+# test_held_stdin.
+pipe_report()
+{
+    local label="$1" pattern="$2" rc="$3" output="$4"
 
     if [ "$rc" = "124" ]; then
         report_timeout "$label"
@@ -889,6 +912,8 @@ run_unit_tests()
     test_check "$runner" "test-synthetic-wait-signal" "0 failed" \
         "$bindir/test-synthetic-wait-signal"
     test_check "$runner" "test-sigpipe" "0 failed" "$bindir/test-sigpipe"
+    test_held_stdin "$runner" "splice SPLICE_F_NONBLOCK on held stdin" \
+        "stdin splice: EAGAIN" "$bindir/test-io-opt" stdin
 
     printf "\nNegative tests\n"
     test_check "$runner" "test-negative" "0 failed" "$bindir/test-negative"

@@ -1817,6 +1817,21 @@ static ssize_t io_pwritev_at(int host_fd,
     return ret;
 }
 
+/* rw_verify_area (Linux fs/read_write.c) refuses a positioned write whose end,
+ * offset plus count, does not fit in loff_t, with EINVAL ahead of any size
+ * check. A descriptor not open for writing, or one that cannot seek, is left to
+ * the host call, which answers EBADF or ESPIPE first, as vfs_write and
+ * ksys_pwrite64 do.
+ */
+static bool io_write_range_wraps(int host_fd, int64_t offset, uint64_t count)
+{
+    if (offset < 0 || count <= (uint64_t) (INT64_MAX - offset))
+        return false;
+    int fl = fcntl(host_fd, F_GETFL);
+    return fl >= 0 && (fl & O_ACCMODE) != O_RDONLY &&
+           lseek(host_fd, 0, SEEK_CUR) >= 0;
+}
+
 int64_t sys_pwrite64(guest_t *g,
                      int fd,
                      uint64_t buf_gva,
@@ -1840,6 +1855,10 @@ int64_t sys_pwrite64(guest_t *g,
     /* Linux: pwrite(fd, NULL, 0, off) returns 0, not EFAULT */
     if (count == 0)
         return io_return_zero(&host_ref);
+    if (io_write_range_wraps(host_ref.fd, offset, count)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EINVAL;
+    }
 
     uint64_t avail = 0;
     void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_R, count);
@@ -2452,6 +2471,15 @@ int64_t sys_pwritev(guest_t *g,
     if (err < 0) {
         host_fd_ref_close(&host_ref);
         return err;
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; i++)
+        total += host_iov.iov[i].iov_len;
+    if (io_write_range_wraps(host_ref.fd, offset, total)) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EINVAL;
     }
 
     int64_t intercepted = proc_try_writev_intercept(

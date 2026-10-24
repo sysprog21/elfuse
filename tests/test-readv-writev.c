@@ -13,7 +13,9 @@
  *                     lseek(62), close(57), unlink(35)
  */
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -373,6 +375,42 @@ static void test_pwrite_o_append_race(void)
     EXPECT_TRUE(ok, "a record was overwritten");
 }
 
+/* A positioned write whose end does not fit in off_t is EINVAL, for pwrite and
+ * for pwritev, before the file is looked at.
+ */
+static void test_pwrite_range_wrap(void)
+{
+    TEST("pwrite/pwritev range wrap EINVAL");
+
+    char path[] = "/tmp/elfuse-pwrite-wrap-XXXXXX";
+    int fd = mkstemp(path);
+    int pfd[2];
+    if (fd < 0 || pipe(pfd) != 0) {
+        FAIL("setup");
+        return;
+    }
+
+    struct iovec wv[2] = {
+        {.iov_base = (void *) "X", .iov_len = 1},
+        {.iov_base = (void *) "Y", .iov_len = 1},
+    };
+    errno = 0;
+    int ok = pwrite(fd, "X", 1, INT64_MAX) == -1 && errno == EINVAL;
+    errno = 0;
+    ok = ok && pwritev(fd, wv, 2, INT64_MAX - 1) == -1 && errno == EINVAL;
+    /* A pipe cannot seek, which ksys_pwrite64 reports before the range. */
+    errno = 0;
+    ok = ok && pwrite(pfd[1], "X", 1, INT64_MAX) == -1 && errno == ESPIPE;
+    errno = 0;
+    ok = ok && pwritev(pfd[1], wv, 2, INT64_MAX - 1) == -1 && errno == ESPIPE;
+    close(pfd[0]);
+    close(pfd[1]);
+    close(fd);
+    unlink(path);
+
+    EXPECT_TRUE(ok, "range wrap not EINVAL, or pipe not ESPIPE");
+}
+
 /* Test 8: zero iovcnt returns 0 without moving the append file offset. Linux
  * reference (verified under qemu-system-aarch64): import_iovec() yields an
  * empty iterator, do_iter_write returns 0 before the offset is touched, so
@@ -550,6 +588,7 @@ int main(void)
     test_pwritev2_append();
     test_pwrite_o_append();
     test_pwrite_o_append_race();
+    test_pwrite_range_wrap();
     test_pwritev2_append_zero_iovcnt();
     test_zero_iovcnt_validation();
 

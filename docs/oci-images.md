@@ -146,3 +146,15 @@ to any more, left when a tag moved and was pulled again, shows as `<none>`.
 `scripts/ci/oci-smoke.sh`: those table tests, then pull, run, list, and clean
 under elfuse on Alpine and Debian images, an image whose `/etc` climbs to a host
 directory, and `clean` refusing a non-store and a store in use.
+
+The self-hosted `oci-runtime` job runs elfuse itself on real runtimes, one lane
+per key of `scripts/ci/oci-runtime.sh`:
+
+| Key | Coverage |
+|-----|----------|
+| `python` | Threaded SQLite writers, a filesystem walk, subprocesses, and a Unix socket path too deep for the host's `sun_path` |
+| `node` | Filesystem, zlib, JSON, and crypto work, then 100 requests to an HTTP server guest |
+| `go` | `gofmt` over a generated tree with `GOMAXPROCS=2`, and async preemption of a spinning goroutine |
+| `jvm` | `javac`, a thread pool, SHA-256 hashing, and `ProcessBuilder` |
+| `c` | A multi-file `make` project and a 1000-function compile |
+| `redis` | A server guest driven by a second guest through `SET` and `BGSAVE` |

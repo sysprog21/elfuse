@@ -590,7 +590,8 @@ int guest_bootstrap_prepare(guest_t *g,
     t0 = startup_trace_now_ns();
     syscall_init();
     proc_init();
-    sys_rlimit_init();
+    if (!sys_rlimit_init())
+        return -1;
 
     {
         char self_path[LINUX_PATH_MAX];

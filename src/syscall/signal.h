@@ -117,6 +117,7 @@ typedef struct {
 
 /* si_code values */
 #define LINUX_SI_USER 0
+#define LINUX_SI_KERNEL 0x80
 #define LINUX_SI_TIMER (-2)
 
 /* si_code values for SIGTRAP */

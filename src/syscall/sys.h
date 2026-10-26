@@ -88,8 +88,10 @@ uint64_t sys_guest_ram_free(void);
 
 /* Seed the table from host getrlimit. Called once by the process that boots the
  * guest.
+ *
+ * Returns false when an inherited finite RLIMIT_CPU cannot be enforced.
  */
-void sys_rlimit_init(void);
+bool sys_rlimit_init(void);
 
 /* The fork boundary: the parent snapshots, the child checks the header copy
  * before trusting it and restores it in place of sys_rlimit_init.
@@ -97,6 +99,20 @@ void sys_rlimit_init(void);
 void sys_rlimit_snapshot(linux_rlimit64_t out[LINUX_RLIMIT_COUNT]);
 bool sys_rlimit_table_valid(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT]);
 void sys_rlimit_restore(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT]);
+
+/* Start RLIMIT_CPU enforcement in a fork child. It runs after signal_set_state,
+ * which replaces the shared pending set, so a signal the sampler queued earlier
+ * would be lost.
+ *
+ * Returns false as sys_rlimit_init does.
+ */
+bool sys_rlimit_cpu_start(void);
+
+/* End RLIMIT_CPU enforcement before the guest is destroyed. A signal the
+ * sampler queues raises attention in the guest's shim globals, so on return no
+ * send is in flight and none can start.
+ */
+void sys_rlimit_cpu_stop(void);
 
 /* Soft limit of @resource, LINUX_RLIM_INFINITY when unlimited. Lock-free, for
  * the sites that enforce a limit.

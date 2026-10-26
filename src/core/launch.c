@@ -33,6 +33,7 @@
 #include "runtime/thread.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
+#include "syscall/sys.h" /* sys_rlimit_cpu_stop */
 
 #include "debug/gdbstub.h"
 #include "debug/log.h"
@@ -74,6 +75,7 @@ void launch_destroy_guest(guest_t *g)
      * hv_vcpu_run) and the 100ms join cap in thread_join_workers detaches them,
      * leaving live pthreads to crash on the imminent munmap.
      */
+    sys_rlimit_cpu_stop();
     if (!proc_exit_group_requested())
         proc_request_exit_group(0);
     thread_wake_all_blocked();

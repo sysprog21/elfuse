@@ -1185,8 +1185,9 @@ static void check_dev_bus_names(void)
         close(fd);
 
     /* path_rebuild_under folds a relative name against a /dev/bus cwd or dirfd
-     * up to a usbfs node, so every other '..' is applied before any entry point
-     * or stamp sees the name.
+     * only through /dev/bus and /dev/bus/usb, and the intercepts fold what
+     * path_translate_at leaves. The cwd and a descriptor's stamp come from the
+     * descriptor, so they name the directory reached.
      */
     TEST("getcwd after chdir(\"..\") from /dev/bus/usb/001 is /dev/bus/usb");
     EXPECT_TRUE(chdir("/dev/bus/usb/001") == 0 && chdir("..") == 0 &&
@@ -1312,14 +1313,17 @@ static void check_dotdot_leaves_bus(void)
 }
 
 /* openat of @rel from the host directory @dir, which the host refuses and
- * openat retries through the guest spelling: ENOTDIR when @enotdir, else a
+ * openat retries through the guest spelling: @err when it is not 0, else a
  * descriptor.
  */
-static void check_hostdir_openat(const char *dir, const char *rel, bool enotdir)
+static void check_hostdir_openat(const char *dir, const char *rel, int err)
 {
     char what[96];
     snprintf(what, sizeof(what), "openat(%s, \"%s\") %s", dir, rel,
-             enotdir ? "is ENOTDIR" : "opens");
+             !err             ? "opens"
+             : err == ENOTDIR ? "is ENOTDIR"
+             : err == ENOENT  ? "is ENOENT"
+                              : "fails");
     TEST(what);
     int hfd = open(dir, O_RDONLY | O_DIRECTORY);
     if (hfd < 0) {
@@ -1328,7 +1332,7 @@ static void check_hostdir_openat(const char *dir, const char *rel, bool enotdir)
     }
     errno = 0;
     int fd = openat(hfd, rel, O_RDONLY | O_DIRECTORY);
-    EXPECT_TRUE(enotdir ? fd < 0 && errno == ENOTDIR : fd >= 0, what);
+    EXPECT_TRUE(err ? fd < 0 && errno == err : fd >= 0, what);
     if (fd >= 0)
         close(fd);
     close(hfd);
@@ -1379,8 +1383,9 @@ static void check_node_dotdot_relative(void)
     EXPECT_ERRNO(openat(dfd, "001/", O_RDWR), ENOTDIR,
                  "openat(/dev/bus/usb/001, \"001/\", O_RDWR)");
 
-    /* Every other '..' is still applied before the layer sees the name, so
-     * usbdev_open_path, which takes only the canonical spelling, gets it.
+    /* Relative or absolute, /dev/bus/usb/001/../001/001 keeps its '..' through
+     * path translation, and sys_openat_path folds it for usbdev_open_path,
+     * which takes only the canonical spelling.
      */
     TEST("\"../001/001\" against a /dev/bus/usb/001 dirfd opens read-write");
     int fd = openat(dfd, "../001/001", O_RDWR);
@@ -1388,9 +1393,6 @@ static void check_node_dotdot_relative(void)
     if (fd >= 0)
         close(fd);
 
-    /* An absolute name keeps its '..' through path translation, so
-     * sys_openat_path folds it for usbdev_open_path.
-     */
     TEST("/dev/bus/usb/001/../001/001 opens read-write as the node");
     fd = open("/dev/bus/usb/001/../001/001", O_RDWR);
     EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001/001"),
@@ -1416,13 +1418,135 @@ static void check_node_dotdot_relative(void)
         close(fd);
     close(dfd);
 
-    /* The retry folds the name up to the node, so the node is not folded away
-     * and a walk from / or out of /dev still reaches the layer.
+    /* The retry folds the name only up to bus 001, so the node is not folded
+     * away and a walk from / or out of /dev still reaches the layer.
      */
-    check_hostdir_openat("/dev", "bus/usb/001/001/..", true);
-    check_hostdir_openat("/", "dev/bus/usb/001/001/..", true);
-    check_hostdir_openat("/dev", "../dev/bus/usb/001/001/..", true);
-    check_hostdir_openat("/", "dev/bus/usb/001", false);
+    check_hostdir_openat("/dev", "bus/usb/001/001/..", ENOTDIR);
+    check_hostdir_openat("/", "dev/bus/usb/001/001/..", ENOTDIR);
+    check_hostdir_openat("/dev", "../dev/bus/usb/001/001/..", ENOTDIR);
+    check_hostdir_openat("/", "dev/bus/usb/001", 0);
+}
+
+/* A '..' after a missing /dev/bus/usb name is ENOENT, absolute or relative to a
+ * cwd, a dirfd or a host directory, as Linux fails the walk at the missing
+ * name.
+ */
+static void check_dotdot_after_missing(void)
+{
+    static const char *const names[] = {
+        "/dev/bus/usb/099/../001/001",
+        "/dev/bus/usb/foo/../001/001",
+        "/dev/bus/usb/001/foo/../001",
+        "/dev/bus/usb/../usb/099/../001/001",
+        "/dev/bus/../bus/usb/099/../001/001",
+    };
+    static const char *const relative[] = {
+        "099/../001/001",
+        "099/../../../null",
+        "foo/..",
+    };
+    struct stat st;
+    char what[96];
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        snprintf(what, sizeof(what), "%s is ENOENT", names[i]);
+        TEST(what);
+        EXPECT_ERRNO(stat(names[i], &st), ENOENT, names[i]);
+    }
+
+    TEST("a read-write open of /dev/bus/usb/099/../001/001 is ENOENT");
+    EXPECT_ERRNO(open("/dev/bus/usb/099/../001/001", O_RDWR), ENOENT,
+                 "open(\"/dev/bus/usb/099/../001/001\", O_RDWR)");
+
+    for (size_t i = 0; i < sizeof(relative) / sizeof(relative[0]); i++) {
+        snprintf(what, sizeof(what), "\"%s\" in a /dev/bus/usb cwd is ENOENT",
+                 relative[i]);
+        TEST(what);
+        if (chdir("/dev/bus/usb") != 0)
+            FAIL("chdir /dev/bus/usb");
+        else
+            EXPECT_ERRNO(stat(relative[i], &st), ENOENT, relative[i]);
+        if (chdir("/") != 0)
+            FAIL("chdir back to /");
+    }
+
+    TEST("chdir(\"099/..\") in a /dev/bus/usb cwd is ENOENT");
+    if (chdir("/dev/bus/usb") != 0)
+        FAIL("chdir /dev/bus/usb");
+    else
+        EXPECT_ERRNO(chdir("099/.."), ENOENT, "chdir(\"099/..\")");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    check_hostdir_openat("/", "dev/bus/usb/099/../001", ENOENT);
+
+    int dfd = open("/dev/bus/usb/001", O_RDONLY | O_DIRECTORY);
+    TEST("\"../099/../001/001\" against a /dev/bus/usb/001 dirfd is ENOENT");
+    if (dfd < 0) {
+        FAIL("open /dev/bus/usb/001");
+        return;
+    }
+    EXPECT_ERRNO(fstatat(dfd, "../099/../001/001", &st, 0), ENOENT,
+                 "fstatat(/dev/bus/usb/001, \"../099/../001/001\")");
+
+    TEST("\"../001/001\" against a /dev/bus/usb/001 dirfd is the node");
+    EXPECT_TRUE(fstatat(dfd, "../001/001", &st, 0) == 0 && S_ISCHR(st.st_mode),
+                "fstatat(/dev/bus/usb/001, \"../001/001\")");
+
+    TEST(
+        "\"../099/../001/001\" in a /dev/bus/usb/001 cwd from fchdir is "
+        "ENOENT");
+    if (fchdir(dfd) != 0)
+        FAIL("fchdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("../099/../001/001", &st), ENOENT,
+                     "stat(\"../099/../001/001\")");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+    close(dfd);
+}
+
+/* A '..' after a /dev/bus name outside /dev/bus/usb is the backing's to apply,
+ * and the macOS host has no /dev/bus, so with no sysroot the walk fails at that
+ * name, absolute or relative to a cwd, a dirfd or a host directory.
+ */
+static void check_dotdot_after_foreign(void)
+{
+    struct stat st;
+
+    TEST("/dev/bus/nosuch/../usb/001/001 is ENOENT");
+    EXPECT_ERRNO(stat("/dev/bus/nosuch/../usb/001/001", &st), ENOENT,
+                 "stat(\"/dev/bus/nosuch/../usb/001/001\")");
+
+    TEST("\"nosuch/../usb/001/001\" in a /dev/bus cwd is ENOENT");
+    if (chdir("/dev/bus") != 0)
+        FAIL("chdir /dev/bus");
+    else
+        EXPECT_ERRNO(stat("nosuch/../usb/001/001", &st), ENOENT,
+                     "stat(\"nosuch/../usb/001/001\")");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    check_hostdir_openat("/", "dev/bus/nosuch/../usb/001", ENOENT);
+
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    TEST("\"nosuch/../usb/001/001\" against a /dev/bus dirfd is ENOENT");
+    if (dfd < 0) {
+        FAIL("open /dev/bus");
+        return;
+    }
+    EXPECT_ERRNO(fstatat(dfd, "nosuch/../usb/001/001", &st, 0), ENOENT,
+                 "fstatat(/dev/bus, \"nosuch/../usb/001/001\")");
+
+    TEST("\"nosuch/../usb/001/001\" in a /dev/bus cwd from fchdir is ENOENT");
+    if (fchdir(dfd) != 0)
+        FAIL("fchdir /dev/bus");
+    else
+        EXPECT_ERRNO(stat("nosuch/../usb/001/001", &st), ENOENT,
+                     "stat(\"nosuch/../usb/001/001\")");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+    close(dfd);
 }
 
 int main(void)
@@ -1435,6 +1559,8 @@ int main(void)
     check_dev_bus_names();
     check_dotdot_leaves_bus();
     check_node_dotdot_relative();
+    check_dotdot_after_missing();
+    check_dotdot_after_foreign();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.

@@ -599,6 +599,69 @@ static void path_fold_components(const char *path, char *out)
     out[w] = '\0';
 }
 
+/* Apply the '..' at @dotdot to @name, a /dev/bus name the backing owns, and
+ * leave in @name the guest name that results. As on Linux, the '..' fails
+ * unless @name is a directory this process may search, and a symbolic link is
+ * followed first: its target takes its place, with the '..' and the rest after
+ * it. @links counts the links followed for the whole name, up to MAXSYMLINKS.
+ *
+ * Returns 0, or -1 with errno set.
+ */
+static int path_backing_dotdot(char *name,
+                               size_t namesz,
+                               const char *dotdot,
+                               unsigned *links)
+{
+    char host[LINUX_PATH_MAX], next[LINUX_PATH_MAX];
+    struct stat st;
+    const char *hp =
+        path_resolve_sysroot_nofollow_path(name, host, sizeof(host));
+    if (!hp || lstat(hp, &st) < 0)
+        return -1;
+
+    char *slash = strrchr(name, '/');
+    if (!slash) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        char target[LINUX_PATH_MAX];
+        if (++*links > MAXSYMLINKS) {
+            errno = ELOOP;
+            return -1;
+        }
+        ssize_t n = readlink(hp, target, sizeof(target) - 1);
+        if (n < 0)
+            return -1;
+        target[n] = '\0';
+        if (path_splice_link_target(name, (size_t) (slash + 1 - name), target,
+                                    dotdot, next, sizeof(next)) < 0)
+            return -1;
+        path_fold_components(next, next);
+    } else if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    } else if (access(hp, X_OK) < 0) {
+        return -1;
+    } else {
+        /* A final '..' leaves '.', as the climb rewrite does. */
+        const char *rest = dotdot + 2;
+        while (*rest == '/')
+            rest++;
+        *slash = '\0';
+        int n = snprintf(next, sizeof(next), "%s/%s", name, *rest ? rest : ".");
+        if (n < 0 || (size_t) n >= sizeof(next)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+    }
+    if (str_copy_trunc(name, next, namesz) >= namesz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
 int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
@@ -677,15 +740,26 @@ int path_translate_at(guest_fd_t dirfd,
     }
 
     /* usb_sysfs_resolve_dev_climb rewrites a /dev/bus name whose '..' climbs
-     * out of it. What follows can climb out again, as in
-     * /dev/bus/../bus/../null, and each pass shortens the name. A climb can
-     * land in /sys, so this runs before the /sys rewrite below.
+     * out of it, and fails one whose '..' follows a bus no device has or a name
+     * under /dev/bus/usb that is not a bus or device number. A '..' after a
+     * /dev/bus name outside /dev/bus/usb is the backing's to apply. What
+     * follows can climb out again, as in /dev/bus/../bus/../null; each pass
+     * applies a '..' or follows a link, and MAXSYMLINKS bounds the links. A
+     * climb can land in /sys, so this runs before the /sys rewrite below.
      */
+    unsigned links = 0;
     while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
         char resolved[LINUX_PATH_MAX];
-        if (!usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
-                                         sizeof(resolved)))
+        const char *dotdot = NULL;
+        int crc = usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
+                                              sizeof(resolved), &dotdot);
+        if (crc < 0)
+            return -1;
+        if (crc == 0)
             break;
+        if (crc == 2 &&
+            path_backing_dotdot(resolved, sizeof(resolved), dotdot, &links) < 0)
+            return -1;
         str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
         tx->guest_path = tx->guest_buf;
         tx->intercept_path = tx->guest_buf;
@@ -1398,10 +1472,11 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
 }
 
 /* Rebuild @path against the guest directory @base as an absolute guest path,
- * folding its components. Once the walk reaches a usbfs node the rest is joined
- * as written from the slash after it: Linux applies '..' only to a directory,
- * and the USB layer answers ENOTDIR for a '..', a name or a trailing slash
- * after a node.
+ * folding its components. Once the walk reaches a name under /dev/bus other
+ * than /dev/bus/usb, the rest is joined as written from the slash after it:
+ * Linux applies '..' only to a directory that exists, which path_translate_at
+ * asks the USB layer or the backing about, and the USB layer answers ENOTDIR
+ * for a '..', a name or a trailing slash after a node.
  *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */
@@ -1418,7 +1493,7 @@ static int path_rebuild_under(const char *base,
     if (proc_seed_absolute_path(base, out, outsz, marks, ARRAY_SIZE(marks),
                                 &depth) < 0)
         goto toolong;
-    while (*p && !usb_sysfs_names_node(out)) {
+    while (*p && !usb_sysfs_stops_fold(out)) {
         p += strspn(p, "/");
         size_t n = strcspn(p, "/");
         if (n == 0)

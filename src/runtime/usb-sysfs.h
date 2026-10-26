@@ -75,10 +75,12 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
                                  char *out,
                                  size_t outsz);
 
-/* Whether the folded guest name @guest_path is a usbfs node, by its shape
- * alone; it takes no lock.
+/* Whether a fold of a relative name stops at the folded guest name @guest_path:
+ * every name under /dev/bus but /dev/bus/usb, so that each '..' after it
+ * reaches path_translate_at, since Linux applies '..' only to a directory that
+ * exists.
  */
-bool usb_sysfs_names_node(const char *guest_path);
+bool usb_sysfs_stops_fold(const char *guest_path);
 
 /* The canonical /dev/bus/usb/BBB/DDD spelling of @guest_path when it names a
  * usbfs node once its '.' and '..' are folded as the stat intercept folds them.
@@ -95,14 +97,21 @@ bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz);
  * directories the layer serves, to /dev followed by what comes after the '..'
  * that climbed, or to /dev/. when nothing does. Those directories are the
  * layer's, and the macOS host has no /dev/bus at all, so the '..' cannot be
- * left to the backing; a walk through any other name is. A further '..' is
- * applied to /dev and stops at the root.
+ * left to the backing. A further '..' is applied to /dev and stops at the root.
+ * A '..' after a bus no device has, or after a name under /dev/bus/usb that is
+ * not a bus or device number, fails the walk, as on Linux; one after a node or
+ * a name below a node is left as written. A '..' after a name outside
+ * /dev/bus/usb stops the walk, since only the backing can say whether that name
+ * is a directory.
  *
- * Returns true with @out filled, or false when nothing is rewritten.
+ * Returns 1 with @out filled, 2 with @out holding the name outside /dev/bus/usb
+ * and *@dotdot on the '..' after it in @guest_path, 0 when nothing is
+ * rewritten, or -1 with errno set to ENOENT for a '..' that fails the walk.
  */
-bool usb_sysfs_resolve_dev_climb(const char *guest_path,
-                                 char *out,
-                                 size_t outsz);
+int usb_sysfs_resolve_dev_climb(const char *guest_path,
+                                char *out,
+                                size_t outsz,
+                                const char **dotdot);
 
 /* Malloc'd copy of the usbfs descriptors blob (18-byte little-endian device
  * descriptor followed by every raw configuration descriptor in index order) for

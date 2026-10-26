@@ -6,15 +6,16 @@
  *
  * Code under test: the /sys ours/not-ours split in src/runtime/usb-sysfs.c, the
  * /sys + /dev/bus arms of sys_fchdir (src/syscall/fs.c) and
- * resolve_proc_cwd_path (src/syscall/path.c), and the /dev/bus climb rewrite in
- * usb_sysfs_resolve_dev_climb and path_translate_at.
+ * resolve_proc_cwd_path (src/syscall/path.c), the /dev/bus climb rewrite in
+ * usb_sysfs_resolve_dev_climb and path_translate_at, and the backing '..' in
+ * path_backing_dotdot.
  *
  * Run under --sysroot over a tree that carries a real /sys skeleton
  * (/sys/class/net/eth0/address, /sys/kernel/mm/transparent_hugepage/enabled,
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Three regressions are pinned here.
+ * Four regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -34,6 +35,10 @@
  * F3: a '..' out of /dev/bus that ends the name must not let rmdir or rename
  * act on the sysroot's /dev, which the lane leaves empty, and one that lands in
  * /sys must reach the sysroot's files there.
+ *
+ * F4: a '..' after a sysroot /dev/bus directory without search permission fails
+ * with EACCES. F3 needs /dev empty, so the lane runs the guest again with the
+ * argument search after adding /dev/bus/other at mode 000.
  */
 
 #include <dirent.h>
@@ -83,9 +88,54 @@ static bool dir_has_entry(const char *dir, const char *name)
     return found;
 }
 
-int main(void)
+/* may_lookup in fs/namei.c asks for search permission on the directory before
+ * each component, a '..' included.
+ */
+static void check_dotdot_unsearchable(void)
+{
+    struct stat st;
+
+    TEST("/dev/bus/usb/001/001 is a char device");
+    if (stat("/dev/bus/usb/001/001", &st) != 0 || !S_ISCHR(st.st_mode))
+        FAIL("stat(\"/dev/bus/usb/001/001\")");
+    else
+        PASS();
+
+    TEST("/dev/bus/other/../usb/001/001 is EACCES");
+    EXPECT_ERRNO(stat("/dev/bus/other/../usb/001/001", &st), EACCES,
+                 "stat(\"/dev/bus/other/../usb/001/001\")");
+
+    TEST("/dev/bus/other/.. is EACCES");
+    EXPECT_ERRNO(stat("/dev/bus/other/..", &st), EACCES,
+                 "stat(\"/dev/bus/other/..\")");
+
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    TEST("\"other/../usb/001/001\" against a /dev/bus dirfd is EACCES");
+    if (dfd < 0) {
+        FAIL("open /dev/bus");
+    } else {
+        EXPECT_ERRNO(fstatat(dfd, "other/../usb/001/001", &st, 0), EACCES,
+                     "fstatat(/dev/bus, \"other/../usb/001/001\")");
+        close(dfd);
+    }
+
+    TEST("\"other/../usb/001/001\" in a /dev/bus cwd is EACCES");
+    if (chdir("/dev/bus") != 0)
+        FAIL("chdir /dev/bus");
+    else
+        EXPECT_ERRNO(stat("other/../usb/001/001", &st), EACCES,
+                     "stat(\"other/../usb/001/001\")");
+}
+
+int main(int argc, char **argv)
 {
     char buf[256];
+
+    if (argc > 1 && !strcmp(argv[1], "search")) {
+        check_dotdot_unsearchable();
+        SUMMARY("test-usb-sysfs-sysroot search");
+        return fails ? 1 : 0;
+    }
 
     printf(
         "test-usb-sysfs-sysroot: /sys fall-through and fchdir containment\n");

@@ -1683,12 +1683,8 @@ path is built by `usb_sys_resolve_suffix`, which resolves symlinks and applies
 each `..` to what the previous component resolved to, as Linux does, so
 `<dev>/subsystem/..` names `/sys/bus`. On `/dev/bus` a `..` after a usbfs node
 is not applied, since Linux applies `..` only to a directory, and the name
-answers `ENOTDIR` once the node exists. A `..` after any other name is applied
-without checking that the name exists, so `/dev/bus/usb/099/../001/001` is
-served where Linux answers `ENOENT`. A relative name is folded the same way up
-to a usbfs node, so `099/../../../null` from a `/dev/bus/usb` cwd skips the
-check the climb rewrite makes for the absolute spelling. Deciding ownership on
-the unfolded spelling splits the two halves apart in both directions:
+answers `ENOTDIR` once the node exists. Deciding ownership on the unfolded
+spelling splits the two halves apart in both directions:
 `/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
 and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
 A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
@@ -1702,6 +1698,27 @@ reaches the `/proc` intercept. When the climb ends the name, the rewrite ends
 in `.`, as in `/dev/.`, so `rmdir` and `rename` fail rather than act on the
 directory reached, with `EINVAL` on a sysroot where Linux gives `ENOTEMPTY` and
 `EBUSY` for a final `..`.
+
+Every name under `/dev/bus/usb` is the layer's, so a `..` after a bus no device
+has, or after a malformed bus or device number, fails the walk with `ENOENT`, as
+Linux fails it at the missing name. The path layer refuses
+`/dev/bus/usb/099/../001/001` in the same step that rewrites a climb, before any
+intercept sees it. A `..` after a name shaped like a node for a device that does
+not exist is left to the intercepts, which answer `ENOENT`, though calls that
+skip the intercepts, such as `chmod`, still reach the backing for it. A `..`
+after any other name under `/dev/bus` belongs to the backing, so the path layer
+looks the name up there and applies the `..` only to a directory elfuse may
+search, following a symbolic link first, as Linux does.
+`/dev/bus/other/f/../../usb/099/../001/001` is `ENOTDIR` for a file `f`, and
+`/dev/bus/nosuch/../usb/001/001` is `ENOENT` for a name the backing does not
+have, which on a macOS host without a sysroot is every such name. The walk then
+goes on, so `/dev/bus/other/../usb/099/../001/001` is `ENOENT` at `099`, and
+`EACCES` at `other` when `other` is at mode `000`. A relative name is folded
+only through `/dev/bus` and `/dev/bus/usb`, so `099/../001/001` from a
+`/dev/bus/usb` cwd and `other/f/../../../null` from a `/dev/bus` cwd go through
+the same steps. A name that enters `/dev/bus` through a `..` from outside it is
+not checked this way: `/etc/../dev/bus/usb/099/001` reaches a
+`dev/bus/usb/099/001` the sysroot plants, where Linux answers `ENOENT`.
 
 ### Filesystem Identity Of A Descriptor
 

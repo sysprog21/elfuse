@@ -800,6 +800,7 @@ run_unit_tests()
     test_check "$runner" "test-pidfd-targets" "0 failed" \
         "$bindir/test-pidfd-targets"
     test_rc "$runner" "test-sigio" 0 "$bindir/test-sigio"
+    test_check "$runner" "test-rlimit-cpu" "0 failed" "$bindir/test-rlimit-cpu"
     test_rc "$runner" "test-fault-signal-mt" 0 "$bindir/test-fault-signal-mt"
     test_rc "$runner" "test-exit-group-worker" 0 "$bindir/test-exit-group-worker"
 

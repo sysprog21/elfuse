@@ -542,6 +542,11 @@ int fork_child_main(int ipc_fd,
      * are properly restored to the thread entry.
      */
     signal_set_state(&sig);
+    if (!sys_rlimit_cpu_start()) {
+        proc_pty_release_process_slaves();
+        launch_destroy_guest(&g);
+        return 1;
+    }
 
     log_debug("fork-child: entering vCPU loop");
 

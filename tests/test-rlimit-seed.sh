@@ -97,6 +97,32 @@ else
     report_fail "a guest write past the host soft file size limit lands (exit $rc: $got)"
 fi
 
+# A host RLIMIT_CPU soft limit would end elfuse with a host SIGXCPU. elfuse
+# lifts its own soft limit to the hard one, so a guest that raises its soft
+# limit above a 1 s host soft limit spins past it. The guest spins until times
+# reports 1 s of user time, so the case crosses the limit on any machine; times
+# writes to a file, since in a command substitution it would report the
+# subshell; the file case above is done with that file.
+# shellcheck disable=SC2016  # Expanded by the guest shell.
+SPIN_PAST_1S='ulimit -S -t unlimited || exit 1
+n=0
+while [ $n -lt 1000 ]; do
+    i=0
+    while [ $i -lt 100000 ]; do i=$((i+1)); done
+    times > "$1"
+    read -r user sys < "$1"
+    case $user in 0m0.*) ;; *) echo done; exit 0 ;; esac
+    n=$((n+1))
+done
+echo "under 1 s of CPU after $n rounds"'
+got="$(bash -c 'ulimit -S -t 1 && exec "$0" "$1" sh -c "$2" sh "$3"' \
+    "$ELFUSE" "$BB" "$SPIN_PAST_1S" "$XFSZ_FILE" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [ "$got" = "done" ]; then
+    report_pass "a guest spins past the host soft CPU limit"
+else
+    report_fail "a guest spins past the host soft CPU limit (exit $rc: $got)"
+fi
+
 report_summary
 # shellcheck disable=SC2154  # fail is incremented in tests/lib/report.sh
 [ "$fail" -eq 0 ] || exit 1

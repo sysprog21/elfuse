@@ -553,6 +553,15 @@ int main(int argc, char **argv)
      */
     signal(SIGXFSZ, SIG_IGN);
 
+    /* Past this process's own RLIMIT_CPU soft limit the host kernel sends
+     * SIGXCPU, whose default action kills elfuse even when the guest caught
+     * SIGXCPU. The guest's limit lives in the guest table, sys_rlimit_init
+     * lifts the host soft limit to the hard one, and XNU sends nothing at the
+     * hard limit, so the RLIMIT_CPU sampler (sys.c) enforces both the guest
+     * limits and the host hard limit.
+     */
+    signal(SIGXCPU, SIG_IGN);
+
     /* Block the vCPU-preemption signals and start the sigwait thread before any
      * vCPU thread exists, so both the normal path and the fork-child path below
      * inherit the block on every thread they spawn.

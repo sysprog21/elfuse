@@ -741,6 +741,24 @@ static bool rlimit_cpu_started;
 static uint64_t rlimit_cpu_run_ns;
 static bool rlimit_cpu_rebase = true, rlimit_cpu_killing;
 
+/* The host hard RLIMIT_CPU in seconds, under rlimit_lock. XNU sends SIGXCPU at
+ * the soft limit and nothing at the hard one, and elfuse lifts its soft limit
+ * and ignores SIGXCPU (sys_rlimit_init, main.c), so the host never stops
+ * elfuse. The sampler holds the guest to this limit as well, since a guest with
+ * euid 0 can raise its own hard limit past it.
+ */
+static uint64_t rlimit_cpu_host_max = LINUX_RLIM_INFINITY;
+
+/* elfuse never moves its hard limit, and a fork child inherits it, so the value
+ * read here is the one the parent read. The caller holds rlimit_lock.
+ */
+static void rlimit_cpu_host_max_read_locked(void)
+{
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_CPU, &rl) == 0 && rl.rlim_max != RLIM_INFINITY)
+        rlimit_cpu_host_max = rl.rlim_max;
+}
+
 /* rlimit_cpu_stopping ends the sampler before the guest is destroyed.
  * rlimit_cpu_sending is set while the sampler queues a signal with rlimit_lock
  * dropped, so sys_rlimit_cpu_stop and a new RLIMIT_CPU in rlimit_exchange can
@@ -778,7 +796,11 @@ static void *rlimit_cpu_main(void *arg)
     while (!rlimit_cpu_stopping) {
         linux_rlimit64_t lim =
             rlimit_slot_load(&rlimit_private, LINUX_RLIMIT_CPU);
-        if (lim.rlim_cur == LINUX_RLIM_INFINITY) {
+        uint64_t hard = lim.rlim_max < rlimit_cpu_host_max
+                            ? lim.rlim_max
+                            : rlimit_cpu_host_max;
+        if (lim.rlim_cur == LINUX_RLIM_INFINITY &&
+            hard == LINUX_RLIM_INFINITY) {
             pthread_cond_wait(&rlimit_cpu_cond, &rlimit_lock);
             continue;
         }
@@ -793,9 +815,9 @@ static void *rlimit_cpu_main(void *arg)
         bool ran = run >= rlimit_cpu_run_ns + RLIMIT_CPU_RAN_NS;
         rlimit_cpu_run_ns = run;
         uint64_t soft_ns = rlimit_cpu_ns(lim.rlim_cur);
+        uint64_t hard_ns = rlimit_cpu_ns(hard);
         uint64_t wait = RLIMIT_CPU_MIN_WAIT_NS;
-        bool past_hard = lim.rlim_max != LINUX_RLIM_INFINITY &&
-                         used >= rlimit_cpu_ns(lim.rlim_max);
+        bool past_hard = hard != LINUX_RLIM_INFINITY && used >= hard_ns;
         if (!ran && (past_hard ? !rlimit_cpu_killing : used >= soft_ns)) {
             /* Idle past a limit: check again at the minimum wait. */
         } else if (past_hard) {
@@ -828,7 +850,8 @@ static void *rlimit_cpu_main(void *arg)
              * a soft limit near the rlimit_cpu_ns saturation from handing the
              * host timed wait centuries.
              */
-            wait = (soft_ns - used) / (uint64_t) ncpu;
+            wait = ((soft_ns < hard_ns ? soft_ns : hard_ns) - used) /
+                   (uint64_t) ncpu;
             if (wait < RLIMIT_CPU_MIN_WAIT_NS)
                 wait = RLIMIT_CPU_MIN_WAIT_NS;
             if (wait > RLIMIT_CPU_MAX_WAIT_NS)
@@ -858,7 +881,8 @@ static bool rlimit_cpu_changed_locked(void)
         pthread_cond_signal(&rlimit_cpu_cond);
         return true;
     }
-    if (sys_rlimit_cur(LINUX_RLIMIT_CPU) == LINUX_RLIM_INFINITY)
+    if (sys_rlimit_cur(LINUX_RLIMIT_CPU) == LINUX_RLIM_INFINITY &&
+        rlimit_cpu_host_max == LINUX_RLIM_INFINITY)
         return true;
     pthread_t t;
     int err = pthread_create(&t, NULL, rlimit_cpu_main, NULL);
@@ -959,22 +983,27 @@ bool sys_rlimit_init(void)
             nproc = lim;
         rlimit_slot_store(&rlimit_private, r, lim);
     }
+    rlimit_cpu_host_max_read_locked();
     bool cpu_ok = rlimit_cpu_changed_locked();
     pthread_mutex_unlock(&rlimit_lock);
     if (!cpu_ok)
         return false;
 
-    /* The guest's RLIMIT_FSIZE is enforced from the table just seeded, so the
-     * host soft limit only stands in the way of a guest that raises its own:
-     * lift it to the host hard limit. A guest that raises past the hard limit
-     * still meets the host's, which the ignored SIGXFSZ (main.c) turns into
-     * EFBIG. This runs before the check below records the host limits, which
-     * stay fixed from here on.
+    /* The guest's RLIMIT_FSIZE and RLIMIT_CPU are enforced from the table just
+     * seeded, so the host soft limits only stand in the way of a guest that
+     * raises its own: lift them to the host hard limits. A guest that raises
+     * past a hard limit still meets the host's: the ignored SIGXFSZ (main.c)
+     * turns a write past it into EFBIG, and the RLIMIT_CPU sampler sends
+     * SIGKILL at the host hard CPU limit. This runs before the check below
+     * records the host limits, which stay fixed from here on.
      */
-    struct rlimit fsz;
-    if (getrlimit(RLIMIT_FSIZE, &fsz) == 0 && fsz.rlim_cur < fsz.rlim_max) {
-        fsz.rlim_cur = fsz.rlim_max;
-        (void) setrlimit(RLIMIT_FSIZE, &fsz);
+    static const int lifted[] = {RLIMIT_FSIZE, RLIMIT_CPU};
+    for (size_t i = 0; i < sizeof(lifted) / sizeof(lifted[0]); i++) {
+        struct rlimit host;
+        if (getrlimit(lifted[i], &host) == 0 && host.rlim_cur < host.rlim_max) {
+            host.rlim_cur = host.rlim_max;
+            (void) setrlimit(lifted[i], &host);
+        }
     }
     host_rlimit_check_arm();
     return true;
@@ -1021,6 +1050,7 @@ void sys_rlimit_restore(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT])
 bool sys_rlimit_cpu_start(void)
 {
     pthread_mutex_lock(&rlimit_lock);
+    rlimit_cpu_host_max_read_locked();
     bool ok = rlimit_cpu_changed_locked();
     pthread_mutex_unlock(&rlimit_lock);
     return ok;

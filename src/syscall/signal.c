@@ -289,6 +289,14 @@ static guest_posix_timer_t *posix_timer_find_locked(int id)
     return NULL;
 }
 
+/* Threads parked in rt_sigtimedwait. The signals they wait for are normally
+ * blocked everywhere, so signal_should_interrupt() rejects them and the queue
+ * paths do not ring the wakeup pipe for them; a queue site rings it itself when
+ * anyone is parked. attention_raise() always rings, which covers a timer armed
+ * from another thread.
+ */
+static _Atomic int sigwait_parked;
+
 static void posix_timer_dequeued_locked(signal_rt_info_t *info)
 {
     if (info->si_code != LINUX_SI_TIMER)
@@ -301,6 +309,13 @@ static void posix_timer_dequeued_locked(signal_rt_info_t *info)
     timer->last_overrun = timer->overruns;
     timer->overruns = 0;
     timer->notification = POSIX_TIMER_NONE;
+
+    /* A parked waiter skipped this timer while it was queued, so it holds no
+     * bound for the timer's next expiry; ring it to recompute. wake_lock is a
+     * leaf, so ringing under sig_lock is safe.
+     */
+    if (atomic_load_explicit(&sigwait_parked, memory_order_seq_cst) > 0)
+        wakeup_pipe_signal();
 }
 
 /* Default disposition table. Index 0 unused (signals are 1-based). */
@@ -717,6 +732,16 @@ void signal_reset_for_exec(void)
     pending_fault.valid = false;
 }
 
+/* Every queue site calls this once the signal is in a pending set and sig_lock
+ * is dropped.
+ */
+static void signal_notify_waiters(int signum)
+{
+    signalfd_notify(signum);
+    if (atomic_load_explicit(&sigwait_parked, memory_order_seq_cst) > 0)
+        wakeup_pipe_signal();
+}
+
 void signal_queue(int signum)
 {
     if (signum < 1 || signum > LINUX_NSIG)
@@ -730,7 +755,7 @@ void signal_queue(int signum)
     /* Notify any signalfd instances whose mask includes this signal. This makes
      * the signalfd pipe readable so poll/epoll sees it.
      */
-    signalfd_notify(signum);
+    signal_notify_waiters(signum);
 
     /* Only force vCPUs out of hv_vcpu_run(), and only force the shim's identity
      * fast path off, if the signal is actually deliverable to at least one
@@ -770,7 +795,7 @@ void signal_queue_info(int signum,
     signal_enqueue_locked(&sig_state.shared, signum, &info);
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
-    signalfd_notify(signum);
+    signal_notify_waiters(signum);
 
     /* Same shim-globals attention raise as signal_queue: force the fast path
      * off only when the queued signal can reach signal_deliver.
@@ -821,7 +846,7 @@ static bool signal_queue_thread_common(int64_t tid,
      * signalfd" pattern -- which matters far more than sparing a sibling a
      * spurious wake.
      */
-    signalfd_notify(signum);
+    signal_notify_waiters(signum);
 
     /* Interrupt only if the signal can actually reach the target: uncatchable
      * signals always, otherwise the target must not block it. A concurrent
@@ -1639,7 +1664,7 @@ static void posix_timer_check(void)
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
     for (uint64_t pending = notify; pending; pending &= pending - 1)
-        signalfd_notify(bit_ctz64(pending) + 1);
+        signal_notify_waiters(bit_ctz64(pending) + 1);
     if (notify)
         attention_raise();
 }
@@ -2310,6 +2335,9 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
     return signum;
 }
 
+#define SIGWAIT_IDLE_NS 1000000000LL
+#define SIGWAIT_WAITING_NS 1000000LL
+
 int64_t signal_rt_sigtimedwait(guest_t *g,
                                uint64_t set_gva,
                                uint64_t info_gva,
@@ -2346,12 +2374,24 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
         remaining_ns = linux_timespec_to_ns_sat(&lts);
     }
 
-    /* Poll/wait loop. */
-#define SIGWAIT_CHUNK_NS 1000000LL /* 1ms chunks */
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int64_t timeout_ns = remaining_ns;
+    int64_t ret;
+
+    /* Raised before the first test, so a queue site that misses the count has
+     * queued before that test.
+     */
+    atomic_fetch_add_explicit(&sigwait_parked, 1, memory_order_seq_cst);
 
     while (1) {
+        /* Read the wake counter before testing anything, so a signal queued
+         * between the test and the park moves it and the park returns at once.
+         */
+        uint64_t counter = wakeup_counter();
+
         signal_rt_info_t info;
-        posix_timer_check();
+        signal_check_timer_real();
         int signum = sigtimedwait_try_dequeue(mask, &info);
         if (signum > 0) {
             /* Populate guest siginfo_t if the caller wants it. */
@@ -2363,24 +2403,30 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
                 si.si_pid = info.si_pid;
                 si.si_uid = (int32_t) info.si_uid;
                 si.si_value = info.si_ptr;
-                if (guest_write_small(g, info_gva, &si, sizeof(si)) < 0)
-                    return -LINUX_EFAULT;
+                if (guest_write_small(g, info_gva, &si, sizeof(si)) < 0) {
+                    ret = -LINUX_EFAULT;
+                    break;
+                }
             }
-            return signum;
+            ret = signum;
+            break;
         }
 
         /* For a zero timeout (poll-once), bail immediately. */
-        if (has_timeout && remaining_ns <= 0)
-            return -LINUX_EAGAIN;
+        if (has_timeout && remaining_ns <= 0) {
+            ret = -LINUX_EAGAIN;
+            break;
+        }
 
-        /* Exit if the process, or just this thread, is tearing down. The chunks
-         * already consumed above came out of the guest's timeout, so a restart
-         * of the original request would grant it the full span again.
+        /* Exit if the process, or just this thread, is tearing down. Time
+         * already spent came out of the guest's timeout, so a restart of the
+         * original request would grant it the full span again.
          */
         if (thread_stop_requested()) {
             if (has_timeout)
                 syscall_restart_forbid();
-            return -LINUX_EINTR;
+            ret = -LINUX_EINTR;
+            break;
         }
 
         /* If a non-waited, guest-visible signal is pending, return -EINTR.
@@ -2398,39 +2444,81 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
             signal_claim_waking_locked(
                 atomic_load_explicit(blocked, memory_order_relaxed) | mask) !=
             0;
-        pthread_mutex_unlock(&sig_lock);
         if (interrupt) {
+            pthread_mutex_unlock(&sig_lock);
             if (has_timeout)
                 syscall_restart_forbid();
-            return -LINUX_EINTR;
+            ret = -LINUX_EINTR;
+            break;
         }
 
-        /* Sleep one chunk, then recheck. */
-        int64_t sleep_ns =
-            has_timeout ? (remaining_ns < SIGWAIT_CHUNK_NS ? remaining_ns
-                                                           : SIGWAIT_CHUNK_NS)
-                        : SIGWAIT_CHUNK_NS;
-        struct timespec req = {
-            .tv_sec = sleep_ns / 1000000000LL,
-            .tv_nsec = sleep_ns % 1000000000LL,
-        };
-        struct timespec rem = {0};
-        if (nanosleep(&req, &rem) < 0) {
-            /* Host EINTR: account for time already slept. */
-            int64_t slept =
-                sleep_ns - (rem.tv_sec * 1000000000LL + rem.tv_nsec);
-            if (slept < 0)
-                slept = 0;
-            if (has_timeout)
-                remaining_ns -= slept;
-            /* Recheck immediately (will catch deliverable signal). */
-            continue;
+        /* Recheck periodically for realtime clock changes and missed wakes. */
+        int64_t sleep_ns = has_timeout && remaining_ns < SIGWAIT_IDLE_NS
+                               ? remaining_ns
+                               : SIGWAIT_IDLE_NS;
+        for (int i = 0; i < POSIX_TIMER_MAX; i++) {
+            const guest_posix_timer_t *timer = &posix_timers[i];
+
+            if (!timer->used || !timer->signum)
+                continue;
+
+            /* A fired timer parked behind a pending signal retries its enqueue
+             * only when a check runs after that signal is consumed, and the
+             * consumer may be another thread or a different signal source, so
+             * poll at the old 1 ms rate while one exists.
+             */
+            if (timer->notification == POSIX_TIMER_WAITING &&
+                sleep_ns > SIGWAIT_WAITING_NS)
+                sleep_ns = SIGWAIT_WAITING_NS;
+
+            /* A queued timer's later expiries only add overruns, which the next
+             * check folds in; waking per period for them is pure cost.
+             */
+            if (!timer->expiry_ns || timer->notification == POSIX_TIMER_QUEUED)
+                continue;
+            int64_t now = posix_timer_now(timer->host_clock);
+            int64_t until = timer->expiry_ns > now ? timer->expiry_ns - now : 0;
+            if (until < sleep_ns)
+                sleep_ns = until;
         }
-        if (has_timeout)
-            remaining_ns -= sleep_ns;
+
+        /* ITIMER_REAL is advanced by the check at the top of the loop, which
+         * nothing else runs while this thread is parked, so bound the park by
+         * its expiry the same way. Once SIGALRM is pending, later periods
+         * coalesce into it, so they are not worth a wake. The seconds test
+         * keeps the nanosecond conversion in range for a far-off expiry.
+         */
+        if (atomic_load_explicit(&guest_itimer.active, memory_order_acquire) &&
+            !(self_pending_locked() & sig_bit(LINUX_SIGALRM))) {
+            struct timeval now = monotonic_now();
+            int64_t until = 0;
+            if (timeval_cmp(&guest_itimer.expiry, &now) > 0) {
+                struct timeval d = timeval_sub(&guest_itimer.expiry, &now);
+                until = d.tv_sec > sleep_ns / NSEC_PER_SEC
+                            ? sleep_ns
+                            : (int64_t) d.tv_sec * NSEC_PER_SEC +
+                                  d.tv_usec * 1000LL;
+            }
+            if (until < sleep_ns)
+                sleep_ns = until;
+        }
+        pthread_mutex_unlock(&sig_lock);
+        wakeup_wait_ns(sleep_ns, counter);
+
+        /* Charge the time that actually passed: the wake is process-wide and
+         * the park may return spuriously.
+         */
+        if (has_timeout) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            remaining_ns = timeout_ns - ((int64_t) (now.tv_sec - start.tv_sec) *
+                                             1000000000LL +
+                                         (now.tv_nsec - start.tv_nsec));
+        }
     }
 
-#undef SIGWAIT_CHUNK_NS
+    atomic_fetch_sub_explicit(&sigwait_parked, 1, memory_order_seq_cst);
+    return ret;
 }
 
 

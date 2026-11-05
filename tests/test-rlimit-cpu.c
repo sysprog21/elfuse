@@ -83,15 +83,16 @@ static void child_caught(void)
     spin();
 }
 
-static volatile unsigned char late_seen[8];
-static volatile int late_n;
+static volatile sig_atomic_t late_seen[8];
+static volatile sig_atomic_t late_n;
 
 static void on_xcpu_late(int sig)
 {
     (void) sig;
     struct rlimit rl;
-    if (late_n < (int) sizeof(late_seen) && getrlimit(RLIMIT_CPU, &rl) == 0)
-        late_seen[late_n++] = (unsigned char) rl.rlim_cur;
+    if (late_n < (int) (sizeof(late_seen) / sizeof(late_seen[0])) &&
+        getrlimit(RLIMIT_CPU, &rl) == 0)
+        late_seen[late_n++] = (sig_atomic_t) rl.rlim_cur;
 }
 
 static uint64_t now_ns(void)

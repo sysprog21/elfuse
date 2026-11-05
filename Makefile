@@ -419,6 +419,12 @@ $(BUILD_DIR)/test-rlimit-fsize: tests/test-rlimit-fsize.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-rlimit-cpu spins a worker thread under a sleeping leader to show the hard
+# limit ends the whole process.
+$(BUILD_DIR)/test-rlimit-cpu: tests/test-rlimit-cpu.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-usbdev-ioctl churns open/read/close on one usbdevfs node from four
 # threads, so a close and a sibling's open contend for the same fd number.
 $(BUILD_DIR)/test-usbdev-ioctl: tests/test-usbdev-ioctl.c | $(BUILD_DIR)

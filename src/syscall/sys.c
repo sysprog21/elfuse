@@ -27,6 +27,8 @@
 
 #include "utils.h"
 
+#include "debug/log.h"
+
 #include "proved/slice.h"
 
 #include "core/shim-globals.h"
@@ -707,6 +709,193 @@ static void rlimit_slot_store(rlimit_table_t *t,
                           memory_order_relaxed);
 }
 
+/* RLIMIT_CPU, enforced as check_process_timers does it (Linux
+ * kernel/time/posix-cpu-timers.c): at the hard limit SIGKILL and nothing more;
+ * at the soft limit SIGXCPU and a soft limit one second higher, so a process
+ * that survives SIGXCPU gets another one each CPU second.
+ *
+ * A guest spinning at EL0 takes no exit that could check the limit, so a thread
+ * of its own samples the process CPU time. That is host CPU time, the clock
+ * guest CLOCK_PROCESS_CPUTIME_ID reads, and it includes the time elfuse spends
+ * serving guest syscalls, which Linux charges as system time. The thread starts
+ * the first time a soft limit is finite and waits on rlimit_cpu_cond while it
+ * is not.
+ */
+#define RLIMIT_CPU_MIN_WAIT_NS 10000000ULL              /* 10 ms */
+#define RLIMIT_CPU_MAX_WAIT_NS (3600ULL * NSEC_PER_SEC) /* 1 h */
+
+static pthread_cond_t rlimit_cpu_cond = PTHREAD_COND_INITIALIZER;
+static bool rlimit_cpu_started;
+
+/* Linux checks the limits on a tick that lands while the process runs, so a
+ * process idle past a limit gets no signal until it runs again. The sampler
+ * sends only when the process spent RLIMIT_CPU_RAN_NS, a tick at HZ 1000,
+ * outside the sampler since the previous check; an idle elfuse spends far less
+ * than that per minimum wait. rlimit_cpu_run_ns is that CPU time at the
+ * previous check, or at the last limit change (rlimit_cpu_rebase), so a change
+ * sends nothing until the next check. rlimit_cpu_killing skips the test once a
+ * SIGKILL went out, since a sleeping leader must still get the resend. Under
+ * rlimit_lock.
+ */
+#define RLIMIT_CPU_RAN_NS 1000000ULL /* 1 ms */
+static uint64_t rlimit_cpu_run_ns;
+static bool rlimit_cpu_rebase = true, rlimit_cpu_killing;
+
+/* The host hard RLIMIT_CPU in seconds, under rlimit_lock. XNU sends SIGXCPU at
+ * the soft limit and nothing at the hard one, and elfuse lifts its soft limit
+ * and ignores SIGXCPU (sys_rlimit_init, main.c), so the host never stops
+ * elfuse. The sampler holds the guest to this limit as well, since a guest with
+ * euid 0 can raise its own hard limit past it.
+ */
+static uint64_t rlimit_cpu_host_max = LINUX_RLIM_INFINITY;
+
+/* elfuse never moves its hard limit, and a fork child inherits it, so the value
+ * read here is the one the parent read. The caller holds rlimit_lock.
+ */
+static void rlimit_cpu_host_max_read_locked(void)
+{
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_CPU, &rl) == 0 && rl.rlim_max != RLIM_INFINITY)
+        rlimit_cpu_host_max = rl.rlim_max;
+}
+
+/* rlimit_cpu_stopping ends the sampler before the guest is destroyed.
+ * rlimit_cpu_sending is set while the sampler queues a signal with rlimit_lock
+ * dropped, so sys_rlimit_cpu_stop and a new RLIMIT_CPU in rlimit_exchange can
+ * wait that send out. Both under rlimit_lock.
+ */
+static bool rlimit_cpu_stopping, rlimit_cpu_sending;
+
+static uint64_t rlimit_cpu_ns(uint64_t sec)
+{
+    return sec > UINT64_MAX / NSEC_PER_SEC ? UINT64_MAX : sec * NSEC_PER_SEC;
+}
+
+/* rlimit_lock is a leaf and signal_queue_info takes sig_lock, so @sig is queued
+ * with the lock dropped. Sent as SEND_SIG_PRIV, so the guest sees SI_KERNEL and
+ * no sender. The caller holds rlimit_lock, and holds it again on return.
+ */
+static void rlimit_cpu_send_locked(int sig)
+{
+    rlimit_cpu_sending = true;
+    pthread_mutex_unlock(&rlimit_lock);
+    signal_queue_info(sig, LINUX_SI_KERNEL, 0, 0, 0, 0);
+    pthread_mutex_lock(&rlimit_lock);
+    rlimit_cpu_sending = false;
+    pthread_cond_broadcast(&rlimit_cpu_cond);
+}
+
+static void *rlimit_cpu_main(void *arg)
+{
+    (void) arg;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1)
+        ncpu = 1;
+
+    pthread_mutex_lock(&rlimit_lock);
+    while (!rlimit_cpu_stopping) {
+        linux_rlimit64_t lim =
+            rlimit_slot_load(&rlimit_private, LINUX_RLIMIT_CPU);
+        uint64_t hard = lim.rlim_max < rlimit_cpu_host_max
+                            ? lim.rlim_max
+                            : rlimit_cpu_host_max;
+        if (lim.rlim_cur == LINUX_RLIM_INFINITY &&
+            hard == LINUX_RLIM_INFINITY) {
+            pthread_cond_wait(&rlimit_cpu_cond, &rlimit_lock);
+            continue;
+        }
+
+        uint64_t used = clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID);
+        uint64_t own = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+        uint64_t run = used > own ? used - own : 0;
+        if (rlimit_cpu_rebase) {
+            rlimit_cpu_run_ns = run;
+            rlimit_cpu_rebase = false;
+        }
+        bool ran = run >= rlimit_cpu_run_ns + RLIMIT_CPU_RAN_NS;
+        rlimit_cpu_run_ns = run;
+        uint64_t soft_ns = rlimit_cpu_ns(lim.rlim_cur);
+        uint64_t hard_ns = rlimit_cpu_ns(hard);
+        uint64_t wait = RLIMIT_CPU_MIN_WAIT_NS;
+        bool past_hard = hard != LINUX_RLIM_INFINITY && used >= hard_ns;
+        if (!ran && (past_hard ? !rlimit_cpu_killing : used >= soft_ns)) {
+            /* Idle past a limit: check again at the minimum wait. */
+        } else if (past_hard) {
+            /* Sent again each minimum wait until teardown stops the sampler: a
+             * CLONE_THREAD worker that dequeues SIGKILL ends alone rather than
+             * taking the thread group with it as do_group_exit does, so one
+             * send can leave the other threads past the hard limit.
+             */
+            rlimit_cpu_killing = true;
+            rlimit_cpu_send_locked(LINUX_SIGKILL);
+            if (rlimit_cpu_stopping)
+                break;
+        } else if (used >= soft_ns) {
+            /* Raised before the signal is queued, so a handler reads the new
+             * soft limit. Below the hard limit, or that check would have fired.
+             *
+             * One raise per check, as check_process_timers makes one per tick,
+             * so a soft limit set far below the CPU time already used catches
+             * up a step per minimum wait rather than in one burst.
+             */
+            lim.rlim_cur++;
+            rlimit_slot_store(&rlimit_private, LINUX_RLIMIT_CPU, lim);
+            rlimit_cpu_send_locked(LINUX_SIGXCPU);
+            if (rlimit_cpu_stopping)
+                break;
+        } else {
+            /* The process spends at most ncpu CPU seconds per wall second, so
+             * it cannot reach the soft limit sooner than this. A limit change
+             * signals rlimit_cpu_cond, so the hour cap costs nothing; it keeps
+             * a soft limit near the rlimit_cpu_ns saturation from handing the
+             * host timed wait centuries.
+             */
+            wait = ((soft_ns < hard_ns ? soft_ns : hard_ns) - used) /
+                   (uint64_t) ncpu;
+            if (wait < RLIMIT_CPU_MIN_WAIT_NS)
+                wait = RLIMIT_CPU_MIN_WAIT_NS;
+            if (wait > RLIMIT_CPU_MAX_WAIT_NS)
+                wait = RLIMIT_CPU_MAX_WAIT_NS;
+        }
+        struct timespec rel = {
+            .tv_sec = (time_t) (wait / NSEC_PER_SEC),
+            .tv_nsec = (long) (wait % NSEC_PER_SEC),
+        };
+        pthread_cond_timedwait_relative_np(&rlimit_cpu_cond, &rlimit_lock,
+                                           &rel);
+    }
+    pthread_mutex_unlock(&rlimit_lock);
+    return NULL;
+}
+
+/* Tell the sampler the CPU slot changed, starting it on the first finite soft
+ * limit. The caller holds rlimit_lock.
+ *
+ * Returns false when the sampler is needed and cannot start, so the limit would
+ * go unenforced.
+ */
+static bool rlimit_cpu_changed_locked(void)
+{
+    rlimit_cpu_rebase = true;
+    if (rlimit_cpu_started) {
+        pthread_cond_signal(&rlimit_cpu_cond);
+        return true;
+    }
+    if (sys_rlimit_cur(LINUX_RLIMIT_CPU) == LINUX_RLIM_INFINITY &&
+        rlimit_cpu_host_max == LINUX_RLIM_INFINITY)
+        return true;
+    pthread_t t;
+    int err = pthread_create(&t, NULL, rlimit_cpu_main, NULL);
+    if (err != 0) {
+        log_error("elfuse: cannot start the RLIMIT_CPU sampler: %s",
+                  strerror(err));
+        return false;
+    }
+    pthread_detach(t);
+    rlimit_cpu_started = true;
+    return true;
+}
+
 /* Test hook, off unless ELFUSE_HOST_RLIMIT_CHECK is set: record every host
  * limit of this process and fail its exit when one has moved. Only elfuse can
  * read its own limits, and a guest limit that reached host setrlimit shows
@@ -771,7 +960,7 @@ static linux_rlimit64_t rlimit_linux_default(int resource,
     }
 }
 
-void sys_rlimit_init(void)
+bool sys_rlimit_init(void)
 {
     linux_rlimit64_t nproc = {LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY};
 
@@ -794,21 +983,30 @@ void sys_rlimit_init(void)
             nproc = lim;
         rlimit_slot_store(&rlimit_private, r, lim);
     }
+    rlimit_cpu_host_max_read_locked();
+    bool cpu_ok = rlimit_cpu_changed_locked();
     pthread_mutex_unlock(&rlimit_lock);
+    if (!cpu_ok)
+        return false;
 
-    /* The guest's RLIMIT_FSIZE is enforced from the table just seeded, so the
-     * host soft limit only stands in the way of a guest that raises its own:
-     * lift it to the host hard limit. A guest that raises past the hard limit
-     * still meets the host's, which the ignored SIGXFSZ (main.c) turns into
-     * EFBIG. This runs before the check below records the host limits, which
-     * stay fixed from here on.
+    /* The guest's RLIMIT_FSIZE and RLIMIT_CPU are enforced from the table just
+     * seeded, so the host soft limits only stand in the way of a guest that
+     * raises its own: lift them to the host hard limits. A guest that raises
+     * past a hard limit still meets the host's: the ignored SIGXFSZ (main.c)
+     * turns a write past it into EFBIG, and the RLIMIT_CPU sampler sends
+     * SIGKILL at the host hard CPU limit. This runs before the check below
+     * records the host limits, which stay fixed from here on.
      */
-    struct rlimit fsz;
-    if (getrlimit(RLIMIT_FSIZE, &fsz) == 0 && fsz.rlim_cur < fsz.rlim_max) {
-        fsz.rlim_cur = fsz.rlim_max;
-        (void) setrlimit(RLIMIT_FSIZE, &fsz);
+    static const int lifted[] = {RLIMIT_FSIZE, RLIMIT_CPU};
+    for (size_t i = 0; i < sizeof(lifted) / sizeof(lifted[0]); i++) {
+        struct rlimit host;
+        if (getrlimit(lifted[i], &host) == 0 && host.rlim_cur < host.rlim_max) {
+            host.rlim_cur = host.rlim_max;
+            (void) setrlimit(lifted[i], &host);
+        }
     }
     host_rlimit_check_arm();
+    return true;
 }
 
 uint64_t sys_rlimit_cur(int resource)
@@ -849,16 +1047,42 @@ void sys_rlimit_restore(const linux_rlimit64_t in[LINUX_RLIMIT_COUNT])
     host_rlimit_check_arm();
 }
 
+bool sys_rlimit_cpu_start(void)
+{
+    pthread_mutex_lock(&rlimit_lock);
+    rlimit_cpu_host_max_read_locked();
+    bool ok = rlimit_cpu_changed_locked();
+    pthread_mutex_unlock(&rlimit_lock);
+    return ok;
+}
+
+void sys_rlimit_cpu_stop(void)
+{
+    pthread_mutex_lock(&rlimit_lock);
+    rlimit_cpu_stopping = true;
+    pthread_cond_broadcast(&rlimit_cpu_cond);
+    while (rlimit_cpu_sending)
+        pthread_cond_wait(&rlimit_cpu_cond, &rlimit_lock);
+    pthread_mutex_unlock(&rlimit_lock);
+}
+
 /* Read the slot into @old_lim and, when @new_lim is set, replace it under the
  * rules of do_prlimit (Linux kernel/sys.c). The caller holds rlimit_lock.
  *
- * Returns 0 or a positive Linux errno.
+ * Returns 0 or a positive Linux errno. On EAGAIN the sampler could not start
+ * and the slot is back to @old_lim.
  */
 static int rlimit_exchange(rlimit_table_t *t,
                            int resource,
                            const linux_rlimit64_t *new_lim,
                            linux_rlimit64_t *old_lim)
 {
+    /* The sampler decides on SIGXCPU or SIGKILL under rlimit_lock and queues it
+     * with the lock dropped. Wait out a send in flight, so the signal lands
+     * before the new limit applies and never after prlimit64 returns.
+     */
+    while (new_lim && resource == LINUX_RLIMIT_CPU && rlimit_cpu_sending)
+        pthread_cond_wait(&rlimit_cpu_cond, &rlimit_lock);
     *old_lim = rlimit_slot_load(t, resource);
     if (!new_lim)
         return 0;
@@ -874,6 +1098,12 @@ static int rlimit_exchange(rlimit_table_t *t,
         return LINUX_EPERM;
 
     rlimit_slot_store(t, resource, *new_lim);
+    if (resource == LINUX_RLIMIT_CPU) {
+        if (!rlimit_cpu_changed_locked()) {
+            rlimit_slot_store(t, resource, *old_lim);
+            return LINUX_EAGAIN;
+        }
+    }
     return 0;
 }
 

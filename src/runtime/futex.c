@@ -1083,6 +1083,8 @@ static int64_t futex_wake(const guest_t *g,
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
+    val = futex_wake_budget(val);
+
     unsigned idx = futex_hash(uaddr);
     futex_bucket_t *b = &buckets[idx];
     int woken = 0;
@@ -1233,7 +1235,7 @@ static int64_t futex_requeue(guest_t *g,
         checked--;
     }
 
-    int woken = 0, requeued = 0;
+    uint32_t woken = 0, requeued = 0;
 
     /* Walk source bucket: wake up to wake_count, requeue up to requeue_count */
     futex_waiter_t **pp = &b_src->head;
@@ -1244,12 +1246,17 @@ static int64_t futex_requeue(guest_t *g,
             continue;
         }
 
-        if ((uint32_t) woken < wake_count) {
+        int act =
+            futex_requeue_step(woken, requeued, wake_count, requeue_count);
+        if (act == FUTEX_REQ_STOP)
+            break; /* Both limits reached */
+
+        if (act == FUTEX_REQ_WAKE) {
             /* Wake this waiter: unlink from source, then signal */
             futex_wake_waiter_locked(pp);
             woken++;
             /* Leave pp unchanged because *pp is already the next node */
-        } else if ((uint32_t) requeued < requeue_count) {
+        } else {
             if (idx_src == idx_dst) {
                 /* Same bucket: only the key changes. Linux's requeue_futex()
                  * takes this path too (hb1 == hb2), rewriting q->key without
@@ -1284,8 +1291,6 @@ static int64_t futex_requeue(guest_t *g,
                 pthread_cond_signal(&w->cond);
             }
             requeued++;
-        } else {
-            break; /* Both limits reached */
         }
     }
 
@@ -1325,6 +1330,9 @@ static int64_t futex_wake_op(guest_t *g,
 {
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
+
+    val = futex_wake_budget(val);
+    val2 = futex_wake_budget(val2);
 
     /* Decode operation and comparison from val3. Bits 31-28: operation (bit 31
      * = OPARG_SHIFT flag, bits 30-28 = op) Bits 27-24: comparison operator Bits

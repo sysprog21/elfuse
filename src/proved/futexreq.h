@@ -57,3 +57,67 @@ static inline uint64_t futex_requeue_budget(uint32_t nr_wake,
 {
     return (uint64_t) nr_wake + nr_requeue;
 }
+
+/* How many waiters a FUTEX_WAKE style call may wake, from its count word.
+ *
+ * Linux takes the count as a signed int and checks it only after waking a
+ * waiter (futex_wake: "if (++ret >= nr_wake) break"), so a count of zero or a
+ * negative one still wakes one. Only the futex2 entry points ask for a strict
+ * zero (FLAGS_STRICT). Read as unsigned, as the walk did before this, a zero
+ * wakes nobody and a negative count wakes every waiter, the opposite of what
+ * Linux does for the same guest. glibc passes 1 or INT_MAX, so no libc hits it,
+ * but the guest picks the word.
+ *
+ * The result is what the walk and the PI pre-scan both bound by, so they agree
+ * on the window by construction.
+ */
+/*@
+  assigns \nothing;
+  ensures at_least_one: \result >= 1;
+  ensures at_most_int_max: \result <= 0x7fffffff;
+  ensures positive_kept: 1 <= val <= 0x7fffffff ==> \result == val;
+  ensures nonpositive_is_one: val == 0 || val > 0x7fffffff ==> \result == 1;
+ */
+static inline uint32_t futex_wake_budget(uint32_t val)
+{
+    if (val == 0 || val > 0x7fffffffu)
+        return 1;
+    return val;
+}
+
+/* What the requeue walk does with the next waiter parked on the source key.
+ *
+ * The PI pre-scan in futex_requeue inspects futex_requeue_budget() waiters and
+ * refuses the call if one of them is a PI waiter. That check covers every
+ * waiter the walk can touch only if the walk never touches more than the
+ * budget. This step is where the walk decides, so the claim is stated here:
+ * from any state inside the counts, WAKE and MOVE each stay inside them, and
+ * STOP is answered exactly when the budget is spent. Induction over the walk is
+ * then the caller's loop and needs nothing else.
+ */
+#define FUTEX_REQ_STOP 0
+#define FUTEX_REQ_WAKE 1
+#define FUTEX_REQ_MOVE 2
+
+/*@
+  requires woken_in: woken <= nr_wake;
+  requires moved_in: requeued <= nr_requeue;
+  assigns \nothing;
+  ensures kind: \result == 0 || \result == 1 || \result == 2;
+  ensures wake: \result == 1 ==> woken < nr_wake;
+  ensures move: \result == 2 ==> woken == nr_wake && requeued < nr_requeue;
+  ensures stop:
+    \result == 0 <==> (uint64_t) woken + requeued
+                        == (uint64_t) nr_wake + nr_requeue;
+ */
+static inline int futex_requeue_step(uint32_t woken,
+                                     uint32_t requeued,
+                                     uint32_t nr_wake,
+                                     uint32_t nr_requeue)
+{
+    if (woken < nr_wake)
+        return FUTEX_REQ_WAKE;
+    if (requeued < nr_requeue)
+        return FUTEX_REQ_MOVE;
+    return FUTEX_REQ_STOP;
+}

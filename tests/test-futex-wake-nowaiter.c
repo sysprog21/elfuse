@@ -84,6 +84,28 @@ static void *waker(void *arg)
     return NULL;
 }
 
+static uint32_t count_word;
+static uint32_t count_ready;
+
+/* Announce arrival before parking, so the main thread knows all three have at
+ * least started. A thread cannot announce that it is inside FUTEX_WAIT, so the
+ * main thread still settles after the last arrival; a waiter that is late then
+ * costs a missed detection, never a false failure.
+ */
+static void *count_waiter(void *arg)
+{
+    (void) arg;
+    __atomic_fetch_add(&count_ready, 1, __ATOMIC_SEQ_CST);
+    wait_on(&count_word, 0);
+    return NULL;
+}
+
+/* How many of the three parked waiters one wake of count n releases. */
+static long wake_three_count(int n)
+{
+    return wake(&count_word, n);
+}
+
 int main(void)
 {
     printf("FUTEX_WAKE no-waiter tests\n");
@@ -132,6 +154,45 @@ int main(void)
         pthread_join(th, NULL);
         PASS();
     }
+
+    /* The count is a signed int that Linux checks after waking a waiter, so a
+     * zero or negative count still wakes exactly one. Three waiters park on one
+     * word; each call below releases one, and the last count is the ordinary
+     * large one for the remaining waiter.
+     */
+    pthread_t cw[3];
+    int started = 0;
+    int create_rc = 0;
+    for (; started < 3; started++) {
+        create_rc = pthread_create(&cw[started], NULL, count_waiter, NULL);
+        if (create_rc != 0)
+            break;
+    }
+    if (create_rc != 0) {
+        errno = create_rc;
+        TEST("start three waiters for the wake count");
+        FAIL("pthread_create");
+    } else {
+        struct timespec park = {0, 10000000L};
+        while (__atomic_load_n(&count_ready, __ATOMIC_SEQ_CST) < 3)
+            nanosleep(&park, NULL);
+        park.tv_nsec = 100000000L;
+        nanosleep(&park, NULL);
+
+        TEST("wake with count 0 wakes one waiter");
+        EXPECT_RAW_ERRNO(wake_three_count(0), 1, "expected 1 woken");
+
+        TEST("wake with a negative count wakes one waiter");
+        EXPECT_RAW_ERRNO(wake_three_count(-1), 1, "expected 1 woken");
+
+        TEST("wake with INT_MAX wakes the rest");
+        EXPECT_RAW_ERRNO(wake_three_count(0x7fffffff), 1, "expected 1 woken");
+    }
+
+    /* A waiter the wakes above missed would hang the join. */
+    wake(&count_word, 0x7fffffff);
+    for (int i = 0; i < started; i++)
+        pthread_join(cw[i], NULL);
 
     SUMMARY("test-futex-wake-nowaiter");
     return fails > 0 ? 1 : 0;

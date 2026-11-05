@@ -497,10 +497,38 @@ VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-cove
 #                  deadline that futex_make_deadline establishes
 #   room, sorted:  futex_bucket_insert, discharged by the FUTEX_WAITV_MAX bound
 #                  and by its own result for the next call
-# Not stated by any WP contract, and waiting on a model rather than a proof: the
-# concurrent properties (a parked waiter is woken or still queued, the published
-# census never understates the chain). ELFUSE_CONTRACT_ASSERT in futex_wake is
-# the executable form of the second.
+#
+# The syscall-level invariants the contracts above are fragments of. These are
+# the properties a userspace mutex or condvar built on futex relies on the API
+# to hold (Evrard and Donaldson, SPIN 2023 model those protocols, not this
+# implementation). Each says how it is held: proved, asserted at run time, or
+# test-covered.
+#   1. Every walk is bounded. FUTEX_WAKE touches at most val waiters; requeue
+#      touches at most wake + requeue. Proved: futex_requeue_step and
+#      futex_requeue_budget.
+#   2. A plain wake or requeue never moves a PI waiter. The refusal comes before
+#      anything moves, over the same window the walk may touch, so a refused
+#      call leaves the queue as it found it. Window proved (invariant 1); the
+#      refusal is test-covered by test-futex-wake-pi and test-futex-requeue-pi.
+#   3. A woken waiter is unlinked before it is signalled, and a requeued waiter
+#      is re-pointed at its new bucket before it is signalled, so a wake finds
+#      it in exactly one place. Test-covered: test-futex-requeue-race and
+#      test-futex-requeue-samebucket.
+#   4. The published waiter count never understates the chain, which is what the
+#      shim reads as "nobody here". Requeue credits the destination before it
+#      debits the source. Asserted at run time under ELFUSE_CONTRACT_ASSERT in
+#      futex_wake; test-covered by test-futex-requeue-account.
+#   5. Bucket locks are taken in ascending index order. Proved for futex_waitv:
+#      futex_bucket_insert. Requeue orders its two locks by comparing indices;
+#      test-covered.
+#   6. A guest word is read and compared under the bucket lock that orders it
+#      against a wake, and a mismatch answers EAGAIN. Test-covered:
+#      test-futex-ops.
+# Invariants 3, 4 and 6 are concurrent. WP cannot state them over pthread
+# interleavings. An EVA run over the requeue walk with unconstrained counts
+# (interval domain) could not prove even the relational bound of invariant 1,
+# so EVA adds nothing over WP here. A model is the tool for the concurrent
+# three, to be written when a specific claim needs one.
 
 VERIFY_FUTEXREQ_SRC  := src/proved/futexreq.h
 VERIFY_FUTEXREQ_FCTS := futex_requeue_counts_valid futex_requeue_budget \

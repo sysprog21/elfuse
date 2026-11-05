@@ -477,14 +477,42 @@ VERIFY_FUTEXOP_SCAN := src/proved/futexop.h
 VERIFY_FUTEXOP_CLAIM := for ANY guest-supplied val3 word
 VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-covered
 
+# Total versus conditional, per futex contract. Conditional means a requires
+# clause the caller discharges; each is deliberate, and the caller named here is
+# the one that does so (issue #356).
+#   total:         futex_op_sign_extend12, futex_op_shift_arg_mask,
+#                  futex_requeue_counts_valid, futex_uaddr_is_aligned,
+#                  futex_wake_op_supported, futex_wake_cmp_supported, the
+#                  futex_pi_* word predicates
+#   nbuckets > 0:  futex_bucket_index; its one caller passes FUTEX_BUCKETS
+#   counts valid:  futex_requeue_budget, discharged by
+#                  futex_requeue_counts_valid at the top of futex_requeue. The
+#                  sum itself is exact for any pair; the requires buys the
+#                  no_overflow claim that it fits in 32 bits
+#   walk state:    futex_requeue_step, kept inside the counts by its own result
+#   op <= 4, cmp <= 5: futex_wake_op_apply and futex_wake_op_cmp, discharged by
+#                  the *_supported gates in futex_wake_op
+#   valid timespec: linux_timespec_is_valid, futex_remaining_ns and
+#                  futex_quantum_deadline take pointers or a range-checked
+#                  deadline that futex_make_deadline establishes
+#   room, sorted:  futex_bucket_insert, discharged by the FUTEX_WAITV_MAX bound
+#                  and by its own result for the next call
+# Not stated by any WP contract, and waiting on a model rather than a proof: the
+# concurrent properties (a parked waiter is woken or still queued, the published
+# census never understates the chain). ELFUSE_CONTRACT_ASSERT in futex_wake is
+# the executable form of the second.
+
 VERIFY_FUTEXREQ_SRC  := src/proved/futexreq.h
-VERIFY_FUTEXREQ_FCTS := futex_requeue_counts_valid futex_requeue_budget
+VERIFY_FUTEXREQ_FCTS := futex_requeue_counts_valid futex_requeue_budget \
+                        futex_requeue_step
 VERIFY_FUTEXREQ_MIN_GOALS ?= 14
 # typed: two scalars in, one out, no buffer and no aliasing question.
 VERIFY_FUTEXREQ_MODEL := typed
 VERIFY_FUTEXREQ_SCAN := src/proved/futexreq.h
-VERIFY_FUTEXREQ_CLAIM := for ANY pair of guest-supplied requeue counts
-VERIFY_FUTEXREQ_UNPROVED := the bucket walk the budget bounds stays test-covered
+VERIFY_FUTEXREQ_CLAIM := for ANY pair of guest-supplied requeue counts, and \
+                         any walk state inside them
+VERIFY_FUTEXREQ_UNPROVED := the list surgery the step decides stays \
+                            test-covered
 
 VERIFY_FUTEXWAKEOP_SRC  := src/proved/futexwakeop.h
 VERIFY_FUTEXWAKEOP_FCTS := futex_wake_op_supported futex_wake_cmp_supported \

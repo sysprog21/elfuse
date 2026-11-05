@@ -57,3 +57,40 @@ static inline uint64_t futex_requeue_budget(uint32_t nr_wake,
 {
     return (uint64_t) nr_wake + nr_requeue;
 }
+
+/* What the requeue walk does with the next waiter parked on the source key.
+ *
+ * The PI pre-scan in futex_requeue inspects futex_requeue_budget() waiters and
+ * refuses the call if one of them is a PI waiter. That check covers every
+ * waiter the walk can touch only if the walk never touches more than the
+ * budget. This step is where the walk decides, so the claim is stated here:
+ * from any state inside the counts, WAKE and MOVE each stay inside them, and
+ * STOP is answered exactly when the budget is spent. Induction over the walk is
+ * then the caller's loop and needs nothing else.
+ */
+#define FUTEX_REQ_STOP 0
+#define FUTEX_REQ_WAKE 1
+#define FUTEX_REQ_MOVE 2
+
+/*@
+  requires woken_in: woken <= nr_wake;
+  requires moved_in: requeued <= nr_requeue;
+  assigns \nothing;
+  ensures kind: \result == 0 || \result == 1 || \result == 2;
+  ensures wake: \result == 1 ==> woken < nr_wake;
+  ensures move: \result == 2 ==> woken == nr_wake && requeued < nr_requeue;
+  ensures stop:
+    \result == 0 <==> (uint64_t) woken + requeued
+                        == (uint64_t) nr_wake + nr_requeue;
+ */
+static inline int futex_requeue_step(uint32_t woken,
+                                     uint32_t requeued,
+                                     uint32_t nr_wake,
+                                     uint32_t nr_requeue)
+{
+    if (woken < nr_wake)
+        return FUTEX_REQ_WAKE;
+    if (requeued < nr_requeue)
+        return FUTEX_REQ_MOVE;
+    return FUTEX_REQ_STOP;
+}

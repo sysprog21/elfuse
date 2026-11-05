@@ -222,6 +222,22 @@ MUTATIONS = [
         "    return (uint64_t) nr_wake + nr_requeue;\n",
         "    return (uint64_t) nr_requeue;\n",
     ),
+    (
+        "futexreq",
+        "src/proved/futexreq.h",
+        "futex_requeue_step",
+        "stop one waiter short (the budget is never fully spent)",
+        "    if (requeued < nr_requeue)\n        return FUTEX_REQ_MOVE;\n",
+        "    if (requeued + 1 < nr_requeue)\n        return FUTEX_REQ_MOVE;\n",
+    ),
+    (
+        "futexreq",
+        "src/proved/futexreq.h",
+        "futex_requeue_step",
+        "move before the wake half is spent (the walk overshoots wake)",
+        "    if (woken < nr_wake)\n        return FUTEX_REQ_WAKE;\n",
+        "    if (woken < nr_wake / 2)\n        return FUTEX_REQ_WAKE;\n",
+    ),
     # ---- verify-futexwaitv -------------------------------------------------
     (
         "futexwaitv",

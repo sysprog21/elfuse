@@ -1745,11 +1745,12 @@ static int64_t fcntl_host_ref_open(int fd,
 
 /* fcntl(F_SETFL): replace the settable status flags. O_APPEND, O_ASYNC,
  * O_DIRECT, O_NOATIME and O_NONBLOCK are the writable ones; the rest of @arg is
- * dropped as Linux drops it. Where the flag lives depends on the fd: a FUSE
- * shadow, elfuse's own anon-inode emulation, or a real host description plus
- * the shadow for the bits macOS has no equivalent for. @snap is the slot as the
- * caller snapshotted it, so a close and reopen in between is EBADF and not a
- * change to an unrelated fd.
+ * dropped as Linux drops it, except on a FUSE fd, whose shadow keeps every bit
+ * outside the preserved open flags. Where the flag lives depends on the fd: a
+ * FUSE shadow, elfuse's own anon-inode emulation, or a real host description
+ * plus the shadow for the bits macOS has no equivalent for. @snap is the slot
+ * as the caller snapshotted it, so a close and reopen in between is EBADF and
+ * not a change to an unrelated fd.
  */
 static int64_t fcntl_setfl(int fd, const fd_entry_t *snap, uint64_t arg)
 {

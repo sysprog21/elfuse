@@ -113,13 +113,246 @@ void fork_notify_vfork_exec(void)
     fork_child_vfork_notify_fd = -1;
 }
 
-/* Over the function-size limit on purpose.
+/* Check the allocator and page-table cursors the parent sent against the
+ * child's own page-table pool, then restore them and the Rosetta placement onto
+ * the freshly created guest.
+ *
+ * Returns 0, or -1 after logging; the caller owns the cleanup of the guest and
+ * the socket.
+ */
+static int fork_child_restore_layout(guest_t *g, const ipc_header_t *hdr)
+{
+    /* Restore allocator/page-table cursors before mmap/brk can run in child.
+     * Validate pt_pool_next and ttbr0 against the child's own page-table pool,
+     * which the child just computed from hdr->guest_size + hdr->ipa_bits via
+     * compute_infra_layout.
+     *
+     * Range alone is not enough: pt_alloc_page advances pt_pool_next in
+     * GUEST_PAGE_SIZE quanta, and pt_at converts page-table GPAs straight into
+     * host-buffer pointers. An unaligned value passes the [base, end) gate but
+     * then misaligns the walker. Require:
+     *   - pt_pool_next page-aligned relative to pt_pool_base
+     *   - ttbr0 strictly inside the in-use pool [pt_pool_base, pt_pool_next)
+     *     (parent must have allocated the L0 page) and page-aligned.
+     */
+    if (hdr->pt_pool_next < g->pt_pool_base ||
+        hdr->pt_pool_next > g->pt_pool_end ||
+        ((hdr->pt_pool_next - g->pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
+        log_error("fork-child: invalid pt_pool_next 0x%llx",
+                  (unsigned long long) hdr->pt_pool_next);
+        return -1;
+    }
+    uint64_t ttbr0_off = hdr->ttbr0 - g->ipa_base;
+    if (ttbr0_off < g->pt_pool_base || ttbr0_off >= hdr->pt_pool_next ||
+        ((ttbr0_off - g->pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
+        log_error("fork-child: invalid ttbr0 0x%llx",
+                  (unsigned long long) hdr->ttbr0);
+        return -1;
+    }
+    g->brk_base = hdr->brk_base;
+    g->brk_current = hdr->brk_current;
+    g->elf_load_min = hdr->elf_load_min;
+    g->stack_base = hdr->stack_base;
+    g->stack_top = hdr->stack_top;
+    g->start_stack = hdr->start_stack;
+    g->mmap_next = hdr->mmap_next;
+    g->mmap_end = hdr->mmap_end;
+    g->pt_pool_next = hdr->pt_pool_next;
+    g->ttbr0 = hdr->ttbr0;
+    g->mmap_rx_next = hdr->mmap_rx_next;
+    g->mmap_rx_end = hdr->mmap_rx_end;
+
+    /* Restore rosetta placement so the non-identity page-table entries that
+     * came across in the memory transfer continue to resolve. ttbr1 points at
+     * the L0 page the parent's PT pool emitted; that page sits inside the
+     * primary buffer and is copied by the region transfer below, so the child
+     * can reuse it without rebuilding the tree.
+     */
+    g->is_rosetta = hdr->is_rosetta;
+    proc_set_rosetta_active(g->is_rosetta);
+    g->rosetta_guest_base = hdr->rosetta_guest_base;
+    g->rosetta_va_base = hdr->rosetta_va_base;
+    g->rosetta_size = hdr->rosetta_size;
+    g->rosetta_entry = hdr->rosetta_entry;
+    g->kbuf_gpa = hdr->kbuf_gpa;
+    g->ttbr1 = hdr->ttbr1;
+    if (g->is_rosetta && g->kbuf_gpa)
+        g->kbuf_base = (uint8_t *) g->host_base + g->kbuf_gpa;
+    return 0;
+}
+
+/* Receive the registers, memory regions, fd table and pty keepalives that
+ * follow the header. The keepalive recv resolves each payload guest_fd through
+ * the fd table installed just before it, so the order is fixed.
+ *
+ * Returns 0, or -1 after logging; the caller destroys the guest.
+ */
+static int fork_child_recv_state(int ipc_fd,
+                                 guest_t *g,
+                                 const ipc_header_t *hdr,
+                                 ipc_registers_t *regs)
+{
+    if (fork_ipc_read_all(ipc_fd, regs, sizeof(*regs)) < 0) {
+        log_error("fork-child: failed to read registers");
+        return -1;
+    }
+
+    if (fork_ipc_recv_memory_regions(ipc_fd, g) < 0) {
+        log_error("fork-child: failed to receive memory regions");
+        return -1;
+    }
+
+    if (fork_ipc_recv_fd_table(ipc_fd, g) < 0) {
+        log_error("fork-child: failed to receive fd table");
+        return -1;
+    }
+
+    /* Linux preserves already-open descriptors above a newly lowered soft limit
+     * across fork. Install the inherited table under the default table limit
+     * first, then restore the parent's guest-visible limits.
+     */
+    sys_rlimit_restore(hdr->rlimits);
+
+    /* Must follow fork_ipc_recv_fd_table: the keepalive recv resolves each
+     * payload guest_fd to its (now installed) child-side host master fd.
+     */
+    if (fork_ipc_recv_pty_keepalives(ipc_fd) < 0) {
+        log_error("fork-child: failed to receive pty keepalives");
+        return -1;
+    }
+    return 0;
+}
+
+/* Adopt the inherited pty slaves, then receive the process state and chown
+ * overlay and wait for the parent's admission. Every failure after the adoption
+ * gives the slave credit back first; the caller destroys the guest afterwards.
+ * Returns 0, or -1 after logging.
+ */
+static int fork_child_recv_admission(int ipc_fd,
+                                     guest_t *g,
+                                     signal_state_snapshot_t *sig)
+{
+    /* Both the fd table and the keepalives are in place, which is what this
+     * needs to recognize the slave fds inherited from the parent and put them
+     * back on the books. Without it the parent's close of its own copy makes
+     * the pty look hung up while this child still holds a live slave.
+     *
+     * From here on every bail gives the credit back before destroying the
+     * guest. Nothing below reaches the teardown that normally returns it, and a
+     * child that never runs must not leave the pty looking busy to the master
+     * the parent still holds.
+     */
+    proc_pty_adopt_inherited_slaves();
+
+    if (fork_ipc_recv_process_state(ipc_fd, g, sig) < 0) {
+        log_error("fork-child: failed to receive process state");
+
+        proc_pty_release_process_slaves();
+        return -1;
+    }
+
+    if (chown_overlay_recv(ipc_fd) < 0) {
+        log_error("fork-child: failed to receive chown overlay");
+
+        proc_pty_release_process_slaves();
+        return -1;
+    }
+
+    /* Do not enter guest code until the parent has committed both the local
+     * process-table slot and the shared lifecycle entry. EOF here means fork
+     * admission failed, so this helper exits without exposing a child whose PID
+     * the parent cannot later wait for.
+     */
+    uint8_t admission_ready = 0;
+    if (fork_ipc_read_all(ipc_fd, &admission_ready, sizeof(admission_ready)) <
+            0 ||
+        admission_ready != 1) {
+        log_error("fork-child: parent did not commit child admission");
+
+        proc_pty_release_process_slaves();
+        return -1;
+    }
+    return 0;
+}
+
+/* Give the child vCPU the parent's state at the clone return: the system
+ * registers, the MMU turned on directly (the page tables arrived over IPC), all
+ * 31 GPRs and the SIMD state, with X0 forced to 0, and PC at the clone return
+ * point in EL0t.
+ *
+ * Returns 0, or -1 if the per-vCPU shim globals could not be installed; the
+ * caller then gives the pty credit back and destroys the guest.
+ */
+static int fork_child_restore_vcpu(hv_vcpu_t vcpu,
+                                   guest_t *g,
+                                   const ipc_header_t *hdr,
+                                   const ipc_registers_t *regs)
+{
+    /* Restore system registers. For fork children, the child enables the MMU
+     * directly via hv_vcpu_set_sys_reg (rather than going through the shim
+     * entry point) because:
+     * 1. The page tables are already set up (copied from parent via IPC)
+     * 2. The shim entry zeros ALL GPRs before ERET, which would destroy
+     *    callee-saved registers (X19-X28, FP, LR) that the guest expects
+     *    preserved across the clone() syscall
+     * 3. The child can restore the exact parent GPR state and only set X0=0
+     */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, regs->vbar_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, regs->mair_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, regs->tcr_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, regs->ttbr0_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, regs->ttbr1_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, regs->cpacr_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, regs->sp_el0));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, regs->sp_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs->tpidr_el0));
+
+    /* TPIDR_EL1 is set by the host (never inherited from the parent's register
+     * snapshot) because it must point at the child's own shim_globals base in
+     * the child's IPA; shim_data_base happens to be the same value in both
+     * processes (layout derives from guest_size + ipa_bits which match across
+     * fork), but installing it explicitly keeps the child consistent with the
+     * bootstrap path. CONTEXTIDR_EL1 holds the per-vCPU tid (== child pid for
+     * the single-threaded child at this point).
+     */
+    if (shim_globals_install_per_vcpu(vcpu, g, hdr->child_pid) < 0)
+        return -1;
+
+    /* Enable MMU directly (page tables already in guest memory from IPC). SCTLR
+     * must include MMU-enable (M), caches (C, I), RES1 bits, and EL0 cache
+     * maintenance access (UCI, UCT) for JIT translators.
+     */
+    uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I |
+                              SCTLR_DZE | SCTLR_UCT | SCTLR_UCI;
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr_with_mmu));
+
+    /* Restore all 31 GPRs from parent state, then override X0=0 (child clone
+     * return value). This preserves X1-X30 exactly as they were when the parent
+     * called clone(), which is required by the Linux syscall ABI (especially
+     * callee-saved X19-X28, FP=X29, LR=X30).
+     */
+    vcpu_restore_gprs(vcpu, regs->x);
+    vcpu_set_gpr(vcpu, 0, 0); /* Child gets 0 from clone */
+
+    vcpu_restore_simd(vcpu, &regs->simd_state);
+
+    /* Start at the clone return point in EL0 (not the shim entry). ELR_EL1
+     * points to the guest's clone return site. SPSR_EL1 has the saved EL0
+     * state. The child sets PC/CPSR for EL0t execution.
+     */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, regs->elr_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, regs->spsr_el1));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, regs->elr_el1));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
+    return 0;
+}
+
+/* Kept as one function on purpose.
  *
  * The child's whole bring-up in receive order, and the order is the contract:
  * every step depends on the one before it, and the rollback on failure differs
  * per step. Splitting hides which stage a failure came from.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int fork_child_main(int ipc_fd,
                     int vfork_notify_fd,
                     bool verbose,
@@ -232,145 +465,25 @@ int fork_child_main(int ipc_fd,
         }
     }
 
-    /* Restore allocator/page-table cursors before mmap/brk can run in child.
-     * Validate pt_pool_next and ttbr0 against the child's own page-table pool,
-     * which the child just computed from hdr.guest_size + hdr.ipa_bits via
-     * compute_infra_layout.
-     *
-     * Range alone is not enough: pt_alloc_page advances pt_pool_next in
-     * GUEST_PAGE_SIZE quanta, and pt_at converts page-table GPAs straight into
-     * host-buffer pointers. An unaligned value passes the [base, end) gate but
-     * then misaligns the walker. Require:
-     *   - pt_pool_next page-aligned relative to pt_pool_base
-     *   - ttbr0 strictly inside the in-use pool [pt_pool_base, pt_pool_next)
-     *     (parent must have allocated the L0 page) and page-aligned.
-     */
-    if (hdr.pt_pool_next < g.pt_pool_base || hdr.pt_pool_next > g.pt_pool_end ||
-        ((hdr.pt_pool_next - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
-        log_error("fork-child: invalid pt_pool_next 0x%llx",
-                  (unsigned long long) hdr.pt_pool_next);
+    if (fork_child_restore_layout(&g, &hdr) < 0) {
         launch_destroy_guest(&g);
         close(ipc_fd);
         return 1;
     }
-    uint64_t ttbr0_off = hdr.ttbr0 - g.ipa_base;
-    if (ttbr0_off < g.pt_pool_base || ttbr0_off >= hdr.pt_pool_next ||
-        ((ttbr0_off - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
-        log_error("fork-child: invalid ttbr0 0x%llx",
-                  (unsigned long long) hdr.ttbr0);
-        launch_destroy_guest(&g);
-        close(ipc_fd);
-        return 1;
-    }
-    g.brk_base = hdr.brk_base;
-    g.brk_current = hdr.brk_current;
-    g.elf_load_min = hdr.elf_load_min;
-    g.stack_base = hdr.stack_base;
-    g.stack_top = hdr.stack_top;
-    g.start_stack = hdr.start_stack;
-    g.mmap_next = hdr.mmap_next;
-    g.mmap_end = hdr.mmap_end;
-    g.pt_pool_next = hdr.pt_pool_next;
-    g.ttbr0 = hdr.ttbr0;
-    g.mmap_rx_next = hdr.mmap_rx_next;
-    g.mmap_rx_end = hdr.mmap_rx_end;
-
-    /* Restore rosetta placement so the non-identity page-table entries that
-     * came across in the memory transfer continue to resolve. ttbr1 points at
-     * the L0 page the parent's PT pool emitted; that page sits inside the
-     * primary buffer and is copied by the region transfer below, so the child
-     * can reuse it without rebuilding the tree.
-     */
-    g.is_rosetta = hdr.is_rosetta;
-    proc_set_rosetta_active(g.is_rosetta);
-    g.rosetta_guest_base = hdr.rosetta_guest_base;
-    g.rosetta_va_base = hdr.rosetta_va_base;
-    g.rosetta_size = hdr.rosetta_size;
-    g.rosetta_entry = hdr.rosetta_entry;
-    g.kbuf_gpa = hdr.kbuf_gpa;
-    g.ttbr1 = hdr.ttbr1;
-    if (g.is_rosetta && g.kbuf_gpa)
-        g.kbuf_base = (uint8_t *) g.host_base + g.kbuf_gpa;
 
     /* Register state is the fork return frame captured from the parent vCPU. */
     ipc_registers_t regs;
-    if (fork_ipc_read_all(ipc_fd, &regs, sizeof(regs)) < 0) {
-        log_error("fork-child: failed to read registers");
+    if (fork_child_recv_state(ipc_fd, &g, &hdr, &regs) < 0) {
         launch_destroy_guest(&g);
         return 1;
     }
-
-    if (fork_ipc_recv_memory_regions(ipc_fd, &g) < 0) {
-        log_error("fork-child: failed to receive memory regions");
-        launch_destroy_guest(&g);
-        return 1;
-    }
-
-    if (fork_ipc_recv_fd_table(ipc_fd, &g) < 0) {
-        log_error("fork-child: failed to receive fd table");
-        launch_destroy_guest(&g);
-        return 1;
-    }
-
-    /* Linux preserves already-open descriptors above a newly lowered soft limit
-     * across fork. Install the inherited table under the default table limit
-     * first, then restore the parent's guest-visible limits.
-     */
-    sys_rlimit_restore(hdr.rlimits);
-
-    /* Must follow fork_ipc_recv_fd_table: the keepalive recv resolves each
-     * payload guest_fd to its (now installed) child-side host master fd.
-     */
-    if (fork_ipc_recv_pty_keepalives(ipc_fd) < 0) {
-        log_error("fork-child: failed to receive pty keepalives");
-        launch_destroy_guest(&g);
-        return 1;
-    }
-
-    /* Both the fd table and the keepalives are in place, which is what this
-     * needs to recognize the slave fds inherited from the parent and put them
-     * back on the books. Without it the parent's close of its own copy makes
-     * the pty look hung up while this child still holds a live slave.
-     *
-     * From here on every bail gives the credit back before destroying the
-     * guest. Nothing below reaches the teardown that normally returns it, and a
-     * child that never runs must not leave the pty looking busy to the master
-     * the parent still holds.
-     */
-    proc_pty_adopt_inherited_slaves();
 
     signal_state_snapshot_t sig;
-    if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
-        log_error("fork-child: failed to receive process state");
-
-        proc_pty_release_process_slaves();
+    if (fork_child_recv_admission(ipc_fd, &g, &sig) < 0) {
         launch_destroy_guest(&g);
         return 1;
     }
 
-    if (chown_overlay_recv(ipc_fd) < 0) {
-        log_error("fork-child: failed to receive chown overlay");
-
-        proc_pty_release_process_slaves();
-        launch_destroy_guest(&g);
-        return 1;
-    }
-
-    /* Do not enter guest code until the parent has committed both the local
-     * process-table slot and the shared lifecycle entry. EOF here means fork
-     * admission failed, so this helper exits without exposing a child whose PID
-     * the parent cannot later wait for.
-     */
-    uint8_t admission_ready = 0;
-    if (fork_ipc_read_all(ipc_fd, &admission_ready, sizeof(admission_ready)) <
-            0 ||
-        admission_ready != 1) {
-        log_error("fork-child: parent did not commit child admission");
-
-        proc_pty_release_process_slaves();
-        launch_destroy_guest(&g);
-        return 1;
-    }
 
     /* POSIX: "Signals pending to the parent shall not be pending to the child."
      * Clear the entire shared pending set before applying state. The child's
@@ -394,66 +507,12 @@ int fork_child_main(int ipc_fd,
     g.vcpu_valid = true;
     g.exit = vexit;
 
-    /* Restore system registers. For fork children, the child enables the MMU
-     * directly via hv_vcpu_set_sys_reg (rather than going through the shim
-     * entry point) because:
-     * 1. The page tables are already set up (copied from parent via IPC)
-     * 2. The shim entry zeros ALL GPRs before ERET, which would destroy
-     *    callee-saved registers (X19-X28, FP, LR) that the guest expects
-     *    preserved across the clone() syscall
-     * 3. The child can restore the exact parent GPR state and only set X0=0
-     */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, regs.vbar_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, regs.mair_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, regs.tcr_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, regs.ttbr0_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, regs.ttbr1_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, regs.cpacr_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, regs.sp_el0));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, regs.sp_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs.tpidr_el0));
-
-    /* TPIDR_EL1 is set by the host (never inherited from the parent's register
-     * snapshot) because it must point at the child's own shim_globals base in
-     * the child's IPA; shim_data_base happens to be the same value in both
-     * processes (layout derives from guest_size + ipa_bits which match across
-     * fork), but installing it explicitly keeps the child consistent with the
-     * bootstrap path. CONTEXTIDR_EL1 holds the per-vCPU tid (== child pid for
-     * the single-threaded child at this point).
-     */
-    if (shim_globals_install_per_vcpu(vcpu, &g, hdr.child_pid) < 0) {
+    if (fork_child_restore_vcpu(vcpu, &g, &hdr, &regs) < 0) {
         /* Give the pty credit back, as every bail below the adopt does. */
         proc_pty_release_process_slaves();
         launch_destroy_guest(&g);
         return 1;
     }
-
-    /* Enable MMU directly (page tables already in guest memory from IPC). SCTLR
-     * must include MMU-enable (M), caches (C, I), RES1 bits, and EL0 cache
-     * maintenance access (UCI, UCT) for JIT translators.
-     */
-    uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I |
-                              SCTLR_DZE | SCTLR_UCT | SCTLR_UCI;
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr_with_mmu));
-
-    /* Restore all 31 GPRs from parent state, then override X0=0 (child clone
-     * return value). This preserves X1-X30 exactly as they were when the parent
-     * called clone(), which is required by the Linux syscall ABI (especially
-     * callee-saved X19-X28, FP=X29, LR=X30).
-     */
-    vcpu_restore_gprs(vcpu, regs.x);
-    vcpu_set_gpr(vcpu, 0, 0); /* Child gets 0 from clone */
-
-    vcpu_restore_simd(vcpu, &regs.simd_state);
-
-    /* Start at the clone return point in EL0 (not the shim entry). ELR_EL1
-     * points to the guest's clone return site. SPSR_EL1 has the saved EL0
-     * state. The child sets PC/CPSR for EL0t execution.
-     */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, regs.elr_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, regs.spsr_el1));
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, regs.elr_el1));
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
 
     /* Register the fork child's main thread in the thread table. Without this,
      * current_thread is NULL and any syscall handler that accesses per-thread
@@ -737,15 +796,16 @@ static bool clone_apply_tid_flags(guest_t *g,
 
 static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
                                 guest_t *g,
-                                uint64_t flags,
-                                uint64_t child_stack,
-                                uint64_t stack_map_start,
-                                uint64_t stack_map_end,
-                                uint64_t ptid_gva,
-                                uint64_t tls,
-                                uint64_t ctid_gva,
+                                const clone_req_t *req,
                                 bool verbose)
 {
+    const uint64_t flags = req->flags;
+    const uint64_t child_stack = req->child_stack;
+    uint64_t stack_map_start = req->stack_map_start;
+    uint64_t stack_map_end = req->stack_map_end;
+    const uint64_t ptid_gva = req->ptid_gva;
+    const uint64_t tls = req->tls;
+    const uint64_t ctid_gva = req->ctid_gva;
     thread_startup_t startup = {
         .lock = PTHREAD_MUTEX_INITIALIZER,
         .cond = PTHREAD_COND_INITIALIZER,
@@ -1187,16 +1247,17 @@ static int clone_create_pidfd(guest_t *g,
 
 static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
                             guest_t *g,
-                            uint64_t flags,
-                            uint64_t child_stack,
-                            uint64_t stack_map_start,
-                            uint64_t stack_map_end,
-                            uint64_t ptid_gva,
-                            uint64_t pidfd_gva,
-                            uint64_t tls,
-                            uint64_t ctid_gva,
+                            const clone_req_t *req,
                             bool verbose)
 {
+    const uint64_t flags = req->flags;
+    const uint64_t child_stack = req->child_stack;
+    uint64_t stack_map_start = req->stack_map_start;
+    uint64_t stack_map_end = req->stack_map_end;
+    const uint64_t ptid_gva = req->ptid_gva;
+    const uint64_t pidfd_gva = req->pidfd_gva;
+    const uint64_t tls = req->tls;
+    const uint64_t ctid_gva = req->ctid_gva;
     /* Allocate guest TID */
     int64_t child_tid = proc_alloc_pid();
     if (child_tid < 0)
@@ -1539,6 +1600,53 @@ static void clone_close_channels(const int sock_fds[2],
         close(vfork_notify_fds[1]);
 }
 
+/* Open the control channel to the fork-child (and, for CLONE_VFORK, the pipe
+ * that tells the parent the child has exec'd or exited). Both ends of each are
+ * returned in the caller's arrays, with the unused vfork pipe left at -1. On
+ * failure nothing stays open and the result is -LINUX_ENOMEM.
+ */
+static int clone_open_channels(bool is_vfork,
+                               int sock_fds[2],
+                               int vfork_notify_fds[2])
+{
+    /* socketpair provides the control channel used to transfer snapshot state
+     * and SCM_RIGHTS file descriptors to the fork-child process.
+     */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds) < 0) {
+        log_error("clone: socketpair failed: %s", strerror(errno));
+        return -LINUX_ENOMEM;
+    }
+
+    /* A fork-child that dies mid-handshake makes every send on this socket
+     * raise SIGPIPE, which elfuse leaves at its default terminate disposition
+     * (only SIGUSR2 and SIGALRM are masked at bring-up), so the whole host
+     * process would die instead of the clone failing. Suppress it per-socket
+     * the way syscall/net.c does for guest sockets; the option rides on the
+     * file description, so the spawned child inherits it.
+     *
+     * Failing the clone beats continuing without it: proceeding would leave the
+     * host one dead child away from being killed by a signal it never handles,
+     * which is worse than the guest seeing a fork it can retry.
+     */
+    int nosigpipe = 1;
+    if (setsockopt(sock_fds[0], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+                   sizeof(nosigpipe)) < 0 ||
+        setsockopt(sock_fds[1], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+                   sizeof(nosigpipe)) < 0) {
+        log_error("clone: SO_NOSIGPIPE failed: %s", strerror(errno));
+        close(sock_fds[0]);
+        close(sock_fds[1]);
+        return -LINUX_ENOMEM;
+    }
+    if (is_vfork && pipe(vfork_notify_fds) < 0) {
+        log_error("clone: vfork notify pipe failed: %s", strerror(errno));
+        close(sock_fds[0]);
+        close(sock_fds[1]);
+        return -LINUX_ENOMEM;
+    }
+    return 0;
+}
+
 /* Spawn the fork-child helper. Its argv is intentionally minimal (guest argv is
  * restored later from IPC) and it inherits only stdio, the control socket and,
  * for CLONE_VFORK, the notify pipe's write end (@vfork_notify_wr >= 0).
@@ -1603,246 +1711,68 @@ static int clone_spawn_child(const char *self_path,
     return ret;
 }
 
-/* Over the function-size limit on purpose.
+/* Copy the bytes of overlay-backed regions into shm_fd. The parent's host VA
+ * for each overlay region maps the overlay file, not shm_fd, so shm_fd's
+ * contents at those offsets are stale (typically zero) until this copies them
+ * in; the snapshot taken afterwards then carries them.
  *
- * One transaction. The failure paths unwind state established earlier in the
- * same function (quiesced siblings, promoted overlays, the snapshot fd), so the
- * goto ladder has to see all of it.
+ * Returns 0, or -1 after logging the failed write.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
-int64_t sys_clone(hv_vcpu_t vcpu,
-                  guest_t *g,
-                  uint64_t flags,
-                  uint64_t child_stack,
-                  uint64_t stack_map_start,
-                  uint64_t stack_map_end,
-                  uint64_t ptid_gva,
-                  uint64_t pidfd_gva,
-                  uint64_t tls,
-                  uint64_t ctid_gva,
-                  bool verbose)
+static int fork_sync_overlays_to_shm(const guest_t *g)
 {
-    /* Namespaces are not implemented. CLONE_NEWTIME (0x80) lives in the CSIGNAL
-     * low byte and, like CLONE_INTO_CGROUP (bit 33) and set_tid, cannot be
-     * conveyed through clone(2) at all, so only the higher namespace bits are
-     * reachable here.
-     */
-    if ((flags & ~(uint64_t) 0xff) & LINUX_CLONE3_NS_FLAGS)
-        return -LINUX_EINVAL;
-
-    bool want_pidfd = (flags & LINUX_CLONE_PIDFD) != 0;
-
-    /* clone shares the parent_tid and pidfd argument; clone3 keeps them
-     * separate. Linux rejects aliased outputs and CLONE_DETACHED with PIDFD.
-     * Thread pidfds are unsupported here.
-     */
-    if (want_pidfd &&
-        ((flags & (LINUX_CLONE_THREAD | LINUX_CLONE_DETACHED)) ||
-         ((flags & LINUX_CLONE_PARENT_SETTID) && pidfd_gva == ptid_gva)))
-        return -LINUX_EINVAL;
-
-    /* CLONE_THREAD: create a new thread in the same VM (not a new process) */
-    if (flags & LINUX_CLONE_THREAD) {
-        return sys_clone_thread(vcpu, g, flags, child_stack, stack_map_start,
-                                stack_map_end, ptid_gva, tls, ctid_gva,
-                                verbose);
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (!r->overlay_active)
+            continue;
+        int64_t err =
+            pwrite_all_at(g->shm_fd, (const uint8_t *) g->host_base + r->start,
+                          r->end - r->start, r->start);
+        if (err < 0) {
+            log_error("clone: shm overlay sync pwrite failed: Linux errno %lld",
+                      (long long) err);
+            return -1;
+        }
     }
+    return 0;
+}
 
-    /* Rosetta fork takes the helper-process IPC path. The parent cannot remap
-     * its live guest memory under the running vCPU because HVF caches VA->PA at
-     * hv_vm_map time; instead, the fork path snapshots shm with clonefile when
-     * available and otherwise falls back to region copy. The TTBR1 kbuf tree,
-     * translator image, and kbuf bytes ride along as primary-buffer used
-     * regions; the child restores TCR_EL1 / TTBR1_EL1 from ipc_registers_t and
-     * recomputes kbuf_base from kbuf_gpa.
-     */
-
-    /* elfuse only supports fork-like clone (SIGCHLD) and posix_spawn-like
-     * clone (CLONE_VM|CLONE_VFORK|SIGCHLD)
-     */
-    bool is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
-
-    /* CLONE_VM without CLONE_THREAD usually creates an in-process VM-clone
-     * child that shares guest memory and is waitable via wait4/ptrace. However
-     * CLONE_VFORK must go through the helper-process path below so the child's
-     * later execve replaces only the child image rather than resetting the
-     * parent's shared guest_t.
-     */
-    if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD) &&
-        !is_vfork) {
-        return sys_clone_vm(vcpu, g, flags, child_stack, stack_map_start,
-                            stack_map_end, ptid_gva, pidfd_gva, tls, ctid_gva,
-                            verbose);
-    }
-
-    log_debug("clone(flags=0x%llx, vfork=%d)", (unsigned long long) flags,
-              is_vfork);
-
-    /* socketpair provides the control channel used to transfer snapshot state
-     * and SCM_RIGHTS file descriptors to the fork-child process.
-     */
-    int sock_fds[2];
-    int vfork_notify_fds[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds) < 0) {
-        log_error("clone: socketpair failed: %s", strerror(errno));
-        return -LINUX_ENOMEM;
-    }
-
-    /* A fork-child that dies mid-handshake makes every send on this socket
-     * raise SIGPIPE, which elfuse leaves at its default terminate disposition
-     * (only SIGUSR2 and SIGALRM are masked at bring-up), so the whole host
-     * process would die instead of the clone failing. Suppress it per-socket
-     * the way syscall/net.c does for guest sockets; the option rides on the
-     * file description, so the spawned child inherits it.
-     *
-     * Failing the clone beats continuing without it: proceeding would leave the
-     * host one dead child away from being killed by a signal it never handles,
-     * which is worse than the guest seeing a fork it can retry.
-     */
-    int nosigpipe = 1;
-    if (setsockopt(sock_fds[0], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
-                   sizeof(nosigpipe)) < 0 ||
-        setsockopt(sock_fds[1], SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
-                   sizeof(nosigpipe)) < 0) {
-        log_error("clone: SO_NOSIGPIPE failed: %s", strerror(errno));
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        return -LINUX_ENOMEM;
-    }
-    if (is_vfork && pipe(vfork_notify_fds) < 0) {
-        log_error("clone: vfork notify pipe failed: %s", strerror(errno));
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        return -LINUX_ENOMEM;
-    }
-
-    /* Spawn the same elfuse binary so the child has the same entitlement and
-     * build as the parent.
-     */
-    char self_path[LINUX_PATH_MAX];
-    uint32_t path_len = sizeof(self_path);
-    if (_NSGetExecutablePath(self_path, &path_len) != 0) {
-        log_error("clone: _NSGetExecutablePath failed");
-        clone_close_channels(sock_fds, vfork_notify_fds);
-        return -LINUX_ENOMEM;
-    }
-
-    /* Allocate and reserve all guest-visible bookkeeping before creating the
-     * host helper. Linux fork failure must not leave a child running, and a
-     * successful fork must always return a PID that wait4/waitid can track.
-     */
-    proc_registry_sync_self_pgid(g);
-    int64_t child_pgid = proc_get_pgid();
-    int64_t child_guest_pid = proc_alloc_pid();
-    if (child_guest_pid < 0) {
-        clone_close_channels(sock_fds, vfork_notify_fds);
-        return child_guest_pid;
-    }
-    int reserve_rc = proc_reserve_child(child_guest_pid, child_pgid);
-    if (reserve_rc < 0) {
-        clone_close_channels(sock_fds, vfork_notify_fds);
-        return reserve_rc;
-    }
-    pid_t child_host_pid;
-    int spawn_ret = clone_spawn_child(
-        self_path, sock_fds[1], vfork_notify_fds[1], verbose, &child_host_pid);
-    if (spawn_ret != 0) {
-        log_error("clone: posix_spawn failed: %s", strerror(spawn_ret));
-        proc_cancel_child(child_guest_pid);
-        clone_close_channels(sock_fds, vfork_notify_fds);
-        return -LINUX_ENOMEM;
-    }
-
-    /* The parent keeps only its end of the control channel. Reset the closed
-     * write end to -1 so the fail_snapshot guarded close at the bottom of the
-     * function cannot double-close it. In a multithreaded guest, another vCPU
-     * could open a new fd between the two closes and get the same number, which
-     * the second close would then steal.
-     */
-    close(sock_fds[1]);
-    if (vfork_notify_fds[1] >= 0) {
-        close(vfork_notify_fds[1]);
-        vfork_notify_fds[1] = -1;
-    }
-    int ipc_sock = sock_fds[0];
-
-    mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
-    guest_region_t *regions_snapshot = NULL;
-    int snapshot_shm_fd = -1;
-    bool siblings_quiesced = false;
-    bool mmap_locked = false;
-    int64_t fail_rc = -LINUX_ENOMEM;
-    int clone_pidfd = -1;
-
-    /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
-     * sibling vCPUs may be actively mutating guest memory during the fork
-     * snapshot (CoW or legacy IPC copy). Without quiescing them, the child
-     * process can receive a torn snapshot with partially-updated data
-     * structures. This matches POSIX fork semantics where only the calling
-     * thread survives.
-     */
-    if (!thread_quiesce_siblings()) {
-        /* An execve is reaping this thread. The snapshot would run without the
-         * quiet it needs, and the child would outlive a parent that is already
-         * gone, so refuse the fork instead.
-         */
-        fail_rc = -LINUX_EINTR;
-        goto fail_snapshot;
-    }
-    siblings_quiesced = true;
-
-    /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd into
-     * memfd-backed overlay regions. The conversion seeds a private temp file
-     * with the current bytes and installs a host MAP_SHARED|MAP_FIXED overlay
-     * on the parent. The child receives the fd via SCM_RIGHTS and re-installs
-     * its own overlay so subsequent writes from either side flow through the
-     * kernel page cache and reach the other. File-backed MAP_SHARED regions
-     * already carry a backing fd and are unaffected. Misaligned shared regions
-     * (snapshot-style) remain incoherent across fork by design.
-     *
-     * mmap_lock is held from here until the process-state send has passed the
-     * region backing fds over SCM_RIGHTS. The quiesce above gives up after its
-     * timeout, and a sibling already queued on mmap_lock never reaches the
-     * barrier, so without the lock its munmap could rewrite the region table
-     * during the overlay sync, the clone snapshot, the header, or the region
-     * copy, or close a backing fd before it is sent. Everything taken beneath
-     * it (fd_lock, pty_keepalive_lock, elf_path_lock, sysroot_lock, sig_lock)
-     * follows mmap_lock in the order in syscall/internal.h. The IPC writes
-     * under it cannot deadlock: the child only reads until admission and needs
-     * nothing from this process to keep reading, and a child that dies turns
-     * the next write into EPIPE (SO_NOSIGPIPE above). The cost lands on that
-     * same straggler: it now waits in pthread_mutex_lock for the whole send,
-     * the region copy included on the non-shm path, where no teardown wake
-     * reaches it, so an exit_group join during a slow fork can time out on it.
-     */
-    mmap_lock_acquire();
-    mmap_locked = true;
-    if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
-        goto fail_snapshot;
-
-    /* CoW fast path: if shm_fd >= 0, send a snapshot of guest memory to the
-     * child instead of the per-region copy. The child maps that snapshot
-     * MAP_PRIVATE; subsequent writes on either side are private.
-     *
-     * The parent's own mapping cannot be flipped to MAP_PRIVATE here: hv_vm_map
-     * caches the host VA->PA mapping, and a MAP_FIXED remap invalidates it (the
-     * parent then reads stale memory and writev returns EFAULT). So the parent
-     * stays on MAP_SHARED and the snapshot is what isolates the child.
-     *
-     * Two snapshot sources, in preference order (selected just below):
-     *   1. fclonefileat of g->shm_fd to an independent APFS clone. The clone
-     *      shares blocks with the parent until either side writes, so the
-     *      parent's subsequent writes never reach the child's backing.
-     *   2. The live g->shm_fd. Any page the child has not yet COW'd reads the
-     *      parent's current bytes -- benign for typical guest state, but
-     *      corrupts Rosetta's translator-internal structures (TLS slabs, code
-     *      caches, indirect-call tables) on mid-update reads. Issue #45.
-     *
-     * Rosetta therefore requires path 1 and falls back to region copy if
-     * fclonefileat fails; native guests accept path 2 as a fallback so a
-     * non-APFS /tmp does not silently slow forks down to per-region copy cost.
-     */
-    bool use_shm = (g->shm_fd >= 0);
+/* Decide how the child gets guest memory when the guest is shm-backed: sync
+ * overlay bytes into the shm file, then take an APFS clone snapshot of it.
+ * *use_shm is cleared when Rosetta cannot be given a clone, so the region-copy
+ * path runs instead; *snapshot_shm_fd receives the clone or stays -1 for the
+ * live-fd fallback.
+ *
+ * With shm_fd >= 0 the child gets a snapshot of guest memory instead of the
+ * per-region copy and maps it MAP_PRIVATE; later writes on either side are
+ * private. The parent's own mapping cannot be flipped to MAP_PRIVATE: hv_vm_map
+ * caches the host VA->PA mapping, and a MAP_FIXED remap invalidates it (the
+ * parent then reads stale memory and writev returns EFAULT). So the parent
+ * stays on MAP_SHARED and the snapshot is what isolates the child.
+ *
+ * Two snapshot sources, in preference order:
+ *   1. fclonefileat of g->shm_fd to an independent APFS clone. The clone
+ *      shares blocks with the parent until either side writes, so the parent's
+ *      later writes never reach the child's backing.
+ *   2. The live g->shm_fd. Any page the child has not yet COW'd reads the
+ *      parent's current bytes, which is benign for typical guest state but
+ *      corrupts Rosetta's translator-internal structures (TLS slabs, code
+ *      caches, indirect-call tables) on mid-update reads. Issue #45.
+ *
+ * Rosetta therefore requires path 1 and falls back to region copy if
+ * fclonefileat fails; native guests accept path 2 so a non-APFS /tmp does not
+ * silently slow forks down to per-region copy cost. The Rosetta TTBR1 kbuf
+ * tree, translator image, and kbuf bytes ride along as primary-buffer used
+ * regions; the child restores TCR_EL1 / TTBR1_EL1 from ipc_registers_t and
+ * recomputes kbuf_base from kbuf_gpa.
+ *
+ * Returns 0, or -1 after logging a failed overlay sync.
+ */
+static int fork_prepare_shm_snapshot(const guest_t *g,
+                                     bool *use_shm,
+                                     int *snapshot_shm_fd)
+{
+    if (!*use_shm)
+        return 0;
 
     /* Overlay sync runs before the snapshot so the cloned file picks up the
      * overlay-backed bytes. The parent's host VA for each overlay region maps
@@ -1850,64 +1780,48 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * stale (typically zero) until the pwrite below copies them in. Both the
      * clone-fd path and the live-shm_fd fallback consume this sync.
      */
-    if (use_shm) {
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (!r->overlay_active)
-                continue;
-            uint64_t len = r->end - r->start;
-            const uint8_t *src = (const uint8_t *) g->host_base + r->start;
-            uint64_t off = r->start;
-            while (len > 0) {
-                size_t chunk = len > (uint64_t) SSIZE_MAX ? (size_t) SSIZE_MAX
-                                                          : (size_t) len;
-                ssize_t nw = pwrite(g->shm_fd, src, chunk, (off_t) off);
-                if (nw < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    log_error("clone: shm overlay sync pwrite failed: %s",
-                              strerror(errno));
-                    goto fail_snapshot;
-                }
-                if (nw == 0) {
-                    log_error("clone: shm overlay sync pwrite returned 0");
-                    goto fail_snapshot;
-                }
-                src += nw;
-                off += (uint64_t) nw;
-                len -= (uint64_t) nw;
-            }
-        }
+    if (fork_sync_overlays_to_shm(g) < 0)
+        return -1;
 
-        /* Attempt the APFS clone snapshot for every guest, not just Rosetta:
-         * the clone gives POSIX-style isolation at O(metadata) cost and avoids
-         * torn-snapshot reads in guests that snapshot their own state across
-         * fork (Redis BGSAVE, checkpointing runtimes). On failure the fallback
-         * differs per design above: Rosetta drops use_shm so the region-copy
-         * path runs; native guests keep use_shm and send the live g->shm_fd.
-         */
-        snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
-        if (snapshot_shm_fd < 0) {
-            if (g->is_rosetta) {
-                log_warn(
-                    "clone: rosetta CoW snapshot via fclonefileat failed "
-                    "(%s); falling back to region-copy path",
-                    strerror(errno));
-                use_shm = false;
-            } else {
-                log_debug(
-                    "clone: CoW snapshot via fclonefileat failed (%s); "
-                    "sending live shm fd as fallback",
-                    strerror(errno));
-            }
+    /* Attempt the APFS clone snapshot for every guest, not just Rosetta: the
+     * clone gives POSIX-style isolation at O(metadata) cost and avoids
+     * torn-snapshot reads in guests that snapshot their own state across fork
+     * (Redis BGSAVE, checkpointing runtimes). On failure the fallback differs:
+     * Rosetta drops use_shm so the region-copy path runs; native guests keep
+     * use_shm and send the live g->shm_fd.
+     */
+    *snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
+    if (*snapshot_shm_fd < 0) {
+        if (g->is_rosetta) {
+            log_warn(
+                "clone: rosetta CoW snapshot via fclonefileat failed "
+                "(%s); falling back to region-copy path",
+                strerror(errno));
+            *use_shm = false;
+        } else {
+            log_debug(
+                "clone: CoW snapshot via fclonefileat failed (%s); "
+                "sending live shm fd as fallback",
+                strerror(errno));
         }
     }
+    return 0;
+}
 
-    /* Snapshot of the semantic region array, populated after the memory dump
-     * but before sibling vCPUs resume. Declared up front so all goto paths to
-     * fail_snapshot can free it unconditionally. Header
-     */
-    ipc_header_t hdr = {
+/* Fill the fork IPC header from the parent's state: layout and allocator
+ * cursors, identity, rlimits, Rosetta placement and the CLONE_CHILD_* request.
+ * The child checks the magic, the rlimit table, the layout sizes and the
+ * page-table cursors; the other fields are taken as sent.
+ */
+static void fork_build_header(const guest_t *g,
+                              const clone_req_t *req,
+                              bool use_shm,
+                              bool shm_is_clone,
+                              int64_t child_guest_pid,
+                              int64_t child_pgid,
+                              ipc_header_t *hdr)
+{
+    *hdr = (ipc_header_t) {
         .magic = IPC_MAGIC_HEADER,
         .ipa_bits = g->ipa_bits,
         .has_shm = use_shm,
@@ -1943,12 +1857,329 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .rosetta_entry = g->rosetta_entry,
         .kbuf_gpa = g->kbuf_gpa,
         .ttbr1 = g->ttbr1,
-        .clone_flags =
-            flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID),
-        .ctid_gva = ctid_gva,
-        .shm_is_clone = (snapshot_shm_fd >= 0) ? 1 : 0,
+        .clone_flags = req->flags &
+                       (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID),
+        .ctid_gva = req->ctid_gva,
+        .shm_is_clone = shm_is_clone ? 1 : 0,
     };
-    sys_rlimit_snapshot(hdr.rlimits);
+    sys_rlimit_snapshot(hdr->rlimits);
+}
+
+/* Capture the parent vCPU's register state for the child's fork return frame. A
+ * non-zero @child_stack replaces SP_EL0.
+ */
+static void fork_capture_registers(hv_vcpu_t vcpu,
+                                   uint64_t child_stack,
+                                   ipc_registers_t *regs)
+{
+    regs->elr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+    regs->sp_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL0);
+    if (child_stack)
+        regs->sp_el0 = child_stack;
+    regs->spsr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    regs->vbar_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_VBAR_EL1);
+    regs->ttbr0_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR0_EL1);
+    regs->ttbr1_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR1_EL1);
+    regs->sctlr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SCTLR_EL1);
+    regs->tcr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TCR_EL1);
+    regs->mair_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_MAIR_EL1);
+    regs->cpacr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_CPACR_EL1);
+    regs->tpidr_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDR_EL0);
+    regs->sp_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
+    vcpu_snapshot_gprs(vcpu, regs->x);
+
+    vcpu_snapshot_simd(vcpu, &regs->simd_state);
+}
+
+/* CLONE_VFORK suspends the parent until the child exits or execs. The emulator
+ * cannot observe guest exec completion across the helper process, so it waits
+ * for the helper to exit.
+ *
+ * Consumes @notify_rd: it is closed here, and the caller's copy is stale.
+ */
+static void clone_wait_vfork_child(int notify_rd, pid_t child_host_pid)
+{
+    char byte;
+    ssize_t nr;
+    do {
+        nr = read(notify_rd, &byte, 1);
+    } while (nr < 0 && errno == EINTR);
+    close(notify_rd);
+
+    if (nr <= 0) {
+        int status = 0;
+        struct rusage ru;
+        if (wait4(child_host_pid, &status, 0, &ru) == child_host_pid)
+            proc_children_cpu_add(&ru);
+        proc_mark_child_exited(child_host_pid, status);
+    } else {
+        int status;
+        struct rusage ru;
+        pid_t waited = wait4(child_host_pid, &status, WNOHANG, &ru);
+        if (waited == child_host_pid) {
+            proc_children_cpu_add(&ru);
+            proc_mark_child_exited(child_host_pid, status);
+        }
+    }
+}
+
+/* Send the fd table, then the pty keepalives. The keepalive payload carries a
+ * guest_fd that the child resolves through its just-installed fd_table to
+ * recover the child-side master host fd, so the order is fixed.
+ *
+ * Returns 0, or -1 after logging which send failed.
+ */
+static int clone_send_fd_state(int ipc_sock)
+{
+    if (fork_ipc_send_fd_table(ipc_sock) < 0) {
+        log_error("clone: failed to send fd table");
+        return -1;
+    }
+    if (fork_ipc_send_pty_keepalives(ipc_sock) < 0) {
+        log_error("clone: failed to send pty keepalives");
+        return -1;
+    }
+    return 0;
+}
+
+/* Copy the semantic region array so the IPC send has a stable view after
+ * siblings resume. Heap-allocated because GUEST_MAX_REGIONS *
+ * sizeof(guest_region_t) exceeds safe stack limits on worker threads. An empty
+ * table leaves *out NULL and succeeds; only allocation failure returns false.
+ */
+static bool fork_copy_regions(const guest_t *g, guest_region_t **out)
+{
+    if (g->nregions <= 0)
+        return true;
+    size_t sz = (size_t) g->nregions * sizeof(guest_region_t);
+    *out = malloc(sz);
+    if (!*out)
+        return false;
+    memcpy(*out, g->regions, sz);
+    return true;
+}
+
+/* Roll back the in-place anon-shared overlay conversion while siblings are
+ * still parked. A partial rollback failure (e.g., region drift past the quiesce
+ * timeout) leaves the parent in a mixed state: the originating fork-IPC error
+ * is the user-visible one, but log abort failures so post-mortem can spot the
+ * lingering overlay without grepping for behavioral symptoms.
+ */
+static void clone_rollback_anon_shared(guest_t *g,
+                                       mmap_fork_anon_shared_txn_t **txn)
+{
+    int abort_rc = mmap_fork_abort_anon_shared(g, txn);
+    if (abort_rc < 0)
+        log_warn(
+            "clone: anon-shared rollback partial failure (%d); parent "
+            "may have stale memfd-backed regions",
+            abort_rc);
+}
+
+/* Reap a helper whose fork failed. The spawn always succeeded before any
+ * failure exit fires, so the pid is a live process. The IPC socket just closed;
+ * the child reads EOF on fork_ipc_read_all and returns nonzero from
+ * fork_child_main. Without an explicit waitpid the exited child becomes a
+ * zombie: proc_register_child only runs on the success path, so neither
+ * proc_reap_finished nor sys_wait4 will ever pick this PID up, and the guest's
+ * fork(2) already reported failure. Reap it here to keep host PIDs from
+ * accumulating across repeated failures.
+ */
+static void clone_reap_failed_child(pid_t child_host_pid)
+{
+    pid_t reaped;
+    do {
+        reaped = waitpid(child_host_pid, NULL, 0);
+    } while (reaped < 0 && errno == EINTR);
+    if (reaped < 0)
+        log_warn("clone: failed to reap fork-child pid=%d: %s",
+                 (int) child_host_pid, strerror(errno));
+}
+
+/* Reject clone flag combinations that elfuse or Linux refuses outright.
+ * Returns 0 or -LINUX_EINVAL.
+ */
+static int clone_check_flags(uint64_t flags,
+                             uint64_t ptid_gva,
+                             uint64_t pidfd_gva)
+{
+    /* Namespaces are not implemented. CLONE_NEWTIME (0x80) lives in the CSIGNAL
+     * low byte and, like CLONE_INTO_CGROUP (bit 33) and set_tid, cannot be
+     * conveyed through clone(2) at all, so only the higher namespace bits are
+     * reachable here.
+     */
+    if ((flags & ~(uint64_t) 0xff) & LINUX_CLONE3_NS_FLAGS)
+        return -LINUX_EINVAL;
+
+    /* clone shares the parent_tid and pidfd argument; clone3 keeps them
+     * separate. Linux rejects aliased outputs and CLONE_DETACHED with PIDFD.
+     * Thread pidfds are unsupported here.
+     */
+    if ((flags & LINUX_CLONE_PIDFD) &&
+        ((flags & (LINUX_CLONE_THREAD | LINUX_CLONE_DETACHED)) ||
+         ((flags & LINUX_CLONE_PARENT_SETTID) && pidfd_gva == ptid_gva)))
+        return -LINUX_EINVAL;
+    return 0;
+}
+
+/* Kept as one function on purpose.
+ *
+ * One transaction. The failure paths unwind state established earlier in the
+ * same function (quiesced siblings, promoted overlays, the snapshot fd), so the
+ * goto ladder has to see all of it.
+ */
+int64_t sys_clone(hv_vcpu_t vcpu,
+                  guest_t *g,
+                  const clone_req_t *req,
+                  bool verbose)
+{
+    const uint64_t flags = req->flags;
+    const uint64_t child_stack = req->child_stack;
+    const uint64_t ptid_gva = req->ptid_gva;
+    const uint64_t pidfd_gva = req->pidfd_gva;
+
+    int flag_err = clone_check_flags(flags, ptid_gva, pidfd_gva);
+    if (flag_err < 0)
+        return flag_err;
+    bool want_pidfd = (flags & LINUX_CLONE_PIDFD) != 0;
+
+    /* CLONE_THREAD: create a new thread in the same VM (not a new process) */
+    if (flags & LINUX_CLONE_THREAD) {
+        return sys_clone_thread(vcpu, g, req, verbose);
+    }
+
+    /* elfuse only supports fork-like clone (SIGCHLD) and posix_spawn-like
+     * clone (CLONE_VM|CLONE_VFORK|SIGCHLD)
+     */
+    bool is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
+
+    /* CLONE_VM without CLONE_THREAD usually creates an in-process VM-clone
+     * child that shares guest memory and is waitable via wait4/ptrace. However
+     * CLONE_VFORK must go through the helper-process path below so the child's
+     * later execve replaces only the child image rather than resetting the
+     * parent's shared guest_t.
+     */
+    if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD) &&
+        !is_vfork) {
+        return sys_clone_vm(vcpu, g, req, verbose);
+    }
+
+    log_debug("clone(flags=0x%llx, vfork=%d)", (unsigned long long) flags,
+              is_vfork);
+
+    int sock_fds[2];
+    int vfork_notify_fds[2] = {-1, -1};
+    if (clone_open_channels(is_vfork, sock_fds, vfork_notify_fds) < 0)
+        return -LINUX_ENOMEM;
+
+    /* Spawn the same elfuse binary so the child has the same entitlement and
+     * build as the parent.
+     */
+    char self_path[LINUX_PATH_MAX];
+    uint32_t path_len = sizeof(self_path);
+    if (_NSGetExecutablePath(self_path, &path_len) != 0) {
+        log_error("clone: _NSGetExecutablePath failed");
+        clone_close_channels(sock_fds, vfork_notify_fds);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Allocate and reserve all guest-visible bookkeeping before creating the
+     * host helper. Linux fork failure must not leave a child running, and a
+     * successful fork must always return a PID that wait4/waitid can track.
+     */
+    proc_registry_sync_self_pgid(g);
+    int64_t child_pgid = proc_get_pgid();
+    int64_t child_guest_pid = proc_alloc_pid();
+    int64_t pid_err = child_guest_pid < 0
+                          ? child_guest_pid
+                          : proc_reserve_child(child_guest_pid, child_pgid);
+    if (pid_err < 0) {
+        clone_close_channels(sock_fds, vfork_notify_fds);
+        return pid_err;
+    }
+    pid_t child_host_pid;
+    int spawn_ret = clone_spawn_child(
+        self_path, sock_fds[1], vfork_notify_fds[1], verbose, &child_host_pid);
+    if (spawn_ret != 0) {
+        log_error("clone: posix_spawn failed: %s", strerror(spawn_ret));
+        proc_cancel_child(child_guest_pid);
+        clone_close_channels(sock_fds, vfork_notify_fds);
+        return -LINUX_ENOMEM;
+    }
+
+    /* The parent keeps only its end of the control channel. Reset the closed
+     * write end to -1 so the fail_snapshot guarded close at the bottom of the
+     * function cannot double-close it. In a multithreaded guest, another vCPU
+     * could open a new fd between the two closes and get the same number, which
+     * the second close would then steal.
+     */
+    close(sock_fds[1]);
+    if (vfork_notify_fds[1] >= 0) {
+        close(vfork_notify_fds[1]);
+        vfork_notify_fds[1] = -1;
+    }
+    int ipc_sock = sock_fds[0];
+
+    mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
+
+    /* Declared up front so every goto to fail_snapshot can free these. */
+    guest_region_t *regions_snapshot = NULL;
+    int snapshot_shm_fd = -1;
+    bool siblings_quiesced = false;
+    bool mmap_locked = false;
+    int64_t fail_rc = -LINUX_ENOMEM;
+    int clone_pidfd = -1;
+
+    /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
+     * sibling vCPUs may be actively mutating guest memory during the fork
+     * snapshot (CoW or legacy IPC copy). Without quiescing them, the child
+     * process can receive a torn snapshot with partially-updated data
+     * structures. This matches POSIX fork semantics where only the calling
+     * thread survives.
+     */
+    if (!thread_quiesce_siblings()) {
+        /* An execve is reaping this thread. The snapshot would run without the
+         * quiet it needs, and the child would outlive a parent that is already
+         * gone, so refuse the fork instead.
+         */
+        fail_rc = -LINUX_EINTR;
+        goto fail_snapshot;
+    }
+    siblings_quiesced = true;
+
+    /* mmap_lock is held from here until the process-state send has passed the
+     * region backing fds over SCM_RIGHTS. The quiesce above gives up after its
+     * timeout, and a sibling already queued on mmap_lock never reaches the
+     * barrier, so without the lock its munmap could rewrite the region table
+     * during the overlay sync, the clone snapshot, the header, or the region
+     * copy, or close a backing fd before it is sent. Everything taken beneath
+     * it (fd_lock, pty_keepalive_lock, elf_path_lock, sysroot_lock, sig_lock)
+     * follows mmap_lock in the order in syscall/internal.h. The IPC writes
+     * under it cannot deadlock: the child only reads until admission, and a
+     * child that dies turns the next write into EPIPE (SO_NOSIGPIPE above). The
+     * cost lands on a straggler waiting in pthread_mutex_lock for the whole
+     * send, where no teardown wake reaches it, so an exit_group join during a
+     * slow fork can time out on it.
+     *
+     * The prepare call below converts MAP_SHARED|MAP_ANONYMOUS regions with no
+     * backing fd into memfd-backed overlays that the child re-installs from the
+     * SCM_RIGHTS fd. Misaligned shared regions stay incoherent across fork by
+     * design.
+     */
+    mmap_lock_acquire();
+    mmap_locked = true;
+    if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
+        goto fail_snapshot;
+
+    bool use_shm = (g->shm_fd >= 0);
+
+    if (fork_prepare_shm_snapshot(g, &use_shm, &snapshot_shm_fd) < 0)
+        goto fail_snapshot;
+
+    /* IPC header describing the parent state the child will rebuild. */
+    ipc_header_t hdr;
+    fork_build_header(g, req, use_shm, snapshot_shm_fd >= 0, child_guest_pid,
+                      child_pgid, &hdr);
     proc_registry_publish_self();
     if (fork_ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
         log_error("clone: failed to send header");
@@ -1969,23 +2200,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     /* Registers: capture current vCPU state */
     ipc_registers_t regs = {0};
-    regs.elr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
-    regs.sp_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL0);
-    if (child_stack)
-        regs.sp_el0 = child_stack;
-    regs.spsr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
-    regs.vbar_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_VBAR_EL1);
-    regs.ttbr0_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR0_EL1);
-    regs.ttbr1_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR1_EL1);
-    regs.sctlr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SCTLR_EL1);
-    regs.tcr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TCR_EL1);
-    regs.mair_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_MAIR_EL1);
-    regs.cpacr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_CPACR_EL1);
-    regs.tpidr_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDR_EL0);
-    regs.sp_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
-    vcpu_snapshot_gprs(vcpu, regs.x);
-
-    vcpu_snapshot_simd(vcpu, &regs.simd_state);
+    fork_capture_registers(vcpu, child_stack, &regs);
 
     if (fork_ipc_write_all(ipc_sock, &regs, sizeof(regs)) < 0) {
         log_error("clone: failed to send registers");
@@ -2004,28 +2219,11 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      */
     int nregions_snapshot = g->nregions;
     bool regions_tracker_stale_snapshot = g->regions_tracker_stale;
-    size_t snap_sz = (size_t) nregions_snapshot * sizeof(guest_region_t);
-    if (nregions_snapshot > 0) {
-        regions_snapshot = malloc(snap_sz);
-        if (!regions_snapshot) {
-            goto fail_snapshot;
-        }
-        memcpy(regions_snapshot, g->regions, snap_sz);
-    }
-
-    if (fork_ipc_send_fd_table(ipc_sock) < 0) {
-        log_error("clone: failed to send fd table");
+    if (!fork_copy_regions(g, &regions_snapshot))
         goto fail_snapshot;
-    }
 
-    /* Must follow fork_ipc_send_fd_table because the keepalive payload carries
-     * a guest_fd that the child resolves through its just-installed fd_table to
-     * recover the child-side master host fd.
-     */
-    if (fork_ipc_send_pty_keepalives(ipc_sock) < 0) {
-        log_error("clone: failed to send pty keepalives");
+    if (clone_send_fd_state(ipc_sock) < 0)
         goto fail_snapshot;
-    }
 
     uint32_t num_guest_regions = (uint32_t) nregions_snapshot;
     if (fork_ipc_send_process_state(ipc_sock, regions_snapshot,
@@ -2096,34 +2294,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * its own MAP_PRIVATE view of the same file.
      */
 
-    /* CLONE_VFORK suspends the parent until the child exits or execs. The
-     * emulator cannot observe guest exec completion across the helper process,
-     * so it waits for the helper to exit.
-     */
-    if (is_vfork) {
-        char byte;
-        ssize_t nr;
-        do {
-            nr = read(vfork_notify_fds[0], &byte, 1);
-        } while (nr < 0 && errno == EINTR);
-        close(vfork_notify_fds[0]);
-
-        if (nr <= 0) {
-            int status = 0;
-            struct rusage ru;
-            if (wait4(child_host_pid, &status, 0, &ru) == child_host_pid)
-                proc_children_cpu_add(&ru);
-            proc_mark_child_exited(child_host_pid, status);
-        } else {
-            int status;
-            struct rusage ru;
-            pid_t waited = wait4(child_host_pid, &status, WNOHANG, &ru);
-            if (waited == child_host_pid) {
-                proc_children_cpu_add(&ru);
-                proc_mark_child_exited(child_host_pid, status);
-            }
-        }
-    }
+    if (is_vfork)
+        clone_wait_vfork_child(vfork_notify_fds[0], child_host_pid);
 
     log_debug("clone: child pid=%lld (host=%d)", (long long) child_guest_pid,
               child_host_pid);
@@ -2144,19 +2316,7 @@ fail_snapshot:
     if (snapshot_shm_fd >= 0)
         close(snapshot_shm_fd);
 
-    /* Roll back the in-place anon-shared overlay conversion while siblings are
-     * still parked. A partial rollback failure (e.g., region drift past the
-     * quiesce timeout) leaves the parent in a mixed state: the originating
-     * fork-IPC error is the user-visible one, but log abort failures so
-     * post-mortem can spot the lingering overlay without grepping for
-     * behavioral symptoms.
-     */
-    int abort_rc = mmap_fork_abort_anon_shared(g, &anon_shared_txn);
-    if (abort_rc < 0)
-        log_warn(
-            "clone: anon-shared rollback partial failure (%d); parent "
-            "may have stale memfd-backed regions",
-            abort_rc);
+    clone_rollback_anon_shared(g, &anon_shared_txn);
     if (siblings_quiesced)
         thread_resume_siblings();
     close(ipc_sock);
@@ -2165,22 +2325,7 @@ fail_snapshot:
     if (vfork_notify_fds[1] >= 0)
         close(vfork_notify_fds[1]);
 
-    /* posix_spawn at the top of sys_clone always succeeds before any goto
-     * fail_snapshot fires, so child_host_pid is a live process here. The IPC
-     * socket just closed; the child reads EOF on fork_ipc_read_all and returns
-     * nonzero from fork_child_main. Without an explicit waitpid the exited
-     * child becomes a zombie: proc_register_child only runs on the success
-     * path, so neither proc_reap_finished nor sys_wait4 will ever pick this PID
-     * up, and the guest's fork(2) already reported failure. Reap it here to
-     * keep host PIDs from accumulating across repeated failures.
-     */
-    pid_t reaped;
-    do {
-        reaped = waitpid(child_host_pid, NULL, 0);
-    } while (reaped < 0 && errno == EINTR);
-    if (reaped < 0)
-        log_warn("clone: failed to reap fork-child pid=%d: %s",
-                 (int) child_host_pid, strerror(errno));
+    clone_reap_failed_child(child_host_pid);
     return fail_rc;
 }
 
@@ -2290,7 +2435,15 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
         (unsigned long long) ca.stack, (unsigned long long) ca.stack_size,
         (unsigned long long) ca.tls, (unsigned long long) cl_args_size);
 
-    return sys_clone(vcpu, g, flags, child_stack, ca.stack,
-                     ca.stack + ca.stack_size, ca.parent_tid, ca.pidfd, ca.tls,
-                     ca.child_tid, verbose);
+    const clone_req_t req = {
+        .flags = flags,
+        .child_stack = child_stack,
+        .stack_map_start = ca.stack,
+        .stack_map_end = ca.stack + ca.stack_size,
+        .ptid_gva = ca.parent_tid,
+        .pidfd_gva = ca.pidfd,
+        .tls = ca.tls,
+        .ctid_gva = ca.child_tid,
+    };
+    return sys_clone(vcpu, g, &req, verbose);
 }

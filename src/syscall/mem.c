@@ -1066,9 +1066,8 @@ static int64_t high_va_open_backing(guest_fd_t fd,
         bk->host_fd = bk->ref.fd;
     }
     bk->track_fd = dup(bk->host_fd);
-    if (bk->track_fd < 0) {
+    if (bk->track_fd < 0)
         return -LINUX_ENOMEM;
-    }
     if (prot != LINUX_PROT_NONE) {
         char probe;
         ssize_t nr;
@@ -3382,9 +3381,8 @@ static int mmap_extend_fresh(guest_t *g,
         uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
         if (ext_end > g->mmap_limit)
             ext_end = g->mmap_limit;
-        if (guest_extend_page_tables(g, ext_start, ext_end, MEM_PERM_RX) < 0) {
+        if (guest_extend_page_tables(g, ext_start, ext_end, MEM_PERM_RX) < 0)
             return -LINUX_ENOMEM;
-        }
 
         /* Re-validate any previously-invalidated L3 entries (see the RW path
          * comment below for the full explanation).
@@ -3406,9 +3404,8 @@ static int mmap_extend_fresh(guest_t *g,
         int ext_perms = MEM_PERM_RW;
         if (prot & LINUX_PROT_EXEC)
             ext_perms |= MEM_PERM_X;
-        if (guest_extend_page_tables(g, ext_start, ext_end, ext_perms) < 0) {
+        if (guest_extend_page_tables(g, ext_start, ext_end, ext_perms) < 0)
             return -LINUX_ENOMEM;
-        }
 
         /* Update permissions on the allocated range. This handles two cases:
          * 1. RWX: pre-existing RW blocks need execute permission added
@@ -3429,13 +3426,12 @@ static int mmap_extend_fresh(guest_t *g,
     return 0;
 }
 
-/* Over the function-size limit on purpose.
+/* Why this stays one function.
  *
  * Flag combinations, not steps: MAP_FIXED, MAP_SHARED, the file-backed overlay
  * and the anonymous path each qualify the others. Splitting by flag duplicates
  * the interactions between them.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,
                  uint64_t length,
@@ -3599,9 +3595,8 @@ int64_t sys_mmap(guest_t *g,
      * RW page table entries, letting the guest read/write what should be
      * inaccessible memory.
      */
-    if (is_prot_none && !is_fixed) {
+    if (is_prot_none && !is_fixed)
         guest_invalidate_ptes(g, result_off, result_off + length);
-    }
 
     if (!is_prot_none && !is_fixed && !is_noreserve &&
         mmap_extend_fresh(g, result_off, length, prot) < 0) {
@@ -4159,12 +4154,11 @@ static int64_t mremap_fixed_copy_failed(guest_t *g,
     return copy_err;
 }
 
-/* Over the function-size limit on purpose.
+/* Why this stays one function.
  *
  * Same shape as sys_mmap, with the grow-in-place and move cases sharing one
  * rollback of the region table.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mremap(guest_t *g,
                    uint64_t old_addr,
                    uint64_t old_size,
@@ -4941,10 +4935,10 @@ static int same_backing_file(int fd_a, int fd_b)
     return st_a.st_dev == st_b.st_dev && st_a.st_ino == st_b.st_ino;
 }
 
-static int64_t pwrite_all_at(int fd,
-                             const uint8_t *src,
-                             uint64_t len,
-                             uint64_t file_off)
+int64_t pwrite_all_at(int fd,
+                      const uint8_t *src,
+                      uint64_t len,
+                      uint64_t file_off)
 {
     while (len > 0) {
         size_t chunk =

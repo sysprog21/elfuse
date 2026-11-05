@@ -2053,20 +2053,18 @@ static int64_t exec_follow_shebangs(exec_ctx_t *c, bool *is_script)
         }
         chown_overlay_apply(&interp_st);
         err = exec_check_permission(&interp_st);
-        if (err < 0) {
+        if (err < 0)
             return err;
-        }
     }
     return 0;
 }
 
-/* Over the function-size limit on purpose.
+/* Why this stays one function.
  *
  * The point of no return runs through the middle of it. Before PNR every exit
  * restores the old image; after it there is no exit but the fatal one. A split
  * would put that boundary at a call edge, where it is invisible.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_execve(hv_vcpu_t vcpu,
                    guest_t *g,
                    uint64_t path_gva,
@@ -2310,12 +2308,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                                  owned_rosetta_temp, c.path, c.argc, c.argv,
                                  c.envp, shim_size);
         free(temp_str);
-        if (c.exec_fd >= 0) {
+        if (c.exec_fd >= 0)
             close(c.exec_fd);
-        }
-        if (interp.fd >= 0) {
+        if (interp.fd >= 0)
             close(interp.fd);
-        }
         if (interp.resolved_temp)
             unlink(interp.resolved);
         exec_cleanup_inputs(&c);

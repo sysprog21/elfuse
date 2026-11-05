@@ -371,7 +371,13 @@ INVENTORY = {
         "not-a-wait",
         "Refuses the fork because an execve is reaping this thread.",
     ),
-    "syscall/syscall.c::syscall_dispatch": (
+    "syscall/syscall.c::syscall_fast_rw": (
+        "not-a-wait",
+        "Inline read/write: io_xfer's interrupted wait diverts to the slow "
+        "path, and a host EINTR is passed through for the dispatcher to "
+        "classify.",
+    ),
+    "syscall/syscall.c::syscall_restart_try_arm": (
         "not-a-wait",
         "Tests a handler's EINTR result to decide the restart; produces none "
         "of its own.",

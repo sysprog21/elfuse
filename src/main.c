@@ -630,13 +630,11 @@ static bool parse_options(int argc, char **argv, cli_opts_t *o)
     return true;
 }
 
-/* Over the function-size limit on purpose.
- *
- * Option parsing: one flag per arm, no shared state between them. Splitting
- * trades a flat table for a dozen one-caller helpers and a struct to thread the
- * results through.
+/* The launch sequence: defaults from the environment, the options, the sysroot,
+ * the shebang chain, then bring-up through elfuse_launch. Each step feeds the
+ * next through cli_opts_t and the locals the single cleanup label frees, so the
+ * order is the contract and the steps stay in one place.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int main(int argc, char **argv)
 {
     log_init();

@@ -360,6 +360,32 @@ static bool build_boot_regions(mem_region_t *regions,
     return true;
 }
 
+/* Decide how the ELF's machine type is run: aarch64 natively, x86_64 through
+ * Rosetta unless that was disabled with --no-rosetta or ELFUSE_NO_ROSETTA=1.
+ * Sets *want_rosetta, and returns -1 after logging for a machine type that
+ * cannot run.
+ */
+static int bootstrap_classify_machine(const elf_info_t *elf_info,
+                                      const char *elf_guest_path,
+                                      bool *want_rosetta)
+{
+    *want_rosetta = false;
+    if (elf_info->e_machine == EM_X86_64) {
+        if (!proc_rosetta_enabled()) {
+            log_error(
+                "x86_64 ELF rejected by --no-rosetta "
+                "(or ELFUSE_NO_ROSETTA=1): %s",
+                elf_guest_path);
+            return -1;
+        }
+        *want_rosetta = true;
+    } else if (elf_info->e_machine != EM_AARCH64) {
+        log_error("unsupported ELF machine type %u", elf_info->e_machine);
+        return -1;
+    }
+    return 0;
+}
+
 int guest_bootstrap_prepare(guest_t *g,
                             const char *elf_host_path,
                             bool elf_host_path_temp,
@@ -389,20 +415,10 @@ int guest_bootstrap_prepare(guest_t *g,
     }
     startup_trace_step("elf_load", t0);
 
-    bool want_rosetta = false;
-    if (boot->elf_info.e_machine == EM_X86_64) {
-        if (!proc_rosetta_enabled()) {
-            log_error(
-                "x86_64 ELF rejected by --no-rosetta "
-                "(or ELFUSE_NO_ROSETTA=1): %s",
-                elf_guest_path);
-            return -1;
-        }
-        want_rosetta = true;
-    } else if (boot->elf_info.e_machine != EM_AARCH64) {
-        log_error("unsupported ELF machine type %u", boot->elf_info.e_machine);
+    bool want_rosetta;
+    if (bootstrap_classify_machine(&boot->elf_info, elf_guest_path,
+                                   &want_rosetta) < 0)
         return -1;
-    }
 
     log_debug(
         "ELF entry=0x%llx, %d segments, load range [0x%llx, 0x%llx), "

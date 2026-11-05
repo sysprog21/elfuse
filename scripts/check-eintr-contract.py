@@ -356,9 +356,10 @@ INVENTORY = {
         "not-a-wait",
         "Refuses the unmap window because an execve is reaping this thread.",
     ),
-    "syscall/mem.c::sys_mmap_high_va": (
+    "syscall/mem.c::high_va_populate": (
         "not-a-wait",
-        "Refuses the overlay because an execve is reaping this thread.",
+        "Refuses the overlay because an execve is reaping this thread. It is "
+        "the replace-existing step of sys_mmap_high_va, which forwards it.",
     ),
     "runtime/forkipc.c::sys_clone": (
         "not-a-wait",

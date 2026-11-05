@@ -110,6 +110,105 @@ static void recvmsg_close_host_rights(const void *data_src, size_t data_len)
         close(fds[i]);
 }
 
+/* Publish each received host descriptor as a guest fd, rewriting fds[] in place
+ * to the guest numbers (-1 where allocation failed, after closing the host
+ * descriptor). Successes are recorded in the scm_* arrays so a later failure
+ * can retire them; the arrays are bounded by scm_cap and scm_nfds accumulates
+ * across control messages.
+ */
+static void recvmsg_install_rights(int *fds,
+                                   size_t nfds,
+                                   int flags,
+                                   int *scm_gfds,
+                                   int *scm_hfds,
+                                   int *scm_nfds,
+                                   int scm_cap)
+{
+    for (size_t i = 0; i < nfds; i++) {
+        int host_recv_fd = fds[i];
+
+        /* A received descriptor belongs to whoever sent it, so elfuse never
+         * sets O_NONBLOCK on one: that would mutate a description this process
+         * did not create, and a guest that passes fd 0 to itself would leave
+         * the launching shell's terminal nonblocking after exit. Marked foreign
+         * so a dup of it inherits the same restraint.
+         *
+         * Which view of the flag is the guest's still has to be decided, and
+         * the flag as found answers it. A description already carrying
+         * O_NONBLOCK is one elfuse itself owns: every pipe and fifo it opens
+         * carries the flag precisely because it emulates blocking on top, and
+         * an ordinary program's description does not. Adopting that emulation
+         * here sets nothing (the flag is already there) and gives a plain read
+         * the wait it asked for. Reading the host flag as the guest's view
+         * instead would hand a blocking read a spurious EAGAIN, which a program
+         * that never requested O_NONBLOCK has no handling for.
+         *
+         * What stays wrong is a sender that meant the description to be
+         * nonblocking: the receiver sees blocking. The O_NONBLOCK shadow is per
+         * process, and this is the survivable direction of that divergence: a
+         * wait the sender would not have waited, rather than an error on an fd
+         * that has none.
+         */
+        int recv_fl = fcntl(host_recv_fd, F_GETFL);
+        fd_alias_spec_t spec =
+            fd_alias_carried(true, recv_fl >= 0 && (recv_fl & O_NONBLOCK));
+        int gfd = fd_alloc_alias(&spec, FD_REGULAR, fds[i], NULL);
+        if (gfd < 0) {
+            close(fds[i]);
+            fds[i] = -1;
+            continue;
+        }
+        fds[i] = gfd;
+        if (*scm_nfds < scm_cap) {
+            scm_gfds[*scm_nfds] = gfd;
+            scm_hfds[*scm_nfds] = host_recv_fd;
+            (*scm_nfds)++;
+        }
+        if (flags & LINUX_MSG_CMSG_CLOEXEC)
+            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
+    }
+}
+
+/* Write the peer address and its length back to the guest msghdr.
+ *
+ * Returns 0 or -LINUX_EFAULT; the caller owns every cleanup.
+ */
+static int64_t recvmsg_write_name(guest_t *g,
+                                  uint64_t msg_gva,
+                                  const linux_msghdr_t *lmsg,
+                                  const struct sockaddr_storage *mac_sa,
+                                  socklen_t mac_namelen)
+{
+    /* Stays 0 when the host reported no address, and when one could not be
+     * converted: either way nothing was written for a length to describe.
+     */
+    uint32_t nl = 0;
+    if (mac_namelen > 0) {
+        uint8_t linux_sa[128];
+        int out_len =
+            net_sockaddr_from_mac((const struct sockaddr *) mac_sa, mac_namelen,
+                                  linux_sa, (uint32_t) sizeof(linux_sa));
+        if (out_len > 0) {
+            /* The length must describe the bytes written, which are the
+             * translated address rather than the host one: a pathname socket's
+             * host spelling is the longer of the two, so passing the host
+             * length on leaves the guest reading past the address it was given.
+             * Reported untruncated, per recvmsg(2).
+             */
+            nl = (uint32_t) out_len;
+            uint32_t write_len = nl;
+            if (write_len > lmsg->msg_namelen)
+                write_len = lmsg->msg_namelen;
+            if (guest_write_small(g, lmsg->msg_name, linux_sa, write_len) < 0)
+                return -LINUX_EFAULT;
+        }
+    }
+    if (guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_namelen),
+                          &nl, sizeof(nl)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
 /* Wire size of a Linux SCM_CREDENTIALS control message: cmsghdr plus ucred,
  * rounded up to the cmsg alignment.
  */
@@ -796,42 +895,13 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     }
 
     if (lmsg.msg_name) {
-        /* Stays 0 when the host reported no address, and when one could not be
-         * converted: either way nothing was written for a length to describe.
-         */
-        uint32_t nl = 0;
-        if (msg.msg_namelen > 0) {
-            uint8_t linux_sa[128];
-            int out_len = net_sockaddr_from_mac((struct sockaddr *) &mac_sa,
-                                                msg.msg_namelen, linux_sa,
-                                                (uint32_t) sizeof(linux_sa));
-            if (out_len > 0) {
-                /* The length must describe the bytes written, which are the
-                 * translated address rather than the host one: a pathname
-                 * socket's host spelling is the longer of the two, so passing
-                 * the host length on leaves the guest reading past the address
-                 * it was given. Reported untruncated, per recvmsg(2).
-                 */
-                nl = (uint32_t) out_len;
-                uint32_t write_len = nl;
-                if (write_len > lmsg.msg_namelen)
-                    write_len = lmsg.msg_namelen;
-                if (guest_write_small(g, lmsg.msg_name, linux_sa, write_len) <
-                    0) {
-                    free(mac_ctrl_heap);
-                    host_iov_free(&host_iov);
-                    host_fd_ref_close(&host_ref);
-                    return -LINUX_EFAULT;
-                }
-            }
-        }
-        if (guest_write_small(g,
-                              msg_gva + offsetof(linux_msghdr_t, msg_namelen),
-                              &nl, sizeof(nl)) < 0) {
+        int64_t name_err =
+            recvmsg_write_name(g, msg_gva, &lmsg, &mac_sa, msg.msg_namelen);
+        if (name_err < 0) {
             free(mac_ctrl_heap);
             host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
+            return name_err;
         }
     }
 
@@ -917,55 +987,9 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                     data_copy = data_copy_heap;
                 }
                 memcpy(data_copy, data_src, data_len);
-                int *fds = (int *) data_copy;
-                size_t nfds = data_len / sizeof(int);
-                for (size_t i = 0; i < nfds; i++) {
-                    int host_recv_fd = fds[i];
-
-                    /* A received descriptor belongs to whoever sent it, so
-                     * elfuse never sets O_NONBLOCK on one: that would mutate a
-                     * description this process did not create, and a guest that
-                     * passes fd 0 to itself would leave the launching shell's
-                     * terminal nonblocking after exit. Marked foreign so a dup
-                     * of it inherits the same restraint.
-                     *
-                     * Which view of the flag is the guest's still has to be
-                     * decided, and the flag as found answers it. A description
-                     * already carrying O_NONBLOCK is one elfuse itself owns:
-                     * every pipe and fifo it opens carries the flag precisely
-                     * because it emulates blocking on top, and an ordinary
-                     * program's description does not. Adopting that emulation
-                     * here sets nothing (the flag is already there) and gives a
-                     * plain read the wait it asked for. Reading the host flag
-                     * as the guest's view instead would hand a blocking read a
-                     * spurious EAGAIN, which a program that never requested
-                     * O_NONBLOCK has no handling for.
-                     *
-                     * What stays wrong is a sender that meant the description
-                     * to be nonblocking: the receiver sees blocking. The
-                     * O_NONBLOCK shadow is per process, and this is the
-                     * survivable direction of that divergence: a wait the
-                     * sender would not have waited, rather than an error on an
-                     * fd that has none.
-                     */
-                    int recv_fl = fcntl(host_recv_fd, F_GETFL);
-                    fd_alias_spec_t spec = fd_alias_carried(
-                        true, recv_fl >= 0 && (recv_fl & O_NONBLOCK));
-                    int gfd = fd_alloc_alias(&spec, FD_REGULAR, fds[i], NULL);
-                    if (gfd < 0) {
-                        close(fds[i]);
-                        fds[i] = -1;
-                    } else {
-                        fds[i] = gfd;
-                        if (scm_nfds < (int) ARRAY_SIZE(scm_gfds)) {
-                            scm_gfds[scm_nfds] = gfd;
-                            scm_hfds[scm_nfds] = host_recv_fd;
-                            scm_nfds++;
-                        }
-                        if (flags & LINUX_MSG_CMSG_CLOEXEC)
-                            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
-                    }
-                }
+                recvmsg_install_rights(
+                    (int *) data_copy, data_len / sizeof(int), flags, scm_gfds,
+                    scm_hfds, &scm_nfds, (int) ARRAY_SIZE(scm_gfds));
                 data_src = data_copy;
             }
 

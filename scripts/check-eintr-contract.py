@@ -228,8 +228,14 @@ INVENTORY = {
     ),
     "syscall/net-msg.c::sys_recvmsg": (
         "restartable",
-        "The first wait precedes recvmsg, and later interrupted waits return "
-        "the accumulated count instead of EINTR.",
+        "The general path: the first wait precedes recvmsg, and later "
+        "interrupted waits return the accumulated count instead of EINTR.",
+    ),
+    "syscall/net-msg.c::recvmsg_single_iov": (
+        "restartable",
+        "The single-iovec path sys_recvmsg hands off to: the first wait "
+        "precedes recvmsg, and later interrupted waits return the accumulated "
+        "count instead of EINTR.",
     ),
     "syscall/net-msg.c::sys_recvmmsg": (
         "forbids",

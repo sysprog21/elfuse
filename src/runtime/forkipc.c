@@ -1524,6 +1524,85 @@ static int fork_snapshot_shm_via_clonefile(int src_fd)
     return clone_fd;
 }
 
+/* Close both ends of the fork control socket and whichever vfork notify pipe
+ * ends exist. Only for exits that run before the parent hands the write ends
+ * off, while every descriptor is still open or still -1.
+ */
+static void clone_close_channels(const int sock_fds[2],
+                                 const int vfork_notify_fds[2])
+{
+    close(sock_fds[0]);
+    close(sock_fds[1]);
+    if (vfork_notify_fds[0] >= 0)
+        close(vfork_notify_fds[0]);
+    if (vfork_notify_fds[1] >= 0)
+        close(vfork_notify_fds[1]);
+}
+
+/* Spawn the fork-child helper. Its argv is intentionally minimal (guest argv is
+ * restored later from IPC) and it inherits only stdio, the control socket and,
+ * for CLONE_VFORK, the notify pipe's write end (@vfork_notify_wr >= 0).
+ * Returns the posix_spawn error code.
+ */
+static int clone_spawn_child(const char *self_path,
+                             int ipc_fd,
+                             int vfork_notify_wr,
+                             bool verbose,
+                             pid_t *out_pid)
+{
+    char fd_str[32];
+    snprintf(fd_str, sizeof(fd_str), "%d", ipc_fd);
+    char *child_argv[16];
+    int ci = 0;
+    child_argv[ci++] = (char *) self_path;
+    if (verbose)
+        child_argv[ci++] = "--verbose";
+
+    /* Rosetta is on by default; only propagate the opt-out flag when the parent
+     * explicitly disabled it. The child re-reads ELFUSE_NO_ROSETTA from the
+     * environment too, so an env-based opt-out is preserved across fork without
+     * an explicit argv entry.
+     */
+    if (!proc_rosetta_enabled())
+        child_argv[ci++] = "--no-rosetta";
+    if (proc_fakeroot_enabled())
+        child_argv[ci++] = "--fakeroot";
+    child_argv[ci++] = "--fork-child";
+    child_argv[ci++] = fd_str;
+    char notify_fd_str[32];
+    if (vfork_notify_wr >= 0) {
+        snprintf(notify_fd_str, sizeof(notify_fd_str), "%d", vfork_notify_wr);
+        child_argv[ci++] = "--vfork-notify-fd";
+        child_argv[ci++] = notify_fd_str;
+    }
+    child_argv[ci] = NULL;
+
+    /* Close all inherited FDs by default. POSIX_SPAWN_CLOEXEC_DEFAULT (macOS
+     * extension) marks all FDs as close-on-exec in the child. Without this, ALL
+     * parent host FDs (pipes, sockets, etc.) leak into the child elfuse
+     * process, wasting file descriptors and potentially preventing pipe EOF
+     * detection. File actions then opt back in only what the child needs.
+     */
+    posix_spawnattr_t spawn_attr;
+    posix_spawnattr_init(&spawn_attr);
+    posix_spawnattr_setflags(&spawn_attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    posix_spawn_file_actions_t file_actions;
+    posix_spawn_file_actions_init(&file_actions);
+    posix_spawn_file_actions_addinherit_np(&file_actions, STDIN_FILENO);
+    posix_spawn_file_actions_addinherit_np(&file_actions, STDOUT_FILENO);
+    posix_spawn_file_actions_addinherit_np(&file_actions, STDERR_FILENO);
+    posix_spawn_file_actions_addinherit_np(&file_actions, ipc_fd);
+    if (vfork_notify_wr >= 0)
+        posix_spawn_file_actions_addinherit_np(&file_actions, vfork_notify_wr);
+
+    extern char **environ;
+    int ret = posix_spawn(out_pid, self_path, &file_actions, &spawn_attr,
+                          child_argv, environ);
+    posix_spawn_file_actions_destroy(&file_actions);
+    posix_spawnattr_destroy(&spawn_attr);
+    return ret;
+}
+
 /* Over the function-size limit on purpose.
  *
  * One transaction. The failure paths unwind state established earlier in the
@@ -1649,62 +1728,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         return -LINUX_ENOMEM;
     }
 
-    /* The child starts in --fork-child mode and receives the inherited state on
-     * the socket fd.
-     */
-    char fd_str[32];
-    snprintf(fd_str, sizeof(fd_str), "%d", sock_fds[1]);
-
-    /* argv is intentionally minimal; guest argv is restored later from IPC. */
-    char notify_fd_str[32];
-    char *child_argv[16];
-    int ci = 0;
-    child_argv[ci++] = self_path;
-    if (verbose)
-        child_argv[ci++] = "--verbose";
-
-    /* Rosetta is on by default; only propagate the opt-out flag when the parent
-     * explicitly disabled it. The child re-reads ELFUSE_NO_ROSETTA from the
-     * environment too, so an env-based opt-out is preserved across fork without
-     * an explicit argv entry.
-     */
-    if (!proc_rosetta_enabled())
-        child_argv[ci++] = "--no-rosetta";
-    if (proc_fakeroot_enabled())
-        child_argv[ci++] = "--fakeroot";
-    child_argv[ci++] = "--fork-child";
-    child_argv[ci++] = fd_str;
-    if (is_vfork) {
-        snprintf(notify_fd_str, sizeof(notify_fd_str), "%d",
-                 vfork_notify_fds[1]);
-        child_argv[ci++] = "--vfork-notify-fd";
-        child_argv[ci++] = notify_fd_str;
-    }
-    child_argv[ci] = NULL;
-
-    /* Set up spawn attributes: close all inherited FDs by default.
-     * POSIX_SPAWN_CLOEXEC_DEFAULT (macOS extension) marks all FDs as
-     * close-on-exec in the child. Without this, ALL parent host FDs (pipes,
-     * sockets, etc.) leak into the child elfuse process, wasting file
-     * descriptors and potentially preventing pipe EOF detection.
-     */
-    posix_spawnattr_t spawn_attr;
-    posix_spawnattr_init(&spawn_attr);
-    posix_spawnattr_setflags(&spawn_attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
-
-    /* Set up file actions: explicitly inherit only needed FDs. With
-     * CLOEXEC_DEFAULT, everything is closed unless elfuse opts in.
-     */
-    posix_spawn_file_actions_t file_actions;
-    posix_spawn_file_actions_init(&file_actions);
-    posix_spawn_file_actions_addinherit_np(&file_actions, STDIN_FILENO);
-    posix_spawn_file_actions_addinherit_np(&file_actions, STDOUT_FILENO);
-    posix_spawn_file_actions_addinherit_np(&file_actions, STDERR_FILENO);
-    posix_spawn_file_actions_addinherit_np(&file_actions, sock_fds[1]);
-    if (is_vfork)
-        posix_spawn_file_actions_addinherit_np(&file_actions,
-                                               vfork_notify_fds[1]);
-
     /* Allocate and reserve all guest-visible bookkeeping before creating the
      * host helper. Linux fork failure must not leave a child running, and a
      * successful fork must always return a PID that wait4/waitid can track.
@@ -1713,44 +1736,21 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     int64_t child_pgid = proc_get_pgid();
     int64_t child_guest_pid = proc_alloc_pid();
     if (child_guest_pid < 0) {
-        posix_spawn_file_actions_destroy(&file_actions);
-        posix_spawnattr_destroy(&spawn_attr);
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        if (vfork_notify_fds[0] >= 0)
-            close(vfork_notify_fds[0]);
-        if (vfork_notify_fds[1] >= 0)
-            close(vfork_notify_fds[1]);
+        clone_close_channels(sock_fds, vfork_notify_fds);
         return child_guest_pid;
     }
     int reserve_rc = proc_reserve_child(child_guest_pid, child_pgid);
     if (reserve_rc < 0) {
-        posix_spawn_file_actions_destroy(&file_actions);
-        posix_spawnattr_destroy(&spawn_attr);
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        if (vfork_notify_fds[0] >= 0)
-            close(vfork_notify_fds[0]);
-        if (vfork_notify_fds[1] >= 0)
-            close(vfork_notify_fds[1]);
+        clone_close_channels(sock_fds, vfork_notify_fds);
         return reserve_rc;
     }
-    extern char **environ;
     pid_t child_host_pid;
-    int spawn_ret = posix_spawn(&child_host_pid, self_path, &file_actions,
-                                &spawn_attr, child_argv, environ);
-    posix_spawn_file_actions_destroy(&file_actions);
-    posix_spawnattr_destroy(&spawn_attr);
-
+    int spawn_ret = clone_spawn_child(
+        self_path, sock_fds[1], vfork_notify_fds[1], verbose, &child_host_pid);
     if (spawn_ret != 0) {
         log_error("clone: posix_spawn failed: %s", strerror(spawn_ret));
         proc_cancel_child(child_guest_pid);
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        if (vfork_notify_fds[0] >= 0)
-            close(vfork_notify_fds[0]);
-        if (vfork_notify_fds[1] >= 0)
-            close(vfork_notify_fds[1]);
+        clone_close_channels(sock_fds, vfork_notify_fds);
         return -LINUX_ENOMEM;
     }
 

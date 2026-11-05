@@ -161,25 +161,46 @@ static void exec_republish_shim_globals_or_die(hv_vcpu_t vcpu,
 
 /* Release the buffers and temporary host-side files that sys_execve allocates
  * before crossing the point of no return. Used by both the Rosetta and the
- * aarch64 success paths.
+ * aarch64 success paths. The strings and vectors an execve carries from its
+ * first copy of the guest's inputs to its last cleanup. path is the
+ * guest-visible name and path_host the host path the image is opened from,
+ * either the caller's execveat path or one of the two buffers; the temp flags
+ * say a buffer holds a materialized file to unlink, and path_host_shm says
+ * path_host is a /dev/shm leaf (which drives O_NOFOLLOW on the exec open),
+ * re-evaluated whenever path_host is repointed at an interpreter. argv and envp
+ * are the vectors with their string buffers, and running_bytes is the total
+ * charged against the argument limit by both.
  */
-static void exec_cleanup_inputs(char **argv,
-                                char **envp,
-                                char *argv_buf,
-                                char *envp_buf,
-                                const char *path_host_buf,
-                                bool path_host_temp,
-                                const char *interp_host_buf,
-                                bool interp_host_temp)
+typedef struct {
+    char path[LINUX_PATH_MAX];
+    char path_host_buf[LINUX_PATH_MAX];
+    char interp_host_buf[LINUX_PATH_MAX];
+    const char *path_host;
+    bool path_host_temp;
+    bool interp_host_temp;
+    bool path_host_shm;
+    int exec_fd;
+    char **argv;
+    char **envp;
+    char *argv_buf;
+    char *envp_buf;
+    size_t argv_buf_size;
+    size_t envp_buf_size;
+    size_t running_bytes;
+    int argc;
+    int envc;
+} exec_ctx_t;
+
+static void exec_cleanup_inputs(exec_ctx_t *c)
 {
-    if (path_host_temp)
-        unlink(path_host_buf);
-    if (interp_host_temp)
-        unlink(interp_host_buf);
-    free(argv);
-    free(envp);
-    free(argv_buf);
-    free(envp_buf);
+    if (c->path_host_temp)
+        unlink(c->path_host_buf);
+    if (c->interp_host_temp)
+        unlink(c->interp_host_buf);
+    free(c->argv);
+    free(c->envp);
+    free(c->argv_buf);
+    free(c->envp_buf);
 }
 
 /* Open an execve image (binary or interpreter). For a shm redirect, force
@@ -1028,9 +1049,10 @@ static inline uint64_t exec_seg_end(const elf_info_t *info,
 }
 
 /* What the post-PNR rebuild needs from the pre-PNR resolution, gathered in one
- * place because two phases already take the whole set and the phases still
- * inlined in sys_execve take most of it. Every member is settled before
- * guest_reset and read-only afterwards.
+ * place because every phase of it takes the same set: mapping the segments,
+ * installing the address space, publishing the maps and building the stack.
+ * Every member, interp_base included, is settled before guest_reset and
+ * read-only afterwards.
  */
 typedef struct {
     unsigned int shim_size;
@@ -1307,394 +1329,300 @@ static void exec_enter_new_image(hv_vcpu_t vcpu,
     exec_sync_vcpu_regs(vcpu);
 }
 
-/* Over the function-size limit on purpose.
- *
- * The point of no return runs through the middle of it. Before PNR every exit
- * restores the old image; after it there is no exit but the fatal one. A split
- * would put that boundary at a call edge, where it is invisible.
+/* Enter a Rosetta-hosted x86_64 image after guest_reset(). Runs entirely past
+ * the point of no return: every failure is fatal, so there is no error return
+ * and the boundary stays visible in sys_execve. owned_rosetta_temp is a
+ * materialized temp the caller already disowned; on failure it is unlinked here
+ * because rosettad never reached its ownership-commit point.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
-int64_t sys_execve(hv_vcpu_t vcpu,
-                   guest_t *g,
-                   uint64_t path_gva,
-                   uint64_t argv_gva,
-                   uint64_t envp_gva,
-                   bool verbose,
-                   const char *host_path)
+static void exec_enter_rosetta_image(hv_vcpu_t vcpu,
+                                     guest_t *g,
+                                     bool verbose,
+                                     const char *path_host,
+                                     const char *owned_rosetta_temp,
+                                     const char *path,
+                                     int argc,
+                                     char **argv,
+                                     char **envp,
+                                     unsigned int shim_size)
 {
-    /* Not the leader: hand the whole syscall to it. See exec_handoff_to_leader
-     * for why the leader has to be the one that survives.
+    /* Drain the previous rosettad bridge before rosetta_finalize wires a fresh
+     * one. The detached handler thread only clears its global client-fd marker
+     * on its own EOF/exit. 1 s is enough headroom for a loaded host; a hung
+     * handler past that point will lose the start_handler CAS later, and the
+     * warning here marks the cause. Soft cap; the install may still succeed on
+     * timeout if the handler's CAS races us favourably.
      */
-    if (!thread_current_is_leader())
-        return exec_handoff_to_leader(path_gva, argv_gva, envp_gva, host_path);
-
-    /* Linux gives the exec'ing task a new mm and leaves a CLONE_VM child on the
-     * old one. elfuse has a single guest slab, so guest_reset would zero the
-     * memory that child is executing. Refuse while one is live, for the same
-     * reason and with the same recoverable errno as above.
-     */
-    if (thread_count_active_vm_clones() > 0) {
-        log_error(
-            "execve with %d live CLONE_VM child(ren) is not supported; "
-            "they share the guest memory guest_reset would zero",
-            thread_count_active_vm_clones());
-        return -LINUX_ENOSYS;
+    if (!rosettad_wait_for_idle(1000)) {
+        log_warn(
+            "execve: rosettad bridge did not drain within 1s; "
+            "rosetta_finalize CAS may lose the race");
     }
-
-    /* Copy guest execve inputs before any state-reset point of no return. A
-     * provided host_path (from execveat resolution) is used directly for the
-     * exec open, but the guest-visible identity in path must carry the guest
-     * spelling: strip the sysroot and decode escaped components so
-     * /proc/self/exe never reports the private host namespace.
-     */
-    char path[LINUX_PATH_MAX];
-    if (host_path) {
-        if (path_host_to_guest(host_path, path, sizeof(path)) < 0)
-            return -LINUX_ENAMETOOLONG;
-    } else if (guest_read_str(g, path_gva, path, sizeof(path)) < 0) {
-        return -LINUX_EFAULT;
-    }
-
-    log_debug("execve(\"%s\")", path);
-
-    char path_host_buf[LINUX_PATH_MAX];
-    const char *path_host = host_path ? host_path : path;
-    bool path_host_temp = false;
-
-    /* Whether path_host is a shm redirect leaf (drives O_NOFOLLOW on the exec
-     * open). Re-evaluated whenever path_host is repointed to an interpreter.
-     */
-    bool path_host_shm = false;
-    char interp_host_buf[LINUX_PATH_MAX];
-    bool interp_host_temp = false;
-
-    int64_t err = 0;
-    char **argv = NULL;
-    char **envp = NULL;
-    char *argv_buf = NULL;
-    char *envp_buf = NULL;
-    size_t argv_buf_size = 0;
-    size_t envp_buf_size = 0;
-    size_t running_bytes = 0;
-    int exec_fd = -1;
-    exec_interp_t interp;
-    memset(&interp, 0, sizeof(interp));
-    interp.fd = -1;
-
-
-    char *temp_str = malloc(LINUX_MAX_ARG_STRLEN);
-    if (!temp_str) {
-        err = -LINUX_ENOMEM;
-        goto fail;
-    }
-
-    int argc = read_string_array(g, argv_gva, &argv, &argv_buf, &argv_buf_size,
-                                 temp_str, &running_bytes);
-    if (argc < 0) {
-        err = (argc == -2) ? -LINUX_E2BIG
-                           : ((argc == -3) ? -LINUX_ENOMEM : -LINUX_EFAULT);
-        goto fail;
-    }
-
-    int envc = 0;
-    if (envp_gva != 0) {
-        envc = read_string_array(g, envp_gva, &envp, &envp_buf, &envp_buf_size,
-                                 temp_str, &running_bytes);
-        if (envc < 0) {
-            err = (envc == -2) ? -LINUX_E2BIG
-                               : ((envc == -3) ? -LINUX_ENOMEM : -LINUX_EFAULT);
-            goto fail;
-        }
-    }
-
-    /* Resolve /proc/self/exe to the actual binary path. Busybox sh execs
-     * applets via execve("/proc/self/exe", ["applet", ...]) and macOS has no
-     * /proc filesystem.
-     */
-    if (!strcmp(path, "/proc/self/exe")) {
-        /* Snapshot rather than proc_get_elf_path(): that pointer is shared
-         * mutable state, and a sibling execve republishing it would tear the
-         * string this copy -- and the fakeroot decision below -- reads.
+    uint64_t r_entry = 0, r_sp = 0, r_ttbr0 = 0;
+    if (guest_bootstrap_rosetta_post_reset(
+            g, path_host, owned_rosetta_temp != NULL, path, argc,
+            (const char **) argv, envp, shim_size, false, &r_entry, &r_sp,
+            &r_ttbr0) < 0) {
+        /* Post-PNR fatal failure. The temp flag was cleared up front so
+         * exec_cleanup_inputs would be a no-op, and rosettad never reached its
+         * ownership-commit point on this failure path. Best-effort unlink so
+         * the materialized temp does not orphan in /tmp on a path the kernel
+         * parallels with SIGKILL.
          */
-        if (!proc_elf_path_snapshot(path, sizeof(path))) {
-            err = -LINUX_ENOENT;
-            goto fail;
-        }
-        log_debug("execve resolved to \"%s\"", path);
+        if (owned_rosetta_temp)
+            unlink(owned_rosetta_temp);
+        log_fatal(
+            "execve failed after point of no return: "
+            "rosetta re-bootstrap failed for %s",
+            path);
+        exit(128);
     }
+    exec_republish_shim_globals_or_die(vcpu, g, verbose);
 
-    if (!host_path) {
-        path_translation_t tx;
-        if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &tx) < 0) {
-            err = linux_errno();
-            goto fail;
-        }
-        if (tx.fuse_path) {
-            err = fuse_materialize_path(tx.intercept_path, path_host_buf,
-                                        sizeof(path_host_buf));
-            if (err < 0)
-                goto fail;
-            path_host_temp = true;
-        } else {
-            str_copy_trunc(path_host_buf, tx.host_path, sizeof(path_host_buf));
-            path_host_shm = tx.is_dev_shm;
-        }
-        path_host = path_host_buf;
-    }
-    if (!path_host) {
-        err = -LINUX_ENAMETOOLONG;
-        goto fail;
-    }
-
-    /* Resolve binfmt_script before probing ELF. elf_load() logs parse errors,
-     * and a script is an expected non-ELF input here.
+    /* I-cache for the (possibly re-mapped) rosetta segments has already been
+     * invalidated inside rosetta_prepare; only the shim needs an I-cache flush
+     * from here.
      */
-    elf_info_t elf_info;
-    int shebang_depth = 0;
+    sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base, shim_size);
 
-    /* Open the directly-executed file first and bind it to an fd to avoid
-     * TOCTOU.
+    /* The kbuf alias lives under TTBR1, so the translator enters on a different
+     * regime than a native image does. Everything else about entering an image
+     * is the same, hence the shared helper.
      */
-    exec_fd = exec_open_image(path_host, path_host_shm);
-    if (exec_fd < 0) {
-        err = linux_errno();
-        goto fail;
-    }
+    const exec_addr_space_t as = {r_ttbr0, g->ttbr1, TCR_EL1_VALUE_KBUF};
+    exec_enter_new_image(vcpu, g, r_entry, r_sp, &as);
 
-    /* Snapshot the directly-executed file's metadata before shebang resolution
-     * overwrites path_host with the interpreter path. The setuid/setgid check
-     * below needs the *original* file's mode bits.
-     */
-    bool exec_is_script = false;
-    struct stat exec_st;
-    bool have_exec_st = (fstat(exec_fd, &exec_st) == 0);
-    if (!have_exec_st) {
-        err = linux_errno();
-        goto fail;
-    }
+    log_debug("execve: rosetta target %s, entry=0x%llx sp=0x%llx", path,
+              (unsigned long long) guest_ipa(g, r_entry),
+              (unsigned long long) guest_ipa(g, r_sp));
+}
 
-    /* Judge access by the ownership the guest sees: fs-stat.c reports every
-     * guest stat through the virtual chown overlay, so the physical owner would
-     * refuse a file the guest's own stat says it may execute. Trusting a
-     * guest-writable overlay here -- chown_result records the intended owner on
-     * any EPERM, unchecked -- is a deliberate trade. A guest can chown a file
-     * into its own name to pass a check the physical mode refuses, and gains
-     * nothing: the host open must still succeed on the physical file.
-     *
-     * exec_st itself stays physical, and the set-id decision below takes both:
-     * it grants only where the two agree, so the overlay can withdraw an
-     * elevation but never conjure one.
-     */
-    struct stat exec_st_seen = exec_st;
-    chown_overlay_apply(&exec_st_seen);
+/* Rebuild the exec argv for one shebang hop: [interpreter, optional arg, script
+ * path, original argv[1:]]. Only the new prefix strings are copied into
+ * argv_buf, appended after the existing data so the argv[1:] strings that new
+ * argv still points at stay put; growing the buffer rebases those pointers.
+ * @interp_arg is NULL when the shebang line carried no argument.
+ * Returns 0, or -E2BIG / -ENOMEM. On failure argv and argc are unchanged, but
+ * argv_buf, its size and running_bytes already reflect any growth done before
+ * the failure: a moved buffer has freed the old one, so the caller must keep
+ * the updated pointer.
+ */
+static int64_t exec_shebang_rebuild_argv(const char *interp,
+                                         const char *interp_arg,
+                                         const char *path,
+                                         exec_ctx_t *c)
+{
+    int argc = c->argc;
+    char **argv = c->argv;
+    bool has_arg = (interp_arg != NULL);
 
-    err = exec_check_permission(&exec_st_seen);
-    if (err < 0) {
-        goto fail;
-    }
+    int prefix = (has_arg ? 2 : 1) + 1;
+    if (argc + prefix - 1 > ELFUSE_MAX_ARG_STRINGS)
+        return -LINUX_E2BIG;
+    int ni = 0;
+    int new_cap = argc + prefix;
+    char **new_argv = malloc(sizeof(char *) * (new_cap + 1));
+    if (!new_argv)
+        return -LINUX_ENOMEM;
+    new_argv[ni++] = (char *) interp;
+    if (has_arg)
+        new_argv[ni++] = (char *) interp_arg;
+    new_argv[ni++] = (char *) path;
+    for (int i = 1; i < argc; i++)
+        new_argv[ni++] = argv[i];
+    new_argv[ni] = NULL;
 
-    /* Decide the fakeroot transition from the directly-executed file, before
-     * the shebang loop repoints path_host at an interpreter: a marked wrapper
-     * script has to elevate on its own identity, not on /bin/sh's.
-     *
-     * Unlike the setuid rule below, a script is not excluded. That rule exists
-     * because any file on the system can carry a setuid bit, so the kernel
-     * cannot trust the interpreter line of one it never vetted. Here the
-     * embedder named exactly one file out of band; its shebang line is as much
-     * the embedder's choice as its ELF contents would be, and a marked dynamic
-     * binary would trust guest-reachable shared libraries just the same.
-     */
-    bool enter_fakeroot = exec_matches_fakeroot_target(&exec_st);
-
-    while (true) {
-        char interp_start[256];
-        char interp_arg[256];
-        int rc =
-            elf_read_shebang_fd(exec_fd, interp_start, sizeof(interp_start),
-                                interp_arg, sizeof(interp_arg));
-        if (rc < 0) {
-            errno = -rc;
-            err = linux_errno();
-            goto fail;
+    size_t buf_off = 0;
+    if (argc > 0)
+        buf_off = (size_t) (argv[argc - 1] - c->argv_buf) +
+                  strlen(argv[argc - 1]) + 1;
+    int prefix_end = ni - (argc > 1 ? argc - 1 : 0);
+    for (int i = 0; i < prefix_end; i++) {
+        size_t len = strlen(new_argv[i]);
+        if (c->running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
+            free(new_argv);
+            return -LINUX_E2BIG;
         }
-        if (rc == 0)
-            break;
-
-        exec_is_script = true;
-
-        /* Bound the resolution chain only once a further shebang is confirmed,
-         * so a max-depth chain ending in a real ELF still loads (matches the
-         * prior elf_load-first loop).
-         */
-        if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
-            err = -LINUX_ELOOP;
-            goto fail;
+        if (buf_off + len + 1 > c->argv_buf_size) {
+            size_t new_size = (buf_off + len + 1 + 4095) & ~4095ULL;
+            char *old_buf = c->argv_buf;
+            char *new_buf = malloc(new_size);
+            if (!new_buf) {
+                free(new_argv);
+                return -LINUX_ENOMEM;
+            }
+            memcpy(new_buf, old_buf, buf_off);
+            ptrdiff_t diff = new_buf - old_buf;
+            for (int j = 0; j < ni; j++) {
+                if (j < i || j >= prefix_end)
+                    new_argv[j] += diff;
+            }
+            free(old_buf);
+            c->argv_buf = new_buf;
+            c->argv_buf_size = new_size;
         }
-        shebang_depth++;
+        memcpy(c->argv_buf + buf_off, new_argv[i], len + 1);
+        new_argv[i] = c->argv_buf + buf_off;
+        buf_off += len + 1;
+        c->running_bytes += len + 1;
+    }
+    free(argv);
+    c->argv = new_argv;
+    c->argc = ni;
+    return 0;
+}
 
-        bool has_arg = (interp_arg[0] != '\0');
+/* Map the validated ELF and its interpreter into the freshly reset guest and
+ * make the bytes executable. Runs entirely past the point of no return: every
+ * failure is fatal, so there is no error return.
+ */
+static void exec_map_new_image(guest_t *g,
+                               const exec_image_t *image,
+                               int exec_fd,
+                               const char *path_host)
+{
+    const elf_info_t *elf_info = image->elf_info;
+    const exec_interp_t *interp = image->interp;
+    uint64_t elf_load_base = image->elf_load_base;
+    uint64_t interp_base = image->interp_base;
+
+    /* Load the executable image that was validated before guest_reset(). */
+    uint64_t infra_lo, infra_hi;
+    guest_infra_window(g, &infra_lo, &infra_hi);
+    if (elf_map_segments_fd(elf_info, exec_fd, path_host, g->host_base,
+                            g->guest_size, (elf_window_t) {0, elf_load_base},
+                            infra_lo, g->guest_size) < 0) {
+        log_fatal(
+            "execve failed after point of no return: "
+            "failed to map ELF segments for %s",
+            path_host);
+        exit(128);
+    }
+
+    /* Track lowest loaded ELF address for the legacy fork IPC path after exec
+     * replaces the previous image (see guest_get_used_regions).
+     */
+    g->elf_load_min = elf_info->load_min + elf_load_base;
+
+    /* If PT_INTERP was present, map the already-validated interpreter at the
+     * exec-time interp_base.
+     */
+    if (elf_info->interp_path[0] != '\0') {
+        if (elf_map_segments_fd(&interp->info, interp->fd, interp->resolved,
+                                g->host_base, g->guest_size,
+                                (elf_window_t) {0, interp_base}, infra_lo,
+                                infra_hi) < 0) {
+            log_fatal(
+                "execve failed after point of no return: "
+                "failed to map interpreter segments");
+            exit(128);
+        }
 
         log_debug(
-            "execve: shebang interp=\"%s\" arg=\"%s\" script=\"%s\" depth=%d",
-            interp_start, has_arg ? interp_arg : "(none)", path, shebang_depth);
-
-        /* Rebuild argv: [interpreter, optional-arg, script-path,
-         * original-argv[1:]]
-         */
-        int prefix = (has_arg ? 2 : 1) + 1;
-        if (argc + prefix - 1 > ELFUSE_MAX_ARG_STRINGS) {
-            err = -LINUX_E2BIG;
-            goto fail;
-        }
-        int ni = 0;
-        int new_cap = argc + prefix;
-        char **new_argv = malloc(sizeof(char *) * (new_cap + 1));
-        if (!new_argv) {
-            err = -LINUX_ENOMEM;
-            goto fail;
-        }
-        new_argv[ni++] = interp_start;
-        if (has_arg)
-            new_argv[ni++] = interp_arg;
-        new_argv[ni++] = path;
-        for (int i = 1; i < argc; i++)
-            new_argv[ni++] = argv[i];
-        new_argv[ni] = NULL;
-
-        /* Copy only the prefix strings (from shebang_buf/path, which go out of
-         * scope) into argv_buf. Append after existing data to avoid overwriting
-         * original argv[1:] strings that are already in argv_buf and are
-         * referenced by new_argv[prefix_end:].
-         */
-        size_t buf_off = 0;
-        if (argc > 0)
-            buf_off = (size_t) (argv[argc - 1] - argv_buf) +
-                      strlen(argv[argc - 1]) + 1;
-        int prefix_end = ni - (argc > 1 ? argc - 1 : 0);
-        for (int i = 0; i < prefix_end; i++) {
-            size_t len = strlen(new_argv[i]);
-            if (running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
-                free(new_argv);
-                err = -LINUX_E2BIG;
-                goto fail;
-            }
-            if (buf_off + len + 1 > argv_buf_size) {
-                size_t new_size = (buf_off + len + 1 + 4095) & ~4095ULL;
-                char *new_buf = realloc(argv_buf, new_size);
-                if (!new_buf) {
-                    free(new_argv);
-                    err = -LINUX_ENOMEM;
-                    goto fail;
-                }
-                if (new_buf != argv_buf) {
-                    ptrdiff_t diff = new_buf - argv_buf;
-                    for (int j = prefix_end; j < ni; j++)
-                        new_argv[j] += diff;
-                    argv_buf = new_buf;
-                }
-                argv_buf_size = new_size;
-            }
-            memcpy(argv_buf + buf_off, new_argv[i], len + 1);
-            new_argv[i] = argv_buf + buf_off;
-            buf_off += len + 1;
-            running_bytes += len + 1;
-        }
-        free(argv);
-        argv = new_argv;
-        argc = ni;
-
-        /* Continue the same exec transaction using the interpreter image. */
-        str_copy_trunc(path, interp_start, sizeof(path));
-        path_translation_t interp_tx;
-        if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &interp_tx) <
-            0) {
-            err = linux_errno();
-            goto fail;
-        }
-        if (path_host_temp) {
-            unlink(path_host_buf);
-            path_host_temp = false;
-        }
-        if (interp_host_temp) {
-            unlink(interp_host_buf);
-            interp_host_temp = false;
-        }
-        if (interp_tx.fuse_path) {
-            err =
-                fuse_materialize_path(interp_tx.intercept_path, interp_host_buf,
-                                      sizeof(interp_host_buf));
-            if (err < 0)
-                goto fail;
-            interp_host_temp = true;
-            path_host = interp_host_buf;
-            path_host_shm = false;
-        } else {
-            str_copy_trunc(path_host_buf, interp_tx.host_path,
-                           sizeof(path_host_buf));
-            path_host = path_host_buf;
-            path_host_shm = interp_tx.is_dev_shm;
-        }
-
-        /* Close old fd and open the new interpreter */
-        close(exec_fd);
-        exec_fd = exec_open_image(path_host, path_host_shm);
-        if (exec_fd < 0) {
-            err = linux_errno();
-            goto fail;
-        }
-        struct stat interp_st;
-        if (fstat(exec_fd, &interp_st) < 0) {
-            err = linux_errno();
-            goto fail;
-        }
-        chown_overlay_apply(&interp_st);
-        err = exec_check_permission(&interp_st);
-        if (err < 0) {
-            goto fail;
-        }
+            "execve: interpreter at base=0x%llx, entry=0x%llx, %d segments",
+            (unsigned long long) interp_base,
+            (unsigned long long) (interp->info.entry + interp_base),
+            interp->info.num_segments);
     }
 
-    if (elf_load_fd(exec_fd, path_host, &elf_info) < 0) {
-        err = -LINUX_ENOEXEC;
-        goto fail;
-    }
-
-    /* Compute setuid/setgid from the directly-executed file (fs/exec.c
-     * bprm_fill_uid). A set-id bit on the shebang script itself is ignored, as
-     * on Linux, so the interpreter named in the script cannot be manipulated
-     * into carrying the script's privilege. S_ISGID is only effective when the
-     * group-execute bit is also set, matching the kernel's mandatory-locking vs
-     * setgid distinction.
-     *
-     * Where this deliberately stops short of Linux: the kernel derives file
-     * creds from the file it finally executes, so a set-id *interpreter* named
-     * in a "#!" line does elevate there. exec_st is the directly-executed file
-     * and is never refreshed after the shebang loop, so it does not here.
-     * Elevating through an interpreter is unsupported, not accidentally lost.
+    /* memcpy wrote executable bytes through D-cache; invalidate I-cache before
+     * EL0 can fetch the replacement image.
      */
-    uint32_t new_euid = proc_get_euid();
-    uint32_t new_egid = proc_get_egid();
-    if (have_exec_st && !exec_is_script && S_ISREG(exec_st.st_mode)) {
-        if ((exec_st.st_mode & S_ISUID) &&
-            exec_id_may_elevate((uint32_t) exec_st.st_uid,
-                                (uint32_t) exec_st_seen.st_uid,
-                                proc_get_uid())) {
-            new_euid = (uint32_t) exec_st.st_uid;
-        }
-        if ((exec_st.st_mode & S_ISGID) && (exec_st.st_mode & S_IXGRP) &&
-            exec_id_may_elevate((uint32_t) exec_st.st_gid,
-                                (uint32_t) exec_st_seen.st_gid,
-                                proc_get_gid())) {
-            new_egid = (uint32_t) exec_st.st_gid;
+    for (int i = 0; i < elf_info->num_segments; i++) {
+        if (elf_info->segments[i].flags & PF_X) {
+            void *host_addr = (uint8_t *) g->host_base +
+                              elf_info->segments[i].gpa + elf_load_base;
+            sys_icache_invalidate(host_addr, elf_info->segments[i].memsz);
         }
     }
+    for (int i = 0; i < interp->info.num_segments; i++) {
+        if (interp->info.segments[i].flags & PF_X) {
+            void *host_addr = (uint8_t *) g->host_base +
+                              interp->info.segments[i].gpa + interp_base;
+            sys_icache_invalidate(host_addr, interp->info.segments[i].memsz);
+        }
+    }
+    sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base,
+                          image->shim_size);
+}
 
-    /* Pre-PNR validation. All checks that can fail gracefully MUST happen
-     * before guest_reset(). After guest_reset(), the old process image is gone.
-     * Failures are unrecoverable, matching the Linux kernel's behavior
-     * (SIGKILL).
+/* Build argc/argv/envp/auxv for the replacement image and publish the
+ * guest-visible process state (exe path, cmdline, environ, auxv).
+ *
+ * Returns the initial SP and stores the entry point. Past the point of no
+ * return, so a stack that cannot be built is fatal.
+ */
+static uint64_t exec_build_new_stack(hv_vcpu_t vcpu,
+                                     guest_t *g,
+                                     bool verbose,
+                                     const exec_image_t *image,
+                                     int argc,
+                                     char **argv,
+                                     char **envp,
+                                     uint64_t *entry_out)
+{
+    const elf_info_t *elf_info = image->elf_info;
+    const exec_interp_t *interp = image->interp;
+    const char **argv_const = (const char **) argv;
+    const char **envp_const = (const char **) envp;
+    const char *path = image->path;
+    linux_stack_auxv_t auxv;
+
+    /* The vDSO supplies a stable rt_sigreturn trampoline when user handlers
+     * omit sa_restorer.
      */
+    uint64_t exec_vdso = vdso_build(g);
+    exec_republish_shim_globals_or_die(vcpu, g, verbose);
 
+    /* AT_EXECFN gets the same guest-visible spelling published to
+     * /proc/self/exe below, so the two surfaces agree on what this process is.
+     * Passing path rather than argv_const[0] also matches Linux for
+     * execve(path, ["altname"], ...), where the kernel reports path.
+     */
+    uint64_t sp =
+        build_linux_stack(g, g->stack_top, argc, argv_const, envp_const,
+                          elf_info, image->elf_load_base, image->interp_base,
+                          exec_vdso, -1 /* no AT_EXECFD */, path, &auxv);
+
+    /* 0 is build_linux_stack's failure return. Past the point of no return
+     * there is no image to go back to, and programming SP_EL0 from it would
+     * ERET the guest onto a null stack. read_string_array already enforces the
+     * same argc cap upstream, so the live case here is allocation failure.
+     */
+    if (sp == 0) {
+        log_fatal("execve failed after point of no return: build_linux_stack");
+        exit(128);
+    }
+    g->start_stack = sp;
+
+    *entry_out = (image->interp_base != 0)
+                     ? (interp->info.entry + image->interp_base)
+                     : (elf_info->entry + image->elf_load_base);
+
+    /* Publish the guest-visible path so /proc/self/exe remains stable across
+     * sysroot translation and can be re-exec'd by the guest.
+     */
+    proc_set_elf_path(path);
+    proc_set_cmdline(argc, argv_const);
+    proc_set_environ(envp_const);
+    proc_set_auxv(auxv.words, auxv.nwords * sizeof(auxv.words[0]));
+    return sp;
+}
+
+/* Decide whether the parsed image can be exec'd and where it would load, before
+ * anything is torn down: Rosetta eligibility, load base, placement of the
+ * segments and of the heap and stack, and the interpreter pre-load.
+ *
+ * Returns 0 or the errno the guest should see; the caller's old image is
+ * untouched.
+ */
+static int64_t exec_validate_image(guest_t *g,
+                                   elf_info_t *elf_info,
+                                   const char *path,
+                                   exec_interp_t *interp,
+                                   bool *target_is_rosetta_out,
+                                   uint64_t *elf_load_base_out)
+{
     /* x86_64 targets dispatch through guest_bootstrap_rosetta_post_reset once
      * the point-of-no-return work below clears guest state. Reject here only
      * when Rosetta is disabled via --no-rosetta or ELFUSE_NO_ROSETTA=1;
@@ -1702,14 +1630,13 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * setup below.
      */
     bool target_is_rosetta = false;
-    if (elf_info.e_machine == EM_X86_64) {
+    if (elf_info->e_machine == EM_X86_64) {
         if (!proc_rosetta_enabled()) {
             log_error(
                 "execve: x86_64 ELF rejected by --no-rosetta "
                 "(or ELFUSE_NO_ROSETTA=1): %s",
                 path);
-            err = -LINUX_ENOEXEC;
-            goto fail;
+            return -LINUX_ENOEXEC;
         }
 
         /* rosetta_finalize pre-opens the x86_64 binary at a guest fd >= 3 past
@@ -1721,17 +1648,18 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         if (!fd_reexec_slot_available(3)) {
             log_error("execve: no free guest fd for the Rosetta binary: %s",
                       path);
-            err = -LINUX_EMFILE;
-            goto fail;
+            return -LINUX_EMFILE;
         }
         target_is_rosetta = true;
     }
+    *target_is_rosetta_out = target_is_rosetta;
 
     /* Compute load base once (used for size check and later mapping). PIE
      * (ET_DYN) binaries start near address 0 and would overlap with the shim;
      * load them at PIE_LOAD_BASE instead.
      */
-    uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
+    uint64_t elf_load_base = (elf_info->e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
+    *elf_load_base_out = elf_load_base;
 
     /* Settle where the image lands before anything is torn down. The mapper
      * takes the same per-segment decision, so passing here means the map after
@@ -1753,11 +1681,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     uint64_t pre_infra_lo, pre_infra_hi;
     guest_infra_window(g, &pre_infra_lo, &pre_infra_hi);
     if (!target_is_rosetta &&
-        !elf_check_placement(&elf_info, path, g->guest_size,
+        !elf_check_placement(elf_info, path, g->guest_size,
                              (elf_window_t) {0, elf_load_base}, pre_infra_lo,
                              g->guest_size)) {
-        err = -LINUX_ENOEXEC;
-        goto fail;
+        return -LINUX_ENOEXEC;
     }
 
     /* Segments that fit still leave the heap and stack to place, and an image
@@ -1767,43 +1694,23 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * guest gets ENOEXEC instead.
      */
     if (!target_is_rosetta &&
-        !guest_image_placement(elf_info.load_max + elf_load_base, NULL, NULL)) {
+        !guest_image_placement(elf_info->load_max + elf_load_base, NULL,
+                               NULL)) {
         log_error("execve: %s leaves no room for the guest stack", path);
-        err = -LINUX_ENOEXEC;
-        goto fail;
+        return -LINUX_ENOEXEC;
     }
 
     /* Pre-load the interpreter before the point of no return. */
-    err = exec_preload_interp(g, &elf_info, target_is_rosetta, &interp);
-    if (err < 0)
-        goto fail;
+    return exec_preload_interp(g, elf_info, *target_is_rosetta_out, interp);
+}
 
-    /* Past pre-PNR validation. Fall through to point of no return. The fail
-     * label below handles all pre-PNR error paths.
-     */
-
-    /* Linux de_thread(): the siblings die before the new image exists, and
-     * before commit_creds, so ordering it first here matches begin_new_exec and
-     * keeps the credential commit below from reaching a thread that Linux would
-     * already have destroyed. It also has to precede the CLOEXEC sweep and
-     * guest_reset: a sibling parked in read() on a fd about to close, or still
-     * executing the old image's code, winds down against the memory and fd
-     * table its guest still expects. Both callers hold mmap_lock (order 1)
-     * across the whole syscall, and the teardown must not run under it: a
-     * sibling blocked acquiring mmap_lock inside sc_brk, sc_mmap, sc_munmap,
-     * sc_mprotect, or its own deferred stack unmap is reachable by none of the
-     * teardown wakes, so it can never reach a stop check and the join below
-     * would always time out. Measured before this release: four siblings
-     * looping on mmap/munmap took the fatal path every time.
-     *
-     * Dropping it here is safe because nothing in the teardown touches guest
-     * memory or the region table, and re-acquiring cannot contend: by the time
-     * it returns 0 no other guest thread is left to hold it.
-     */
-    mmap_lock_release();
-    int survivors = thread_exec_de_thread();
-    mmap_lock_acquire();
-
+/* After de_thread, any guest thread still alive holds registers into the image
+ * guest_reset is about to zero. @survivors is what de_thread left; CLONE_VM
+ * children it does not wait for are counted here. Does not return when anything
+ * survives.
+ */
+static void exec_require_no_survivors(int survivors)
+{
     /* The refusal above is a snapshot: a sibling could have created a CLONE_VM
      * child in the window between it and here. de_thread neither reaps nor
      * waits for one (Linux leaves it on the old mm), so count it now, when
@@ -1824,28 +1731,34 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             survivors);
         exit(128);
     }
+}
 
-    /* Commit credentials right before the Point of No Return. Saved UID/GID are
-     * refreshed from the final effective IDs.
-     *
-     * The fakeroot transition lands here, past every failure path, so an exec
-     * that never happens leaves the current image unprivileged. It mirrors what
-     * --fakeroot gives a process at startup (proc_identity_init): root IDs plus
-     * the process-wide gate, and it reaches fork children through the
-     * --fakeroot argv forkipc already derives from that gate. Nothing clears
-     * the gate afterwards, so this elevates the whole process tree from here
-     * on, not just the image being loaded.
-     *
-     * The gate is published after the IDs because no permission check
-     * grants on the gate alone: proc-identity.c pairs it with "emu_euid == 0 ||
-     * fakeroot", and sys_getgroups and capget require both. Publishing it last
-     * can therefore only narrow the window, never open one.
-     *
-     * The ATTN_BIT_CRED bracket is the same protocol the setuid family uses in
-     * syscall.c: without it the shim's EL1 identity cache keeps answering
-     * sibling getuid fast paths with pre-exec IDs until
-     * exec_republish_shim_globals_or_die runs, well past guest_reset.
-     */
+/* Commit credentials right before the Point of No Return. Saved UID/GID are
+ * refreshed from the final effective IDs.
+ *
+ * The fakeroot transition lands here, past every failure path, so an exec that
+ * never happens leaves the current image unprivileged. It mirrors what
+ * --fakeroot gives a process at startup (proc_identity_init): root IDs plus the
+ * process-wide gate, and it reaches fork children through the --fakeroot argv
+ * forkipc already derives from that gate. Nothing clears the gate afterwards,
+ * so this elevates the whole process tree from here on, not just the image
+ * being loaded.
+ *
+ * The gate is published after the IDs because no permission check
+ * grants on the gate alone: proc-identity.c pairs it with "emu_euid == 0 ||
+ * fakeroot", and sys_getgroups and capget require both. Publishing it last can
+ * therefore only narrow the window, never open one.
+ *
+ * The ATTN_BIT_CRED bracket is the same protocol the setuid family uses in
+ * syscall.c: without it the shim's EL1 identity cache keeps answering sibling
+ * getuid fast paths with pre-exec IDs until exec_republish_shim_globals_or_die
+ * runs, well past guest_reset.
+ */
+static void exec_commit_credentials(guest_t *g,
+                                    bool enter_fakeroot,
+                                    uint32_t new_euid,
+                                    uint32_t new_egid)
+{
     uint32_t new_uid = proc_get_uid();
     uint32_t new_gid = proc_get_gid();
     if (enter_fakeroot) {
@@ -1859,29 +1772,17 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     shim_globals_publish_creds(g, proc_get_uid(), proc_get_euid(),
                                proc_get_gid(), proc_get_egid());
     shim_globals_attn_and(g, ~ATTN_BIT_CRED);
+}
 
-    if (0) {
-    fail:
-        if (exec_fd >= 0)
-            close(exec_fd);
-        if (interp.fd >= 0)
-            close(interp.fd);
-        free(temp_str);
-        if (interp.resolved_temp)
-            unlink(interp.resolved);
-        exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
-                            path_host_temp, interp_host_buf, interp_host_temp);
-        return err;
-    }
-
-    /* Point of no return. guest_reset() zeroes all guest memory. The old
-     * process image is gone. All validation that can fail gracefully MUST
-     * happen above this line. Failures below are unrecoverable; elfuse exits
-     * fatally, matching the Linux kernel's behavior (SIGKILL after exec PNR).
-     */
-
-    exec_close_cloexec_fds();
-
+/* Tear down the old image and reset the process for the new one: Rosetta mode,
+ * MAP_SHARED overlays, guest memory, thread-group and signal state, and the
+ * shim bytes guest_reset cleared. Runs entirely past the point of no return, so
+ * every failure is fatal.
+ *
+ * Returns the shim size the later phases need.
+ */
+static unsigned int exec_reset_for_new_image(guest_t *g, bool target_is_rosetta)
+{
     /* Past this point the old image is gone; later failures are fatal like a
      * kernel exec failure after its point of no return.
      */
@@ -1946,26 +1847,447 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     if (shim_ptr && shim_size > 0) {
         memcpy((uint8_t *) g->host_base + g->shim_base, shim_ptr, shim_size);
     }
+    return shim_size;
+}
+
+/* Map a read_string_array failure code to the errno the guest sees. */
+static int64_t read_array_errno(int rc)
+{
+    return (rc == -2) ? -LINUX_E2BIG
+                      : ((rc == -3) ? -LINUX_ENOMEM : -LINUX_EFAULT);
+}
+
+/* Translate the guest path of an exec into a host path in @host_buf, the way
+ * every other path goes through path_translate_at. A FUSE-backed file is
+ * materialized to a temp (*host_temp, which the caller unlinks); anything else
+ * records whether it is a /dev/shm leaf, which drives O_NOFOLLOW on the open.
+ * Returns 0 or a negative errno.
+ */
+static int64_t exec_resolve_host_path(const char *path,
+                                      char *host_buf,
+                                      size_t host_sz,
+                                      bool *host_temp,
+                                      bool *host_shm)
+{
+    path_translation_t tx;
+    if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &tx) < 0)
+        return linux_errno();
+    if (tx.fuse_path) {
+        int64_t err =
+            fuse_materialize_path(tx.intercept_path, host_buf, host_sz);
+        if (err < 0)
+            return err;
+        *host_temp = true;
+    } else {
+        str_copy_trunc(host_buf, tx.host_path, host_sz);
+        *host_shm = tx.is_dev_shm;
+    }
+    return 0;
+}
+
+/* Compute setuid/setgid from the directly-executed file (fs/exec.c
+ * bprm_fill_uid). A set-id bit on the shebang script itself is ignored, as on
+ * Linux, so the interpreter named in the script cannot be manipulated into
+ * carrying the script's privilege. S_ISGID is only effective when the
+ * group-execute bit is also set, matching the kernel's mandatory-locking vs
+ * setgid distinction.
+ *
+ * Where this deliberately stops short of Linux: the kernel derives file creds
+ * from the file it finally executes, so a set-id *interpreter* named in a "#!"
+ * line does elevate there. @st is the directly-executed file and is never
+ * refreshed after the shebang loop, so it does not here. Elevating through an
+ * interpreter is unsupported, not accidentally lost.
+ *
+ * @seen is the same file with the ownership the guest sees. @eligible is false
+ * when there was no stat or the file was a script; the IDs then stay as they
+ * are.
+ */
+static void exec_compute_set_ids(bool eligible,
+                                 const struct stat *st,
+                                 const struct stat *seen,
+                                 uint32_t *euid_out,
+                                 uint32_t *egid_out)
+{
+    uint32_t new_euid = proc_get_euid();
+    uint32_t new_egid = proc_get_egid();
+    if (eligible && S_ISREG(st->st_mode)) {
+        if ((st->st_mode & S_ISUID) &&
+            exec_id_may_elevate((uint32_t) st->st_uid, (uint32_t) seen->st_uid,
+                                proc_get_uid())) {
+            new_euid = (uint32_t) st->st_uid;
+        }
+        if ((st->st_mode & S_ISGID) && (st->st_mode & S_IXGRP) &&
+            exec_id_may_elevate((uint32_t) st->st_gid, (uint32_t) seen->st_gid,
+                                proc_get_gid())) {
+            new_egid = (uint32_t) st->st_gid;
+        }
+    }
+    *euid_out = new_euid;
+    *egid_out = new_egid;
+}
+
+/* Stat the directly-executed file and check that the guest may execute it. @st
+ * is the physical stat, which the set-id decision needs, taken now because
+ * shebang resolution overwrites the host path with the interpreter's. @seen is
+ * the same file with the ownership the guest sees.
+ *
+ * Returns 0 or a negative errno.
+ *
+ * Access is judged by the ownership the guest sees: fs-stat.c reports every
+ * guest stat through the virtual chown overlay, so the physical owner would
+ * refuse a file the guest's own stat says it may execute. Trusting a
+ * guest-writable overlay here -- chown_result records the intended owner on any
+ * EPERM, unchecked -- is a deliberate trade. A guest can chown a file into its
+ * own name to pass a check the physical mode refuses, and gains nothing: the
+ * host open must still succeed on the physical file.
+ *
+ * st itself stays physical, and the set-id decision takes both: it grants only
+ * where the two agree, so the overlay can withdraw an elevation but never
+ * conjure one.
+ */
+static int64_t exec_stat_image(int exec_fd, struct stat *st, struct stat *seen)
+{
+    if (fstat(exec_fd, st) < 0)
+        return linux_errno();
+    *seen = *st;
+    chown_overlay_apply(seen);
+    return exec_check_permission(seen);
+}
+
+/* Follow "#!" lines from the opened image until it is not a script, rewriting
+ * the argv and the context to name the interpreter at each hop (as Linux's
+ * binfmt_script does): rebuild argv, translate and open the interpreter, and
+ * check that the guest may execute it. Sets *is_script once any hop was taken,
+ * because a set-id bit on a script is ignored. The hop count is bounded only
+ * once a further shebang is confirmed, so a max-depth chain ending in a real
+ * ELF still loads.
+ *
+ * Returns 0, or the negative errno the exec fails with.
+ */
+static int64_t exec_follow_shebangs(exec_ctx_t *c, bool *is_script)
+{
+    int shebang_depth = 0;
+    int64_t err;
+
+    while (true) {
+        char interp_start[256];
+        char interp_arg[256];
+        int rc =
+            elf_read_shebang_fd(c->exec_fd, interp_start, sizeof(interp_start),
+                                interp_arg, sizeof(interp_arg));
+        if (rc < 0) {
+            errno = -rc;
+            err = linux_errno();
+            return err;
+        }
+        if (rc == 0)
+            return 0;
+
+        *is_script = true;
+
+        /* Bound the resolution chain only once a further shebang is confirmed,
+         * so a max-depth chain ending in a real ELF still loads (matches the
+         * prior elf_load-first loop).
+         */
+        if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
+            err = -LINUX_ELOOP;
+            return err;
+        }
+        shebang_depth++;
+
+        bool has_arg = (interp_arg[0] != '\0');
+
+        log_debug(
+            "execve: shebang interp=\"%s\" arg=\"%s\" script=\"%s\" depth=%d",
+            interp_start, has_arg ? interp_arg : "(none)", c->path,
+            shebang_depth);
+
+        err = exec_shebang_rebuild_argv(
+            interp_start, has_arg ? interp_arg : NULL, c->path, c);
+        if (err < 0)
+            return err;
+
+        /* Continue the same exec transaction using the interpreter image. */
+        str_copy_trunc(c->path, interp_start, sizeof(c->path));
+        path_translation_t interp_tx;
+        if (path_translate_at(LINUX_AT_FDCWD, c->path, PATH_TR_NONE,
+                              &interp_tx) < 0) {
+            err = linux_errno();
+            return err;
+        }
+        if (c->path_host_temp) {
+            unlink(c->path_host_buf);
+            c->path_host_temp = false;
+        }
+        if (c->interp_host_temp) {
+            unlink(c->interp_host_buf);
+            c->interp_host_temp = false;
+        }
+        if (interp_tx.fuse_path) {
+            err = fuse_materialize_path(interp_tx.intercept_path,
+                                        c->interp_host_buf,
+                                        sizeof(c->interp_host_buf));
+            if (err < 0)
+                return err;
+            c->interp_host_temp = true;
+            c->path_host = c->interp_host_buf;
+            c->path_host_shm = false;
+        } else {
+            str_copy_trunc(c->path_host_buf, interp_tx.host_path,
+                           sizeof(c->path_host_buf));
+            c->path_host = c->path_host_buf;
+            c->path_host_shm = interp_tx.is_dev_shm;
+        }
+
+        /* Close old fd and open the new interpreter */
+        close(c->exec_fd);
+        c->exec_fd = exec_open_image(c->path_host, c->path_host_shm);
+        if (c->exec_fd < 0) {
+            err = linux_errno();
+            return err;
+        }
+        struct stat interp_st;
+        if (fstat(c->exec_fd, &interp_st) < 0) {
+            err = linux_errno();
+            return err;
+        }
+        chown_overlay_apply(&interp_st);
+        err = exec_check_permission(&interp_st);
+        if (err < 0) {
+            return err;
+        }
+    }
+    return 0;
+}
+
+/* Over the function-size limit on purpose.
+ *
+ * The point of no return runs through the middle of it. Before PNR every exit
+ * restores the old image; after it there is no exit but the fatal one. A split
+ * would put that boundary at a call edge, where it is invisible.
+ */
+/* NOLINTNEXTLINE(readability-function-size) */
+int64_t sys_execve(hv_vcpu_t vcpu,
+                   guest_t *g,
+                   uint64_t path_gva,
+                   uint64_t argv_gva,
+                   uint64_t envp_gva,
+                   bool verbose,
+                   const char *host_path)
+{
+    /* Not the leader: hand the whole syscall to it. See exec_handoff_to_leader
+     * for why the leader has to be the one that survives.
+     */
+    if (!thread_current_is_leader())
+        return exec_handoff_to_leader(path_gva, argv_gva, envp_gva, host_path);
+
+    /* Linux gives the exec'ing task a new mm and leaves a CLONE_VM child on the
+     * old one. elfuse has a single guest slab, so guest_reset would zero the
+     * memory that child is executing. Refuse while one is live, for the same
+     * reason and with the same recoverable errno as above.
+     */
+    if (thread_count_active_vm_clones() > 0) {
+        log_error(
+            "execve with %d live CLONE_VM child(ren) is not supported; "
+            "they share the guest memory guest_reset would zero",
+            thread_count_active_vm_clones());
+        return -LINUX_ENOSYS;
+    }
+
+    /* Copy guest execve inputs before any state-reset point of no return. A
+     * provided host_path (from execveat resolution) is used directly for the
+     * exec open, but the guest-visible identity in path must carry the guest
+     * spelling: strip the sysroot and decode escaped components so
+     * /proc/self/exe never reports the private host namespace.
+     */
+    exec_ctx_t c = {.exec_fd = -1};
+    if (host_path) {
+        if (path_host_to_guest(host_path, c.path, sizeof(c.path)) < 0)
+            return -LINUX_ENAMETOOLONG;
+    } else if (guest_read_str(g, path_gva, c.path, sizeof(c.path)) < 0) {
+        return -LINUX_EFAULT;
+    }
+
+    log_debug("execve(\"%s\")", c.path);
+
+    c.path_host = host_path ? host_path : c.path;
+
+    int64_t err = 0;
+    exec_interp_t interp;
+    memset(&interp, 0, sizeof(interp));
+    interp.fd = -1;
+
+
+    char *temp_str = malloc(LINUX_MAX_ARG_STRLEN);
+    if (!temp_str) {
+        err = -LINUX_ENOMEM;
+        goto fail;
+    }
+
+    c.argc = read_string_array(g, argv_gva, &c.argv, &c.argv_buf,
+                               &c.argv_buf_size, temp_str, &c.running_bytes);
+    if (c.argc < 0) {
+        err = read_array_errno(c.argc);
+        goto fail;
+    }
+
+    c.envc = 0;
+    if (envp_gva != 0) {
+        c.envc =
+            read_string_array(g, envp_gva, &c.envp, &c.envp_buf,
+                              &c.envp_buf_size, temp_str, &c.running_bytes);
+        if (c.envc < 0) {
+            err = read_array_errno(c.envc);
+            goto fail;
+        }
+    }
+
+    /* Resolve /proc/self/exe to the actual binary path. Busybox sh execs
+     * applets via execve("/proc/self/exe", ["applet", ...]) and macOS has no
+     * /proc filesystem.
+     */
+    if (!strcmp(c.path, "/proc/self/exe")) {
+        /* Snapshot rather than proc_get_elf_path(): that pointer is shared
+         * mutable state, and a sibling execve republishing it would tear the
+         * string this copy -- and the fakeroot decision below -- reads.
+         */
+        if (!proc_elf_path_snapshot(c.path, sizeof(c.path))) {
+            err = -LINUX_ENOENT;
+            goto fail;
+        }
+        log_debug("execve resolved to \"%s\"", c.path);
+    }
+
+    if (!host_path) {
+        err = exec_resolve_host_path(c.path, c.path_host_buf,
+                                     sizeof(c.path_host_buf), &c.path_host_temp,
+                                     &c.path_host_shm);
+        if (err < 0)
+            goto fail;
+        c.path_host = c.path_host_buf;
+    }
+    if (!c.path_host) {
+        err = -LINUX_ENAMETOOLONG;
+        goto fail;
+    }
+
+    /* Resolve binfmt_script before probing ELF. elf_load() logs parse errors,
+     * and a script is an expected non-ELF input here.
+     */
+    elf_info_t elf_info;
+
+    /* Open the directly-executed file first and bind it to an fd to avoid
+     * TOCTOU.
+     */
+    c.exec_fd = exec_open_image(c.path_host, c.path_host_shm);
+    if (c.exec_fd < 0) {
+        err = linux_errno();
+        goto fail;
+    }
+
+    bool exec_is_script = false;
+    struct stat exec_st, exec_st_seen;
+    err = exec_stat_image(c.exec_fd, &exec_st, &exec_st_seen);
+    if (err < 0)
+        goto fail;
+
+    /* Decide the fakeroot transition from the directly-executed file, before
+     * the shebang loop repoints path_host at an interpreter: a marked wrapper
+     * script has to elevate on its own identity, not on /bin/sh's.
+     *
+     * Unlike the setuid rule below, a script is not excluded. That rule exists
+     * because any file on the system can carry a setuid bit, so the kernel
+     * cannot trust the interpreter line of one it never vetted. Here the
+     * embedder named exactly one file out of band; its shebang line is as much
+     * the embedder's choice as its ELF contents would be, and a marked dynamic
+     * binary would trust guest-reachable shared libraries just the same.
+     */
+    bool enter_fakeroot = exec_matches_fakeroot_target(&exec_st);
+
+    err = exec_follow_shebangs(&c, &exec_is_script);
+    if (err < 0)
+        goto fail;
+
+    if (elf_load_fd(c.exec_fd, c.path_host, &elf_info) < 0) {
+        err = -LINUX_ENOEXEC;
+        goto fail;
+    }
+
+    uint32_t new_euid, new_egid;
+    exec_compute_set_ids(!exec_is_script, &exec_st, &exec_st_seen, &new_euid,
+                         &new_egid);
+
+    /* Pre-PNR validation. All checks that can fail gracefully MUST happen
+     * before guest_reset(). After guest_reset(), the old process image is gone.
+     * Failures are unrecoverable, matching the Linux kernel's behavior
+     * (SIGKILL).
+     */
+
+    bool target_is_rosetta;
+    uint64_t elf_load_base;
+    err = exec_validate_image(g, &elf_info, c.path, &interp, &target_is_rosetta,
+                              &elf_load_base);
+    if (err < 0)
+        goto fail;
+
+    /* Past pre-PNR validation. Fall through to point of no return. The fail
+     * label below handles all pre-PNR error paths.
+     */
+
+    /* Linux de_thread(): the siblings die before the new image exists, and
+     * before commit_creds, so ordering it first here matches begin_new_exec and
+     * keeps the credential commit below from reaching a thread that Linux would
+     * already have destroyed. It also has to precede the CLOEXEC sweep and
+     * guest_reset: a sibling parked in read() on a fd about to close, or still
+     * executing the old image's code, winds down against the memory and fd
+     * table its guest still expects. Both callers hold mmap_lock (order 1)
+     * across the whole syscall, and the teardown must not run under it: a
+     * sibling blocked acquiring mmap_lock inside sc_brk, sc_mmap, sc_munmap,
+     * sc_mprotect, or its own deferred stack unmap is reachable by none of the
+     * teardown wakes, so it can never reach a stop check and the join below
+     * would always time out. Measured before this release: four siblings
+     * looping on mmap/munmap took the fatal path every time.
+     *
+     * Dropping it here is safe because nothing in the teardown touches guest
+     * memory or the region table, and re-acquiring cannot contend: by the time
+     * it returns 0 no other guest thread is left to hold it.
+     */
+    mmap_lock_release();
+    int survivors = thread_exec_de_thread();
+    mmap_lock_acquire();
+
+    exec_require_no_survivors(survivors);
+
+    exec_commit_credentials(g, enter_fakeroot, new_euid, new_egid);
+
+    if (0) {
+    fail:
+        if (c.exec_fd >= 0)
+            close(c.exec_fd);
+        if (interp.fd >= 0)
+            close(interp.fd);
+        free(temp_str);
+        if (interp.resolved_temp)
+            unlink(interp.resolved);
+        exec_cleanup_inputs(&c);
+        return err;
+    }
+
+    /* Point of no return. guest_reset() zeroes all guest memory. The old
+     * process image is gone. All validation that can fail gracefully MUST
+     * happen above this line. Failures below are unrecoverable; elfuse exits
+     * fatally, matching the Linux kernel's behavior (SIGKILL after exec PNR).
+     */
+
+    exec_close_cloexec_fds();
+
+    unsigned int shim_size = exec_reset_for_new_image(g, target_is_rosetta);
 
     /* x86_64 re-bootstrap branch: hand off the post-reset work to the
      * Rosetta-aware helper, then write vCPU sysregs for kernel-VA execution and
      * return without touching the aarch64-specific block below.
      */
     if (target_is_rosetta) {
-        /* Drain the previous rosettad bridge before rosetta_finalize wires a
-         * fresh one. The detached handler thread only clears its global
-         * client-fd marker on its own EOF/exit. 1 s is enough headroom for a
-         * loaded host; a hung handler past that point will lose the
-         * start_handler CAS later, and the warning here marks the cause. Soft
-         * cap; the install may still succeed on timeout if the handler's CAS
-         * races us favourably.
-         */
-        if (!rosettad_wait_for_idle(1000)) {
-            log_warn(
-                "execve: rosettad bridge did not drain within 1s; "
-                "rosetta_finalize CAS may lose the race");
-        }
-
         /* path_host may point at path_host_buf (normal path) or at
          * interp_host_buf (shebang resolution landed on a FUSE-backed x86_64
          * binary). Ownership of any materialized temp transfers to rosettad
@@ -1976,126 +2298,41 @@ int64_t sys_execve(hv_vcpu_t vcpu,
          * re-discriminating which buffer was selected.
          */
         const char *owned_rosetta_temp = NULL;
-        if (path_host == path_host_buf && path_host_temp) {
-            owned_rosetta_temp = path_host_buf;
-            path_host_temp = false;
-        } else if (path_host == interp_host_buf && interp_host_temp) {
-            owned_rosetta_temp = interp_host_buf;
-            interp_host_temp = false;
+        if (c.path_host == c.path_host_buf && c.path_host_temp) {
+            owned_rosetta_temp = c.path_host_buf;
+            c.path_host_temp = false;
+        } else if (c.path_host == c.interp_host_buf && c.interp_host_temp) {
+            owned_rosetta_temp = c.interp_host_buf;
+            c.interp_host_temp = false;
         }
 
-        uint64_t r_entry = 0, r_sp = 0, r_ttbr0 = 0;
-        if (guest_bootstrap_rosetta_post_reset(
-                g, path_host, owned_rosetta_temp != NULL, path, argc,
-                (const char **) argv, envp, shim_size, false, &r_entry, &r_sp,
-                &r_ttbr0) < 0) {
-            /* Post-PNR fatal failure. The temp flag was cleared up front so
-             * exec_cleanup_inputs would be a no-op, and rosettad never reached
-             * its ownership-commit point on this failure path. Best-effort
-             * unlink so the materialized temp does not orphan in /tmp on a path
-             * the kernel parallels with SIGKILL.
-             */
-            if (owned_rosetta_temp)
-                unlink(owned_rosetta_temp);
-            log_fatal(
-                "execve failed after point of no return: "
-                "rosetta re-bootstrap failed for %s",
-                path);
-            exit(128);
-        }
-        exec_republish_shim_globals_or_die(vcpu, g, verbose);
-
-        /* I-cache for the (possibly re-mapped) rosetta segments has already
-         * been invalidated inside rosetta_prepare; only the shim needs an
-         * I-cache flush from here.
-         */
-        sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base,
-                              shim_size);
-
-        /* The kbuf alias lives under TTBR1, so the translator enters on a
-         * different regime than a native image does. Everything else about
-         * entering an image is the same, hence the shared helper.
-         */
-        const exec_addr_space_t as = {r_ttbr0, g->ttbr1, TCR_EL1_VALUE_KBUF};
-        exec_enter_new_image(vcpu, g, r_entry, r_sp, &as);
-
-        log_debug("execve: rosetta target %s, entry=0x%llx sp=0x%llx", path,
-                  (unsigned long long) guest_ipa(g, r_entry),
-                  (unsigned long long) guest_ipa(g, r_sp));
+        exec_enter_rosetta_image(vcpu, g, verbose, c.path_host,
+                                 owned_rosetta_temp, c.path, c.argc, c.argv,
+                                 c.envp, shim_size);
         free(temp_str);
-        if (exec_fd >= 0) {
-            close(exec_fd);
+        if (c.exec_fd >= 0) {
+            close(c.exec_fd);
         }
         if (interp.fd >= 0) {
             close(interp.fd);
         }
         if (interp.resolved_temp)
             unlink(interp.resolved);
-        exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
-                            path_host_temp, interp_host_buf, interp_host_temp);
+        exec_cleanup_inputs(&c);
         return SYSCALL_EXEC_HAPPENED;
     }
 
-    /* Load the executable image that was validated before guest_reset(). */
-    uint64_t infra_lo, infra_hi;
-    guest_infra_window(g, &infra_lo, &infra_hi);
-    if (elf_map_segments_fd(&elf_info, exec_fd, path_host, g->host_base,
-                            g->guest_size, (elf_window_t) {0, elf_load_base},
-                            infra_lo, g->guest_size) < 0) {
-        log_fatal(
-            "execve failed after point of no return: "
-            "failed to map ELF segments for %s",
-            path_host);
-        exit(128);
-    }
-
-    /* Track lowest loaded ELF address for the legacy fork IPC path after exec
-     * replaces the previous image (see guest_get_used_regions).
+    /* The interpreter base is decided by the ELF alone, so the image is fully
+     * settled before anything is mapped.
      */
-    g->elf_load_min = elf_info.load_min + elf_load_base;
-
-    /* If PT_INTERP was present, map the already-validated interpreter at the
-     * exec-time interp_base.
-     */
-    uint64_t interp_base = 0;
-
-    if (elf_info.interp_path[0] != '\0') {
-        interp_base = g->interp_base;
-        if (elf_map_segments_fd(&interp.info, interp.fd, interp.resolved,
-                                g->host_base, g->guest_size,
-                                (elf_window_t) {0, interp_base}, infra_lo,
-                                infra_hi) < 0) {
-            log_fatal(
-                "execve failed after point of no return: "
-                "failed to map interpreter segments");
-            exit(128);
-        }
-
-        log_debug(
-            "execve: interpreter at base=0x%llx, entry=0x%llx, %d segments",
-            (unsigned long long) interp_base,
-            (unsigned long long) (interp.info.entry + interp_base),
-            interp.info.num_segments);
-    }
-
-    /* memcpy wrote executable bytes through D-cache; invalidate I-cache before
-     * EL0 can fetch the replacement image.
-     */
-    for (int i = 0; i < elf_info.num_segments; i++) {
-        if (elf_info.segments[i].flags & PF_X) {
-            void *host_addr = (uint8_t *) g->host_base +
-                              elf_info.segments[i].gpa + elf_load_base;
-            sys_icache_invalidate(host_addr, elf_info.segments[i].memsz);
-        }
-    }
-    for (int i = 0; i < interp.info.num_segments; i++) {
-        if (interp.info.segments[i].flags & PF_X) {
-            void *host_addr = (uint8_t *) g->host_base +
-                              interp.info.segments[i].gpa + interp_base;
-            sys_icache_invalidate(host_addr, interp.info.segments[i].memsz);
-        }
-    }
-    sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base, shim_size);
+    const exec_image_t image = {
+        .shim_size = shim_size,
+        .elf_info = &elf_info,
+        .elf_load_base = elf_load_base,
+        .interp = &interp,
+        .interp_base = (elf_info.interp_path[0] != '\0') ? g->interp_base : 0,
+        .path = c.path};
+    exec_map_new_image(g, &image, c.exec_fd, c.path_host);
 
     /* Heap and stack, placed the same way the initial load places them. */
     if (!guest_place_image(g, elf_info.load_max + elf_load_base)) {
@@ -2103,78 +2340,28 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         exit(128);
     }
 
-    const exec_image_t image = {.shim_size = shim_size,
-                                .elf_info = &elf_info,
-                                .elf_load_base = elf_load_base,
-                                .interp = &interp,
-                                .interp_base = interp_base,
-                                .path = path};
     uint64_t ttbr0 = exec_install_address_space(g, &image);
 
     exec_publish_maps(g, &image);
 
-    /* Build argc/argv/envp/auxv for the replacement image. */
-    const char **argv_const = (const char **) argv;
-    const char **envp_const = (const char **) envp;
-    uint64_t sp, entry_point;
-    linux_stack_auxv_t auxv;
-
-    {
-        /* The vDSO supplies a stable rt_sigreturn trampoline when user handlers
-         * omit sa_restorer.
-         */
-        uint64_t exec_vdso = vdso_build(g);
-        exec_republish_shim_globals_or_die(vcpu, g, verbose);
-
-        /* AT_EXECFN gets the same guest-visible spelling published to
-         * /proc/self/exe below, so the two surfaces agree on what this process
-         * is. Passing path rather than argv_const[0] also matches Linux for
-         * execve(path, ["altname"], ...), where the kernel reports path.
-         */
-        sp = build_linux_stack(g, g->stack_top, argc, argv_const, envp_const,
-                               &elf_info, elf_load_base, interp_base, exec_vdso,
-                               -1 /* no AT_EXECFD */, path, &auxv);
-
-        /* 0 is build_linux_stack's failure return. Past the point of no return
-         * there is no image to go back to, and programming SP_EL0 from it would
-         * ERET the guest onto a null stack. read_string_array already enforces
-         * the same argc cap upstream, so the live case here is allocation
-         * failure.
-         */
-        if (sp == 0) {
-            log_fatal(
-                "execve failed after point of no return: build_linux_stack");
-            exit(128);
-        }
-        g->start_stack = sp;
-
-        entry_point = (interp_base != 0) ? (interp.info.entry + interp_base)
-                                         : (elf_info.entry + elf_load_base);
-
-        /* Publish the guest-visible path so /proc/self/exe remains stable
-         * across sysroot translation and can be re-exec'd by the guest.
-         */
-        proc_set_elf_path(path);
-        proc_set_cmdline(argc, argv_const);
-        proc_set_environ(envp_const);
-        proc_set_auxv(auxv.words, auxv.nwords * sizeof(auxv.words[0]));
-    }
+    uint64_t entry_point;
+    uint64_t sp = exec_build_new_stack(vcpu, g, verbose, &image, c.argc, c.argv,
+                                       c.envp, &entry_point);
 
     const exec_addr_space_t as = {ttbr0, 0, TCR_EL1_VALUE};
     exec_enter_new_image(vcpu, g, entry_point, sp, &as);
-    log_debug("execve: loaded %s, entry=0x%llx sp=0x%llx", path_host,
+    log_debug("execve: loaded %s, entry=0x%llx sp=0x%llx", c.path_host,
               (unsigned long long) guest_ipa(g, entry_point),
               (unsigned long long) guest_ipa(g, sp));
 
     free(temp_str);
-    if (exec_fd >= 0)
-        close(exec_fd);
+    if (c.exec_fd >= 0)
+        close(c.exec_fd);
     if (interp.fd >= 0)
         close(interp.fd);
     if (interp.resolved_temp)
         unlink(interp.resolved);
-    exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
-                        path_host_temp, interp_host_buf, interp_host_temp);
+    exec_cleanup_inputs(&c);
 
     return SYSCALL_EXEC_HAPPENED;
 }

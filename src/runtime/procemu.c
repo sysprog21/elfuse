@@ -2141,35 +2141,544 @@ static int proc_open_mounts_node(const char *path)
     return PROC_NOT_INTERCEPTED;
 }
 
-/* Over the function-size limit on purpose.
- *
- * One arm per intercepted /proc, /sys and /dev path. The arms share only the
- * guest and the buffer, so a split would be a jump table by another name.
+/* Type-specific fdinfo lines for the fds where Linux exposes more than
+ * pos/flags/mnt_id (eventfd counter, signalfd mask, timerfd settings). Leaves
+ * extra empty for every other type, and when the snapshot is gone.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
-static int intercept_open_dispatch(const guest_t *g,
-                                   const char *path,
-                                   int linux_flags,
-                                   int mode)
+static void fdinfo_format_extra(int n, int type, char *extra, size_t extra_sz)
 {
-    /* /dev/ptmx -> host /dev/ptmx + keepalive slave (see pty_open_master).
-     * O_PATH is path-only on Linux: it must not run the device open hook or
-     * allocate a pty pair. Use a harmless backing fd; FD_PATH gates I/O and
-     * ioctl, while proc_intercept_stat supplies the visible device metadata.
-     */
-    if (!strcmp(path, "/dev/ptmx")) {
-        if (linux_flags & LINUX_O_PATH) {
-            if (linux_flags & LINUX_O_DIRECTORY) {
-                errno = ENOTDIR;
-                return -1;
-            }
-            int oflags = O_RDONLY;
-            if (linux_flags & LINUX_O_CLOEXEC)
-                oflags |= O_CLOEXEC;
-            return open("/dev/null", oflags);
+    extra[0] = '\0';
+    if (type == FD_EVENTFD) {
+        uint64_t count;
+
+        /* fs/eventfd.c uses a single space after the colon, matching the
+         * timerfd convention (and unlike pos:/flags:/mnt_id: in fs/proc/fd.c
+         * which use tabs).
+         */
+        if (eventfd_fdinfo_snapshot(n, &count))
+            snprintf(extra, extra_sz, "eventfd-count: %16llx\n",
+                     (unsigned long long) count);
+    } else if (type == FD_SIGNALFD) {
+        uint64_t mask;
+
+        /* fs/signalfd.c uses a tab after the colon (matching the
+         * pos:/flags:/mnt_id: convention in fs/proc/fd.c, not the single-space
+         * style of eventfd/timerfd). Verified against a real Linux 6.x
+         * /proc/self/fdinfo dump.
+         */
+        if (signalfd_fdinfo_snapshot(n, &mask))
+            snprintf(extra, extra_sz, "sigmask:\t%016llx\n",
+                     (unsigned long long) mask);
+    } else if (type == FD_TIMERFD) {
+        int clockid;
+        uint64_t ticks;
+        int64_t value_ns, interval_ns;
+        if (timerfd_fdinfo_snapshot(n, &clockid, &ticks, &value_ns,
+                                    &interval_ns)) {
+            /* Linux fs/timerfd.c emits these fields with single spaces after
+             * the colon, not tabs (unlike pos:/flags:/mnt_id: in fs/proc/fd.c,
+             * which do use tabs). Match the upstream format so guest readers
+             * parsing fdinfo via a "it_value: (" prefix find the field.
+             */
+            snprintf(extra, extra_sz,
+                     "clockid: %d\n"
+                     "ticks: %llu\n"
+                     "settime flags: 0\n"
+                     "it_value: (%lld, %lld)\n"
+                     "it_interval: (%lld, %lld)\n",
+                     clockid, (unsigned long long) ticks,
+                     (long long) (value_ns / 1000000000LL),
+                     (long long) (value_ns % 1000000000LL),
+                     (long long) (interval_ns / 1000000000LL),
+                     (long long) (interval_ns % 1000000000LL));
         }
-        return pty_open_master(linux_flags);
     }
+}
+
+/* /proc/self/fdinfo/<N>: per-fd flags/pos/mnt_id plus the type-specific lines.
+ *
+ * Returns a synthetic fd, or -1 with errno set.
+ */
+static int proc_open_fdinfo(const char *path)
+{
+    int n = proc_parse_fd_index(path, 18, ENOENT);
+    if (n < 0)
+        return -1;
+    fd_entry_t snap;
+    if (!fd_snapshot(n, &snap)) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    /* Pin under fd_lock so a concurrent close+reopen on another vCPU cannot
+     * redirect the lseek to an unrelated host fd that took the freed slot. A
+     * dup would answer that too, but retiring it would drop the guest's record
+     * locks on the file (fcntl(2)), and reading /proc/self/fdinfo must not
+     * unlock anything. The probe pollutes errno with ESPIPE on non-seekable fds
+     * (sockets, pipes), so save and restore around the call to keep the
+     * caller's view clean.
+     */
+    off_t pos = 0;
+    host_fd_ref_t probe_ref;
+    if (host_fd_ref_open(n, &probe_ref) == 0) {
+        int saved_errno = errno;
+        off_t probe = lseek(probe_ref.fd, 0, SEEK_CUR);
+        if (probe >= 0)
+            pos = probe;
+        errno = saved_errno;
+        host_fd_ref_close(&probe_ref);
+    }
+
+    char extra[160];
+    fdinfo_format_extra(n, snap.type, extra, sizeof(extra));
+
+    int mnt_id = 0;
+    if (fuse_fd_mnt_id(n, &mnt_id) < 0)
+        mnt_id = 0;
+    return proc_emit_fmt(
+        "pos:\t%lld\n"
+        "flags:\t0%o\n"
+        "mnt_id:\t%d\n"
+        "%s",
+        (long long) pos, snap.linux_flags, mnt_id, extra);
+}
+
+/* /proc/stat: synthetic CPU statistics. The counters are fixed placeholders;
+ * only the CPU count and boot time come from the host.
+ */
+static int proc_open_stat(void)
+{
+    struct timeval boottime;
+    size_t bt_len = sizeof(boottime);
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    sysctl(mib, 2, &boottime, &bt_len, NULL, 0);
+    int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1)
+        ncpu = 1;
+    char buf[4096];
+    int off = 0;
+
+    /* Aggregate CPU line (user, nice, system, idle, iowait, irq, softirq) */
+    off += snprintf(buf + off, sizeof(buf) - off,
+                    "cpu  1000 0 500 50000 0 0 0 0 0 0\n");
+    /* Per-CPU lines */
+    for (int i = 0; i < ncpu && off < (int) sizeof(buf) - 128; i++) {
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "cpu%d 100 0 50 5000 0 0 0 0 0 0\n", i);
+    }
+    off += snprintf(buf + off, sizeof(buf) - (size_t) off,
+                    "intr 0\n"
+                    "ctxt 0\n"
+                    "btime %lld\n"
+                    "processes 1\n"
+                    "procs_running 1\n"
+                    "procs_blocked 0\n",
+                    (long long) boottime.tv_sec);
+    if (off > (int) sizeof(buf))
+        off = (int) sizeof(buf);
+    return proc_synthetic_fd(buf, off);
+}
+
+/* VM totals over the regions that count toward the process (VmSize and VmRSS in
+ * /proc/self/status, vsize and rss in /proc/self/stat). HVF cannot report which
+ * pages are resident, so a region is resident when it is not PROT_NONE.
+ * rss_pages floors each region on its own, which /proc/self/stat reports; the
+ * byte totals are plain sums, which /proc/self/status reports. A region that
+ * ends mid-page makes the two differ, so neither is derived from the other.
+ */
+typedef struct {
+    uint64_t size;
+    uint64_t rss;
+    uint64_t rss_pages;
+} proc_vm_totals_t;
+
+static proc_vm_totals_t proc_vm_totals(const guest_t *g)
+{
+    proc_vm_totals_t t = {0, 0, 0};
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (!guest_region_in_process_vm(g, r))
+            continue;
+        uint64_t sz = r->end - r->start;
+        t.size += sz;
+        if (r->prot != LINUX_PROT_NONE) {
+            t.rss += sz;
+            t.rss_pages += sz / GUEST_PAGE_SIZE;
+        }
+    }
+    return t;
+}
+
+/* /proc/self/stat -> single-line process stat (man 5 proc). Managed runtimes
+ * read this for resource monitoring (utime, stime, rss, vsize). Format: pid
+ * (comm) state ppid pgrp session tty_nr tpgid flags ... Fields populated with
+ * meaningful values: pid, comm, state, ppid, utime(14), stime(15), vsize(23),
+ * rss(24). Rest are zero/defaults.
+ */
+static int proc_open_self_stat(const guest_t *g)
+{
+    /* Get process CPU times for utime/stime fields */
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    /* Convert to clock ticks (Linux USER_HZ = 100) */
+    long utime_ticks = ru.ru_utime.tv_sec * 100 + ru.ru_utime.tv_usec / 10000;
+    long stime_ticks = ru.ru_stime.tv_sec * 100 + ru.ru_stime.tv_usec / 10000;
+
+    /* vsize and rss cover the regions VmSize and VmRSS count. */
+    proc_vm_totals_t vm = proc_vm_totals(g);
+    uint64_t vsize = vm.size, rss_pages = vm.rss_pages;
+
+    uint64_t start_stack = proc_start_stack(g);
+
+    /* Fields: pid(1) (comm)(2) state(3) ppid(4) pgrp(5) session(6)
+     *   tty_nr(7) tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12)
+     *   cmajflt(13) utime(14) stime(15) cutime(16) cstime(17)
+     *   priority(18) nice(19) num_threads(20) itrealvalue(21)
+     *   starttime(22) vsize(23) rss(24) rsslim(25) ... (52 fields total)
+     */
+    /* tty_nr(7) and tpgid(8) follow the controlling-terminal state rather than
+     * the constants that stood here. elfuse models no specific tty device, so
+     * tty_nr reports the UNIX98 pts major with minor 0 when a terminal is held:
+     * readers such as ps only test it against zero to decide whether to print a
+     * tty at all. tpgid is the foreground process group, or -1 with no
+     * terminal, which is what Linux emits.
+     */
+    int has_ctty = proc_get_ctty();
+    int tty_nr = has_ctty ? (136 << 8) : 0;
+    long long tpgid = has_ctty ? (long long) proc_get_fg_pgrp() : -1;
+
+    return proc_emit_fmt(
+        "%lld (%.15s) R %lld %lld %lld %d %lld 0 "     /* 1-9 */
+        "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
+        "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
+        "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
+        "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
+        (long long) proc_get_pid(), proc_comm_name(),
+        (long long) proc_get_ppid(),
+        (long long) proc_get_pid(), /* pgrp = pid */
+        (long long) proc_get_pid(), /* session = pid */
+        tty_nr, tpgid, utime_ticks, stime_ticks, thread_active_count(),
+        (unsigned long long) vsize, (unsigned long long) rss_pages,
+        (unsigned long long) start_stack);
+}
+
+/* /proc/cpuinfo -> synthetic file with CPU count. Buffer sized dynamically from
+ * ncpu (~200 bytes/entry) to avoid silent truncation on hosts with >16 CPUs.
+ */
+static int proc_open_cpuinfo(void)
+{
+    int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1)
+        ncpu = 1;
+    size_t bufsz = (size_t) ncpu * 256 + 64;
+    char stackbuf[4096];
+    char *buf = (bufsz <= sizeof(stackbuf)) ? stackbuf : malloc(bufsz);
+    if (!buf)
+        return -1;
+    int off = 0;
+    for (int i = 0; i < ncpu && off < (int) bufsz - 256; i++) {
+        off +=
+            snprintf(buf + off, bufsz - off,
+                     "processor\t: %d\n"
+                     "BogoMIPS\t: 48.00\n"
+                     "Features\t: fp asimd aes pmull sha1 sha2 crc32 atomics\n"
+                     "CPU implementer\t: 0x61\n"
+                     "CPU architecture: 8\n"
+                     "CPU variant\t: 0x1\n"
+                     "CPU part\t: 0x022\n"
+                     "CPU revision\t: 1\n\n",
+                     i);
+    }
+    int fd = proc_synthetic_fd(buf, off);
+    if (buf != stackbuf)
+        free(buf);
+    return fd;
+}
+
+/* /proc/self/status: synthetic process status. */
+static int proc_open_self_status(const guest_t *g)
+{
+    /* VmSize is total_vm, which leaves out [shim] and [shim-data]. VmRSS
+     * approximates residency as the non-PROT_NONE part of it, since HVF cannot
+     * report which pages are resident.
+     */
+    proc_vm_totals_t vm = proc_vm_totals(g);
+    uint64_t vm_size_kb = vm.size / 1024;
+    uint64_t vm_rss_kb = vm.rss / 1024;
+
+    /* Linux uses the comm name (basename truncated to 15 chars). */
+    const char *name = proc_comm_name();
+    int threads = thread_active_count();
+    return proc_emit_fmt(
+        "Name:\t%.15s\n"
+        "State:\tR (running)\n"
+        "Tgid:\t%lld\n"
+        "Pid:\t%lld\n"
+        "PPid:\t%lld\n"
+        "Uid:\t%u\t%u\t%u\t%u\n"
+        "Gid:\t%u\t%u\t%u\t%u\n"
+        "VmPeak:\t%llu kB\n"
+        "VmSize:\t%llu kB\n"
+        "VmRSS:\t%llu kB\n"
+        "Threads:\t%d\n",
+        name, (long long) proc_get_pid(), (long long) proc_get_pid(),
+        (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
+        proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
+        proc_get_sgid(), proc_get_egid(), (unsigned long long) vm_size_kb,
+        (unsigned long long) vm_size_kb, (unsigned long long) vm_rss_kb,
+        threads);
+}
+
+/* /proc/uptime -> synthetic uptime in seconds. Uses sysctl(KERN_BOOTTIME), same
+ * as sys_sysinfo() in syscall/sys.c. Idle time is 0 (no meaningful macOS
+ * equivalent).
+ */
+static int proc_open_uptime(void)
+{
+    struct timeval boottime;
+    size_t bt_len = sizeof(boottime);
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(mib, 2, &boottime, &bt_len, NULL, 0) < 0)
+        return -1;
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    double uptime = (double) (now.tv_sec - boottime.tv_sec) +
+                    (double) (now.tv_usec - boottime.tv_usec) / 1e6;
+    return proc_emit_fmt("%.2f 0.00\n", uptime);
+}
+
+/* /var/run/utmp, /run/utmp -> synthetic utmp with current user. Creates one
+ * USER_PROCESS record for who, users, pinky.
+ */
+static int proc_open_utmp(void)
+{
+    _Static_assert(sizeof(linux_utmpx_t) == 400, "linux_utmpx_t size mismatch");
+    linux_utmpx_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.ut_type = LINUX_USER_PROCESS;
+    entry.ut_pid = (int32_t) proc_get_pid();
+    str_copy_trunc(entry.ut_line, "pts/0", sizeof(entry.ut_line));
+    str_copy_trunc(entry.ut_id, "0", sizeof(entry.ut_id));
+    const char *user = getenv("USER");
+    if (!user)
+        user = "user";
+    str_copy_trunc(entry.ut_user, user, sizeof(entry.ut_user));
+    str_copy_trunc(entry.ut_host, "localhost", sizeof(entry.ut_host));
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    entry.ut_tv_sec = now.tv_sec;
+    entry.ut_tv_usec = now.tv_usec;
+    return proc_synthetic_fd(&entry, sizeof(entry));
+}
+
+/* /proc/net: live socket tables. Enumerates sockets from the local FD table AND
+ * from all active fork-child processes via macOS proc_pidfdinfo(). This gives
+ * system-wide visibility matching real Linux /proc/net semantics.
+ */
+static int proc_open_net_inet(const char *path)
+{
+    bool want_tcp = !!strstr(path, "tcp"), want_udp = !!strstr(path, "udp");
+    bool want_v6 = (path[strlen(path) - 1] == '6');
+    struct proc_net_inet_ctx ctx = {
+        .buf = NULL, /* set below */
+        .bufsz = 16384,
+        .off = 0,
+        .sl = 0,
+        .want_af = want_v6 ? AF_INET6 : AF_INET,
+        .want_stype = want_tcp   ? SOCK_STREAM
+                      : want_udp ? SOCK_DGRAM
+                                 : SOCK_RAW,
+        .want_tcp = want_tcp,
+        .want_v6 = want_v6,
+    };
+    char *buf = malloc(ctx.bufsz);
+    if (!buf)
+        return -1;
+    ctx.buf = buf;
+    ctx.off = snprintf(
+        buf, ctx.bufsz, "%s",
+        want_tcp ? "  sl  local_address rem_address   st tx_queue "
+                   "rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+                 : "  sl  local_address rem_address   st tx_queue "
+                   "rx_queue tr tm->when retrnsmt   uid  timeout inode"
+                   " ref pointer drops\n");
+    proc_net_for_each_socket(proc_net_inet_visit, &ctx);
+    int fd = proc_synthetic_fd_str(buf, ctx.off, ctx.bufsz);
+    free(buf);
+    return fd;
+}
+
+/* /proc/net/unix: live AF_UNIX sockets, from the same walk as the inet tables
+ * above.
+ */
+static int proc_open_net_unix(void)
+{
+    const size_t bufsz = 8192;
+    char *buf = malloc(bufsz);
+    if (!buf)
+        return -1;
+    struct proc_net_unix_ctx ctx = {
+        .buf = buf,
+        .bufsz = bufsz,
+        .off = snprintf(buf, bufsz,
+                        "Num       RefCount Protocol Flags    Type St "
+                        "Inode Path\n"),
+    };
+    proc_net_for_each_socket(proc_net_unix_visit, &ctx);
+    int fd = proc_synthetic_fd_str(buf, ctx.off, bufsz);
+    free(buf);
+    return fd;
+}
+
+/* /proc/self/task -> directory with per-thread TID entries. Debuggers and
+ * runtimes (GDB, LLDB, JVM, Go runtime) probe this at startup to discover
+ * thread count and per-thread state.
+ *
+ * Rebuilds a temp directory on each open (thread set is dynamic). Cannot rmdir
+ * before returning the fd because macOS getdents on unlinked dirs returns
+ * empty. Uses a static path cleaned up at exit.
+ */
+static int proc_open_self_task_dir(int linux_flags)
+{
+    static proc_persistent_dir_t taskdir =
+        PROC_PERSISTENT_DIR("/tmp/elfuse-task-XXXXXX");
+    const char *dir = proc_persistent_dir_acquire(&taskdir);
+    if (!dir)
+        return -1;
+
+    int64_t tids[MAX_THREADS];
+    proc_task_collect_ctx_t ctx = {tids, 0};
+    thread_for_each(proc_task_collect_cb, &ctx);
+    for (int i = 0; i < ctx.ntids; i++) {
+        char tidpath[128];
+        snprintf(tidpath, sizeof(tidpath), "%s/%lld", dir, (long long) tids[i]);
+        mkdir(tidpath, 0755);
+    }
+
+    int fd = proc_open_dir_fd(dir, linux_flags);
+    proc_persistent_dir_release(&taskdir);
+    return fd;
+}
+
+/* /dev/pts/N -> the macOS slave path captured at /dev/ptmx open time. Looking
+ * up the exact ptsname(3) string (rather than reformatting /dev/ttys%03lu)
+ * keeps the guest correct against any future macOS format change and against
+ * tty minor encodings that do not round-trip through plain zero-padding. ENOENT
+ * until the owning master is opened matches Linux devpts behavior for an
+ * unallocated slave number.
+ */
+static int proc_open_pts_slave(int linux_flags, const char *path)
+{
+    uint32_t n;
+    if (!pty_slave_num_from_path(path, &n)) {
+        errno = ENOENT;
+        return -1;
+    }
+    int slave_fd = pty_open_slave(n, linux_flags);
+    proc_pty_note_guest_slave(slave_fd, n);
+    return slave_fd;
+}
+
+/* /dev/ptmx -> host /dev/ptmx + keepalive slave (see pty_open_master). O_PATH
+ * is path-only on Linux: it must not run the device open hook or allocate a pty
+ * pair. Use a harmless backing fd; FD_PATH gates I/O and ioctl, while
+ * proc_intercept_stat supplies the visible device metadata.
+ */
+static int proc_open_ptmx(int linux_flags)
+{
+    if (linux_flags & LINUX_O_PATH) {
+        if (linux_flags & LINUX_O_DIRECTORY) {
+            errno = ENOTDIR;
+            return -1;
+        }
+        int oflags = O_RDONLY;
+        if (linux_flags & LINUX_O_CLOEXEC)
+            oflags |= O_CLOEXEC;
+        return open("/dev/null", oflags);
+    }
+    return pty_open_master(linux_flags);
+}
+
+/* /proc/net: the synthetic directory under the per-process proc scratch dir. */
+static int proc_open_net_dir(const guest_t *g, int linux_flags)
+{
+    const char *dir = ensure_proc_tmpdir(g);
+    if (!dir)
+        return -1;
+    char netdir[LINUX_PATH_MAX];
+    if (snprintf(netdir, sizeof(netdir), "%s/net", dir) >=
+        (int) sizeof(netdir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return proc_open_dir_fd(netdir, linux_flags);
+}
+
+/* /dev/shm/<name>: open the file in the tmpfs-backed host directory without
+ * following symlinks the guest created inside it.
+ */
+static int proc_open_dev_shm_file(int linux_flags, const char *path, int mode)
+{
+    char host_path[512];
+    if (dev_shm_resolve_path(path + 9, host_path, sizeof(host_path)) < 0)
+        return -1;
+    int oflags = translate_open_flags(linux_flags);
+
+    /* O_NOFOLLOW: do not follow symlinks created by the guest inside the shm
+     * directory (prevents symlink-based escape).
+     */
+    return open(host_path, oflags | O_NOFOLLOW, mode);
+}
+
+/* /proc/self/io -> synthetic I/O counters. Some node-style observability
+ * runtimes read this for resource monitoring metrics. procfs emulation returns
+ * zeroed counters because it does not track per-guest I/O.
+ */
+static int proc_open_self_io(void)
+{
+    return proc_emit_literal(
+        "rchar: 0\n"
+        "wchar: 0\n"
+        "syscr: 0\n"
+        "syscw: 0\n"
+        "read_bytes: 0\n"
+        "write_bytes: 0\n"
+        "cancelled_write_bytes: 0\n");
+}
+
+/* /proc/self/exe -> open the actual ELF binary. Unlike readlinkat (which
+ * returns the path string), openat needs to return an actual file descriptor to
+ * the binary. Under rosetta, the binfmt_misc convention treats rosetta as the
+ * interpreter visible to the guest: rosetta opens /proc/self/fd/X via
+ * /proc/self/exe to identify itself and then issues the VZ ioctls on that
+ * descriptor.
+ *
+ * Return ROSETTA_PATH so the VZ ioctl gate (rosetta_ioctl_target_fd) recognises
+ * the fd.
+ */
+static int proc_open_self_exe(const guest_t *g)
+{
+    if (g && g->is_rosetta)
+        return open(ROSETTA_PATH, O_RDONLY);
+    char exe[LINUX_PATH_MAX];
+    if (!proc_elf_path_snapshot(exe, sizeof(exe))) {
+        errno = ENOENT;
+        return -1;
+    }
+    return open(exe, O_RDONLY);
+}
+
+/* The /dev nodes elfuse answers itself: ptmx and the pts tree, the character
+ * devices it opens on the host with the flags that make sense for them, the
+ * shared /dev/shm namespace, and the stdio and fd aliases.
+ *
+ * Returns the fd, -1 with errno set, or PROC_NOT_INTERCEPTED when @path is not
+ * one of them.
+ */
+static int intercept_open_dev(const char *path, int linux_flags, int mode)
+{
+    if (!strcmp(path, "/dev/ptmx"))
+        return proc_open_ptmx(linux_flags);
 
     /* /dev/null, /dev/zero, /dev/(u)random, /dev/tty */
     const char *host_dev = NULL;
@@ -2213,17 +2722,8 @@ static int intercept_open_dispatch(const guest_t *g,
         return shm ? proc_open_dir_fd(shm, linux_flags) : -1;
     }
 
-    if (!strncmp(path, "/dev/shm/", 9)) {
-        char host_path[512];
-        if (dev_shm_resolve_path(path + 9, host_path, sizeof(host_path)) < 0)
-            return -1;
-        int oflags = translate_open_flags(linux_flags);
-
-        /* O_NOFOLLOW: do not follow symlinks created by the guest inside the
-         * shm directory (prevents symlink-based escape).
-         */
-        return open(host_path, oflags | O_NOFOLLOW, mode);
-    }
+    if (!strncmp(path, "/dev/shm/", 9))
+        return proc_open_dev_shm_file(linux_flags, path, mode);
 
     /* /dev/stdin -> dup(0), /dev/stdout -> dup(1), /dev/stderr -> dup(2) */
     if (!strcmp(path, "/dev/stdin"))
@@ -2245,29 +2745,25 @@ static int intercept_open_dispatch(const guest_t *g,
     if (!strcmp(path, "/dev/pts"))
         return pty_open_pts_dir(linux_flags);
 
-    /* /dev/pts/N -> the macOS slave path captured at /dev/ptmx open time.
-     * Looking up the exact ptsname(3) string (rather than reformatting
-     * /dev/ttys%03lu) keeps the guest correct against any future macOS format
-     * change and against tty minor encodings that do not round-trip through
-     * plain zero-padding. ENOENT until the owning master is opened matches
-     * Linux devpts behavior for an unallocated slave number.
-     */
-    if (!strncmp(path, "/dev/pts/", 9)) {
-        uint32_t n;
-        if (!pty_slave_num_from_path(path, &n)) {
-            errno = ENOENT;
-            return -1;
-        }
-        /* /dev/pts/N is a character device; strip O_CREAT and friends so the
-         * two-argument open(2) never sees a creation-mode-required combination
-         * without a mode arg.
-         */
-        {
-            int slave_fd = pty_open_slave((uint32_t) n, linux_flags);
-            proc_pty_note_guest_slave(slave_fd, (uint32_t) n);
-            return slave_fd;
-        }
-    }
+    if (!strncmp(path, "/dev/pts/", 9))
+        return proc_open_pts_slave(linux_flags, path);
+
+    return PROC_NOT_INTERCEPTED;
+}
+
+/* Open dispatch for the synthetic nodes: the /dev group first, through
+ * intercept_open_dev, then one arm per intercepted /proc, /sys and /etc path.
+ * The /proc and /sys arms share only the guest and the buffer, so splitting
+ * them further would be a jump table by another name.
+ */
+static int intercept_open_dispatch(const guest_t *g,
+                                   const char *path,
+                                   int linux_flags,
+                                   int mode)
+{
+    int dev_rc = intercept_open_dev(path, linux_flags, mode);
+    if (dev_rc != PROC_NOT_INTERCEPTED)
+        return dev_rc;
 
     /* /proc -> synthetic directory with PID entries for busybox ps, top, etc.
      * Creates a temp dir once (cached for the process lifetime) with entries
@@ -2297,18 +2793,8 @@ static int intercept_open_dispatch(const guest_t *g,
     if (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/"))
         return proc_open_fd_scratch("elfuse-fd", linux_flags);
 
-    if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
-        const char *dir = ensure_proc_tmpdir(g);
-        if (!dir)
-            return -1;
-        char netdir[LINUX_PATH_MAX];
-        if (snprintf(netdir, sizeof(netdir), "%s/net", dir) >=
-            (int) sizeof(netdir)) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
-        return proc_open_dir_fd(netdir, linux_flags);
-    }
+    if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/"))
+        return proc_open_net_dir(g, linux_flags);
 
     /* /proc/<our_pid>[/...] -> /proc/self[...].
      * Returns -1 on ENAMETOOLONG so the guest sees the same error a real Linux
@@ -2336,100 +2822,15 @@ static int intercept_open_dispatch(const guest_t *g,
         }
     }
 
-    /* /proc/self/exe -> open the actual ELF binary. Unlike readlinkat (which
-     * returns the path string), openat needs to return an actual file
-     * descriptor to the binary. Under rosetta, the binfmt_misc convention
-     * treats rosetta as the interpreter visible to the guest: rosetta opens
-     * /proc/self/fd/X via /proc/self/exe to identify itself and then issues the
-     * VZ ioctls on that descriptor.
-     *
-     * Return ROSETTA_PATH so the VZ ioctl gate (rosetta_ioctl_target_fd)
-     * recognises the fd.
-     */
-    if (!strcmp(path, "/proc/self/exe")) {
-        if (g && g->is_rosetta)
-            return open(ROSETTA_PATH, O_RDONLY);
-        char exe[LINUX_PATH_MAX];
-        if (!proc_elf_path_snapshot(exe, sizeof(exe))) {
-            errno = ENOENT;
-            return -1;
-        }
-        return open(exe, O_RDONLY);
-    }
+    if (!strcmp(path, "/proc/self/exe"))
+        return proc_open_self_exe(g);
 
-    /* /proc/cpuinfo -> synthetic file with CPU count. Buffer sized dynamically
-     * from ncpu (~200 bytes/entry) to avoid silent truncation on hosts with >16
-     * CPUs.
-     */
-    if (!strcmp(path, "/proc/cpuinfo")) {
-        int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
-        if (ncpu < 1)
-            ncpu = 1;
-        size_t bufsz = (size_t) ncpu * 256 + 64;
-        char stackbuf[4096];
-        char *buf = (bufsz <= sizeof(stackbuf)) ? stackbuf : malloc(bufsz);
-        if (!buf)
-            return -1;
-        int off = 0;
-        for (int i = 0; i < ncpu && off < (int) bufsz - 256; i++) {
-            off += snprintf(
-                buf + off, bufsz - off,
-                "processor\t: %d\n"
-                "BogoMIPS\t: 48.00\n"
-                "Features\t: fp asimd aes pmull sha1 sha2 crc32 atomics\n"
-                "CPU implementer\t: 0x61\n"
-                "CPU architecture: 8\n"
-                "CPU variant\t: 0x1\n"
-                "CPU part\t: 0x022\n"
-                "CPU revision\t: 1\n\n",
-                i);
-        }
-        int fd = proc_synthetic_fd(buf, off);
-        if (buf != stackbuf)
-            free(buf);
-        return fd;
-    }
+    if (!strcmp(path, "/proc/cpuinfo"))
+        return proc_open_cpuinfo();
 
     /* /proc/self/status -> synthetic process status */
-    if (!strcmp(path, "/proc/self/status")) {
-        /* VmSize is total_vm, which leaves out [shim] and [shim-data]. VmRSS
-         * approximates residency as the non-PROT_NONE part of it, since HVF
-         * cannot report which pages are resident.
-         */
-        uint64_t vm_size_kb = 0, vm_rss_kb = 0;
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (!guest_region_in_process_vm(g, r))
-                continue;
-            vm_size_kb += r->end - r->start;
-            if (r->prot != LINUX_PROT_NONE)
-                vm_rss_kb += r->end - r->start;
-        }
-        vm_size_kb /= 1024;
-        vm_rss_kb /= 1024;
-
-        /* Linux uses the comm name (basename truncated to 15 chars). */
-        const char *name = proc_comm_name();
-        int threads = thread_active_count();
-        return proc_emit_fmt(
-            "Name:\t%.15s\n"
-            "State:\tR (running)\n"
-            "Tgid:\t%lld\n"
-            "Pid:\t%lld\n"
-            "PPid:\t%lld\n"
-            "Uid:\t%u\t%u\t%u\t%u\n"
-            "Gid:\t%u\t%u\t%u\t%u\n"
-            "VmPeak:\t%llu kB\n"
-            "VmSize:\t%llu kB\n"
-            "VmRSS:\t%llu kB\n"
-            "Threads:\t%d\n",
-            name, (long long) proc_get_pid(), (long long) proc_get_pid(),
-            (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
-            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
-            proc_get_sgid(), proc_get_egid(), (unsigned long long) vm_size_kb,
-            (unsigned long long) vm_size_kb, (unsigned long long) vm_rss_kb,
-            threads);
-    }
+    if (!strcmp(path, "/proc/self/status"))
+        return proc_open_self_status(g);
 
     /* /proc/self/limits -> the guest rlimit table */
     if (!strcmp(path, "/proc/self/limits")) {
@@ -2467,35 +2868,8 @@ static int intercept_open_dispatch(const guest_t *g,
         return proc_synthetic_fd(data, len);
     }
 
-    /* /proc/self/task -> directory with per-thread TID entries. Debuggers and
-     * runtimes (GDB, LLDB, JVM, Go runtime) probe this at startup to discover
-     * thread count and per-thread state.
-     *
-     * Rebuilds a temp directory on each open (thread set is dynamic). Cannot
-     * rmdir before returning the fd because macOS getdents on unlinked dirs
-     * returns empty. Uses a static path cleaned up at exit.
-     */
-    if (!strcmp(path, "/proc/self/task") || !strcmp(path, "/proc/self/task/")) {
-        static proc_persistent_dir_t taskdir =
-            PROC_PERSISTENT_DIR("/tmp/elfuse-task-XXXXXX");
-        const char *dir = proc_persistent_dir_acquire(&taskdir);
-        if (!dir)
-            return -1;
-
-        int64_t tids[MAX_THREADS];
-        proc_task_collect_ctx_t ctx = {tids, 0};
-        thread_for_each(proc_task_collect_cb, &ctx);
-        for (int i = 0; i < ctx.ntids; i++) {
-            char tidpath[128];
-            snprintf(tidpath, sizeof(tidpath), "%s/%lld", dir,
-                     (long long) tids[i]);
-            mkdir(tidpath, 0755);
-        }
-
-        int fd = proc_open_dir_fd(dir, linux_flags);
-        proc_persistent_dir_release(&taskdir);
-        return fd;
-    }
+    if (!strcmp(path, "/proc/self/task") || !strcmp(path, "/proc/self/task/"))
+        return proc_open_self_task_dir(linux_flags);
 
     /* /proc/self/task/<tid>/{stat,status} and the <tid> directory. */
     if (!strncmp(path, "/proc/self/task/", 16))
@@ -2517,22 +2891,8 @@ static int intercept_open_dispatch(const guest_t *g,
     if (!strcmp(path, "/proc/self/smaps"))
         return proc_open_self_smaps(g);
 
-    /* /proc/uptime -> synthetic uptime in seconds. Uses sysctl(KERN_BOOTTIME),
-     * same as sys_sysinfo() in syscall/sys.c. Idle time is 0 (no meaningful
-     * macOS equivalent).
-     */
-    if (!strcmp(path, "/proc/uptime")) {
-        struct timeval boottime;
-        size_t bt_len = sizeof(boottime);
-        int mib[2] = {CTL_KERN, KERN_BOOTTIME};
-        if (sysctl(mib, 2, &boottime, &bt_len, NULL, 0) < 0)
-            return -1;
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        double uptime = (double) (now.tv_sec - boottime.tv_sec) +
-                        (double) (now.tv_usec - boottime.tv_usec) / 1e6;
-        return proc_emit_fmt("%.2f 0.00\n", uptime);
-    }
+    if (!strcmp(path, "/proc/uptime"))
+        return proc_open_uptime();
 
     /* /proc/loadavg -> synthetic load averages. Musl's getloadavg() reads
      * /proc/loadavg, so GNU uptime needs this.
@@ -2545,84 +2905,15 @@ static int intercept_open_dispatch(const guest_t *g,
                              (long long) proc_get_pid());
     }
 
-    /* /var/run/utmp, /run/utmp -> synthetic utmp with current user. Creates one
-     * USER_PROCESS record for who, users, pinky.
-     */
-    if (!strcmp(path, "/var/run/utmp") || !strcmp(path, "/run/utmp")) {
-        _Static_assert(sizeof(linux_utmpx_t) == 400,
-                       "linux_utmpx_t size mismatch");
-        linux_utmpx_t entry;
-        memset(&entry, 0, sizeof(entry));
-        entry.ut_type = LINUX_USER_PROCESS;
-        entry.ut_pid = (int32_t) proc_get_pid();
-        str_copy_trunc(entry.ut_line, "pts/0", sizeof(entry.ut_line));
-        str_copy_trunc(entry.ut_id, "0", sizeof(entry.ut_id));
-        const char *user = getenv("USER");
-        if (!user)
-            user = "user";
-        str_copy_trunc(entry.ut_user, user, sizeof(entry.ut_user));
-        str_copy_trunc(entry.ut_host, "localhost", sizeof(entry.ut_host));
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        entry.ut_tv_sec = now.tv_sec;
-        entry.ut_tv_usec = now.tv_usec;
-        return proc_synthetic_fd(&entry, sizeof(entry));
-    }
+    if (!strcmp(path, "/var/run/utmp") || !strcmp(path, "/run/utmp"))
+        return proc_open_utmp();
 
-    /* /proc/net: live socket tables. Enumerates sockets from the local FD table
-     * AND from all active fork-child processes via macOS proc_pidfdinfo(). This
-     * gives system-wide visibility matching real Linux /proc/net semantics.
-     */
     if (!strcmp(path, "/proc/net/tcp") || !strcmp(path, "/proc/net/tcp6") ||
         !strcmp(path, "/proc/net/udp") || !strcmp(path, "/proc/net/udp6") ||
-        !strcmp(path, "/proc/net/raw") || !strcmp(path, "/proc/net/raw6")) {
-        bool want_tcp = !!strstr(path, "tcp"), want_udp = !!strstr(path, "udp");
-        bool want_v6 = (path[strlen(path) - 1] == '6');
-        struct proc_net_inet_ctx ctx = {
-            .buf = NULL, /* set below */
-            .bufsz = 16384,
-            .off = 0,
-            .sl = 0,
-            .want_af = want_v6 ? AF_INET6 : AF_INET,
-            .want_stype = want_tcp   ? SOCK_STREAM
-                          : want_udp ? SOCK_DGRAM
-                                     : SOCK_RAW,
-            .want_tcp = want_tcp,
-            .want_v6 = want_v6,
-        };
-        char *buf = malloc(ctx.bufsz);
-        if (!buf)
-            return -1;
-        ctx.buf = buf;
-        ctx.off = snprintf(
-            buf, ctx.bufsz, "%s",
-            want_tcp ? "  sl  local_address rem_address   st tx_queue "
-                       "rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-                     : "  sl  local_address rem_address   st tx_queue "
-                       "rx_queue tr tm->when retrnsmt   uid  timeout inode"
-                       " ref pointer drops\n");
-        proc_net_for_each_socket(proc_net_inet_visit, &ctx);
-        int fd = proc_synthetic_fd_str(buf, ctx.off, ctx.bufsz);
-        free(buf);
-        return fd;
-    }
-    if (!strcmp(path, "/proc/net/unix")) {
-        const size_t bufsz = 8192;
-        char *buf = malloc(bufsz);
-        if (!buf)
-            return -1;
-        struct proc_net_unix_ctx ctx = {
-            .buf = buf,
-            .bufsz = bufsz,
-            .off = snprintf(buf, bufsz,
-                            "Num       RefCount Protocol Flags    Type St "
-                            "Inode Path\n"),
-        };
-        proc_net_for_each_socket(proc_net_unix_visit, &ctx);
-        int fd = proc_synthetic_fd_str(buf, ctx.off, bufsz);
-        free(buf);
-        return fd;
-    }
+        !strcmp(path, "/proc/net/raw") || !strcmp(path, "/proc/net/raw6"))
+        return proc_open_net_inet(path);
+    if (!strcmp(path, "/proc/net/unix"))
+        return proc_open_net_unix();
     if (!strcmp(path, "/proc/net/dev")) {
         return proc_open_net_dev();
     }
@@ -2666,94 +2957,8 @@ static int intercept_open_dispatch(const guest_t *g,
      * fields for fds where Linux exposes additional state (eventfd counter,
      * signalfd mask, timerfd settings).
      */
-    if (!strncmp(path, "/proc/self/fdinfo/", 18)) {
-        int n = proc_parse_fd_index(path, 18, ENOENT);
-        if (n < 0)
-            return -1;
-        fd_entry_t snap;
-        if (!fd_snapshot(n, &snap)) {
-            errno = ENOENT;
-            return -1;
-        }
-
-        /* Pin under fd_lock so a concurrent close+reopen on another vCPU cannot
-         * redirect the lseek to an unrelated host fd that took the freed slot.
-         * A dup would answer that too, but retiring it would drop the guest's
-         * record locks on the file (fcntl(2)), and reading /proc/self/fdinfo
-         * must not unlock anything. The probe pollutes errno with ESPIPE on
-         * non-seekable fds (sockets, pipes), so save and restore around the
-         * call to keep the caller's view clean.
-         */
-        off_t pos = 0;
-        host_fd_ref_t probe_ref;
-        if (host_fd_ref_open(n, &probe_ref) == 0) {
-            int saved_errno = errno;
-            off_t probe = lseek(probe_ref.fd, 0, SEEK_CUR);
-            if (probe >= 0)
-                pos = probe;
-            errno = saved_errno;
-            host_fd_ref_close(&probe_ref);
-        }
-
-        char extra[160];
-        extra[0] = '\0';
-        if (snap.type == FD_EVENTFD) {
-            uint64_t count;
-
-            /* fs/eventfd.c uses a single space after the colon, matching the
-             * timerfd convention (and unlike pos:/flags:/mnt_id: in
-             * fs/proc/fd.c which use tabs).
-             */
-            if (eventfd_fdinfo_snapshot(n, &count))
-                snprintf(extra, sizeof(extra), "eventfd-count: %16llx\n",
-                         (unsigned long long) count);
-        } else if (snap.type == FD_SIGNALFD) {
-            uint64_t mask;
-
-            /* fs/signalfd.c uses a tab after the colon (matching the
-             * pos:/flags:/mnt_id: convention in fs/proc/fd.c, not the
-             * single-space style of eventfd/timerfd). Verified against a real
-             * Linux 6.x /proc/self/fdinfo dump.
-             */
-            if (signalfd_fdinfo_snapshot(n, &mask))
-                snprintf(extra, sizeof(extra), "sigmask:\t%016llx\n",
-                         (unsigned long long) mask);
-        } else if (snap.type == FD_TIMERFD) {
-            int clockid;
-            uint64_t ticks;
-            int64_t value_ns, interval_ns;
-            if (timerfd_fdinfo_snapshot(n, &clockid, &ticks, &value_ns,
-                                        &interval_ns)) {
-                /* Linux fs/timerfd.c emits these fields with single spaces
-                 * after the colon, not tabs (unlike pos:/flags:/mnt_id: in
-                 * fs/proc/fd.c, which do use tabs). Match the upstream format
-                 * so guest readers parsing fdinfo via a "it_value: (" prefix
-                 * find the field.
-                 */
-                snprintf(extra, sizeof(extra),
-                         "clockid: %d\n"
-                         "ticks: %llu\n"
-                         "settime flags: 0\n"
-                         "it_value: (%lld, %lld)\n"
-                         "it_interval: (%lld, %lld)\n",
-                         clockid, (unsigned long long) ticks,
-                         (long long) (value_ns / 1000000000LL),
-                         (long long) (value_ns % 1000000000LL),
-                         (long long) (interval_ns / 1000000000LL),
-                         (long long) (interval_ns % 1000000000LL));
-            }
-        }
-
-        int mnt_id = 0;
-        if (fuse_fd_mnt_id(n, &mnt_id) < 0)
-            mnt_id = 0;
-        return proc_emit_fmt(
-            "pos:\t%lld\n"
-            "flags:\t0%o\n"
-            "mnt_id:\t%d\n"
-            "%s",
-            (long long) pos, snap.linux_flags, mnt_id, extra);
-    }
+    if (!strncmp(path, "/proc/self/fdinfo/", 18))
+        return proc_open_fdinfo(path);
 
     /* /proc/self/fdinfo -> directory listing. Each open gets its own scratch
      * dir so concurrent getdents on independent dirfds cannot interfere (the
@@ -2773,116 +2978,14 @@ static int intercept_open_dispatch(const guest_t *g,
     if (!strcmp(path, "/proc/meminfo"))
         return proc_open_meminfo();
 
-    /* /proc/self/io -> synthetic I/O counters. Some node-style observability
-     * runtimes read this for resource monitoring metrics. procfs emulation
-     * returns zeroed counters because it does not track per-guest I/O.
-     */
-    if (!strcmp(path, "/proc/self/io")) {
-        return proc_emit_literal(
-            "rchar: 0\n"
-            "wchar: 0\n"
-            "syscr: 0\n"
-            "syscw: 0\n"
-            "read_bytes: 0\n"
-            "write_bytes: 0\n"
-            "cancelled_write_bytes: 0\n");
-    }
+    if (!strcmp(path, "/proc/self/io"))
+        return proc_open_self_io();
 
-    /* /proc/self/stat -> single-line process stat (man 5 proc). Managed
-     * runtimes read this for resource monitoring (utime, stime, rss, vsize).
-     * Format: pid (comm) state ppid pgrp session tty_nr tpgid flags ... Fields
-     * populated with meaningful values: pid, comm, state, ppid, utime(14),
-     * stime(15), vsize(23), rss(24). Rest are zero/defaults.
-     */
-    if (!strcmp(path, "/proc/self/stat")) {
-        /* Get process CPU times for utime/stime fields */
-        struct rusage ru;
-        getrusage(RUSAGE_SELF, &ru);
-        /* Convert to clock ticks (Linux USER_HZ = 100) */
-        long utime_ticks =
-            ru.ru_utime.tv_sec * 100 + ru.ru_utime.tv_usec / 10000;
-        long stime_ticks =
-            ru.ru_stime.tv_sec * 100 + ru.ru_stime.tv_usec / 10000;
+    if (!strcmp(path, "/proc/self/stat"))
+        return proc_open_self_stat(g);
 
-        /* vsize and rss cover the regions VmSize and VmRSS count. */
-        uint64_t vsize = 0, rss_pages = 0;
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (!guest_region_in_process_vm(g, r))
-                continue;
-            uint64_t sz = r->end - r->start;
-            vsize += sz;
-            if (r->prot != LINUX_PROT_NONE) /* non-PROT_NONE = resident */
-                rss_pages += sz / GUEST_PAGE_SIZE;
-        }
-
-        uint64_t start_stack = proc_start_stack(g);
-
-        /* Fields: pid(1) (comm)(2) state(3) ppid(4) pgrp(5) session(6)
-         *   tty_nr(7) tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12)
-         *   cmajflt(13) utime(14) stime(15) cutime(16) cstime(17)
-         *   priority(18) nice(19) num_threads(20) itrealvalue(21)
-         *   starttime(22) vsize(23) rss(24) rsslim(25) ... (52 fields total)
-         */
-        /* tty_nr(7) and tpgid(8) follow the controlling-terminal state rather
-         * than the constants that stood here. elfuse models no specific tty
-         * device, so tty_nr reports the UNIX98 pts major with minor 0 when a
-         * terminal is held: readers such as ps only test it against zero to
-         * decide whether to print a tty at all. tpgid is the foreground process
-         * group, or -1 with no terminal, which is what Linux emits.
-         */
-        int has_ctty = proc_get_ctty();
-        int tty_nr = has_ctty ? (136 << 8) : 0;
-        long long tpgid = has_ctty ? (long long) proc_get_fg_pgrp() : -1;
-
-        return proc_emit_fmt(
-            "%lld (%.15s) R %lld %lld %lld %d %lld 0 "     /* 1-9 */
-            "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
-            "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
-            "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
-            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
-            (long long) proc_get_pid(), proc_comm_name(),
-            (long long) proc_get_ppid(),
-            (long long) proc_get_pid(), /* pgrp = pid */
-            (long long) proc_get_pid(), /* session = pid */
-            tty_nr, tpgid, utime_ticks, stime_ticks, thread_active_count(),
-            (unsigned long long) vsize, (unsigned long long) rss_pages,
-            (unsigned long long) start_stack);
-    }
-
-    /* /proc/stat -> synthetic CPU statistics */
-    if (!strcmp(path, "/proc/stat")) {
-        struct timeval boottime;
-        size_t bt_len = sizeof(boottime);
-        int mib[2] = {CTL_KERN, KERN_BOOTTIME};
-        sysctl(mib, 2, &boottime, &bt_len, NULL, 0);
-        int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
-        if (ncpu < 1)
-            ncpu = 1;
-        char buf[4096];
-        int off = 0;
-
-        /* Aggregate CPU line (user, nice, system, idle, iowait, irq, softirq)
-         */
-        off += snprintf(buf + off, sizeof(buf) - off,
-                        "cpu  1000 0 500 50000 0 0 0 0 0 0\n");
-        /* Per-CPU lines */
-        for (int i = 0; i < ncpu && off < (int) sizeof(buf) - 128; i++) {
-            off += snprintf(buf + off, sizeof(buf) - off,
-                            "cpu%d 100 0 50 5000 0 0 0 0 0 0\n", i);
-        }
-        off += snprintf(buf + off, sizeof(buf) - (size_t) off,
-                        "intr 0\n"
-                        "ctxt 0\n"
-                        "btime %lld\n"
-                        "processes 1\n"
-                        "procs_running 1\n"
-                        "procs_blocked 0\n",
-                        (long long) boottime.tv_sec);
-        if (off > (int) sizeof(buf))
-            off = (int) sizeof(buf);
-        return proc_synthetic_fd(buf, off);
-    }
+    if (!strcmp(path, "/proc/stat"))
+        return proc_open_stat();
 
     /* /etc/passwd -> synthetic passwd with root + current user */
     if (!strcmp(path, "/etc/passwd")) {

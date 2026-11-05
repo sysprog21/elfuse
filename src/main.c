@@ -220,6 +220,416 @@ static int host_dc_zva_assert(void)
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
 #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
 
+/* Prepend a shebang interpreter (and its argument when present) to the guest
+ * argv and make the interpreter the new elf_path. Takes ownership of the old
+ * argv strings. Commits only after every allocation succeeded, so on -1 the
+ * caller's argv and path are exactly as they were and its unwind frees them.
+ */
+static int shebang_prepend(const char *interp,
+                           const char *arg,
+                           const char ***guest_argv,
+                           int *guest_argc,
+                           char **elf_path)
+{
+    bool has_arg = (arg[0] != '\0');
+    int add_count = has_arg ? 2 : 1;
+    int new_argc = *guest_argc + add_count;
+    const char **new_argv = calloc((size_t) new_argc, sizeof(char *));
+    char *new_elf_path = strdup(interp);
+    char *interp_arg = strdup(interp);
+    char *arg_copy = has_arg ? strdup(arg) : NULL;
+    if (!new_argv || !new_elf_path || !interp_arg || (has_arg && !arg_copy)) {
+        free((void *) new_argv);
+        free(new_elf_path);
+        free(interp_arg);
+        free(arg_copy);
+        return -1;
+    }
+
+    new_argv[0] = interp_arg;
+    if (has_arg)
+        new_argv[1] = arg_copy;
+    for (int i = 0; i < *guest_argc; i++)
+        new_argv[i + add_count] = (*guest_argv)[i];
+
+    free((void *) *guest_argv);
+    *guest_argv = new_argv;
+    *guest_argc = new_argc;
+    free(*elf_path);
+    *elf_path = new_elf_path;
+    return 0;
+}
+
+/* True when the environment variable is set to exactly "1". */
+static bool env_is_one(const char *name)
+{
+    const char *v = getenv(name);
+    return v && !strcmp(v, "1");
+}
+
+/* Turn the host signals whose default action would kill elfuse into plain errno
+ * results on the writes and CPU accounting made on the guest's behalf.
+ */
+static void host_ignore_fatal_signals(void)
+{
+    /* A host write to a pipe or socket whose reader is gone raises SIGPIPE in
+     * this process, and the default action is to die. Every such write is made
+     * on the guest's behalf, so the guest's own SIGPIPE is what the failure
+     * means: ignoring it here lets the write return EPIPE, which the transfer
+     * paths turn into a queued guest SIGPIPE (io_write_result).
+     *
+     * Without this a guest that writes to a pipe nobody is reading -- an
+     * ordinary shell pipeline whose reader exits first, `yes | head` -- takes
+     * the whole VM down with it, before the guest's own handler can run.
+     * Sockets were already covered one at a time by SO_NOSIGPIPE; pipes and
+     * fifos have no such option, so the disposition has to carry it.
+     */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* A host write past this process's own RLIMIT_FSIZE raises SIGXFSZ, whose
+     * default action kills elfuse. The guest's limit lives in the guest table
+     * and never reaches the host, and sys_rlimit_init lifts the host soft limit
+     * to the hard one, so a host limit is only reached by guest_init sizing the
+     * slab file, or by a guest that raised its own limit past the host hard
+     * limit. Ignoring it turns either into EFBIG: the guest sees a failed
+     * write, and guest_init falls back to an anonymous slab.
+     */
+    signal(SIGXFSZ, SIG_IGN);
+
+    /* Past this process's own RLIMIT_CPU soft limit the host kernel sends
+     * SIGXCPU, whose default action kills elfuse even when the guest caught
+     * SIGXCPU. The guest's limit lives in the guest table, sys_rlimit_init
+     * lifts the host soft limit to the hard one, and XNU sends nothing at the
+     * hard limit, so the RLIMIT_CPU sampler (sys.c) enforces both the guest
+     * limits and the host hard limit.
+     */
+    signal(SIGXCPU, SIG_IGN);
+}
+
+/* Opt-in sudo-style transition: name one executable whose exec enters fakeroot,
+ * so a guest can start unprivileged and raise privilege later. Nothing happens
+ * unless the embedder sets this.
+ *
+ * A malformed value is fatal, like every other rejected option in the loop
+ * above. Starting anyway would leave a guest whose marked command silently
+ * never elevates, and a privilege boundary that fails quietly is worse than one
+ * that refuses to start. Arming only records the path; whether it names an
+ * existing file is decided per exec, so a missing file is not an error here.
+ */
+static bool arm_fakeroot_exec_from_env(void)
+{
+    const char *fakeroot_exec_env = getenv("ELFUSE_FAKEROOT_EXEC");
+    if (fakeroot_exec_env && *fakeroot_exec_env &&
+        !proc_set_fakeroot_exec_path(fakeroot_exec_env)) {
+        log_error(
+            "ELFUSE_FAKEROOT_EXEC must be an absolute path shorter than %d "
+            "bytes",
+            LINUX_PATH_MAX);
+        return false;
+    }
+    return true;
+}
+
+/* Print the --help text. It lives apart from main because it is only strings;
+ * the usage line comes from ELFUSE_USAGE_WRAPPED, shared with the error paths.
+ */
+static void print_help(void)
+{
+    printf(ELFUSE_USAGE_WRAPPED
+           "\n"
+           "\n"
+           "Options:\n"
+           "  -h, --help              Show this help and exit\n"
+           "  -V, --version           Show version and exit\n"
+           "  -v, --verbose           Trace each guest syscall\n"
+           "  --timeout N             vCPU watchdog period "
+           "(seconds, default 10; 0 disables)\n"
+           "  --sysroot PATH          Resolve absolute guest paths under "
+           "PATH first\n"
+           "  --create-sysroot PATH   Provision and use a case-sensitive "
+           "APFS sparsebundle mounted at PATH\n"
+           "  --no-rosetta            Disable x86_64-via-Rosetta "
+           "(architecture is auto-detected from the ELF header; "
+           "on by default)\n"
+           "  --fakeroot              Enable fakeroot mode (sets guest "
+           "UID/GID to 0 and provides full caps)\n"
+           "  --gdb PORT              Listen for GDB Remote Serial "
+           "Protocol on PORT\n"
+           "  --gdb-stop-on-entry     Halt before the first guest "
+           "instruction\n"
+           "  --user UID[:GID]        Run the guest as UID (and GID; "
+           "defaults to UID). Numeric only\n"
+           "  --workdir DIR           Guest-absolute initial working "
+           "directory (resolved under --sysroot)\n"
+           "  --env KEY=VALUE         Set a guest environment variable; "
+           "repeatable. 'KEY' (no '=') inherits from the host environ\n"
+           "  --clear-env             Start the guest environment empty "
+           "(only --env entries apply); default inherits the host "
+           "environ\n"
+           "\n"
+           "Environment:\n"
+           "  ELFUSE_NO_ROSETTA=1     Same as --no-rosetta\n"
+           "  ELFUSE_FAKEROOT=1       Same as --fakeroot\n"
+           "  ELFUSE_FAKEROOT_EXEC    Absolute path of the one executable "
+           "whose exec enters fakeroot mode, letting a guest start "
+           "unprivileged and raise privilege later; matched by file "
+           "identity, and never dropped afterwards, so that image and "
+           "everything it execs or forks stay root (unset: no exec ever "
+           "elevates)\n");
+}
+
+/* Parse --user UID[:GID] (numeric only; GID defaults to UID). Logs and returns
+ * false on a malformed spec.
+ */
+static bool parse_user_spec(const char *spec,
+                            uint32_t *uid_out,
+                            uint32_t *gid_out)
+{
+    const char *end;
+    uint32_t u, g;
+    if (!parse_id_component(spec, &end, &u)) {
+        log_error("invalid --user UID: %s", spec);
+        return false;
+    }
+    g = u;
+    if (*end == ':') {
+        const char *gend;
+        if (!parse_id_component(end + 1, &gend, &g) || *gend != '\0') {
+            log_error("invalid --user UID:GID: %s", spec);
+            return false;
+        }
+    } else if (*end != '\0') {
+        log_error("invalid --user spec: %s", spec);
+        return false;
+    }
+    *uid_out = u;
+    *gid_out = g;
+    return true;
+}
+
+/* Follow "#!" lines from *elf_path until the file is not a script, rewriting
+ * the path and the guest argv to name the interpreter at each hop (as
+ * sys_execve does). Leaves the host path of the final image in @elf_host_path,
+ * and *elf_host_temp set when that file is a materialized temp the caller must
+ * unlink. @display names the script in the depth-limit message. Logs and
+ * returns false on any failure.
+ */
+static bool resolve_shebang_chain(char **elf_path,
+                                  const char ***guest_argv,
+                                  int *guest_argc,
+                                  char *elf_host_path,
+                                  size_t host_sz,
+                                  bool *elf_host_temp,
+                                  const char *display)
+{
+    int shebang_depth = 0;
+
+    while (true) {
+        if (resolve_guest_elf_host_path(*elf_path, elf_host_path, host_sz,
+                                        elf_host_temp) < 0) {
+            log_error("failed to resolve ELF path %s: %s", *elf_path,
+                      strerror(errno));
+            return false;
+        }
+
+        /* Check if the file starts with "#!" */
+        char interp[LINUX_PATH_MAX];
+        char arg[LINUX_PATH_MAX];
+        int rc = elf_read_shebang(elf_host_path, interp, sizeof(interp), arg,
+                                  sizeof(arg));
+        if (rc == 0) {
+            /* Not a shebang script, proceed to boot */
+            return true;
+        }
+
+        if (rc < 0) {
+            /* elf_read_shebang forwards -errno from its own open(), so a file
+             * that could not be opened arrives here beside a malformed "#!"
+             * line. Both spellings are reported because under --sysroot an
+             * absolute path resolves into the sysroot, not to the host file the
+             * caller meant.
+             */
+            if (rc == -ENOEXEC) {
+                log_error("empty or invalid shebang interpreter in %s",
+                          *elf_path);
+            } else {
+                log_error("cannot read %s (resolved to %s): %s", *elf_path,
+                          elf_host_path, strerror(-rc));
+            }
+            return false;
+        }
+
+        /* Bound the resolution chain only once a further shebang is confirmed,
+         * so a max-depth chain ending in a real ELF still boots (matches
+         * sys_execve and the Linux kernel).
+         */
+        if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
+            log_error(
+                "too many levels of shebang recursion (max %d) "
+                "resolving %s",
+                ELF_SHEBANG_MAX_DEPTH, display);
+            return false;
+        }
+        shebang_depth++;
+
+        if (shebang_prepend(interp, arg, guest_argv, guest_argc, elf_path) <
+            0) {
+            log_error("out of memory");
+            return false;
+        }
+
+        /* Clean up any materialized temp file before resolving the next path */
+        if (*elf_host_temp) {
+            unlink(elf_host_path);
+            *elf_host_temp = false;
+        }
+    }
+}
+
+/* Everything the command line sets. Gathered in one place because the option
+ * parser writes it and main reads it long after, and the cleanup label frees
+ * workdir and env_overrides whichever way main leaves.
+ */
+typedef struct {
+    bool verbose;
+    bool rosetta_enabled;
+    int timeout_sec;
+    int fork_child_fd;
+    int vfork_notify_fd;
+    const char *sysroot;
+    const char *create_sysroot;
+    int gdb_port;
+    bool gdb_stop_on_entry;
+    bool fakeroot;
+    bool has_creds;
+    uint32_t uid;
+    uint32_t gid;
+    char *workdir;
+    char **env_overrides;
+    int n_env_overrides;
+    bool clear_env;
+    int arg_start; /* Index of the first argv element parse_options left */
+} cli_opts_t;
+
+/* Parse elfuse's own options, from argv[o->arg_start] up to the first guest
+ * argv element or "--", into @o. Logs and returns false on a malformed option
+ * or an unknown one; @o then owns whatever was allocated so far, and the
+ * caller's cleanup releases it.
+ */
+static bool parse_options(int argc, char **argv, cli_opts_t *o)
+{
+    /* Parse elfuse options until the first guest argv element. */
+    while (o->arg_start < argc && argv[o->arg_start][0] == '-') {
+        if (!strcmp(argv[o->arg_start], "--verbose") ||
+            !strcmp(argv[o->arg_start], "-v")) {
+            o->verbose = true;
+            log_set_level(LOG_DEBUG);
+            o->arg_start++;
+        } else if ((!strcmp(argv[o->arg_start], "--timeout") ||
+                    !strcmp(argv[o->arg_start], "-t")) &&
+                   o->arg_start + 1 < argc) {
+            if (parse_int_arg(argv[o->arg_start + 1], 0, INT_MAX,
+                              &o->timeout_sec) < 0)
+                o->timeout_sec = 10;
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--fork-child") &&
+                   o->arg_start + 1 < argc) {
+            if (parse_int_arg(argv[o->arg_start + 1], 0, INT_MAX,
+                              &o->fork_child_fd) < 0) {
+                log_error("invalid fork child fd: %s", argv[o->arg_start + 1]);
+                return false;
+            }
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--vfork-notify-fd") &&
+                   o->arg_start + 1 < argc) {
+            if (parse_int_arg(argv[o->arg_start + 1], 0, INT_MAX,
+                              &o->vfork_notify_fd) < 0) {
+                log_error("invalid vfork notify fd: %s",
+                          argv[o->arg_start + 1]);
+                return false;
+            }
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--sysroot") &&
+                   o->arg_start + 1 < argc) {
+            o->sysroot = argv[o->arg_start + 1];
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--create-sysroot") &&
+                   o->arg_start + 1 < argc) {
+            o->create_sysroot = argv[o->arg_start + 1];
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--no-rosetta")) {
+            o->rosetta_enabled = false;
+            o->arg_start++;
+        } else if (!strcmp(argv[o->arg_start], "--fakeroot")) {
+            o->fakeroot = true;
+            o->arg_start++;
+        } else if (!strcmp(argv[o->arg_start], "--gdb") &&
+                   o->arg_start + 1 < argc) {
+            if (parse_int_arg(argv[o->arg_start + 1], 1, 65535, &o->gdb_port) <
+                0) {
+                log_error("invalid GDB port: %s", argv[o->arg_start + 1]);
+                return false;
+            }
+            if (!o->verbose)
+                log_set_level(LOG_INFO);
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--gdb-stop-on-entry")) {
+            o->gdb_stop_on_entry = true;
+            o->arg_start++;
+        } else if (!strcmp(argv[o->arg_start], "--user") &&
+                   o->arg_start + 1 < argc) {
+            if (!parse_user_spec(argv[o->arg_start + 1], &o->uid, &o->gid))
+                return false;
+            o->has_creds = true;
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--workdir") &&
+                   o->arg_start + 1 < argc) {
+            /* A relative path resolves against the host cwd, silently starting
+             * the guest outside the intended tree. strdup because
+             * runtime_set_process_title() clobbers the argv block.
+             */
+            if (argv[o->arg_start + 1][0] != '/') {
+                log_error("--workdir requires a guest-absolute path, got %s",
+                          argv[o->arg_start + 1]);
+                return false;
+            }
+            free(o->workdir);
+            o->workdir = strdup(argv[o->arg_start + 1]);
+            if (!o->workdir) {
+                log_error("out of memory");
+                return false;
+            }
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--env") &&
+                   o->arg_start + 1 < argc) {
+            /* Tokens are borrowed from argv; guest_env_build strdups what it
+             * keeps (the ordering rationale sits at its call site). argc bounds
+             * the flag count, so one allocation needs no growth path.
+             */
+            if (!o->env_overrides) {
+                o->env_overrides = calloc((size_t) argc, sizeof(char *));
+                if (!o->env_overrides) {
+                    log_error("out of memory");
+                    return false;
+                }
+            }
+            o->env_overrides[o->n_env_overrides++] = argv[o->arg_start + 1];
+            o->arg_start += 2;
+        } else if (!strcmp(argv[o->arg_start], "--clear-env")) {
+            o->clear_env = true;
+            o->arg_start++;
+        } else if (!strcmp(argv[o->arg_start], "--")) {
+            o->arg_start++;
+            break;
+        } else {
+            log_error("unknown option: %s", argv[o->arg_start]);
+            log_error(ELFUSE_USAGE);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Over the function-size limit on purpose.
  *
  * Option parsing: one flag per arm, no shared state between them. Splitting
@@ -236,27 +646,16 @@ int main(int argc, char **argv)
      */
     syscall_hist_init();
 
-    bool verbose = false;
-
     /* x86_64-via-Rosetta is on by default; --no-rosetta or ELFUSE_NO_ROSETTA=1
      * disables it. Architecture is auto-detected from the ELF header in
      * guest_bootstrap_prepare; the access() probe in rosetta_prepare surfaces
      * an install hint if Rosetta is not present.
      */
-    bool rosetta_enabled = true;
-    int timeout_sec = 10, fork_child_fd = -1, vfork_notify_fd = -1;
-    const char *sysroot = NULL;
-    const char *create_sysroot = NULL;
-    int gdb_port = 0;
-    bool gdb_stop_on_entry = false;
-    bool fakeroot = false;
-    bool has_creds = false;
-    uint32_t uid = 0, gid = 0;
-    char *workdir = NULL;
-    char **env_overrides = NULL;
-    int n_env_overrides = 0;
-    bool clear_env = false;
-    int arg_start = 1;
+    cli_opts_t opt = {.rosetta_enabled = true,
+                      .timeout_sec = 10,
+                      .fork_child_fd = -1,
+                      .vfork_notify_fd = -1,
+                      .arg_start = 1};
 
     /* Everything the shared cleanup label reads is declared and initialized
      * here, above the option loop, so any later error path can `goto cleanup`:
@@ -303,48 +702,7 @@ int main(int argc, char **argv)
             return 0;
         }
         if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
-            printf(
-                ELFUSE_USAGE_WRAPPED
-                "\n"
-                "\n"
-                "Options:\n"
-                "  -h, --help              Show this help and exit\n"
-                "  -V, --version           Show version and exit\n"
-                "  -v, --verbose           Trace each guest syscall\n"
-                "  --timeout N             vCPU watchdog period "
-                "(seconds, default 10; 0 disables)\n"
-                "  --sysroot PATH          Resolve absolute guest paths under "
-                "PATH first\n"
-                "  --create-sysroot PATH   Provision and use a case-sensitive "
-                "APFS sparsebundle mounted at PATH\n"
-                "  --no-rosetta            Disable x86_64-via-Rosetta "
-                "(architecture is auto-detected from the ELF header; "
-                "on by default)\n"
-                "  --fakeroot              Enable fakeroot mode (sets guest "
-                "UID/GID to 0 and provides full caps)\n"
-                "  --gdb PORT              Listen for GDB Remote Serial "
-                "Protocol on PORT\n"
-                "  --gdb-stop-on-entry     Halt before the first guest "
-                "instruction\n"
-                "  --user UID[:GID]        Run the guest as UID (and GID; "
-                "defaults to UID). Numeric only\n"
-                "  --workdir DIR           Guest-absolute initial working "
-                "directory (resolved under --sysroot)\n"
-                "  --env KEY=VALUE         Set a guest environment variable; "
-                "repeatable. 'KEY' (no '=') inherits from the host environ\n"
-                "  --clear-env             Start the guest environment empty "
-                "(only --env entries apply); default inherits the host "
-                "environ\n"
-                "\n"
-                "Environment:\n"
-                "  ELFUSE_NO_ROSETTA=1     Same as --no-rosetta\n"
-                "  ELFUSE_FAKEROOT=1       Same as --fakeroot\n"
-                "  ELFUSE_FAKEROOT_EXEC    Absolute path of the one executable "
-                "whose exec enters fakeroot mode, letting a guest start "
-                "unprivileged and raise privilege later; matched by file "
-                "identity, and never dropped afterwards, so that image and "
-                "everything it execs or forks stay root (unset: no exec ever "
-                "elevates)\n");
+            print_help();
             return 0;
         }
     }
@@ -352,129 +710,10 @@ int main(int argc, char **argv)
     if (host_dc_zva_assert() < 0)
         goto cleanup;
 
-    /* Parse elfuse options until the first guest argv element. */
-    while (arg_start < argc && argv[arg_start][0] == '-') {
-        if (!strcmp(argv[arg_start], "--verbose") ||
-            !strcmp(argv[arg_start], "-v")) {
-            verbose = true;
-            log_set_level(LOG_DEBUG);
-            arg_start++;
-        } else if ((!strcmp(argv[arg_start], "--timeout") ||
-                    !strcmp(argv[arg_start], "-t")) &&
-                   arg_start + 1 < argc) {
-            if (parse_int_arg(argv[arg_start + 1], 0, INT_MAX, &timeout_sec) <
-                0)
-                timeout_sec = 10;
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--fork-child") &&
-                   arg_start + 1 < argc) {
-            if (parse_int_arg(argv[arg_start + 1], 0, INT_MAX, &fork_child_fd) <
-                0) {
-                log_error("invalid fork child fd: %s", argv[arg_start + 1]);
-                goto cleanup;
-            }
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--vfork-notify-fd") &&
-                   arg_start + 1 < argc) {
-            if (parse_int_arg(argv[arg_start + 1], 0, INT_MAX,
-                              &vfork_notify_fd) < 0) {
-                log_error("invalid vfork notify fd: %s", argv[arg_start + 1]);
-                goto cleanup;
-            }
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--sysroot") &&
-                   arg_start + 1 < argc) {
-            sysroot = argv[arg_start + 1];
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--create-sysroot") &&
-                   arg_start + 1 < argc) {
-            create_sysroot = argv[arg_start + 1];
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--no-rosetta")) {
-            rosetta_enabled = false;
-            arg_start++;
-        } else if (!strcmp(argv[arg_start], "--fakeroot")) {
-            fakeroot = true;
-            arg_start++;
-        } else if (!strcmp(argv[arg_start], "--gdb") && arg_start + 1 < argc) {
-            if (parse_int_arg(argv[arg_start + 1], 1, 65535, &gdb_port) < 0) {
-                log_error("invalid GDB port: %s", argv[arg_start + 1]);
-                goto cleanup;
-            }
-            if (!verbose)
-                log_set_level(LOG_INFO);
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--gdb-stop-on-entry")) {
-            gdb_stop_on_entry = true;
-            arg_start++;
-        } else if (!strcmp(argv[arg_start], "--user") && arg_start + 1 < argc) {
-            const char *spec = argv[arg_start + 1], *end;
-            uint32_t u, g;
-            if (!parse_id_component(spec, &end, &u)) {
-                log_error("invalid --user UID: %s", spec);
-                goto cleanup;
-            }
-            g = u;
-            if (*end == ':') {
-                const char *gend;
-                if (!parse_id_component(end + 1, &gend, &g) || *gend != '\0') {
-                    log_error("invalid --user UID:GID: %s", spec);
-                    goto cleanup;
-                }
-            } else if (*end != '\0') {
-                log_error("invalid --user spec: %s", spec);
-                goto cleanup;
-            }
-            uid = u;
-            gid = g;
-            has_creds = true;
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--workdir") &&
-                   arg_start + 1 < argc) {
-            /* A relative path resolves against the host cwd, silently starting
-             * the guest outside the intended tree. strdup because
-             * runtime_set_process_title() clobbers the argv block.
-             */
-            if (argv[arg_start + 1][0] != '/') {
-                log_error("--workdir requires a guest-absolute path, got %s",
-                          argv[arg_start + 1]);
-                goto cleanup;
-            }
-            free(workdir);
-            workdir = strdup(argv[arg_start + 1]);
-            if (!workdir) {
-                log_error("out of memory");
-                goto cleanup;
-            }
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--env") && arg_start + 1 < argc) {
-            /* Tokens are borrowed from argv; guest_env_build strdups what it
-             * keeps (the ordering rationale sits at its call site). argc bounds
-             * the flag count, so one allocation needs no growth path.
-             */
-            if (!env_overrides) {
-                env_overrides = calloc((size_t) argc, sizeof(char *));
-                if (!env_overrides) {
-                    log_error("out of memory");
-                    goto cleanup;
-                }
-            }
-            env_overrides[n_env_overrides++] = argv[arg_start + 1];
-            arg_start += 2;
-        } else if (!strcmp(argv[arg_start], "--clear-env")) {
-            clear_env = true;
-            arg_start++;
-        } else if (!strcmp(argv[arg_start], "--")) {
-            arg_start++;
-            break;
-        } else {
-            log_error("unknown option: %s", argv[arg_start]);
-            log_error(ELFUSE_USAGE);
-            goto cleanup;
-        }
-    }
+    if (!parse_options(argc, argv, &opt))
+        goto cleanup;
 
-    if (sysroot && create_sysroot) {
+    if (opt.sysroot && opt.create_sysroot) {
         log_error(
             "use either --sysroot PATH or --create-sysroot PATH, not both");
         goto cleanup;
@@ -486,40 +725,16 @@ int main(int argc, char **argv)
      * early-return so helper processes inherit the parent's opt-out semantics
      * exactly.
      */
-    if (rosetta_enabled) {
-        const char *no_rosetta_env = getenv("ELFUSE_NO_ROSETTA");
-        if (no_rosetta_env && strcmp(no_rosetta_env, "1") == 0)
-            rosetta_enabled = false;
-    }
-    proc_set_rosetta_enabled(rosetta_enabled);
+    if (opt.rosetta_enabled && env_is_one("ELFUSE_NO_ROSETTA"))
+        opt.rosetta_enabled = false;
+    proc_set_rosetta_enabled(opt.rosetta_enabled);
 
-    if (!fakeroot) {
-        const char *fakeroot_env = getenv("ELFUSE_FAKEROOT");
-        if (fakeroot_env && strcmp(fakeroot_env, "1") == 0)
-            fakeroot = true;
-    }
-    proc_set_fakeroot_enabled(fakeroot);
+    if (!opt.fakeroot && env_is_one("ELFUSE_FAKEROOT"))
+        opt.fakeroot = true;
+    proc_set_fakeroot_enabled(opt.fakeroot);
 
-    /* Opt-in sudo-style transition: name one executable whose exec enters
-     * fakeroot, so a guest can start unprivileged and raise privilege later.
-     * Nothing happens unless the embedder sets this.
-     *
-     * A malformed value is fatal, like every other rejected option in the loop
-     * above. Starting anyway would leave a guest whose marked command silently
-     * never elevates, and a privilege boundary that fails quietly is worse than
-     * one that refuses to start. Arming only records the path; whether it names
-     * an existing file is decided per exec, so a missing file is not an error
-     * here.
-     */
-    const char *fakeroot_exec_env = getenv("ELFUSE_FAKEROOT_EXEC");
-    if (fakeroot_exec_env && *fakeroot_exec_env &&
-        !proc_set_fakeroot_exec_path(fakeroot_exec_env)) {
-        log_error(
-            "ELFUSE_FAKEROOT_EXEC must be an absolute path shorter than %d "
-            "bytes",
-            LINUX_PATH_MAX);
+    if (!arm_fakeroot_exec_from_env())
         goto cleanup;
-    }
 
     /* Top-level processes establish the capacity; fork helpers normally inherit
      * it, but recheck before receiving the parent's FD table. Guest
@@ -529,38 +744,7 @@ int main(int argc, char **argv)
     if (host_nofile_ensure_capacity() < 0)
         goto cleanup;
 
-    /* A host write to a pipe or socket whose reader is gone raises SIGPIPE in
-     * this process, and the default action is to die. Every such write is made
-     * on the guest's behalf, so the guest's own SIGPIPE is what the failure
-     * means: ignoring it here lets the write return EPIPE, which the transfer
-     * paths turn into a queued guest SIGPIPE (io_write_result).
-     *
-     * Without this a guest that writes to a pipe nobody is reading -- an
-     * ordinary shell pipeline whose reader exits first, `yes | head` -- takes
-     * the whole VM down with it, before the guest's own handler can run.
-     * Sockets were already covered one at a time by SO_NOSIGPIPE; pipes and
-     * fifos have no such option, so the disposition has to carry it.
-     */
-    signal(SIGPIPE, SIG_IGN);
-
-    /* A host write past this process's own RLIMIT_FSIZE raises SIGXFSZ, whose
-     * default action kills elfuse. The guest's limit lives in the guest table
-     * and never reaches the host, and sys_rlimit_init lifts the host soft limit
-     * to the hard one, so a host limit is only reached by guest_init sizing the
-     * slab file, or by a guest that raised its own limit past the host hard
-     * limit. Ignoring it turns either into EFBIG: the guest sees a failed
-     * write, and guest_init falls back to an anonymous slab.
-     */
-    signal(SIGXFSZ, SIG_IGN);
-
-    /* Past this process's own RLIMIT_CPU soft limit the host kernel sends
-     * SIGXCPU, whose default action kills elfuse even when the guest caught
-     * SIGXCPU. The guest's limit lives in the guest table, sys_rlimit_init
-     * lifts the host soft limit to the hard one, and XNU sends nothing at the
-     * hard limit, so the RLIMIT_CPU sampler (sys.c) enforces both the guest
-     * limits and the host hard limit.
-     */
-    signal(SIGXCPU, SIG_IGN);
+    host_ignore_fatal_signals();
 
     /* Block the vCPU-preemption signals and start the sigwait thread before any
      * vCPU thread exists, so both the normal path and the fork-child path below
@@ -570,9 +754,9 @@ int main(int argc, char **argv)
         goto cleanup;
 
     /* Fork-child mode: receive VM state over IPC and run */
-    if (fork_child_fd >= 0)
-        return fork_child_main(fork_child_fd, vfork_notify_fd, verbose,
-                               timeout_sec);
+    if (opt.fork_child_fd >= 0)
+        return fork_child_main(opt.fork_child_fd, opt.vfork_notify_fd,
+                               opt.verbose, opt.timeout_sec);
 
     /* Before runtime_set_process_title clobbers the argv block env_overrides
      * borrows from, and before --create-sysroot would provision a sparsebundle
@@ -580,16 +764,16 @@ int main(int argc, char **argv)
      * given envp stays NULL, which launch_args_t defines as the host environ,
      * unchanged.
      */
-    if (n_env_overrides > 0 || clear_env) {
-        envp = guest_env_build(environ, env_overrides, n_env_overrides,
-                               clear_env, &n_envp);
+    if (opt.n_env_overrides > 0 || opt.clear_env) {
+        envp = guest_env_build(environ, opt.env_overrides, opt.n_env_overrides,
+                               opt.clear_env, &n_envp);
         if (!envp)
             goto cleanup;
     }
-    free(env_overrides);
-    env_overrides = NULL;
+    free(opt.env_overrides);
+    opt.env_overrides = NULL;
 
-    if (arg_start >= argc) {
+    if (opt.arg_start >= argc) {
         log_error(ELFUSE_USAGE);
         goto cleanup;
     }
@@ -598,9 +782,10 @@ int main(int argc, char **argv)
      * data lives in a contiguous stack region that elfuse clobbers below for
      * the process title (PostgreSQL/nginx argv-clobber technique).
      */
-    elf_path = strdup(argv[arg_start]);
-    bool have_sysroot = (sysroot || create_sysroot);
-    const char *sysroot_src = create_sysroot ? create_sysroot : sysroot;
+    elf_path = strdup(argv[opt.arg_start]);
+    bool have_sysroot = (opt.sysroot || opt.create_sysroot);
+    const char *sysroot_src =
+        opt.create_sysroot ? opt.create_sysroot : opt.sysroot;
     if (have_sysroot) {
         sysroot_path = calloc(LINUX_PATH_MAX, 1);
         if (sysroot_path) {
@@ -613,22 +798,22 @@ int main(int argc, char **argv)
             }
         }
     }
-    sysroot = sysroot_path;
-    guest_argc = argc - arg_start;
+    opt.sysroot = sysroot_path;
+    guest_argc = argc - opt.arg_start;
     guest_argv = calloc((size_t) guest_argc, sizeof(char *));
     if (!elf_path || (have_sysroot && !sysroot_path) || !guest_argv) {
         log_error("out of memory");
         goto cleanup;
     }
     for (int i = 0; i < guest_argc; i++) {
-        guest_argv[i] = strdup(argv[arg_start + i]);
+        guest_argv[i] = strdup(argv[opt.arg_start + i]);
         if (!guest_argv[i]) {
             log_error("out of memory");
             goto cleanup;
         }
     }
 
-    if (create_sysroot) {
+    if (opt.create_sysroot) {
         if (sysroot_create_mount(sysroot_path, &sysroot_mount) < 0) {
             log_error("failed to provision case-sensitive sysroot at %s: %s",
                       sysroot_path, strerror(errno));
@@ -641,118 +826,20 @@ int main(int argc, char **argv)
                       sysroot_mount.mount_path);
             goto cleanup;
         }
-        sysroot = sysroot_path;
+        opt.sysroot = sysroot_path;
     }
 
-    if (have_sysroot && sysroot_validate_case_sensitivity(sysroot) < 0)
+    if (have_sysroot && sysroot_validate_case_sensitivity(opt.sysroot) < 0)
         goto cleanup;
 
-    proc_set_sysroot(sysroot);
+    proc_set_sysroot(opt.sysroot);
 
-    int shebang_depth = 0;
+    if (!resolve_shebang_chain(&elf_path, &guest_argv, &guest_argc,
+                               elf_host_path, sizeof(elf_host_path),
+                               &elf_host_temp, argv[opt.arg_start]))
+        goto cleanup;
 
-    while (true) {
-        if (resolve_guest_elf_host_path(elf_path, elf_host_path,
-                                        sizeof(elf_host_path),
-                                        &elf_host_temp) < 0) {
-            log_error("failed to resolve ELF path %s: %s", elf_path,
-                      strerror(errno));
-            goto cleanup;
-        }
-
-        /* Check if the file starts with "#!" */
-        char interp[LINUX_PATH_MAX];
-        char arg[LINUX_PATH_MAX];
-        int rc = elf_read_shebang(elf_host_path, interp, sizeof(interp), arg,
-                                  sizeof(arg));
-        if (rc == 0) {
-            /* Not a shebang script, proceed to boot */
-            break;
-        }
-
-        if (rc < 0) {
-            /* elf_read_shebang forwards -errno from its own open(), so a file
-             * that could not be opened arrives here beside a malformed "#!"
-             * line. Both spellings are reported because under --sysroot an
-             * absolute path resolves into the sysroot, not to the host file the
-             * caller meant.
-             */
-            if (rc == -ENOEXEC) {
-                log_error("empty or invalid shebang interpreter in %s",
-                          elf_path);
-            } else {
-                log_error("cannot read %s (resolved to %s): %s", elf_path,
-                          elf_host_path, strerror(-rc));
-            }
-            goto cleanup;
-        }
-
-        /* Bound the resolution chain only once a further shebang is confirmed,
-         * so a max-depth chain ending in a real ELF still boots (matches
-         * sys_execve and the Linux kernel).
-         */
-        if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
-            log_error(
-                "too many levels of shebang recursion (max %d) "
-                "resolving %s",
-                ELF_SHEBANG_MAX_DEPTH, argv[arg_start]);
-            goto cleanup;
-        }
-        shebang_depth++;
-
-        /* Prepend interpreter (and argument if present) to guest_argv */
-        bool has_arg = (arg[0] != '\0');
-        int add_count = has_arg ? 2 : 1;
-        int new_argc = guest_argc + add_count;
-        const char **new_argv =
-            (const char **) calloc((size_t) new_argc, sizeof(char *));
-        if (!new_argv) {
-            log_error("out of memory");
-            goto cleanup;
-        }
-
-        new_argv[0] = strdup(interp);
-        if (!new_argv[0]) {
-            log_error("out of memory");
-            free((void *) new_argv);
-            goto cleanup;
-        }
-        if (has_arg) {
-            new_argv[1] = strdup(arg);
-            if (!new_argv[1]) {
-                log_error("out of memory");
-                free((void *) new_argv[0]);
-                free((void *) new_argv);
-                goto cleanup;
-            }
-        }
-
-        /* Transfer ownership of the previous guest_argv elements */
-        for (int i = 0; i < guest_argc; i++) {
-            new_argv[i + add_count] = guest_argv[i];
-        }
-
-        free((void *) guest_argv);
-        guest_argv = new_argv;
-        guest_argc = new_argc;
-
-        /* Update elf_path to point to the interpreter path */
-        char *new_elf_path = strdup(interp);
-        if (!new_elf_path) {
-            log_error("out of memory");
-            goto cleanup;
-        }
-        free(elf_path);
-        elf_path = new_elf_path;
-
-        /* Clean up any materialized temp file before resolving the next path */
-        if (elf_host_temp) {
-            unlink(elf_host_path);
-            elf_host_temp = false;
-        }
-    }
-
-    if (gdb_port > 0) {
+    if (opt.gdb_port > 0) {
         elf_info_t probe_info;
         if (guest_bootstrap_probe_elf(elf_host_path, &probe_info) == 0 &&
             probe_info.e_machine == EM_X86_64) {
@@ -777,18 +864,18 @@ int main(int argc, char **argv)
     launch_args_t largs = {
         .elf_path = elf_host_path,
         .elf_host_temp = elf_host_temp,
-        .sysroot = sysroot,
+        .sysroot = opt.sysroot,
         .guest_argc = guest_argc,
         .guest_argv = guest_argv,
         .envp = envp,
-        .has_creds = has_creds,
-        .uid = uid,
-        .gid = gid,
-        .cwd_guest = workdir,
-        .gdb_port = gdb_port,
-        .gdb_stop_on_entry = gdb_stop_on_entry,
-        .timeout_sec = timeout_sec,
-        .verbose = verbose,
+        .has_creds = opt.has_creds,
+        .uid = opt.uid,
+        .gid = opt.gid,
+        .cwd_guest = opt.workdir,
+        .gdb_port = opt.gdb_port,
+        .gdb_stop_on_entry = opt.gdb_stop_on_entry,
+        .timeout_sec = opt.timeout_sec,
+        .verbose = opt.verbose,
     };
 
     /* Ownership of the temp unlink transfers here (contract in launch.h); drop
@@ -813,8 +900,8 @@ cleanup:
     strv_free(guest_argv, guest_argc);
     free(elf_path);
     free(sysroot_path);
-    free(workdir);
-    free(env_overrides);
+    free(opt.workdir);
+    free(opt.env_overrides);
     strv_free((const char **) envp, n_envp);
     if (elf_host_temp)
         unlink(elf_host_path);

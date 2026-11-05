@@ -100,6 +100,36 @@ static void parent_release_writer(sync_t *s)
     close_fd(&s->parent_to_child[1]);
 }
 
+/* Reap @pid and report a child that did not exit 0.
+ *
+ * Returns true only when the child exited cleanly and the parent side had not
+ * already failed, so the caller can add its own final check before PASS(). A
+ * parent-side failure is already reported; it only has to avoid a second
+ * verdict here.
+ */
+static bool reap_child_ok(pid_t pid, bool failed)
+{
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        FAIL("waitpid");
+        return false;
+    }
+    if (failed)
+        return false;
+    if (!WIFEXITED(status)) {
+        FAIL("child terminated abnormally");
+        return false;
+    }
+    if (WEXITSTATUS(status) != 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "child failed at step %d",
+                 WEXITSTATUS(status));
+        FAIL(buf);
+        return false;
+    }
+    return true;
+}
+
 /* Wait for a single byte from the peer; returns true on success. */
 static bool wait_byte(int fd)
 {
@@ -215,27 +245,15 @@ static void test_file_backed_cross_fork(void)
      * and the test driver kills the parent on timeout.
      */
     parent_release_writer(&s);
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        FAIL("waitpid");
-    } else if (!failed) {
-        if (!WIFEXITED(status)) {
-            FAIL("child terminated abnormally");
-        } else if (WEXITSTATUS(status) != 0) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "child failed at step %d",
-                     WEXITSTATUS(status));
-            FAIL(buf);
-        } else {
-            /* Verify file content reflects both writes. */
-            char disk[3] = {0};
-            if (pread(fd, disk, 3, 0) != 3)
-                FAIL("pread");
-            else if (disk[0] == 'P' && disk[1] == 'C' && disk[2] == 'M')
-                PASS();
-            else
-                FAIL("file content does not reflect both sides");
-        }
+    if (reap_child_ok(pid, failed)) {
+        /* Verify file content reflects both writes. */
+        char disk[3] = {0};
+        if (pread(fd, disk, 3, 0) != 3)
+            FAIL("pread");
+        else if (disk[0] == 'P' && disk[1] == 'C' && disk[2] == 'M')
+            PASS();
+        else
+            FAIL("file content does not reflect both sides");
     }
 
     sync_fini(&s);
@@ -309,21 +327,8 @@ static void test_anon_shared_cross_fork(void)
      * above does not deadlock both ends of the pipe.
      */
     parent_release_writer(&s);
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        FAIL("waitpid");
-    } else if (!failed) {
-        if (!WIFEXITED(status)) {
-            FAIL("child terminated abnormally");
-        } else if (WEXITSTATUS(status) != 0) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "child failed at step %d",
-                     WEXITSTATUS(status));
-            FAIL(buf);
-        } else {
-            PASS();
-        }
-    }
+    if (reap_child_ok(pid, failed))
+        PASS();
 
     sync_fini(&s);
     munmap(p, 4096);
@@ -409,21 +414,8 @@ static void test_shm_cross_fork(void)
      * above does not deadlock both ends of the pipe.
      */
     parent_release_writer(&s);
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        FAIL("waitpid");
-    } else if (!failed) {
-        if (!WIFEXITED(status)) {
-            FAIL("child terminated abnormally");
-        } else if (WEXITSTATUS(status) != 0) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "child failed at step %d",
-                     WEXITSTATUS(status));
-            FAIL(buf);
-        } else {
-            PASS();
-        }
-    }
+    if (reap_child_ok(pid, failed))
+        PASS();
 
     sync_fini(&s);
     munmap(p, 4096);

@@ -25,6 +25,8 @@
 
 #include "test-harness.h"
 
+int passes = 0, fails = 0;
+
 static int ip_bool_roundtrip(int sock, int optname)
 {
     int val = 42;
@@ -39,12 +41,8 @@ static int ip_bool_roundtrip(int sock, int optname)
     return val;
 }
 
-int main(void)
+static void test_tcp_udp(void)
 {
-    int passes = 0, fails = 0;
-
-    printf("test-net: AF_INET/AF_INET6 networking tests\n");
-
     /* Test TCP self-connect: server binds, client connects, exchange data */
     TEST("TCP self-connect");
     {
@@ -167,7 +165,10 @@ tcp_done:;
         close(sock);
     }
 udp_done:;
+}
 
+static void test_efault_consumes(void)
+{
     TEST("accept consumes pending connection on EFAULT");
     {
         int server = -1, client = -1;
@@ -274,7 +275,10 @@ udp_done:;
             close(sock);
         }
     }
+}
 
+static void test_ipv6(void)
+{
     /* Test AF_INET6 socket creation + bind to ::1 */
     TEST("AF_INET6 socket + bind");
     {
@@ -327,7 +331,10 @@ ipv6_done:;
         } else
             FAIL("socket failed");
     }
+}
 
+static void test_sockopts(void)
+{
     /* Test setsockopt + getsockopt: SO_REUSEADDR */
     TEST("SO_REUSEADDR set+get");
     {
@@ -445,6 +452,16 @@ ipv6_done:;
         } else
             FAIL("socket failed");
     }
+}
+
+int main(void)
+{
+    printf("test-net: AF_INET/AF_INET6 networking tests\n");
+
+    test_tcp_udp();
+    test_efault_consumes();
+    test_ipv6();
+    test_sockopts();
 
     SUMMARY("test-net");
     return fails > 0 ? 1 : 0;

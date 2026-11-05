@@ -270,7 +270,8 @@ int main(void)
              * caller an EFAULT and an unchanged fd table.
              */
             if (r >= 0)
-                PASS();
+                EXPECT_TRUE(rbuf == 'w' && after >= before,
+                            "payload lost or fds closed behind the caller");
             else if (err != EFAULT)
                 FAIL("recvmsg errno is not EFAULT");
             else

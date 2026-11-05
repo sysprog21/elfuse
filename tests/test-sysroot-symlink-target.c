@@ -82,14 +82,10 @@ static int reads(const char *name, const char *want)
     return file_content_is(path, want);
 }
 
-int main(void)
+static void test_follow_targets(void)
 {
     char path[PATH_MAX];
-    char buf[PATH_MAX];
     struct stat st;
-    ssize_t n;
-
-    printf("test-sysroot-symlink-target: following escaped link targets\n");
 
     TEST("fixture setup");
     EXPECT_TRUE(mkdir(DIR_T, 0755) == 0 || errno == EEXIST, "mkdir");
@@ -150,6 +146,14 @@ int main(void)
         }
         EXPECT_TRUE(chdir("/") == 0, "restore cwd");
     }
+}
+
+static void test_readlink_and_stat(void)
+{
+    char path[PATH_MAX];
+    char buf[PATH_MAX];
+    struct stat st;
+    ssize_t n;
 
     /* readlink reports the disk. A relative target is stored verbatim, so the
      * guest's own bytes come back; an absolute one was rewritten at symlink()
@@ -184,6 +188,12 @@ int main(void)
 
     TEST("stat sees the target, not the link");
     EXPECT_TRUE(stat(path, &st) == 0 && S_ISREG(st.st_mode), "stat");
+}
+
+static void test_intermediate_and_chains(void)
+{
+    char path[PATH_MAX];
+    struct stat st;
 
     /* An intermediate link is followed whatever the final component asks for,
      * which is what separates "do not follow the last component" from "do not
@@ -219,6 +229,13 @@ int main(void)
         link_to("../../../../../../symlink-target/Target.One", "updot") == 0 &&
             reads("updot", "escaped") == 0,
         "content through an over-climbing target");
+}
+
+static void test_link_budget_and_loops(void)
+{
+    char path[PATH_MAX];
+    char buf[PATH_MAX];
+    struct stat st;
 
     /* Regression guards for the link budget, green at introduction: exactly
      * MAXSYMLINKS (40) links resolve and the 41st reports ELOOP, matching Linux
@@ -270,6 +287,12 @@ int main(void)
     EXPECT_TRUE(lstat(path, &st) == 0 && S_ISLNK(st.st_mode) &&
                     readlink(path, buf, sizeof(buf) - 1) > 0,
                 "the link itself exists");
+}
+
+static void test_unlink_and_create(void)
+{
+    char path[PATH_MAX];
+    struct stat st;
 
     /* Operations that do not follow must keep working on the link, since a fix
      * that resolved targets everywhere would break removing a dangling one.
@@ -298,7 +321,10 @@ int main(void)
     TEST("  and it landed in the directory the link names");
     at(path, sizeof(path), "Sub.Dir/Made.Dir");
     EXPECT_TRUE(stat(path, &st) == 0 && S_ISDIR(st.st_mode), "dir at target");
+}
 
+static void test_dirfd_intermediate(void)
+{
     /* And the same through a descriptor, which is the third resolver: a tree
      * walker reaches every name this way and never builds an absolute path.
      */
@@ -324,6 +350,12 @@ int main(void)
         if (dirfd >= 0)
             close(dirfd);
     }
+}
+
+static void test_dirfd_final_link(void)
+{
+    char path[PATH_MAX];
+    struct stat st;
 
     /* The final component itself may be the link. The follow decision belongs
      * to the caller (openat without O_NOFOLLOW follows, fstatat with
@@ -441,6 +473,19 @@ int main(void)
         if (dirfd >= 0)
             close(dirfd);
     }
+}
+
+int main(void)
+{
+    printf("test-sysroot-symlink-target: following escaped link targets\n");
+
+    test_follow_targets();
+    test_readlink_and_stat();
+    test_intermediate_and_chains();
+    test_link_budget_and_loops();
+    test_unlink_and_create();
+    test_dirfd_intermediate();
+    test_dirfd_final_link();
 
     SUMMARY("test-sysroot-symlink-target");
     return fails > 0 ? 1 : 0;

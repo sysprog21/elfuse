@@ -26,12 +26,10 @@
 #define __NR_epoll_pwait2 441
 #endif
 
-int main(void)
+int passes = 0, fails = 0;
+
+static void test_basic_wait(void)
 {
-    int passes = 0, fails = 0;
-
-    printf("test-epoll: epoll emulation tests\n");
-
     /* Test epoll_create1 with CLOEXEC */
     TEST("epoll_create1(CLOEXEC)");
     {
@@ -66,7 +64,10 @@ int main(void)
         close(pipefd[1]);
         close(epfd);
     }
+}
 
+static void test_read_masks(void)
+{
     /* The read half of "epoll reads the same bits poll does". eventpoll has no
      * mask of its own: ep_item_poll masks the file's answer by
      * epi->event.events, so a registration naming only EPOLLRDNORM asks for one
@@ -252,7 +253,10 @@ int main(void)
         close(pipefd[1]);
         close(epfd);
     }
+}
 
+static void test_write_masks(void)
+{
     /* Test EPOLLOUT on pipe write end (always writable) */
     TEST("ADD pipe write + EPOLLOUT");
     {
@@ -376,7 +380,10 @@ int main(void)
         close(pipefd[1]);
         close(epfd);
     }
+}
 
+static void test_ctl_mod_del(void)
+{
     /* Test EPOLL_CTL_MOD: change monitored events */
     TEST("CTL_MOD events");
     {
@@ -459,7 +466,10 @@ int main(void)
         close(pipefd[1]);
         close(epfd);
     }
+}
 
+static void test_wait_basics(void)
+{
     /* Test timeout=0: non-blocking poll returns immediately */
     TEST("timeout=0 no events");
     {
@@ -536,7 +546,10 @@ int main(void)
         close(pipefd[1]);
         close(epfd);
     }
+}
 
+static void test_oneshot_rearm(void)
+{
     /* Test EPOLLONESHOT + EPOLL_CTL_MOD re-arm This is the critical test: after
      * EPOLLONESHOT fires and is reported, EPOLL_CTL_MOD should succeed to
      * re-arm the registration.
@@ -585,7 +598,10 @@ int main(void)
         close(pipefd[1]);
         close(epfd);
     }
+}
 
+static void test_ctl_validation(void)
+{
     /* An op outside the three constants must be refused before anything is
      * armed. The arms test DEL, then ADD, then MOD, so an unknown value used to
      * fall past all three into the registration path and arm a knote.
@@ -669,6 +685,19 @@ int main(void)
         close(vfd[1]);
         close(vep);
     }
+}
+
+int main(void)
+{
+    printf("test-epoll: epoll emulation tests\n");
+
+    test_basic_wait();
+    test_read_masks();
+    test_write_masks();
+    test_ctl_mod_del();
+    test_wait_basics();
+    test_oneshot_rearm();
+    test_ctl_validation();
 
     SUMMARY("test-epoll");
     return fails > 0 ? 1 : 0;

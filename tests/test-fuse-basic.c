@@ -337,6 +337,17 @@ static void *daemon_main(void *arg)
     }
 }
 
+/* State the stages of the run hand to one another: the daemon thread and its
+ * context, the live device fd, and the two directory fds the later stages
+ * reuse.
+ */
+typedef struct {
+    daemon_ctx_t ctx;
+    pthread_t tid;
+    int fusefd;
+    int dfd, dupdfd;
+} fuse_env_t;
+
 static void die(const char *msg)
 {
     perror(msg);
@@ -371,16 +382,8 @@ static void expect_hello_fd(int fd)
     }
 }
 
-int main(void)
+static int test_fuse_device(const char *mount_dir)
 {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sigusr1_handler;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGUSR1, &sa, NULL) < 0)
-        die("sigaction(SIGUSR1)");
-
-    const char *mount_dir = "/mnt/fuse";
     if (access(mount_dir, F_OK) < 0)
         die("access(mountpoint)");
     if (access("/dev/fuse", F_OK) < 0)
@@ -405,6 +408,11 @@ int main(void)
     }
     close(fusefd);
 
+    return 0;
+}
+
+static int test_mount_init_failure(const char *mount_dir)
+{
     int bad_fusefd = open("/dev/fuse", O_RDWR);
     if (bad_fusefd < 0)
         die("open(/dev/fuse bad)");
@@ -432,8 +440,16 @@ int main(void)
         die("pthread_join bad daemon");
     }
 
-    fusefd = open("/dev/fuse", O_RDWR);
-    if (fusefd < 0)
+    return 0;
+}
+
+static int test_mount_and_sigio(fuse_env_t *env, const char *mount_dir)
+{
+    char opts[128];
+    struct stat st;
+
+    env->fusefd = open("/dev/fuse", O_RDWR);
+    if (env->fusefd < 0)
         die("open(/dev/fuse good)");
     struct sigaction sigio_sa;
     memset(&sigio_sa, 0, sizeof(sigio_sa));
@@ -441,30 +457,29 @@ int main(void)
     sigemptyset(&sigio_sa.sa_mask);
     if (sigaction(SIGIO, &sigio_sa, NULL) < 0)
         die("sigaction(SIGIO)");
-    if (fcntl(fusefd, F_SETOWN, getpid()) < 0)
+    if (fcntl(env->fusefd, F_SETOWN, getpid()) < 0)
         die("fcntl(F_SETOWN fusefd)");
-    int fuse_fl = fcntl(fusefd, F_GETFL);
-    if (fuse_fl < 0 || fcntl(fusefd, F_SETFL, fuse_fl | O_ASYNC) < 0)
+    int fuse_fl = fcntl(env->fusefd, F_GETFL);
+    if (fuse_fl < 0 || fcntl(env->fusefd, F_SETFL, fuse_fl | O_ASYNC) < 0)
         die("fcntl(F_SETFL O_ASYNC fusefd)");
 
     /* Route the daemon and the mount through a dup of the device fd: the
      * original is closed after INIT below, and SIGIO must keep flowing since
      * O_ASYNC and the owner live on the shared open-file description.
      */
-    int sigio_origfd = fusefd;
-    fusefd = dup(sigio_origfd);
-    if (fusefd < 0)
+    int sigio_origfd = env->fusefd;
+    env->fusefd = dup(sigio_origfd);
+    if (env->fusefd < 0)
         die("dup(/dev/fuse)");
 
-    daemon_ctx_t ctx = {.fusefd = fusefd};
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, daemon_main, &ctx) != 0) {
+    env->ctx = (daemon_ctx_t) {.fusefd = env->fusefd};
+    if (pthread_create(&env->tid, NULL, daemon_main, &env->ctx) != 0) {
         errno = EINVAL;
         die("pthread_create");
     }
 
     snprintf(opts, sizeof(opts), "fd=%d,rootmode=40000,user_id=%u,group_id=%u",
-             fusefd, (unsigned) getuid(), (unsigned) getgid());
+             env->fusefd, (unsigned) getuid(), (unsigned) getgid());
     if (syscall(SYS_mount, source_name, mount_dir, "fuse", 0, opts) < 0)
         die("mount(fuse)");
     for (int i = 0; i < 2000 && !got_sigio; i++)
@@ -501,9 +516,16 @@ int main(void)
      * a non-SA_RESTART handler firing mid-syscall surfaces spurious EINTR in
      * the unrelated tests below.
      */
-    fuse_fl = fcntl(fusefd, F_GETFL);
-    if (fuse_fl < 0 || fcntl(fusefd, F_SETFL, fuse_fl & ~O_ASYNC) < 0)
+    fuse_fl = fcntl(env->fusefd, F_GETFL);
+    if (fuse_fl < 0 || fcntl(env->fusefd, F_SETFL, fuse_fl & ~O_ASYNC) < 0)
         die("fcntl(F_SETFL clear O_ASYNC)");
+
+    return 0;
+}
+
+static int test_file_access(fuse_env_t *env, const char *mount_dir)
+{
+    struct stat st;
 
     expect_contains("/proc/self/mountinfo", mount_dir);
     expect_contains("/proc/self/mountinfo", " - fuse ");
@@ -575,7 +597,7 @@ int main(void)
 
     if (lseek(fd, 0, SEEK_SET) < 0)
         die("lseek(fuse-file)");
-    ctx.stall_read_once = 1;
+    env->ctx.stall_read_once = 1;
     got_usr1 = 0;
     pthread_t sender;
     pthread_t main_tid = pthread_self();
@@ -606,7 +628,7 @@ int main(void)
      */
     if (lseek(fd, 0, SEEK_SET) < 0)
         die("lseek(fuse-file)");
-    ctx.over_reply_read = 1;
+    env->ctx.over_reply_read = 1;
     struct {
         uint8_t lead[64];
         uint8_t body[16];
@@ -614,7 +636,7 @@ int main(void)
     } guarded;
     memset(&guarded, 0x5C, sizeof(guarded));
     ssize_t over_rc = read(fd, guarded.body, sizeof(guarded.body));
-    ctx.over_reply_read = 0;
+    env->ctx.over_reply_read = 0;
     if (over_rc < 0)
         die("read(over-replying fuse file)");
     if ((size_t) over_rc > sizeof(guarded.body)) {
@@ -644,6 +666,13 @@ int main(void)
     }
     close(fd);
 
+    return 0;
+}
+
+static int test_paths_and_readdir(fuse_env_t *env, const char *mount_dir)
+{
+    struct stat st;
+
     /* Canonicalization: ./ and intermediate-up traversals must collapse to the
      * same file rather than be forwarded as literal FUSE_LOOKUP names. Without
      * canonicalization the daemon would receive LOOKUP for "." and fail.
@@ -668,19 +697,19 @@ int main(void)
     expect_hello_fd(upfd);
     close(upfd);
 
-    int dfd = open(mount_dir, O_RDONLY | O_DIRECTORY);
-    if (dfd < 0)
+    env->dfd = open(mount_dir, O_RDONLY | O_DIRECTORY);
+    if (env->dfd < 0)
         die("open(dir)");
-    int dupdfd = dup(dfd);
-    if (dupdfd < 0)
+    env->dupdfd = dup(env->dfd);
+    if (env->dupdfd < 0)
         die("dup(fuse-dir)");
-    int relfd = openat(dfd, hello_name, O_RDONLY);
+    int relfd = openat(env->dfd, hello_name, O_RDONLY);
     if (relfd < 0)
         die("openat(dirfd, hello)");
     expect_hello_fd(relfd);
     close(relfd);
 
-    if (fchdir(dfd) < 0)
+    if (fchdir(env->dfd) < 0)
         die("fchdir(fuse-dir)");
     relfd = open(hello_name, O_RDONLY);
     if (relfd < 0)
@@ -709,7 +738,7 @@ int main(void)
         die("chdir(/ restore)");
 
     char dents[512];
-    ssize_t nr = syscall(SYS_getdents64, dfd, dents, sizeof(dents));
+    ssize_t nr = syscall(SYS_getdents64, env->dfd, dents, sizeof(dents));
     if (nr < 0)
         die("getdents64");
 
@@ -724,20 +753,25 @@ int main(void)
         fprintf(stderr, "readdir did not report %s\n", hello_name);
         return 1;
     }
-    nr = syscall(SYS_getdents64, dupdfd, dents, sizeof(dents));
+    nr = syscall(SYS_getdents64, env->dupdfd, dents, sizeof(dents));
     if (nr != 0) {
         fprintf(stderr, "expected dup'd FUSE dir to share EOF offset\n");
         return 1;
     }
 
+    return 0;
+}
+
+static int test_daemon_death(fuse_env_t *env)
+{
     /* Daemon-death + post-tombstone routing test.
      *
-     * Set the virtual cwd to the FUSE mount via fchdir(dfd) so the consumer has
-     * a FUSE-rooted relative-path baseline. Close /dev/fuse from the consumer
-     * side to simulate daemon death: fuse_fd_cleanup tombstones the mount
-     * (mount->session = NULL but the slot path/source/fstype/ mount_id stay
-     * intact), wakes any blocked requests, and the daemon thread's next read
-     * returns ENOTCONN and the thread exits.
+     * Set the virtual cwd to the FUSE mount via fchdir(env->dfd) so the
+     * consumer has a FUSE-rooted relative-path baseline. Close /dev/fuse from
+     * the consumer side to simulate daemon death: fuse_fd_cleanup tombstones
+     * the mount (mount->session = NULL but the slot path/source/fstype/
+     * mount_id stay intact), wakes any blocked requests, and the daemon
+     * thread's next read returns ENOTCONN and the thread exits.
      *
      * After the daemon is gone, a relative open from the still-FUSE-rooted
      * virtual cwd MUST return -LINUX_ENOTCONN rather than silently falling
@@ -745,16 +779,16 @@ int main(void)
      * keeps the path matching FUSE, and fuse_open_path detects session==NULL
      * and returns ENOTCONN.
      */
-    if (fchdir(dfd) < 0)
+    if (fchdir(env->dfd) < 0)
         die("fchdir(dfd) before daemon death");
     int alive_fd = open(hello_name, O_RDONLY);
     if (alive_fd < 0)
         die("open(hello) pre-death sanity");
     close(alive_fd);
 
-    close(fusefd);
-    fusefd = -1;
-    if (pthread_join(tid, NULL) != 0) {
+    close(env->fusefd);
+    env->fusefd = -1;
+    if (pthread_join(env->tid, NULL) != 0) {
         errno = EINVAL;
         die("pthread_join after daemon death");
     }
@@ -773,15 +807,44 @@ int main(void)
 
     if (chdir("/") < 0)
         die("chdir(/) after daemon death");
-    close(dupdfd);
-    close(dfd);
-    if (!ctx.saw_interrupt) {
+    close(env->dupdfd);
+    close(env->dfd);
+    if (!env->ctx.saw_interrupt) {
         fprintf(stderr, "daemon did not observe FUSE_INTERRUPT\n");
         return 1;
     }
-    if (!ctx.saw_forget || ctx.forget_nlookup_total == 0) {
+    if (!env->ctx.saw_forget || env->ctx.forget_nlookup_total == 0) {
         fprintf(stderr, "daemon did not observe FUSE_FORGET traffic\n");
         return 1;
     }
+
+    return 0;
+}
+
+int main(void)
+{
+    fuse_env_t env = {0};
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigusr1_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGUSR1, &sa, NULL) < 0)
+        die("sigaction(SIGUSR1)");
+
+    const char *mount_dir = "/mnt/fuse";
+    if (test_fuse_device(mount_dir))
+        return 1;
+    if (test_mount_init_failure(mount_dir))
+        return 1;
+    if (test_mount_and_sigio(&env, mount_dir))
+        return 1;
+    if (test_file_access(&env, mount_dir))
+        return 1;
+    if (test_paths_and_readdir(&env, mount_dir))
+        return 1;
+    if (test_daemon_death(&env))
+        return 1;
+
     return 0;
 }

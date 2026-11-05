@@ -103,24 +103,8 @@ static void check_accmode_immutable(const char *what, int fd, int want)
     EXPECT_EQ(after & O_ACCMODE, want, "F_SETFL changed the access mode");
 }
 
-int main(void)
+static void test_regular_access(const char *regular_file)
 {
-    printf("test-fcntl-flags: status flags across fd types\n");
-
-    /* A directory private to this run, under /tmp so the guest can create it
-     * under either sysroot. The fixed names it replaces were unlinked mid-test
-     * by concurrent runs.
-     */
-    char tmpdir[] = "/tmp/elfuse-fcntl-flags-XXXXXX";
-    if (!mkdtemp(tmpdir)) {
-        perror("mkdtemp");
-        return 1;
-    }
-    char noatime_file[128], sync_file[128], regular_file[128];
-    snprintf(noatime_file, sizeof(noatime_file), "%s/noatime.tmp", tmpdir);
-    snprintf(sync_file, sizeof(sync_file), "%s/sync.tmp", tmpdir);
-    snprintf(regular_file, sizeof(regular_file), "%s/regular", tmpdir);
-
     /* Regular files, one per access mode. */
     int rd = open("/etc/hostname", O_RDONLY);
     if (rd < 0)
@@ -135,6 +119,17 @@ int main(void)
     check_roundtrip("regular O_APPEND round trip", rw, O_APPEND);
     check_roundtrip("regular O_NONBLOCK round trip", rw, O_NONBLOCK);
 
+    if (rd >= 0)
+        close(rd);
+    if (wr >= 0)
+        close(wr);
+    if (rw >= 0)
+        close(rw);
+    unlink(regular_file);
+}
+
+static void test_pipe_nonblock(void)
+{
     /* A pipe: elfuse owns O_NONBLOCK on both ends. */
     int p[2];
     if (pipe(p) == 0) {
@@ -177,7 +172,10 @@ int main(void)
         close(nbw[0]);
         close(nbw[1]);
     }
+}
 
+static void test_socket_timerfd_eventfd(void)
+{
     /* A socket: never owned, so the host flag is the guest's. */
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock >= 0) {
@@ -227,7 +225,10 @@ int main(void)
                      "read did not EAGAIN");
         close(efd_nb);
     }
+}
 
+static void test_signalfd_nonblock(void)
+{
     /* Same shape for signalfd, whose flag lived in the same private field. */
     sigset_t mask;
     sigemptyset(&mask);
@@ -242,7 +243,10 @@ int main(void)
                      "read did not EAGAIN");
         close(sfd);
     }
+}
 
+static void test_dup_synthetic(void)
+{
     /* inotify keeps the same shape: O_RDONLY on Linux, and a private copy of
      * the nonblock flag would strand a guest that set it after creation. An
      * alias of a synthetic fd shares its open file description, so it inherits
@@ -286,7 +290,10 @@ int main(void)
         }
         close(tdup_src);
     }
+}
 
+static void test_inotify_nonblock(void)
+{
     int ifd = inotify_init();
     if (ifd >= 0) {
         check_accmode("inotify is O_RDONLY", ifd, O_RDONLY);
@@ -306,7 +313,10 @@ int main(void)
                      "read did not EAGAIN");
         close(ifd_nb);
     }
+}
 
+static void test_o_direct(void)
+{
     /* O_DIRECT is settable on a pipe (that is packet mode) and refused on a
      * socket, where Linux has no FMODE_CAN_ODIRECT to offer. Both spellings
      * measured against qemu-aarch64; recording O_DIRECT for a socket would
@@ -329,7 +339,10 @@ int main(void)
         EXPECT_EQ(fcntl(odsock, F_GETFL) & O_DIRECT, 0, "bit leaked in");
         close(odsock);
     }
+}
 
+static void test_noatime_and_dir_flags(const char *noatime_file)
+{
     /* O_NOATIME is settable, and macOS has no equivalent, so the shadow owns
      * it: F_SETFL has to write it there or F_GETFL keeps answering with what
      * open() recorded. Checked in both directions, since a shadow that is only
@@ -367,7 +380,10 @@ int main(void)
         EXPECT_TRUE(fcntl(pathfd, F_GETFL) & O_PATH, "bit lost");
         close(pathfd);
     }
+}
 
+static void test_o_async(void)
+{
     /* O_ASYNC sticks only where the object supports it. Linux does not carry
      * FASYNC in SETFL_MASK: setfl() lands the bit by calling
      * file_operations->fasync, so an object whose fops lack one keeps O_ASYNC
@@ -375,6 +391,9 @@ int main(void)
      * measured under qemu-aarch64, and this table is why they cannot drift:
      * elfuse used to answer 1 for all eleven.
      */
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
     struct {
         const char *name;
         int fd, want;
@@ -436,7 +455,10 @@ int main(void)
             close(afds[i]);
         }
     }
+}
 
+static void test_synthetic_access_modes(void)
+{
     /* Every synthetic fd answers its access mode from elfuse's shadow, because
      * the host fd behind it is a pipe or a kqueue elfuse opened for its own
      * purposes. Each one has to carry the mode Linux gives its anon inode.
@@ -461,15 +483,10 @@ int main(void)
         check_accmode("urandom is O_RDONLY", urand, O_RDONLY);
         close(urand);
     }
+}
 
-    if (rd >= 0)
-        close(rd);
-    if (wr >= 0)
-        close(wr);
-    if (rw >= 0)
-        close(rw);
-    unlink(regular_file);
-
+static void test_sync_flags(const char *sync_file)
+{
     /* A raw openat may carry __O_SYNC without O_DSYNC. Linux normalizes it to
      * O_SYNC, while an O_DSYNC-only open remains weaker. Every F_GETFL result
      * is stored before it is masked. A failed call returns -1, whose bits
@@ -512,6 +529,37 @@ int main(void)
         close(sfd_dsync);
     }
     unlink(sync_file);
+}
+
+int main(void)
+{
+    printf("test-fcntl-flags: status flags across fd types\n");
+
+    /* A directory private to this run, under /tmp so the guest can create it
+     * under either sysroot. The fixed names it replaces were unlinked mid-test
+     * by concurrent runs.
+     */
+    char tmpdir[] = "/tmp/elfuse-fcntl-flags-XXXXXX";
+    if (!mkdtemp(tmpdir)) {
+        perror("mkdtemp");
+        return 1;
+    }
+    char noatime_file[128], sync_file[128], regular_file[128];
+    snprintf(noatime_file, sizeof(noatime_file), "%s/noatime.tmp", tmpdir);
+    snprintf(sync_file, sizeof(sync_file), "%s/sync.tmp", tmpdir);
+    snprintf(regular_file, sizeof(regular_file), "%s/regular", tmpdir);
+
+    test_regular_access(regular_file);
+    test_pipe_nonblock();
+    test_socket_timerfd_eventfd();
+    test_signalfd_nonblock();
+    test_dup_synthetic();
+    test_inotify_nonblock();
+    test_o_direct();
+    test_noatime_and_dir_flags(noatime_file);
+    test_o_async();
+    test_synthetic_access_modes();
+    test_sync_flags(sync_file);
     rmdir(tmpdir);
 
     SUMMARY("test-fcntl-flags");

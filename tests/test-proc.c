@@ -28,6 +28,8 @@
 #include "test-harness.h"
 #include "test-util.h"
 
+int passes = 0, fails = 0;
+
 static char orig_cwd[512];
 
 #define RESTORE_CWD()                   \
@@ -49,17 +51,8 @@ static int cwd_matches_proc_fd_dir(const char *cwd)
     return !strcmp(cwd, expected);
 }
 
-int main(void)
+static void test_proc_files(void)
 {
-    if (!getcwd(orig_cwd, sizeof(orig_cwd))) {
-        orig_cwd[0] = '/';
-        orig_cwd[1] = '\0';
-    }
-
-    int passes = 0, fails = 0;
-
-    printf("test-proc: /proc and /dev emulation tests\n");
-
     /* /proc/self/cmdline: should contain argv[0], NUL-separated */
     TEST("/proc/self/cmdline");
     {
@@ -149,7 +142,10 @@ int main(void)
         } else
             FAIL("read failed");
     }
+}
 
+static void test_proc_exe_and_dirs(void)
+{
     /* readlink("/proc/self/exe"): should return a non-empty path */
     TEST("readlink /proc/self/exe");
     {
@@ -215,7 +211,10 @@ int main(void)
         } else
             FAIL("opendir failed");
     }
+}
 
+static void test_statfs_proc(void)
+{
     /* statfs("/proc") and friends: /proc has no host-filesystem counterpart
      * under the sysroot, so this exercises the intercept path (issue #141)
      * rather than a raw host statfs() on the guest-supplied string.
@@ -302,7 +301,10 @@ int main(void)
         if (fd >= 0)
             close(fd);
     }
+}
 
+static void test_statfs_fd_dirs(void)
+{
     /* /proc/self/fd and /proc/self/fdinfo are directories whose *open* path
      * allocates a fresh scratch directory with one placeholder file per live
      * guest fd (see proc_open_fd_scratch) -- work a plain statfs() has no use
@@ -332,7 +334,10 @@ int main(void)
                 ok = 0;
         EXPECT_TRUE(ok, "statfs failed");
     }
+}
 
+static void test_proc_cwd(void)
+{
     TEST("chdir /proc preserves guest cwd");
     {
         char cwd[256];
@@ -437,7 +442,10 @@ int main(void)
         }
         RESTORE_CWD();
     }
+}
 
+static void test_proc_fd_dirfd(void)
+{
     TEST("fchdir follows /proc/self/fd target");
     {
         char tmpl[] = "/tmp/elfuse-proc-fchdir-XXXXXX";
@@ -563,7 +571,10 @@ int main(void)
             FAIL("open unexpectedly succeeded");
         }
     }
+}
 
+static void test_dev_nodes(void)
+{
     /* /dev/null: write succeeds, read returns 0 (EOF) */
     TEST("/dev/null write+read");
     {
@@ -656,6 +667,24 @@ int main(void)
             close(rand_fd);
         EXPECT_TRUE(ok, "writable device open regression");
     }
+}
+
+int main(void)
+{
+    if (!getcwd(orig_cwd, sizeof(orig_cwd))) {
+        orig_cwd[0] = '/';
+        orig_cwd[1] = '\0';
+    }
+
+    printf("test-proc: /proc and /dev emulation tests\n");
+
+    test_proc_files();
+    test_proc_exe_and_dirs();
+    test_statfs_proc();
+    test_statfs_fd_dirs();
+    test_proc_cwd();
+    test_proc_fd_dirfd();
+    test_dev_nodes();
 
     SUMMARY("test-proc");
     return fails > 0 ? 1 : 0;

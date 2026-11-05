@@ -26,6 +26,18 @@
 
 #include "test-harness.h"
 
+int passes = 0, fails = 0;
+
+/* Scratch paths and payload shared by the cases, all under one private
+ * directory so concurrent runs do not unlink each other's files.
+ */
+typedef struct {
+    char tmpdir[64];
+    char src_path[256], dst_path[256];
+    char alloc_path[256], punch_path[256], cfr_dst[256];
+    const char *test_data;
+} io_fixture_t;
+
 /* splice(@in, NULL, a pipe, NULL, 5, SPLICE_F_NONBLOCK) on a blocking socket
  * whose peer @peer sends those 5 bytes from a child after 300 ms.
  *
@@ -72,62 +84,31 @@ static int splice_stdin_nonblock(void)
     return 0;
 }
 
-int main(int argc, char **argv)
+static void test_sendfile_fsync_fallocate(io_fixture_t *fx)
 {
-    int passes = 0, fails = 0;
-
-    if (argc > 1 && strcmp(argv[1], "stdin") == 0)
-        return splice_stdin_nonblock();
-
-    char tmpdir[] = "/tmp/elfuse-io-opt-XXXXXX";
-    if (!mkdtemp(tmpdir)) {
-        perror("mkdtemp");
-        return 1;
-    }
-    char src_path[256], dst_path[256];
-    char alloc_path[256], punch_path[256], cfr_dst[256];
-    snprintf(src_path, sizeof(src_path), "%s/src.txt", tmpdir);
-    snprintf(dst_path, sizeof(dst_path), "%s/dst.txt", tmpdir);
-    snprintf(alloc_path, sizeof(alloc_path), "%s/alloc.bin", tmpdir);
-    snprintf(punch_path, sizeof(punch_path), "%s/punch.bin", tmpdir);
-    snprintf(cfr_dst, sizeof(cfr_dst), "%s/cfr-dst.txt", tmpdir);
-    const char *test_data = "Hello from sendfile test! This is test data.\n";
-
-    printf("test-io-opt: Batch 3 I/O optimization tests\n");
-
-    /* Create source file */
-    int src_fd = open(src_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (src_fd < 0) {
-        printf("FATAL: cannot create %s\n", src_path);
-        rmdir(tmpdir);
-        return 1;
-    }
-    write(src_fd, test_data, strlen(test_data));
-    close(src_fd);
-
     /* Test sendfile */
     TEST("sendfile");
     {
-        int in_fd = open(src_path, O_RDONLY);
-        int out_fd = open(dst_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int in_fd = open(fx->src_path, O_RDONLY);
+        int out_fd = open(fx->dst_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (in_fd >= 0 && out_fd >= 0) {
             off_t offset = 0;
             ssize_t copied =
-                sendfile(out_fd, in_fd, &offset, strlen(test_data));
-            if (copied == (ssize_t) strlen(test_data)) {
+                sendfile(out_fd, in_fd, &offset, strlen(fx->test_data));
+            if (copied == (ssize_t) strlen(fx->test_data)) {
                 close(out_fd);
                 close(in_fd);
 
                 /* Verify content */
                 char buf[256];
-                int verify_fd = open(dst_path, O_RDONLY);
+                int verify_fd = open(fx->dst_path, O_RDONLY);
                 if (verify_fd < 0) {
                     FAIL("open verify failed");
                 } else {
                     ssize_t n = read(verify_fd, buf, sizeof(buf));
                     close(verify_fd);
-                    if (n == (ssize_t) strlen(test_data) &&
-                        !memcmp(buf, test_data, n))
+                    if (n == (ssize_t) strlen(fx->test_data) &&
+                        !memcmp(buf, fx->test_data, n))
                         PASS();
                     else
                         FAIL("content mismatch");
@@ -149,7 +130,7 @@ int main(int argc, char **argv)
     /* Test fsync */
     TEST("fsync");
     {
-        int fd = open(dst_path, O_RDWR);
+        int fd = open(fx->dst_path, O_RDWR);
         if (fd >= 0) {
             EXPECT_TRUE(fsync(fd) == 0, "fsync failed");
             close(fd);
@@ -160,7 +141,7 @@ int main(int argc, char **argv)
     /* Test fallocate (via ftruncate fallback) */
     TEST("fallocate (extend)");
     {
-        int fd = open(alloc_path, O_CREAT | O_RDWR, 0644);
+        int fd = open(fx->alloc_path, O_CREAT | O_RDWR, 0644);
         if (fd >= 0) {
             /* fallocate mode=0 should extend the file */
             if (fallocate(fd, 0, 0, 4096) == 0) {
@@ -170,14 +151,14 @@ int main(int argc, char **argv)
             } else
                 FAIL("fallocate failed");
             close(fd);
-            unlink(alloc_path);
+            unlink(fx->alloc_path);
         } else
             FAIL("open failed");
     }
 
     TEST("fallocate punch hole keeps size past EOF");
     {
-        int fd = open(punch_path, O_CREAT | O_RDWR, 0644);
+        int fd = open(fx->punch_path, O_CREAT | O_RDWR, 0644);
         if (fd >= 0) {
             const char data[] = "abc";
             const off_t data_size = (off_t) sizeof(data) - 1;
@@ -199,34 +180,37 @@ int main(int argc, char **argv)
             } else
                 FAIL("punch hole setup failed");
             close(fd);
-            unlink(punch_path);
+            unlink(fx->punch_path);
         } else
             FAIL("open failed");
     }
+}
 
+static void test_copy_file_range(io_fixture_t *fx)
+{
     /* Test copy_file_range (via off_t-based API) */
     TEST("copy_file_range");
     {
-        int in_fd = open(src_path, O_RDONLY);
-        int out_fd = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int in_fd = open(fx->src_path, O_RDONLY);
+        int out_fd = open(fx->cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (in_fd >= 0 && out_fd >= 0) {
             off_t off_in = 0, off_out = 0;
             ssize_t copied = copy_file_range(in_fd, &off_in, out_fd, &off_out,
-                                             strlen(test_data), 0);
+                                             strlen(fx->test_data), 0);
             close(in_fd);
             close(out_fd);
 
-            if (copied == (ssize_t) strlen(test_data)) {
+            if (copied == (ssize_t) strlen(fx->test_data)) {
                 /* Verify content */
                 char buf[256];
-                int v = open(cfr_dst, O_RDONLY);
+                int v = open(fx->cfr_dst, O_RDONLY);
                 if (v < 0) {
                     FAIL("open verify failed");
                 } else {
                     ssize_t n = read(v, buf, sizeof(buf));
                     close(v);
-                    if (n == (ssize_t) strlen(test_data) &&
-                        !memcmp(buf, test_data, n))
+                    if (n == (ssize_t) strlen(fx->test_data) &&
+                        !memcmp(buf, fx->test_data, n))
                         PASS();
                     else
                         FAIL("content mismatch");
@@ -240,7 +224,7 @@ int main(int argc, char **argv)
                 close(out_fd);
             FAIL("open failed");
         }
-        unlink(cfr_dst);
+        unlink(fx->cfr_dst);
     }
 
     /* copy_file_range refuses a directory, anything else not a regular file, an
@@ -249,11 +233,11 @@ int main(int argc, char **argv)
      */
     TEST("copy_file_range refuses bad ends");
     {
-        int rd = open(src_path, O_RDONLY);
-        int wr = open(src_path, O_WRONLY);
-        int ap = open(src_path, O_WRONLY | O_APPEND);
-        int out = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-        int dir = open(tmpdir, O_RDONLY);
+        int rd = open(fx->src_path, O_RDONLY);
+        int wr = open(fx->src_path, O_WRONLY);
+        int ap = open(fx->src_path, O_WRONLY | O_APPEND);
+        int out = open(fx->cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int dir = open(fx->tmpdir, O_RDONLY);
         int pfd[2] = {-1, -1};
         int ok = rd >= 0 && wr >= 0 && ap >= 0 && out >= 0 && dir >= 0 &&
                  pipe(pfd) == 0 && write(pfd[1], "x", 1) == 1;
@@ -293,7 +277,7 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
             if (fds[i] >= 0)
                 close(fds[i]);
-        unlink(cfr_dst);
+        unlink(fx->cfr_dst);
     }
 
     /* copy_file_range refuses a range whose end wraps as an unsigned sum, at
@@ -302,8 +286,8 @@ int main(int argc, char **argv)
      */
     TEST("copy_file_range refuses a wrapping range");
     {
-        int rd = open(src_path, O_RDONLY);
-        int out = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int rd = open(fx->src_path, O_RDONLY);
+        int out = open(fx->cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
         int ok = rd >= 0 && out >= 0;
         const char *why = "setup failed";
         loff_t one = 1, neg = -1, zero = 0;
@@ -349,9 +333,12 @@ int main(int argc, char **argv)
             close(rd);
         if (out >= 0)
             close(out);
-        unlink(cfr_dst);
+        unlink(fx->cfr_dst);
     }
+}
 
+static void test_append_output(io_fixture_t *fx)
+{
     /* sendfile and a pipe-to-file splice refuse an O_APPEND output with EINVAL
      * and move nothing, after the EBADF for an end opened the wrong way. A
      * zero-length splice returns 0 before either check. sendfile checks a
@@ -359,8 +346,9 @@ int main(int argc, char **argv)
      */
     TEST("sendfile and splice refuse an O_APPEND output");
     {
-        int rd = open(src_path, O_RDONLY);
-        int ap = open(cfr_dst, O_CREAT | O_WRONLY | O_APPEND | O_TRUNC, 0644);
+        int rd = open(fx->src_path, O_RDONLY);
+        int ap =
+            open(fx->cfr_dst, O_CREAT | O_WRONLY | O_APPEND | O_TRUNC, 0644);
         int pfd[2] = {-1, -1};
         int ok =
             rd >= 0 && ap >= 0 && pipe(pfd) == 0 && write(pfd[1], "xy", 2) == 2;
@@ -380,7 +368,7 @@ int main(int argc, char **argv)
             ok = splice(pfd[0], NULL, ap, NULL, 0, 0) == 0;
         }
         if (ok) {
-            int wr = open(src_path, O_WRONLY);
+            int wr = open(fx->src_path, O_WRONLY);
             why = "write-only input not EBADF ahead of O_APPEND";
             ok = wr >= 0 && sendfile(ap, wr, NULL, 2) == -1 && errno == EBADF &&
                  splice(pfd[1], NULL, ap, NULL, 2, 0) == -1 && errno == EBADF;
@@ -405,16 +393,19 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
             if (fds[i] >= 0)
                 close(fds[i]);
-        unlink(cfr_dst);
+        unlink(fx->cfr_dst);
     }
+}
 
+static void test_splice_nonblock(io_fixture_t *fx)
+{
     /* SPLICE_F_NONBLOCK answers EAGAIN on an empty pipe whose writer is still
      * open, even when the pipe itself is blocking.
      */
     TEST("splice SPLICE_F_NONBLOCK on empty pipe");
     {
         int pfd[2] = {-1, -1};
-        int out = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int out = open(fx->cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (out < 0 || pipe(pfd) != 0) {
             FAIL("setup failed");
         } else {
@@ -429,7 +420,7 @@ int main(int argc, char **argv)
         }
         if (out >= 0)
             close(out);
-        unlink(cfr_dst);
+        unlink(fx->cfr_dst);
     }
 
     /* With the output pipe full, SPLICE_F_NONBLOCK answers EAGAIN before it
@@ -524,7 +515,10 @@ int main(int argc, char **argv)
             if (fds[i] >= 0)
                 close(fds[i]);
     }
+}
 
+static void test_splice_pipe_ends(void)
+{
     /* do_splice raises SPLICE_F_NONBLOCK itself when a pipe end is O_NONBLOCK,
      * so a full O_NONBLOCK output answers EAGAIN before anything is read, and
      * an empty AF_UNIX input does not wait.
@@ -629,13 +623,49 @@ int main(int argc, char **argv)
             if (fds[i] >= 0)
                 close(fds[i]);
     }
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "stdin") == 0)
+        return splice_stdin_nonblock();
+
+    io_fixture_t fx = {.tmpdir = "/tmp/elfuse-io-opt-XXXXXX"};
+    if (!mkdtemp(fx.tmpdir)) {
+        perror("mkdtemp");
+        return 1;
+    }
+    snprintf(fx.src_path, sizeof(fx.src_path), "%s/src.txt", fx.tmpdir);
+    snprintf(fx.dst_path, sizeof(fx.dst_path), "%s/dst.txt", fx.tmpdir);
+    snprintf(fx.alloc_path, sizeof(fx.alloc_path), "%s/alloc.bin", fx.tmpdir);
+    snprintf(fx.punch_path, sizeof(fx.punch_path), "%s/punch.bin", fx.tmpdir);
+    snprintf(fx.cfr_dst, sizeof(fx.cfr_dst), "%s/cfr-dst.txt", fx.tmpdir);
+    fx.test_data = "Hello from sendfile test! This is test data.\n";
+
+    printf("test-io-opt: Batch 3 I/O optimization tests\n");
+
+    /* Create source file */
+    int src_fd = open(fx.src_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (src_fd < 0) {
+        printf("FATAL: cannot create %s\n", fx.src_path);
+        rmdir(fx.tmpdir);
+        return 1;
+    }
+    write(src_fd, fx.test_data, strlen(fx.test_data));
+    close(src_fd);
+
+    test_sendfile_fsync_fallocate(&fx);
+    test_copy_file_range(&fx);
+    test_append_output(&fx);
+    test_splice_nonblock(&fx);
+    test_splice_pipe_ends();
 
     /* Cleanup. The other three fixtures are unlinked by the blocks that make
      * them, so only these two are left for rmdir to trip over.
      */
-    unlink(src_path);
-    unlink(dst_path);
-    rmdir(tmpdir);
+    unlink(fx.src_path);
+    unlink(fx.dst_path);
+    rmdir(fx.tmpdir);
 
     SUMMARY("test-io-opt");
     return fails > 0 ? 1 : 0;

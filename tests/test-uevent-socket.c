@@ -278,33 +278,8 @@ static void *poke_after_delay(void *arg)
     return NULL;
 }
 
-int main(void)
+static void test_uevent_basics(int fd, bool on_elfuse)
 {
-    /* Line-buffered: the watchdog below _exit()s from a signal handler, which
-     * takes any buffered output with it. Without this a hang reports only the
-     * watchdog line, and which assertion hung is exactly what is wanted.
-     */
-    setvbuf(stdout, NULL, _IOLBF, 0);
-
-    /* Which lane is this? The one probe whose two answers cannot be confused:
-     * an unemulated netlink family is EAFNOSUPPORT from elfuse and
-     * EPROTONOSUPPORT from a kernel that simply has no such family registered.
-     * Everything below that differs by lane asks this rather than accepting
-     * both answers, so neither lane can pass on the other lane's behavior.
-     */
-    int bogus = socket(AF_NETLINK, SOCK_RAW, 99);
-    int bogus_errno = errno;
-    if (bogus >= 0)
-        close(bogus);
-    bool on_elfuse = bogus == -1 && bogus_errno == EAFNOSUPPORT;
-
-    /* The exact socket() call libusb's netlink monitor makes. */
-    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                    NETLINK_KOBJECT_UEVENT);
-    CHECK(fd >= 0, "socket(NETLINK_KOBJECT_UEVENT)");
-    if (fd < 0)
-        return 1;
-
     struct sockaddr_nl snl = {.nl_family = AF_NETLINK, .nl_groups = 1};
     CHECK(bind(fd, (struct sockaddr *) &snl, sizeof(snl)) == 0,
           "bind(nl_groups=1)");
@@ -386,11 +361,14 @@ int main(void)
     CHECK(rt >= 0, "socket(NETLINK_ROUTE) still works");
     if (rt >= 0)
         close(rt);
+}
 
-    /* The lane probe from the top of main, asserted rather than merely
-     * consulted: an unemulated netlink family is refused either way, and which
-     * errno it is refused with is what on_elfuse was read from.
-     */
+/* The lane probe from the top of main, asserted rather than merely consulted:
+ * an unemulated netlink family is refused either way, and which errno it is
+ * refused with is what on_elfuse was read from.
+ */
+static void test_socket_type_screening(int bogus, int bogus_errno)
+{
     errno = bogus_errno;
     CHECK(bogus == -1 &&
               (bogus_errno == EAFNOSUPPORT || bogus_errno == EPROTONOSUPPORT),
@@ -438,22 +416,22 @@ int main(void)
     CHECK(dg >= 0, "socket(SOCK_DGRAM) is accepted");
     if (dg >= 0)
         close(dg);
+}
 
-    /* SO_RCVBUF/SO_SNDBUF: two floors, not one
-     *
-     * sk_setsockopt() clamps the request to net.core.{r,w}mem_max, doubles it,
-     * then floors it at SOCK_MIN_RCVBUF or SOCK_MIN_SNDBUF. The two floors are
-     * TCP_SKB_MIN_TRUESIZE and twice that, so the send floor is exactly double
-     * the receive floor whatever sizeof(struct sk_buff) came out to on this
-     * build. Asking for 0 lands on each floor exactly.
-     */
+/* SO_RCVBUF/SO_SNDBUF: two floors, not one
+ *
+ * sk_setsockopt() clamps the request to net.core.{r,w}mem_max, doubles it, then
+ * floors it at SOCK_MIN_RCVBUF or SOCK_MIN_SNDBUF. The two floors are
+ * TCP_SKB_MIN_TRUESIZE and twice that, so the send floor is exactly double the
+ * receive floor whatever sizeof(struct sk_buff) came out to on this build.
+ * Asking for 0 lands on each floor exactly.
+ */
+static int test_sol_socket_options(bool on_elfuse)
+{
     int opt = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
     CHECK(opt >= 0, "socket for the SOL_SOCKET option surface");
-    if (opt < 0) {
-        close(fd);
-        printf("%d passed, %d failed\n", pass, fail);
+    if (opt < 0)
         return 1;
-    }
 
     int rcv_floor = set_get_int(opt, SO_RCVBUF, 0);
     int snd_floor = set_get_int(opt, SO_SNDBUF, 0);
@@ -617,14 +595,21 @@ int main(void)
 
     close(opt);
 
-    /* SO_RCVTIMEO bounds a blocking receive
-     *
-     * A blocking uevent socket bound to no multicast group receives nothing on
-     * either world: elfuse never synthesizes a uevent, and a real kernel has
-     * nothing to deliver to a subscriber of no groups. With a 200 ms
-     * SO_RCVTIMEO the recv must come back EAGAIN rather than parking forever,
-     * which is what an accepted-and-discarded timeout would do.
-     */
+    return 0;
+}
+
+/* SO_RCVTIMEO bounds a blocking receive
+ *
+ * A blocking uevent socket bound to no multicast group receives nothing on
+ * either world: elfuse never synthesizes a uevent, and a real kernel has
+ * nothing to deliver to a subscriber of no groups. With a 200 ms SO_RCVTIMEO
+ * the recv must come back EAGAIN rather than parking forever, which is what an
+ * accepted-and-discarded timeout would do.
+ */
+static void test_rcvtimeo_blocking_recv(void)
+{
+    char buf[4096];
+
     int blk = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
     CHECK(blk >= 0, "blocking socket for the SO_RCVTIMEO wait");
     if (blk >= 0) {
@@ -664,15 +649,18 @@ int main(void)
               "the SO_RCVTIMEO wait lasted about 200ms");
         close(blk);
     }
+}
 
-    /* SOL_NETLINK
-     *
-     * Same contract as bind(): the membership and the flags are recorded, and
-     * nothing is ever delivered on them. Every answer below was measured on
-     * Linux 6.x/aarch64 against both NETLINK_ROUTE and NETLINK_KOBJECT_UEVENT,
-     * so these are strict on both lanes -- except NETLINK_LISTEN_ALL_NSID,
-     * which is a capability check and therefore answers by privilege.
-     */
+/* SOL_NETLINK
+ *
+ * Same contract as bind(): the membership and the flags are recorded, and
+ * nothing is ever delivered on them. Every answer below was measured on Linux
+ * 6.x/aarch64 against both NETLINK_ROUTE and NETLINK_KOBJECT_UEVENT, so these
+ * are strict on both lanes -- except NETLINK_LISTEN_ALL_NSID, which is a
+ * capability check and therefore answers by privilege.
+ */
+static void test_sol_netlink(bool on_elfuse)
+{
     int nlopt = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
     CHECK(nlopt >= 0, "socket for the SOL_NETLINK option surface");
     if (nlopt >= 0) {
@@ -801,16 +789,21 @@ int main(void)
 
         close(nlopt);
     }
+}
 
-    /* A negative tv_sec is sock_set_timeout()'s third state
-     *
-     * Linux stores a literal 0 jiffies for it, which every wait reads as "do
-     * not wait": the receive below must report EAGAIN at once even though the
-     * socket is blocking and the option reads back as {0,0}, the same thing
-     * "wait forever" reads back as. Storing it as forever -- the reading that
-     * {0,0} deserves and this does not -- parks the caller instead, which is
-     * what the watchdog would catch.
-     */
+/* A negative tv_sec is sock_set_timeout()'s third state
+ *
+ * Linux stores a literal 0 jiffies for it, which every wait reads as "do not
+ * wait": the receive below must report EAGAIN at once even though the socket is
+ * blocking and the option reads back as {0,0}, the same thing "wait forever"
+ * reads back as. Storing it as forever -- the reading that {0,0} deserves and
+ * this does not -- parks the caller instead, which is what the watchdog would
+ * catch.
+ */
+static void test_negative_rcvtimeo(void)
+{
+    char buf[4096];
+
     int nw = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
     CHECK(nw >= 0, "socket for the negative-timeout receive");
     if (nw >= 0) {
@@ -838,26 +831,30 @@ int main(void)
               "a blocking recv after tv_sec=-1 reports EAGAIN at once");
         close(nw);
     }
+}
 
-    /* A sibling's execve is not a signal
-     *
-     * io_wait_fd_timed_or_interrupted() reports EINTR for two unrelated
-     * reasons. One is a signal the guest can see. The other is the dispatcher's
-     * own execve handoff, which the leader leaves its wait for so the run loop
-     * can reach it, and which carries no signal at all. Refusing the SVC
-     * restart for both turned a sibling's execve -- even one that fails -- into
-     * an EINTR on a recvmsg the guest issued once, an errno Linux cannot
-     * produce there. Below, an execve fails every 20 ms for the whole of a
-     * two-second SO_RCVTIMEO and the receive still has to come back with EAGAIN
-     * at the deadline it was given.
-     *
-     * The elapsed time is the other half. A restart re-enters the wait from the
-     * top, so one that took a fresh copy of SO_RCVTIMEO rather than resuming
-     * the deadline would push the return out by two seconds per interruption --
-     * around a hundred of them here -- and the watchdog rather than the upper
-     * bound is what would catch it. Resuming the deadline is what Linux's
-     * restart_block carries.
-     */
+/* A sibling's execve is not a signal
+ *
+ * io_wait_fd_timed_or_interrupted() reports EINTR for two unrelated reasons.
+ * One is a signal the guest can see. The other is the dispatcher's own execve
+ * handoff, which the leader leaves its wait for so the run loop can reach it,
+ * and which carries no signal at all. Refusing the SVC restart for both turned
+ * a sibling's execve -- even one that fails -- into an EINTR on a recvmsg the
+ * guest issued once, an errno Linux cannot produce there. Below, an execve
+ * fails every 20 ms for the whole of a two-second SO_RCVTIMEO and the receive
+ * still has to come back with EAGAIN at the deadline it was given.
+ *
+ * The elapsed time is the other half. A restart re-enters the wait from the
+ * top, so one that took a fresh copy of SO_RCVTIMEO rather than resuming the
+ * deadline would push the return out by two seconds per interruption -- around
+ * a hundred of them here -- and the watchdog rather than the upper bound is
+ * what would catch it. Resuming the deadline is what Linux's restart_block
+ * carries.
+ */
+static void test_sibling_execve_recv(void)
+{
+    char buf[4096];
+
     int xw = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
     CHECK(xw >= 0, "socket for the sibling-execve receive");
     if (xw >= 0) {
@@ -890,18 +887,23 @@ int main(void)
         }
         close(xw);
     }
+}
 
-    /* A huge finite SO_RCVTIMEO is finite, and it is huge
-     *
-     * Linux's cutoff for "so long it means forever" is MAX_SCHEDULE_TIMEOUT/HZ
-     * - 1 seconds; a tv_sec of 1e13 is far below it and reads back unchanged
-     * (measured), where a cutoff three orders lower turns it into {0,0}. And
-     * the deadline such a timeout produces has to survive being added to a
-     * clock: an overflowing add lands in the past and turns the longest wait a
-     * guest can ask for into an instant EAGAIN. Both halves are asserted -- the
-     * readback, and a receive that really does park until a second thread gives
-     * it something to read.
-     */
+/* A huge finite SO_RCVTIMEO is finite, and it is huge
+ *
+ * Linux's cutoff for "so long it means forever" is MAX_SCHEDULE_TIMEOUT/HZ
+ * - 1 seconds; a tv_sec of 1e13 is far below it and reads back unchanged
+ * (measured), where a cutoff three orders lower turns it into {0,0}. And the
+ * deadline such a timeout produces has to survive being added to a clock: an
+ * overflowing add lands in the past and turns the longest wait a guest can ask
+ * for into an instant EAGAIN. Both halves are asserted -- the readback, and a
+ * receive that really does park until a second thread gives it something to
+ * read.
+ */
+static void test_huge_rcvtimeo(void)
+{
+    char buf[4096];
+
     poke_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     CHECK(poke_fd >= 0, "rtnetlink socket for the huge-timeout receive");
     if (poke_fd >= 0) {
@@ -958,15 +960,17 @@ int main(void)
         close(poke_fd);
         poke_fd = -1;
     }
+}
 
-    /* Concurrent socket() must not cross-wire two sockets
-     *
-     * The protocol is a behavior discriminator -- it picks between the
-     * rtnetlink emulation and the silent uevent socket -- so a table slot
-     * claimed by two threads at once is two guests sharing one socket's
-     * identity. SO_PROTOCOL and SO_TYPE read the two fields the race could
-     * scramble.
-     */
+/* Concurrent socket() must not cross-wire two sockets
+ *
+ * The protocol is a behavior discriminator -- it picks between the rtnetlink
+ * emulation and the silent uevent socket -- so a table slot claimed by two
+ * threads at once is two guests sharing one socket's identity. SO_PROTOCOL and
+ * SO_TYPE read the two fields the race could scramble.
+ */
+static void test_concurrent_open(void)
+{
     opener_arg_t oargs[OPENERS];
     pthread_t othreads[OPENERS];
     int spawned_openers = 0;
@@ -989,6 +993,48 @@ int main(void)
     CHECK(open_failures == 0, "every concurrent socket(AF_NETLINK) succeeded");
     CHECK(mismatches == 0,
           "concurrent opens each report their own SO_PROTOCOL and SO_TYPE");
+}
+
+int main(void)
+{
+    /* Line-buffered: the watchdog below _exit()s from a signal handler, which
+     * takes any buffered output with it. Without this a hang reports only the
+     * watchdog line, and which assertion hung is exactly what is wanted.
+     */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Which lane is this? The one probe whose two answers cannot be confused:
+     * an unemulated netlink family is EAFNOSUPPORT from elfuse and
+     * EPROTONOSUPPORT from a kernel that simply has no such family registered.
+     * Everything below that differs by lane asks this rather than accepting
+     * both answers, so neither lane can pass on the other lane's behavior.
+     */
+    int bogus = socket(AF_NETLINK, SOCK_RAW, 99);
+    int bogus_errno = errno;
+    if (bogus >= 0)
+        close(bogus);
+    bool on_elfuse = bogus == -1 && bogus_errno == EAFNOSUPPORT;
+
+    /* The exact socket() call libusb's netlink monitor makes. */
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                    NETLINK_KOBJECT_UEVENT);
+    CHECK(fd >= 0, "socket(NETLINK_KOBJECT_UEVENT)");
+    if (fd < 0)
+        return 1;
+
+    test_uevent_basics(fd, on_elfuse);
+    test_socket_type_screening(bogus, bogus_errno);
+    if (test_sol_socket_options(on_elfuse)) {
+        close(fd);
+        printf("%d passed, %d failed\n", pass, fail);
+        return 1;
+    }
+    test_rcvtimeo_blocking_recv();
+    test_sol_netlink(on_elfuse);
+    test_negative_rcvtimeo();
+    test_sibling_execve_recv();
+    test_huge_rcvtimeo();
+    test_concurrent_open();
 
     close(fd);
     printf("%d passed, %d failed\n", pass, fail);

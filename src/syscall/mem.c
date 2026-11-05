@@ -1089,11 +1089,8 @@ static int64_t sys_mmap_high_va(guest_t *g,
         backing_limit =
             g->kbuf_gpa ? g->kbuf_gpa : (g->interp_base - INFRA_RESERVE);
         if (backing_gpa_start >= backing_limit ||
-            backing_span > backing_limit - backing_gpa_start) {
-            if (replaced_remove_fd >= 0)
-                close(replaced_remove_fd);
-            return -LINUX_ENOMEM;
-        }
+            backing_span > backing_limit - backing_gpa_start)
+            goto fail;
     }
 
     if (!is_anon) {
@@ -1102,26 +1099,23 @@ static int64_t sys_mmap_high_va(guest_t *g,
             int rc = fuse_materialize_fd(fd, materialized_path,
                                          sizeof(materialized_path));
             if (rc < 0) {
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return rc;
+                ret = rc;
+                goto fail;
             }
             host_backing_fd = open(materialized_path, O_RDONLY | O_CLOEXEC);
             int saved_errno = errno;
             unlink(materialized_path);
             if (host_backing_fd < 0) {
                 errno = saved_errno;
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return linux_errno();
+                ret = linux_errno();
+                goto fail;
             }
             close_host_backing_fd = true;
         } else {
             int64_t ref_err = host_fd_ref_open(fd, &backing_ref);
             if (ref_err < 0) {
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return ref_err;
+                ret = ref_err;
+                goto fail;
             }
             host_backing_fd = backing_ref.fd;
         }

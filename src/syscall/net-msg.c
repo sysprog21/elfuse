@@ -111,10 +111,11 @@ static void recvmsg_close_host_rights(const void *data_src, size_t data_len)
 }
 
 /* Publish each received host descriptor as a guest fd, rewriting fds[] in place
- * to the guest numbers (-1 where allocation failed, after closing the host
- * descriptor). Successes are recorded in the scm_* arrays so a later failure
- * can retire them; the arrays are bounded by scm_cap and scm_nfds accumulates
- * across control messages.
+ * to the guest numbers (-1 where the descriptor was dropped: allocation failed,
+ * or the scm_* tables were full, after closing the host descriptor). Every
+ * installed fd is recorded in the scm_* arrays so a later failure can retire
+ * all of them; scm_nfds accumulates across control messages and scm_cap bounds
+ * the arrays.
  */
 static void recvmsg_install_rights(int *fds,
                                    size_t nfds,
@@ -126,6 +127,17 @@ static void recvmsg_install_rights(int *fds,
 {
     for (size_t i = 0; i < nfds; i++) {
         int host_recv_fd = fds[i];
+
+        /* An fd that cannot be recorded cannot be rolled back, so it is dropped
+         * like a failed allocation instead of installed. One message carries at
+         * most LINUX_SCM_MAX_FD, so this only triggers for several SCM_RIGHTS
+         * cmsgs that together exceed it.
+         */
+        if (*scm_nfds >= scm_cap) {
+            close(fds[i]);
+            fds[i] = -1;
+            continue;
+        }
 
         /* A received descriptor belongs to whoever sent it, so elfuse never
          * sets O_NONBLOCK on one: that would mutate a description this process
@@ -159,11 +171,9 @@ static void recvmsg_install_rights(int *fds,
             continue;
         }
         fds[i] = gfd;
-        if (*scm_nfds < scm_cap) {
-            scm_gfds[*scm_nfds] = gfd;
-            scm_hfds[*scm_nfds] = host_recv_fd;
-            (*scm_nfds)++;
-        }
+        scm_gfds[*scm_nfds] = gfd;
+        scm_hfds[*scm_nfds] = host_recv_fd;
+        (*scm_nfds)++;
         if (flags & LINUX_MSG_CMSG_CLOEXEC)
             fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
     }
@@ -807,8 +817,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         .msg_flags = 0,
     };
 
-    int scm_gfds[128];
-    int scm_hfds[128];
+    int scm_gfds[LINUX_SCM_MAX_FD];
+    int scm_hfds[LINUX_SCM_MAX_FD];
     int scm_nfds = 0;
 
     /* Retry the EAGAIN a blocking guest socket must not see; see the single-iov

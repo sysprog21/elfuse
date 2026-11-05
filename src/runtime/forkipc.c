@@ -1723,8 +1723,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     uint32_t path_len = sizeof(self_path);
     if (_NSGetExecutablePath(self_path, &path_len) != 0) {
         log_error("clone: _NSGetExecutablePath failed");
-        close(sock_fds[0]);
-        close(sock_fds[1]);
+        clone_close_channels(sock_fds, vfork_notify_fds);
         return -LINUX_ENOMEM;
     }
 

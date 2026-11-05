@@ -1083,6 +1083,8 @@ static int64_t futex_wake(const guest_t *g,
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
+    val = futex_wake_budget(val);
+
     unsigned idx = futex_hash(uaddr);
     futex_bucket_t *b = &buckets[idx];
     int woken = 0;
@@ -1328,6 +1330,9 @@ static int64_t futex_wake_op(guest_t *g,
 {
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
+
+    val = futex_wake_budget(val);
+    val2 = futex_wake_budget(val2);
 
     /* Decode operation and comparison from val3. Bits 31-28: operation (bit 31
      * = OPARG_SHIFT flag, bits 30-28 = op) Bits 27-24: comparison operator Bits

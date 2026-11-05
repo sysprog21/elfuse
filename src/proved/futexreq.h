@@ -58,6 +58,33 @@ static inline uint64_t futex_requeue_budget(uint32_t nr_wake,
     return (uint64_t) nr_wake + nr_requeue;
 }
 
+/* How many waiters a FUTEX_WAKE style call may wake, from its count word.
+ *
+ * Linux takes the count as a signed int and checks it only after waking a
+ * waiter (futex_wake: "if (++ret >= nr_wake) break"), so a count of zero or a
+ * negative one still wakes one. Only the futex2 entry points ask for a strict
+ * zero (FLAGS_STRICT). Read as unsigned, as the walk did before this, a zero
+ * wakes nobody and a negative count wakes every waiter, the opposite of what
+ * Linux does for the same guest. glibc passes 1 or INT_MAX, so no libc hits it,
+ * but the guest picks the word.
+ *
+ * The result is what the walk and the PI pre-scan both bound by, so they agree
+ * on the window by construction.
+ */
+/*@
+  assigns \nothing;
+  ensures at_least_one: \result >= 1;
+  ensures at_most_int_max: \result <= 0x7fffffff;
+  ensures positive_kept: 1 <= val <= 0x7fffffff ==> \result == val;
+  ensures nonpositive_is_one: val == 0 || val > 0x7fffffff ==> \result == 1;
+ */
+static inline uint32_t futex_wake_budget(uint32_t val)
+{
+    if (val == 0 || val > 0x7fffffffu)
+        return 1;
+    return val;
+}
+
 /* What the requeue walk does with the next waiter parked on the source key.
  *
  * The PI pre-scan in futex_requeue inspects futex_requeue_budget() waiters and

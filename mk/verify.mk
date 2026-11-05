@@ -481,7 +481,8 @@ VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-cove
 # clause the caller discharges; each is deliberate, and the caller named here is
 # the one that does so (issue #356).
 #   total:         futex_op_sign_extend12, futex_op_shift_arg_mask,
-#                  futex_requeue_counts_valid, futex_uaddr_is_aligned,
+#                  futex_requeue_counts_valid, futex_wake_budget,
+#                  futex_uaddr_is_aligned,
 #                  futex_wake_op_supported, futex_wake_cmp_supported, the
 #                  futex_pi_* word predicates
 #   nbuckets > 0:  futex_bucket_index; its one caller passes FUTEX_BUCKETS
@@ -503,9 +504,11 @@ VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-cove
 # to hold (Evrard and Donaldson, SPIN 2023 model those protocols, not this
 # implementation). Each says how it is held: proved, asserted at run time, or
 # test-covered.
-#   1. Every walk is bounded. FUTEX_WAKE touches at most val waiters; requeue
-#      touches at most wake + requeue. Proved: futex_requeue_step and
-#      futex_requeue_budget.
+#   1. Every walk is bounded. FUTEX_WAKE and FUTEX_WAKE_OP touch at least one
+#      and at most INT_MAX waiters, and a count of zero or a negative one wakes
+#      one, as Linux does (it checks the count after waking). Requeue touches at
+#      most wake + requeue. Proved: futex_wake_budget, futex_requeue_step and
+#      futex_requeue_budget. Test-covered: test-futex-wake-nowaiter.
 #   2. A plain wake or requeue never moves a PI waiter. The refusal comes before
 #      anything moves, over the same window the walk may touch, so a refused
 #      call leaves the queue as it found it. Window proved (invariant 1); the
@@ -532,13 +535,13 @@ VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-cove
 
 VERIFY_FUTEXREQ_SRC  := src/proved/futexreq.h
 VERIFY_FUTEXREQ_FCTS := futex_requeue_counts_valid futex_requeue_budget \
-                        futex_requeue_step
-VERIFY_FUTEXREQ_MIN_GOALS ?= 14
+                        futex_requeue_step futex_wake_budget
+VERIFY_FUTEXREQ_MIN_GOALS ?= 30
 # typed: two scalars in, one out, no buffer and no aliasing question.
 VERIFY_FUTEXREQ_MODEL := typed
 VERIFY_FUTEXREQ_SCAN := src/proved/futexreq.h
-VERIFY_FUTEXREQ_CLAIM := for ANY pair of guest-supplied requeue counts, and \
-                         any walk state inside them
+VERIFY_FUTEXREQ_CLAIM := for ANY pair of guest-supplied requeue counts, ANY \
+                         wake count word, and any walk state inside them
 VERIFY_FUTEXREQ_UNPROVED := the list surgery the step decides stays \
                             test-covered
 

@@ -238,6 +238,22 @@ MUTATIONS = [
         "    if (woken < nr_wake)\n        return FUTEX_REQ_WAKE;\n",
         "    if (woken < nr_wake / 2)\n        return FUTEX_REQ_WAKE;\n",
     ),
+    (
+        "futexreq",
+        "src/proved/futexreq.h",
+        "futex_wake_budget",
+        "wake nobody for a zero count (the unsigned reading Linux does not use)",
+        "    if (val == 0 || val > 0x7fffffffu)\n        return 1;\n",
+        "    if (val > 0x7fffffffu)\n        return 1;\n",
+    ),
+    (
+        "futexreq",
+        "src/proved/futexreq.h",
+        "futex_wake_budget",
+        "wake every waiter for a negative count (the other unsigned reading)",
+        "    if (val == 0 || val > 0x7fffffffu)\n        return 1;\n",
+        "    if (val == 0)\n        return 1;\n",
+    ),
     # ---- verify-futexwaitv -------------------------------------------------
     (
         "futexwaitv",

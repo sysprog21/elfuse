@@ -58,12 +58,10 @@ static int set_nonblock(int fd)
     return flags < 0 ? -1 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-int main(void)
+int passes = 0, fails = 0;
+
+static void test_edge_basic(void)
 {
-    int passes = 0, fails = 0;
-
-    printf("test-epoll-edge: EPOLLET semantics tests\n");
-
     /* Edge fires once on data arrival */
     TEST("EPOLLET: fire on data arrival");
     {
@@ -157,7 +155,10 @@ int main(void)
         close(p[1]);
         close(epfd);
     }
+}
 
+static void test_edge_stream_eventfd(void)
+{
     /* EPOLLET on a SOCK_STREAM pair, the typical server path. Repeated
      * drain-fill cycles, each producing exactly one edge.
      */
@@ -233,7 +234,10 @@ int main(void)
         close(efd);
         close(epfd);
     }
+}
 
+static void test_edge_oneshot_multi(void)
+{
     /* EPOLLET + EPOLLONESHOT: edge fires exactly once and stays armed until
      * EPOLL_CTL_MOD re-arms.
      */
@@ -319,7 +323,10 @@ int main(void)
         close(p2[1]);
         close(epfd);
     }
+}
 
+static void test_edge_hangup(void)
+{
     /* EOF reports an edge: pipe write end closed -> EPOLLHUP set on the read
      * end, observable through one EPOLLET wait. Require EPOLLHUP explicitly so
      * a regression that drops it is caught.
@@ -374,7 +381,10 @@ int main(void)
             close(sv[1]);
         }
     }
+}
 
+static void test_edge_oneshot_filters(void)
+{
     /* Multi-filter EPOLLONESHOT: register both EPOLLIN and EPOLLOUT. After
      * EPOLLOUT fires (send buffer initially empty), the unfired EPOLLIN filter
      * must NOT fire on a subsequent epoll_wait until EPOLL_CTL_MOD re-arms.
@@ -528,6 +538,17 @@ int main(void)
         }
     stale_write_done:;
     }
+}
+
+int main(void)
+{
+    printf("test-epoll-edge: EPOLLET semantics tests\n");
+
+    test_edge_basic();
+    test_edge_stream_eventfd();
+    test_edge_oneshot_multi();
+    test_edge_hangup();
+    test_edge_oneshot_filters();
 
     SUMMARY("test-epoll-edge");
     return fails > 0 ? 1 : 0;

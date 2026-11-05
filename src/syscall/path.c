@@ -599,16 +599,59 @@ static void path_fold_components(const char *path, char *out)
     out[w] = '\0';
 }
 
-int path_translate_at(guest_fd_t dirfd,
-                      const char *path,
-                      unsigned int flags,
-                      path_translation_t *tx)
+/* Rewrite a /dev/bus or /sys/bus/usb path into the canonical guest spelling of
+ * where it lands, in tx->guest_buf, before anything decides whose name it is.
+ * The /dev/bus climb runs first because a climb can land in /sys.
+ */
+static void path_rewrite_usb_aliases(path_translation_t *tx)
 {
-    if (!tx) {
-        errno = EINVAL;
-        return -1;
+    /* usb_sysfs_resolve_dev_climb rewrites a /dev/bus name whose '..' climbs
+     * out of it. What follows can climb out again, as in
+     * /dev/bus/../bus/../null, and each pass shortens the name. A climb can
+     * land in /sys, so this runs before the /sys rewrite below.
+     */
+    while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
+        char resolved[LINUX_PATH_MAX];
+        if (!usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
+                                         sizeof(resolved)))
+            break;
+        str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
+        tx->guest_path = tx->guest_buf;
+        tx->intercept_path = tx->guest_buf;
     }
 
+    /* A /sys walk that passes through one of the synthetic USB `subsystem`
+     * symlinks is rewritten to the canonical guest spelling of where it lands,
+     * before anything decides whose name it is. The links exist only in the
+     * synthetic tree, so no other layer can resolve them: the sysroot has no
+     * such link, and a lexical fold puts the walk back in the device directory
+     * it had just left. Doing it here, once, is what makes open, stat, lstat,
+     * readlink and getdents64 answer from one name -- the union listing of
+     * `<dev>/subsystem/..` offered /sys/bus/pci while every lookup of
+     * `<dev>/subsystem/../pci` denied it, because each entry point folded the
+     * name for itself.
+     *
+     * Cheap for everything else: the prefix test rejects every path that cannot
+     * contain such a link before the USB layer is called at all.
+     */
+    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21)) {
+        /* Through a local buffer, not straight into guest_buf: guest_path may
+         * already be guest_buf (the FUSE resolver in path_translate_at puts it
+         * there), and the rewrite reads its input while writing its output.
+         */
+        char resolved[LINUX_PATH_MAX];
+        if (usb_sysfs_resolve_guest_path(tx->guest_path, resolved,
+                                         sizeof(resolved)) == 1) {
+            str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
+            tx->guest_path = tx->guest_buf;
+            tx->intercept_path = tx->guest_buf;
+        }
+    }
+}
+
+/* Point every path in @tx at @path and clear the flags. */
+static void path_tx_init(path_translation_t *tx, const char *path)
+{
     /* Only the fields read on the no-rewrite fast path need explicit defaults;
      * proc_path / guest_buf / host_buf are read-after-written by their
      * respective resolvers. memset of all three 4 KiB buffers would add ~12 KiB
@@ -621,6 +664,19 @@ int path_translate_at(guest_fd_t dirfd,
     tx->proc_resolved = 0;
     tx->fuse_path = false;
     tx->is_dev_shm = false;
+}
+
+int path_translate_at(guest_fd_t dirfd,
+                      const char *path,
+                      unsigned int flags,
+                      path_translation_t *tx)
+{
+    if (!tx) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    path_tx_init(tx, path);
 
     if (!path)
         return 0;
@@ -676,48 +732,7 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    /* usb_sysfs_resolve_dev_climb rewrites a /dev/bus name whose '..' climbs
-     * out of it. What follows can climb out again, as in
-     * /dev/bus/../bus/../null, and each pass shortens the name. A climb can
-     * land in /sys, so this runs before the /sys rewrite below.
-     */
-    while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
-        char resolved[LINUX_PATH_MAX];
-        if (!usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
-                                         sizeof(resolved)))
-            break;
-        str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
-        tx->guest_path = tx->guest_buf;
-        tx->intercept_path = tx->guest_buf;
-    }
-
-    /* A /sys walk that passes through one of the synthetic USB `subsystem`
-     * symlinks is rewritten to the canonical guest spelling of where it lands,
-     * before anything decides whose name it is. The links exist only in the
-     * synthetic tree, so no other layer can resolve them: the sysroot has no
-     * such link, and a lexical fold puts the walk back in the device directory
-     * it had just left. Doing it here, once, is what makes open, stat, lstat,
-     * readlink and getdents64 answer from one name -- the union listing of
-     * `<dev>/subsystem/..` offered /sys/bus/pci while every lookup of
-     * `<dev>/subsystem/../pci` denied it, because each entry point folded the
-     * name for itself.
-     *
-     * Cheap for everything else: the prefix test rejects every path that cannot
-     * contain such a link before the USB layer is called at all.
-     */
-    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21)) {
-        /* Through a local buffer, not straight into guest_buf: guest_path may
-         * already be guest_buf (the FUSE resolver above puts it there), and the
-         * rewrite reads its input while writing its output.
-         */
-        char resolved[LINUX_PATH_MAX];
-        if (usb_sysfs_resolve_guest_path(tx->guest_path, resolved,
-                                         sizeof(resolved)) == 1) {
-            str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
-            tx->guest_path = tx->guest_buf;
-            tx->intercept_path = tx->guest_buf;
-        }
-    }
+    path_rewrite_usb_aliases(tx);
 
     /* /dev/shm/<leaf> maps into the per-UID host backing dir, through the same
      * validated resolver as the open and stat intercepts. Only a non-empty flat

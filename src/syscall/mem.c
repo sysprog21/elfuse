@@ -894,13 +894,319 @@ static bool high_va_replaceable_gpa_base(guest_t *g,
     return true;
 }
 
-/* Over the function-size limit on purpose.
+/* Fill @len bytes at @dst from @fd starting at @off. EINTR retries and EOF
+ * stops early, leaving the rest of @dst as the caller set it (callers zero it
+ * first, so a short file reads as zero-padded).
  *
- * The Rosetta high-VA mapping loop plus its rollback, which has to undo page
- * tables installed by the loop it follows. The two cannot be separated without
- * publishing the in-flight block state.
+ * Returns 0, or the translated negative errno of a real host I/O failure: a
+ * partial read followed by an error is an error, never a mapping with a
+ * silently zeroed tail.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
+static int64_t pread_fill(int fd, uint8_t *dst, size_t len, off_t off)
+{
+    while (len > 0) {
+        ssize_t nr = pread(fd, dst, len, off);
+        if (nr < 0) {
+            if (errno == EINTR)
+                continue;
+            return linux_errno();
+        }
+        if (nr == 0)
+            break;
+        dst += nr;
+        len -= (size_t) nr;
+        off += nr;
+    }
+    return 0;
+}
+
+/* How a high-VA MAP_FIXED that replaces an existing mapping is undone. active
+ * is set once the snapshots are captured and the replace branch is in use; it
+ * is explicit because an earlier proxy, gpa_base != 0, mis-classified
+ * replacements over a region backed at GPA 0 (a valid guest physical address)
+ * as fresh allocations, which bypassed the byte snapshot, the region removal
+ * and the rollback restore.
+ */
+typedef struct {
+    bool active;
+    uint64_t gpa_base; /* Host backing of the mapping being replaced */
+    int flags;
+    uint64_t offset;
+    int remove_fd; /* Reserved by guest_region_remove_prepare, -1 once used */
+    region_snapshot_t *snaps;
+    int nsnaps;
+    bool region_removed; /* The old region record has been dropped */
+    bool ptes_modified;  /* Page table entries for the range were rewritten */
+
+    /* Populating the range rewrites the old mapping's bytes in place before the
+     * region tables commit. bytes_snap holds the original contents so the fail
+     * path can restore them, and bytes_dirty says the rewrite started. Sibling
+     * vCPUs would otherwise see transient zeroes, partial file contents or the
+     * rollback bytes, since mmap_lock only serializes memory syscalls, so
+     * quiesced says the quiesce bracket is open and both exits must resume.
+     */
+    uint8_t *bytes_snap;
+    bool bytes_dirty;
+    bool quiesced;
+} high_va_replace_t;
+
+/* The host fd a file-backed high-VA mapping reads from, and the dup the new
+ * region keeps. host_fd is borrowed through ref unless close_host_fd says it
+ * was opened here (a FUSE file materialized to a temp), in which case it is
+ * closed with the rest. track_fd is handed to the region on success.
+ */
+typedef struct {
+    host_fd_ref_t ref;
+    int host_fd;
+    int track_fd;
+    bool close_host_fd;
+} high_va_backing_t;
+
+/* Prepare to replace an existing high-VA mapping, if the range overlaps one:
+ * check that the guest asked for replacement and that the old mapping can be
+ * replaced, then reserve its region removal and snapshot the regions for
+ * rollback. Leaves *rep inactive when the range is free. On failure it has
+ * released what it took, so the caller returns the errno.
+ *
+ * Returns 0 or a negative errno.
+ */
+static int64_t high_va_replace_prepare(guest_t *g,
+                                       uint64_t addr,
+                                       uint64_t length,
+                                       bool is_noreplace,
+                                       bool replace_existing,
+                                       high_va_replace_t *rep)
+{
+    /* Cap the byte-snapshot allocation that populate_existing needs for
+     * rollback. The mapping itself can still be arbitrarily large in the
+     * fresh-allocation path; only the replace-an-existing branch needs the
+     * host-side malloc, so the cap only applies to replacement. 256 MiB is
+     * comfortably above realistic Rosetta dynamic-linker reservations and far
+     * below the multi-GiB malloc bombs a hostile guest could otherwise force.
+     * Reject early with -ENOMEM so the caller falls back to a smaller MAP_FIXED
+     * footprint rather than triggering the host OOM killer.
+     */
+    enum { HIGH_VA_SNAPSHOT_MAX = (size_t) 256 << 20 };
+
+    if (region_range_overlaps(g, addr, addr + length) &&
+        length > HIGH_VA_SNAPSHOT_MAX)
+        return -LINUX_ENOMEM;
+
+    if (region_range_overlaps(g, addr, addr + length)) {
+        if (is_noreplace)
+            return -LINUX_EEXIST;
+        if (!replace_existing)
+            return -LINUX_ENOMEM;
+        if (!high_va_replaceable_gpa_base(g, addr, addr + length,
+                                          &rep->gpa_base, &rep->flags,
+                                          &rep->offset))
+            return -LINUX_ENOMEM;
+        if (!region_has_capacity_after_removes(
+                g, &(remove_range_t) {addr, addr + length}, 1, 1))
+            return -LINUX_ENOMEM;
+        if (guest_region_remove_prepare(g, addr, addr + length,
+                                        &rep->remove_fd) < 0)
+            return -LINUX_ENOMEM;
+        rep->snaps = malloc(GUEST_MAX_REGIONS * sizeof(*rep->snaps));
+        if (!rep->snaps) {
+            if (rep->remove_fd >= 0)
+                close(rep->remove_fd);
+            rep->remove_fd = -1;
+            return -LINUX_ENOMEM;
+        }
+        rep->nsnaps = capture_region_snapshots(
+            g, addr, addr + length, rep->snaps, GUEST_MAX_REGIONS, NULL);
+        if (rep->nsnaps < 0) {
+            if (rep->remove_fd >= 0)
+                close(rep->remove_fd);
+            rep->remove_fd = -1;
+            free(rep->snaps);
+            rep->snaps = NULL;
+            return rep->nsnaps;
+        }
+        rep->active = true;
+    }
+    return 0;
+}
+
+/* Open the host fd a file-backed high-VA mapping reads from: the guest fd's own
+ * host fd, or, for a FUSE file, a temp materialized from it and opened
+ * read-only. Dups it for the region to keep, and for a mapping with permissions
+ * reads one byte so a bad offset fails here instead of mid-fill. Whatever was
+ * taken stays in *bk even on failure, because the caller's fail path releases
+ * it.
+ *
+ * Returns 0 or a negative errno.
+ */
+static int64_t high_va_open_backing(guest_fd_t fd,
+                                    int prot,
+                                    uint64_t offset,
+                                    high_va_backing_t *bk)
+{
+    if (fuse_fd_refuse_mmap(fd)) {
+        char materialized_path[PATH_MAX];
+        int rc = fuse_materialize_fd(fd, materialized_path,
+                                     sizeof(materialized_path));
+        if (rc < 0) {
+            return rc;
+        }
+        bk->host_fd = open(materialized_path, O_RDONLY | O_CLOEXEC);
+        int saved_errno = errno;
+        unlink(materialized_path);
+        if (bk->host_fd < 0) {
+            errno = saved_errno;
+            return linux_errno();
+        }
+        bk->close_host_fd = true;
+    } else {
+        int64_t ref_err = host_fd_ref_open(fd, &bk->ref);
+        if (ref_err < 0) {
+            return ref_err;
+        }
+        bk->host_fd = bk->ref.fd;
+    }
+    bk->track_fd = dup(bk->host_fd);
+    if (bk->track_fd < 0)
+        return -LINUX_ENOMEM;
+    if (prot != LINUX_PROT_NONE) {
+        char probe;
+        ssize_t nr;
+        do {
+            nr = pread(bk->host_fd, &probe, sizeof(probe), (off_t) offset);
+        } while (nr < 0 && errno == EINTR);
+        if (nr < 0) {
+            return linux_errno();
+        }
+    }
+
+    return 0;
+}
+
+/* Install the page tables for a fresh high-VA mapping, one 2 MiB block at a
+ * time over [va_base, va_limit) backed from @backing_gpa_start. Any L1/L2
+ * tables newly allocated here are left in place on rollback: they are zero
+ * descriptors after invalidation and harmless until reused by a later mmap.
+ * *installed_end and *inflight_fresh are updated as it goes, so the caller's
+ * rollback knows how much to undo even when this fails part way: the end of the
+ * VA installed so far, and the one fresh block that is live at full 2 MiB
+ * permissions but not yet scrubbed (UINT64_MAX when none).
+ *
+ * Returns false on any failure.
+ */
+static bool high_va_map_blocks(guest_t *g,
+                               uint64_t va_base,
+                               uint64_t va_limit,
+                               uint64_t backing_gpa_start,
+                               int map_perms,
+                               uint64_t *installed_end,
+                               uint64_t *inflight_fresh)
+{
+    *installed_end = va_base;
+
+    for (uint64_t va = va_base; va < va_limit; va += BLOCK_2MIB) {
+        uint64_t gpa = backing_gpa_start + (va - va_base);
+
+        void *host = host_ptr_for_gpa(g, gpa);
+        if (!host)
+            return false;
+        memset(host, 0, BLOCK_2MIB);
+
+        /* Detect freshness BEFORE guest_map_va_range so the decision is not
+         * confused by a prior high-VA mmap into the same 2 MiB block. A fresh
+         * block needs its split-inherited L3 entries zeroed so gap pages do not
+         * silently inherit block-level perms; a pre-existing block must be left
+         * alone so earlier mappings into the same block survive.
+         */
+        bool fresh_block = !guest_va_block_mapped(g, va);
+
+        if (guest_map_va_range(g, va, va + BLOCK_2MIB, gpa, map_perms) < 0)
+            return false;
+        *installed_end = va + BLOCK_2MIB;
+
+        /* Fresh blocks are live with full-2 MiB block-level perms from here
+         * until guest_invalidate_ptes zeros the split-inherited L3 entries. If
+         * split or invalidate fails in between, the rollback must scrub the
+         * entire block; record it for the fail path.
+         */
+        if (fresh_block)
+            *inflight_fresh = va;
+
+        /* Always split so guest_install_va_pages can write 4 KiB L3 PTEs for
+         * the actual mapped range; pre-existing tables make split a no-op.
+         */
+        if (guest_split_block(g, va) < 0)
+            return false;
+
+        if (fresh_block) {
+            if (guest_invalidate_ptes(g, va, va + BLOCK_2MIB) < 0)
+                return false;
+
+            /* L3 entries are zeroed; the block is no longer live at 2 MiB scope
+             * and the narrow rollback is sufficient.
+             */
+            *inflight_fresh = UINT64_MAX;
+        }
+    }
+    return true;
+}
+
+/* Fill the new mapping's memory: zero it for an anonymous or PROT_NONE mapping,
+ * or read the file into it. When this replaces an existing mapping the range is
+ * rewritten in place before anything commits, so first snapshot the old bytes,
+ * with siblings quiesced so the snapshot sees no torn writes and the rewrite
+ * stays invisible to them, in case the fail path has to put them back. The
+ * fresh-allocation path lands here too, but its memory sits on a brand-new GPA
+ * range no guest mapping observes, so it needs neither the snapshot nor the
+ * quiesce.
+ *
+ * Returns 0, or a negative errno with the rep state set for the caller's
+ * rollback.
+ */
+static int64_t high_va_populate(high_va_replace_t *rep,
+                                int host_fd,
+                                uint8_t *map_host,
+                                uint64_t length,
+                                int prot,
+                                bool is_anon,
+                                uint64_t offset)
+{
+    if (rep->active && (is_anon || prot != LINUX_PROT_NONE)) {
+        rep->bytes_snap = malloc(length);
+        if (!rep->bytes_snap)
+            return -LINUX_ENOMEM;
+
+        /* Quiesce siblings before the snapshot read so the memcpy cannot see
+         * torn writes from another vCPU running guest code on the existing
+         * mapping, and so the destructive memset / pread below stays invisible
+         * to concurrent readers until the region tables commit (or the fail
+         * path restores the bytes).
+         */
+        if (!thread_quiesce_siblings())
+            return -LINUX_EINTR; /* Being reaped; abandon the overlay */
+        rep->quiesced = true;
+        memcpy(rep->bytes_snap, map_host, length);
+    }
+
+    if (is_anon) {
+        memset(map_host, 0, length);
+        rep->bytes_dirty = rep->active;
+    } else if (prot != LINUX_PROT_NONE) {
+        memset(map_host, 0, length);
+        rep->bytes_dirty = rep->active;
+        return pread_fill(host_fd, map_host, length, (off_t) offset);
+    }
+    return 0;
+}
+
+/* Map [addr, addr + length) above the primary window for a Rosetta guest,
+ * replacing an existing mapping when @replace_existing allows it. Everything
+ * that changes state leaves through the fail label, which undoes exactly what
+ * this call installed: the mapping loop reports its progress through
+ * va_installed_end and inflight_fresh_block_va for that purpose.
+ *
+ * Returns the address, or a negative errno; ret keeps its -ENOMEM default for
+ * any failure that does not set a more specific one.
+ */
 static int64_t sys_mmap_high_va(guest_t *g,
                                 uint64_t addr,
                                 uint64_t length,
@@ -912,15 +1218,13 @@ static int64_t sys_mmap_high_va(guest_t *g,
                                 bool is_noreplace)
 {
     int64_t ret = -LINUX_ENOMEM;
+    int64_t step_err;
 
     if (!g->is_rosetta)
         return -LINUX_ENOMEM;
 
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
-    host_fd_ref_t backing_ref = HOST_FD_REF_INIT;
-    int host_backing_fd = -1;
-    int track_backing_fd = -1;
-    bool close_host_backing_fd = false;
+    high_va_backing_t bk = {HOST_FD_REF_INIT, -1, -1, false};
 
     /* High-water mark of VA installed by the mapping loop; reachable from the
      * fail label so the rollback knows what to invalidate. Must be initialized
@@ -935,34 +1239,8 @@ static int64_t sys_mmap_high_va(guest_t *g,
      * block needs full-scope rollback.
      */
     uint64_t inflight_fresh_block_va = UINT64_MAX;
-    uint64_t replaced_gpa_base = 0;
-    int replaced_flags = 0;
-    uint64_t replaced_offset = 0;
-    bool replaced_region_removed = false;
-    int replaced_remove_fd = -1;
-    region_snapshot_t *replaced_snaps = NULL;
-    int replaced_nsnaps = 0;
-    bool replaced_ptes_modified = false;
+    high_va_replace_t rep = {.remove_fd = -1};
     uint8_t *map_host = NULL;
-
-    /* When the high-VA replacement reuses an existing host backing,
-     * populate_existing is about to clobber map_host with memset / pread before
-     * guest_install_va_pages and guest_region_add_ex_owned_gpa commit. Snapshot
-     * the original bytes so the fail path can restore them; without this, a
-     * late-step failure leaves the guest's old mapping pointing at corrupted
-     * memory.
-     */
-    uint8_t *replaced_bytes_snap = NULL;
-    bool replaced_bytes_dirty = false;
-
-    /* Sibling vCPUs may otherwise observe transient zeroes, partial file
-     * contents, or rollback bytes while populate_existing rewrites map_host in
-     * place. The overlay paths already use the same pattern; mmap_lock only
-     * serializes memory syscalls, not vCPU execution. Track whether the
-     * siblings_quiesced bracket is open so the success-return and the fail-path
-     * both resume.
-     */
-    bool siblings_quiesced = false;
 
     /* File-backed MAP_SHARED lands here as a snapshot-style shared region: the
      * page contents are pread into fresh high-VA backing below and tracked with
@@ -990,63 +1268,10 @@ static int64_t sys_mmap_high_va(guest_t *g,
     if (guest_kbuf_user_va_overlap(addr, length))
         return -LINUX_ENOMEM;
 
-    /* Set when this call enters the replace-an-existing-mapping branch
-     * (region_range_overlaps + replaceable + snapshots captured). Used
-     * everywhere the function needs to decide between the fresh-allocation path
-     * and the reuse-the-existing-backing path. The earlier proxy
-     * (replaced_gpa_base != 0) mis-classified replacements targeting a region
-     * backed at GPA 0 (a valid guest physical address) as fresh allocations,
-     * which silently bypassed the byte snapshot, region remove, and rollback
-     * restore work.
-     */
-    bool replacing_existing = false;
-
-    /* Cap the byte-snapshot allocation that populate_existing needs for
-     * rollback. The mapping itself can still be arbitrarily large in the
-     * fresh-allocation path; only the replace-an-existing branch needs the
-     * host-side malloc, so the cap only applies to replacement. 256 MiB is
-     * comfortably above realistic Rosetta dynamic-linker reservations and far
-     * below the multi-GiB malloc bombs a hostile guest could otherwise force.
-     * Reject early with -ENOMEM so the caller falls back to a smaller MAP_FIXED
-     * footprint rather than triggering the host OOM killer.
-     */
-    enum { HIGH_VA_SNAPSHOT_MAX = (size_t) 256 << 20 };
-
-    if (region_range_overlaps(g, addr, addr + length) &&
-        length > HIGH_VA_SNAPSHOT_MAX)
-        return -LINUX_ENOMEM;
-
-    if (region_range_overlaps(g, addr, addr + length)) {
-        if (is_noreplace)
-            return -LINUX_EEXIST;
-        if (!replace_existing)
-            return -LINUX_ENOMEM;
-        if (!high_va_replaceable_gpa_base(g, addr, addr + length,
-                                          &replaced_gpa_base, &replaced_flags,
-                                          &replaced_offset))
-            return -LINUX_ENOMEM;
-        if (!region_has_capacity_after_removes(
-                g, &(remove_range_t) {addr, addr + length}, 1, 1))
-            return -LINUX_ENOMEM;
-        if (guest_region_remove_prepare(g, addr, addr + length,
-                                        &replaced_remove_fd) < 0)
-            return -LINUX_ENOMEM;
-        replaced_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*replaced_snaps));
-        if (!replaced_snaps) {
-            if (replaced_remove_fd >= 0)
-                close(replaced_remove_fd);
-            return -LINUX_ENOMEM;
-        }
-        replaced_nsnaps = capture_region_snapshots(
-            g, addr, addr + length, replaced_snaps, GUEST_MAX_REGIONS, NULL);
-        if (replaced_nsnaps < 0) {
-            if (replaced_remove_fd >= 0)
-                close(replaced_remove_fd);
-            free(replaced_snaps);
-            return replaced_nsnaps;
-        }
-        replacing_existing = true;
-    }
+    int64_t prep_err = high_va_replace_prepare(g, addr, length, is_noreplace,
+                                               replace_existing, &rep);
+    if (prep_err < 0)
+        return prep_err;
 
     uint64_t va_base = ALIGN_DOWN(addr, BLOCK_2MIB);
     uint64_t va_limit = ALIGN_UP(addr + length, BLOCK_2MIB);
@@ -1054,8 +1279,8 @@ static int64_t sys_mmap_high_va(guest_t *g,
     uint64_t backing_gpa_start = 0;
     uint64_t backing_limit = 0;
 
-    if (replacing_existing) {
-        backing_gpa_start = replaced_gpa_base - (addr - va_base);
+    if (rep.active) {
+        backing_gpa_start = rep.gpa_base - (addr - va_base);
     } else {
         backing_gpa_start =
             ALIGN_UP((g->mmap_end > g->mmap_next) ? g->mmap_end : g->mmap_next,
@@ -1063,185 +1288,41 @@ static int64_t sys_mmap_high_va(guest_t *g,
         backing_limit =
             g->kbuf_gpa ? g->kbuf_gpa : (g->interp_base - INFRA_RESERVE);
         if (backing_gpa_start >= backing_limit ||
-            backing_span > backing_limit - backing_gpa_start) {
-            if (replaced_remove_fd >= 0)
-                close(replaced_remove_fd);
-            return -LINUX_ENOMEM;
-        }
+            backing_span > backing_limit - backing_gpa_start)
+            goto fail;
     }
 
     if (!is_anon) {
-        if (fuse_fd_refuse_mmap(fd)) {
-            char materialized_path[PATH_MAX];
-            int rc = fuse_materialize_fd(fd, materialized_path,
-                                         sizeof(materialized_path));
-            if (rc < 0) {
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return rc;
-            }
-            host_backing_fd = open(materialized_path, O_RDONLY | O_CLOEXEC);
-            int saved_errno = errno;
-            unlink(materialized_path);
-            if (host_backing_fd < 0) {
-                errno = saved_errno;
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return linux_errno();
-            }
-            close_host_backing_fd = true;
-        } else {
-            int64_t ref_err = host_fd_ref_open(fd, &backing_ref);
-            if (ref_err < 0) {
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                return ref_err;
-            }
-            host_backing_fd = backing_ref.fd;
-        }
-        track_backing_fd = dup(host_backing_fd);
-        if (track_backing_fd < 0) {
-            ret = -LINUX_ENOMEM;
+        step_err = high_va_open_backing(fd, prot, offset, &bk);
+        if (step_err < 0) {
+            ret = step_err;
             goto fail;
         }
-        if (prot != LINUX_PROT_NONE) {
-            char probe;
-            ssize_t nr;
-            do {
-                nr = pread(host_backing_fd, &probe, sizeof(probe),
-                           (off_t) offset);
-            } while (nr < 0 && errno == EINTR);
-            if (nr < 0) {
-                ret = linux_errno();
-                goto fail;
-            }
-        }
     }
-
     int map_perms =
         (prot == LINUX_PROT_NONE) ? MEM_PERM_RW : prot_to_perms(prot);
 
-    if (replacing_existing) {
+    if (rep.active) {
         map_host = host_ptr_for_gpa(g, backing_gpa_start + (addr - va_base));
         if (!map_host)
             goto fail;
         goto populate_existing;
     }
 
-    /* Mapping loop installs PT state in block-sized steps. Any L1/L2 tables
-     * newly allocated during this call are left in place on rollback: they are
-     * zero descriptors after invalidation and harmless until reused by a later
-     * mmap.
-     */
-    va_installed_end = va_base;
-
-    for (uint64_t va = va_base; va < va_limit; va += BLOCK_2MIB) {
-        uint64_t gpa = backing_gpa_start + (va - va_base);
-
-        void *host = host_ptr_for_gpa(g, gpa);
-        if (!host)
-            goto fail;
-        memset(host, 0, BLOCK_2MIB);
-
-        /* Detect freshness BEFORE guest_map_va_range so the decision is not
-         * confused by a prior high-VA mmap into the same 2 MiB block. A fresh
-         * block needs its split-inherited L3 entries zeroed so gap pages do not
-         * silently inherit block-level perms; a pre-existing block must be left
-         * alone so earlier mappings into the same block survive.
-         */
-        bool fresh_block = !guest_va_block_mapped(g, va);
-
-        if (guest_map_va_range(g, va, va + BLOCK_2MIB, gpa, map_perms) < 0)
-            goto fail;
-        va_installed_end = va + BLOCK_2MIB;
-
-        /* Fresh blocks are live with full-2 MiB block-level perms from here
-         * until guest_invalidate_ptes zeros the split-inherited L3 entries. If
-         * split or invalidate fails in between, the rollback must scrub the
-         * entire block; record it for the fail path.
-         */
-        if (fresh_block)
-            inflight_fresh_block_va = va;
-
-        /* Always split so guest_install_va_pages can write 4 KiB L3 PTEs for
-         * the actual mapped range; pre-existing tables make split a no-op.
-         */
-        if (guest_split_block(g, va) < 0)
-            goto fail;
-
-        if (fresh_block) {
-            if (guest_invalidate_ptes(g, va, va + BLOCK_2MIB) < 0)
-                goto fail;
-
-            /* L3 entries are zeroed; the block is no longer live at 2 MiB scope
-             * and the narrow rollback is sufficient.
-             */
-            inflight_fresh_block_va = UINT64_MAX;
-        }
-    }
+    if (!high_va_map_blocks(g, va_base, va_limit, backing_gpa_start, map_perms,
+                            &va_installed_end, &inflight_fresh_block_va))
+        goto fail;
 
     map_host = host_ptr_for_gpa(g, backing_gpa_start + (addr - va_base));
     if (!map_host)
         goto fail;
 
 populate_existing:
-    /* Snapshot the existing host backing before the destructive write so a
-     * later guest_install_va_pages / guest_region_add failure can restore the
-     * guest's original mapping bytes from the fail path instead of leaving it
-     * pointing at zeroed-or-partially-written memory. The fresh-allocation path
-     * lands here too, but its map_host sits on a brand-new GPA range that no
-     * guest mapping currently observes, so the snapshot is only needed when
-     * replacing_existing.
-     */
-    if (replacing_existing && (is_anon || prot != LINUX_PROT_NONE)) {
-        replaced_bytes_snap = malloc(length);
-        if (!replaced_bytes_snap) {
-            ret = -LINUX_ENOMEM;
-            goto fail;
-        }
-
-        /* Quiesce siblings before the snapshot read so the memcpy cannot see
-         * torn writes from another vCPU running guest code on the existing
-         * mapping, and so the destructive memset / pread below stays invisible
-         * to concurrent readers until the region tables commit (or the fail
-         * path restores the bytes).
-         */
-        if (!thread_quiesce_siblings()) {
-            ret = -LINUX_EINTR; /* Being reaped; abandon the overlay */
-            goto fail;
-        }
-        siblings_quiesced = true;
-        memcpy(replaced_bytes_snap, map_host, length);
-    }
-
-    if (is_anon) {
-        memset(map_host, 0, length);
-        replaced_bytes_dirty = replacing_existing;
-    } else if (prot != LINUX_PROT_NONE) {
-        memset(map_host, 0, length);
-        replaced_bytes_dirty = replacing_existing;
-        uint8_t *dst = map_host;
-        size_t remaining = length;
-        off_t file_off = (off_t) offset;
-        while (remaining > 0) {
-            ssize_t nr = pread(host_backing_fd, dst, remaining, file_off);
-            if (nr < 0) {
-                if (errno == EINTR)
-                    continue;
-
-                /* Real host I/O failure (not EINTR); previously the loop broke
-                 * without setting ret and the syscall returned a "successful"
-                 * partially-zero mapping.
-                 */
-                ret = linux_errno();
-                goto fail;
-            }
-            if (nr == 0)
-                break;
-            dst += nr;
-            remaining -= (size_t) nr;
-            file_off += nr;
-        }
+    step_err = high_va_populate(&rep, bk.host_fd, map_host, length, prot,
+                                is_anon, offset);
+    if (step_err < 0) {
+        ret = step_err;
+        goto fail;
     }
 
     /* Install L3 PTEs for the actual mapped range. Fresh blocks were fully
@@ -1255,19 +1336,19 @@ populate_existing:
      * accessible.
      */
     if (prot == LINUX_PROT_NONE) {
-        replaced_ptes_modified = replacing_existing;
+        rep.ptes_modified = rep.active;
         if (guest_invalidate_ptes(g, addr, addr + length) < 0)
             goto fail;
     } else {
         uint64_t gpa_for_addr = backing_gpa_start + (addr - va_base);
-        replaced_ptes_modified = replacing_existing;
+        rep.ptes_modified = rep.active;
         if (guest_install_va_pages(g, addr, length, gpa_for_addr,
                                    prot_to_perms(prot)) < 0)
             goto fail;
     }
 
     uint64_t backing_gpa_end = backing_gpa_start + backing_span;
-    if (!replacing_existing) {
+    if (!rep.active) {
         if (backing_gpa_end > g->mmap_next)
             g->mmap_next = backing_gpa_end;
         if (backing_gpa_end > g->mmap_end)
@@ -1276,38 +1357,35 @@ populate_existing:
 
     uint64_t gpa_base = backing_gpa_start + (addr - va_base);
     if (!region_has_capacity_after_removes(
-            g,
-            replacing_existing ? &(remove_range_t) {addr, addr + length} : NULL,
-            replacing_existing ? 1 : 0, 1))
+            g, rep.active ? &(remove_range_t) {addr, addr + length} : NULL,
+            rep.active ? 1 : 0, 1))
         goto fail;
-    if (replacing_existing) {
-        guest_region_remove_reserved(g, addr, addr + length,
-                                     replaced_remove_fd);
-        replaced_remove_fd = -1;
-        replaced_region_removed = true;
+    if (rep.active) {
+        guest_region_remove_reserved(g, addr, addr + length, rep.remove_fd);
+        rep.remove_fd = -1;
+        rep.region_removed = true;
     }
     if (guest_region_add_ex_owned_gpa(g, addr, addr + length, gpa_base, prot,
-                                      flags, offset, NULL, track_backing_fd,
-                                      false, 0) < 0)
+                                      flags, offset, NULL, bk.track_fd, false,
+                                      0) < 0)
         goto fail;
 
-    /* Ownership of track_backing_fd is now held by the new region. The fail
-     * handler below skips closing when track_backing_fd < 0, so subsequent
-     * steps must not goto fail or the region's backing fd would be
-     * double-closed.
+    /* Ownership of bk.track_fd is now held by the new region. The fail handler
+     * below skips closing when bk.track_fd < 0, so subsequent steps must not
+     * goto fail or the region's backing fd would be double-closed.
      */
-    if (close_host_backing_fd && host_backing_fd >= 0)
-        close(host_backing_fd);
-    host_fd_ref_close(&backing_ref);
-    if (replaced_snaps) {
-        close_region_snapshots(replaced_snaps, replaced_nsnaps);
-        free(replaced_snaps);
+    if (bk.close_host_fd && bk.host_fd >= 0)
+        close(bk.host_fd);
+    host_fd_ref_close(&bk.ref);
+    if (rep.snaps) {
+        close_region_snapshots(rep.snaps, rep.nsnaps);
+        free(rep.snaps);
     }
-    if (replaced_bytes_snap) {
-        free(replaced_bytes_snap);
-        replaced_bytes_snap = NULL;
+    if (rep.bytes_snap) {
+        free(rep.bytes_snap);
+        rep.bytes_snap = NULL;
     }
-    if (siblings_quiesced)
+    if (rep.quiesced)
         thread_resume_siblings();
 
     return (int64_t) addr;
@@ -1319,8 +1397,8 @@ fail:
      * at the same data it had before this call. The snapshot is freed
      * unconditionally below.
      */
-    if (replaced_bytes_dirty && replaced_bytes_snap && map_host)
-        memcpy(map_host, replaced_bytes_snap, length);
+    if (rep.bytes_dirty && rep.bytes_snap && map_host)
+        memcpy(map_host, rep.bytes_snap, length);
 
     /* Roll back PT state installed by this call. The success path preserves
      * pre-existing 2 MiB blocks (so prior high-VA mmaps in the same block
@@ -1359,52 +1437,50 @@ fail:
                 (unsigned long long) (addr + length));
         }
     }
-    if (track_backing_fd >= 0)
-        close(track_backing_fd);
-    if (replaced_remove_fd >= 0)
-        close(replaced_remove_fd);
+    if (bk.track_fd >= 0)
+        close(bk.track_fd);
+    if (rep.remove_fd >= 0)
+        close(rep.remove_fd);
 
     /* Restore region/PTE snapshots when this call mutated regions[] or the page
      * tables; otherwise just drop the snapshot allocation. Whichever path runs,
      * the common cleanup below frees snapshots and fds and resumes siblings, so
      * a restore failure only needs to override the returned errno -- it must
-     * not skip cleanup. (Earlier code used replaced_gpa_base != 0 as the proxy
-     * for "replacing existing", which mis-classified replacements over a
-     * GPA-0-backed region; replacing_existing is now set explicitly when
-     * snapshots are captured.)
+     * not skip cleanup. (Earlier code used rep.gpa_base != 0 as the proxy for
+     * "replacing existing", which mis-classified replacements over a
+     * GPA-0-backed region; rep.active is now set explicitly when snapshots are
+     * captured.)
      */
-    if (replaced_snaps && replacing_existing && replaced_region_removed) {
-        int restore_err =
-            restore_region_snapshots(g, replaced_snaps, replaced_nsnaps);
-        if (restore_err == 0 && replaced_ptes_modified)
-            restore_err = restore_snapshot_page_tables(
-                g, addr, addr + length, replaced_snaps, replaced_nsnaps);
+    if (rep.snaps && rep.active && rep.region_removed) {
+        int restore_err = restore_region_snapshots(g, rep.snaps, rep.nsnaps);
+        if (restore_err == 0 && rep.ptes_modified)
+            restore_err = restore_snapshot_page_tables(g, addr, addr + length,
+                                                       rep.snaps, rep.nsnaps);
         if (restore_err < 0)
             ret = restore_err;
-    } else if (replaced_snaps && replacing_existing && replaced_ptes_modified) {
-        int restore_err = restore_snapshot_page_tables(
-            g, addr, addr + length, replaced_snaps, replaced_nsnaps);
+    } else if (rep.snaps && rep.active && rep.ptes_modified) {
+        int restore_err = restore_snapshot_page_tables(g, addr, addr + length,
+                                                       rep.snaps, rep.nsnaps);
         if (restore_err < 0)
             ret = restore_err;
         else
-            (void) restore_snapshot_overlays_in_place(g, replaced_snaps,
-                                                      replaced_nsnaps);
+            (void) restore_snapshot_overlays_in_place(g, rep.snaps, rep.nsnaps);
     }
-    if (replaced_snaps) {
-        close_region_snapshots(replaced_snaps, replaced_nsnaps);
-        free(replaced_snaps);
+    if (rep.snaps) {
+        close_region_snapshots(rep.snaps, rep.nsnaps);
+        free(rep.snaps);
     }
-    if (replaced_bytes_snap)
-        free(replaced_bytes_snap);
-    if (close_host_backing_fd && host_backing_fd >= 0)
-        close(host_backing_fd);
-    host_fd_ref_close(&backing_ref);
+    if (rep.bytes_snap)
+        free(rep.bytes_snap);
+    if (bk.close_host_fd && bk.host_fd >= 0)
+        close(bk.host_fd);
+    host_fd_ref_close(&bk.ref);
 
-    /* Close the siblings_quiesced bracket as the very last step, so the byte
-     * restore + region/PTE restore + fd cleanup all complete before any sibling
-     * vCPU resumes guest execution.
+    /* Close the rep.quiesced bracket as the very last step, so the byte restore
+     * + region/PTE restore + fd cleanup all complete before any sibling vCPU
+     * resumes guest execution.
      */
-    if (siblings_quiesced)
+    if (rep.quiesced)
         thread_resume_siblings();
     return ret;
 }
@@ -1458,23 +1534,7 @@ static int read_file_range_to_guest(guest_t *g,
     uint8_t *dst = host_ptr_for_gpa(g, gpa);
     if (!dst)
         return -LINUX_EFAULT;
-    size_t remaining = len;
-
-    while (remaining > 0) {
-        ssize_t nr = pread(fd, dst, remaining, (off_t) file_off);
-        if (nr < 0) {
-            if (errno == EINTR)
-                continue;
-            return linux_errno();
-        }
-        if (nr == 0)
-            break;
-        dst += nr;
-        remaining -= (size_t) nr;
-        file_off += (uint64_t) nr;
-    }
-
-    return 0;
+    return (int) pread_fill(fd, dst, (size_t) len, (off_t) file_off);
 }
 
 static int restore_file_overlay_range(guest_t *g,
@@ -2009,29 +2069,55 @@ static int restore_region_snapshots(guest_t *g, region_snapshot_t *snaps, int n)
     return 0;
 }
 
+/* The allocator cursors and gap hints a failed non-fixed mmap has to put back,
+ * captured before the gap is chosen.
+ */
+typedef struct {
+    uint64_t next;
+    uint64_t end;
+    uint64_t rx_next;
+    uint64_t rx_end;
+    uint64_t rw_gap_hint;
+    uint64_t rx_gap_hint;
+} mmap_alloc_state_t;
+
+/* The host MAP_FIXED|MAP_SHARED overlay a mapping installed, if any, so a later
+ * failure can remove it before the file is left mapped with no tracking.
+ */
+typedef struct {
+    bool installed;
+    uint64_t ipa;
+    uint64_t len;
+} mmap_overlay_t;
+
+static mmap_alloc_state_t mmap_alloc_save(const guest_t *g)
+{
+    return (mmap_alloc_state_t) {
+        .next = g->mmap_next,
+        .end = g->mmap_end,
+        .rx_next = g->mmap_rx_next,
+        .rx_end = g->mmap_rx_end,
+        .rw_gap_hint = g->mmap_rw_gap_hint,
+        .rx_gap_hint = g->mmap_rx_gap_hint,
+    };
+}
+
 static int rollback_fresh_mmap_allocation(guest_t *g,
                                           uint64_t start,
                                           uint64_t length,
-                                          bool overlay_installed,
-                                          uint64_t overlay_ipa,
-                                          uint64_t overlay_len,
-                                          uint64_t saved_mmap_next,
-                                          uint64_t saved_mmap_end,
-                                          uint64_t saved_mmap_rx_next,
-                                          uint64_t saved_mmap_rx_end,
-                                          uint64_t saved_rw_gap_hint,
-                                          uint64_t saved_rx_gap_hint)
+                                          const mmap_overlay_t *overlay,
+                                          const mmap_alloc_state_t *saved)
 {
-    if (overlay_installed)
-        hvf_remove_file_overlay(g, overlay_ipa, overlay_len);
+    if (overlay && overlay->installed)
+        hvf_remove_file_overlay(g, overlay->ipa, overlay->len);
     if (guest_invalidate_ptes(g, start, start + length) < 0)
         return -LINUX_ENOMEM;
-    g->mmap_next = saved_mmap_next;
-    g->mmap_end = saved_mmap_end;
-    g->mmap_rx_next = saved_mmap_rx_next;
-    g->mmap_rx_end = saved_mmap_rx_end;
-    g->mmap_rw_gap_hint = saved_rw_gap_hint;
-    g->mmap_rx_gap_hint = saved_rx_gap_hint;
+    g->mmap_next = saved->next;
+    g->mmap_end = saved->end;
+    g->mmap_rx_next = saved->rx_next;
+    g->mmap_rx_end = saved->rx_end;
+    g->mmap_rw_gap_hint = saved->rw_gap_hint;
+    g->mmap_rx_gap_hint = saved->rx_gap_hint;
     return 0;
 }
 
@@ -2826,13 +2912,526 @@ static void mmap_fresh_dispose(mmap_fresh_t *fresh)
     errno = saved_errno;
 }
 
-/* Over the function-size limit on purpose.
+/* Pick the guest offset for a non-fixed mapping, or UINT64_MAX when the address
+ * space is exhausted (after logging it). Executable-only mappings come from the
+ * RX region and everything else from the RW one; a hint is honored when it
+ * fits. @align is a placement preference that falls back to @fallback_align. On
+ * success the allocator's high-water mark is raised for the fork IPC transfer.
+ */
+static uint64_t mmap_pick_gap(guest_t *g,
+                              uint64_t addr,
+                              uint64_t length,
+                              bool use_rx,
+                              uint64_t align,
+                              uint64_t fallback_align)
+{
+    uint64_t result_off;
+    if (use_rx) {
+        /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region. Apple
+         * HVF enforces W^X on 2MiB block page table entries, so executable
+         * mappings must be in separate 2MiB blocks from writable ones. The RX
+         * region at MMAP_RX_BASE is pre-mapped with execute permission.
+         */
+        result_off =
+            find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit, align);
+        if (result_off == UINT64_MAX && align != fallback_align)
+            result_off = find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit,
+                                       fallback_align);
+        if (result_off == UINT64_MAX) {
+            log_debug(
+                "mmap: RX address space exhausted "
+                "(len=0x%llx, limit=0x%llx, %u-bit IPA / %llu GiB)",
+                (unsigned long long) length, (unsigned long long) g->mmap_limit,
+                g->ipa_bits, (unsigned long long) (g->guest_size >> 30));
+            return UINT64_MAX;
+        }
+        /* High-water mark for fork IPC state transfer */
+        uint64_t rx_hwm = result_off + length;
+        if (rx_hwm > g->mmap_rx_next)
+            g->mmap_rx_next = rx_hwm;
+    } else {
+        /* RW (or PROT_NONE, or PROT_READ): allocate from main mmap region.
+         * Honor the address hint if provided and within bounds. Some
+         * managed-runtime allocators need the heap at a specific high address
+         * range (e.g., ~264GiB for a megablock-style map) and spin-retry if
+         * they get a low address instead. On real Linux, mmap tries the hint
+         * first and falls back to any suitable address.
+         */
+        result_off = UINT64_MAX;
+        if (addr != 0) {
+            uint64_t hint_off = addr - g->ipa_base;
+            if (hint_off >= ELF_DEFAULT_BASE && hint_off <= g->mmap_limit &&
+                length <= g->mmap_limit - hint_off) {
+                /* Real Linux treats non-fixed mmap(addr!=0) as a strong hint,
+                 * including low canonical addresses such as the traditional
+                 * x86-64 ET_EXEC base at 0x400000. box64 uses this pattern when
+                 * reserving address space for static ET_EXEC binaries; forcing
+                 * every hint below MMAP_BASE into the high RW arena breaks that
+                 * expectation and the guest later still dereferences the low
+                 * address.
+                 *
+                 * Probe the hinted range first. Keep low-hint searches below
+                 * MMAP_BASE so an unresolved low hint does not silently spill
+                 * into the high arena on this fast path.
+                 */
+                uint64_t hint_max =
+                    (hint_off < MMAP_BASE) ? MMAP_BASE : g->mmap_limit;
+                if (align != fallback_align) {
+                    uint64_t exact_hint_max = hint_off + length;
+                    result_off = find_free_gap_inner(
+                        g, length, hint_off, exact_hint_max, fallback_align);
+                }
+                if (result_off == UINT64_MAX)
+                    result_off = find_free_gap_inner(g, length, hint_off,
+                                                     hint_max, align);
+                if (result_off == UINT64_MAX && align != fallback_align)
+                    result_off = find_free_gap_inner(g, length, hint_off,
+                                                     hint_max, fallback_align);
+            }
+        }
+        if (result_off == UINT64_MAX)
+            result_off =
+                find_free_gap(g, length, MMAP_BASE, g->mmap_limit, align);
+        if (result_off == UINT64_MAX && align != fallback_align)
+            result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit,
+                                       fallback_align);
+        if (result_off == UINT64_MAX) {
+            log_debug(
+                "mmap: RW address space exhausted "
+                "(len=0x%llx, limit=0x%llx, %u-bit IPA / %llu GiB)",
+                (unsigned long long) length, (unsigned long long) g->mmap_limit,
+                g->ipa_bits, (unsigned long long) (g->guest_size >> 30));
+            return UINT64_MAX;
+        }
+        /* High-water mark for fork IPC state transfer */
+        uint64_t rw_hwm = result_off + length;
+        if (rw_hwm > g->mmap_next)
+            g->mmap_next = rw_hwm;
+    }
+    return result_off;
+}
+
+/* Undo a non-fixed allocation that failed after its gap was chosen, release the
+ * per-call resources, and report @err, or the rollback's own failure if it had
+ * one.
+ */
+static int64_t mmap_abort_alloc(guest_t *g,
+                                uint64_t start,
+                                uint64_t length,
+                                const mmap_alloc_state_t *saved,
+                                mmap_fresh_t *fresh,
+                                int64_t err)
+{
+    int rollback_err =
+        rollback_fresh_mmap_allocation(g, start, length, NULL, saved);
+    mmap_fresh_dispose(fresh);
+    return rollback_err < 0 ? rollback_err : err;
+}
+
+/* Validate the target of a low-VA MAP_FIXED request and return its offset from
+ * ipa_base. The checks run in a fixed order because the first to fail picks the
+ * errno the guest sees.
+ */
+static int64_t mmap_fixed_range(const guest_t *g,
+                                uint64_t addr,
+                                uint64_t length,
+                                uint64_t *off_out)
+{
+    /* High-VA MAP_FIXED (rosetta's JIT slabs at 240 TiB, code caches at 85 TiB,
+     * etc.) is not safe to expose yet. The previous draft could install TTBR0
+     * aliases for addresses above the primary guest buffer, but
+     * munmap/mprotect/fork bookkeeping still track regions by low GPA and
+     * mmap_next only. Returning success here therefore created mappings that
+     * later teardown paths could not manage and let overflow-backed aliases
+     * corrupt the fork snapshot high-water mark. Fail closed until the region
+     * metadata and teardown paths are made VA-aware end-to-end. MAP_FIXED: addr
+     * is IPA-based, convert to offset
+     */
+    uint64_t off = addr - g->ipa_base;
+
+    /* Use subtraction-based check to avoid off+length overflow. Stays
+     * primary-buffer-only for the low-VA path because the body below issues raw
+     * host_base+off arithmetic (memset, pread, etc.). The high-VA path above is
+     * the alternate route for rosetta.
+     */
+    if (off > g->guest_size || length > g->guest_size - off)
+        return -LINUX_ENOMEM;
+
+    /* Reject MAP_FIXED targeting VM infrastructure: page table pool, shim code,
+     * and shim data/stack regions. A guest must not be able to overwrite EL1
+     * exception vectors or page tables. The reserve sits at high IPA (just
+     * below g->interp_base) so the range check uses the runtime fields rather
+     * than compile-time low-memory constants.
+     */
+    if (guest_range_hits_infra(g, off, off + length))
+        return -LINUX_EINVAL;
+    *off_out = off;
+    return 0;
+}
+
+/* Prepare the replacement of [result_off, result_off + length) by a MAP_FIXED
+ * mapping: take the backing fd, make sure the region table can absorb the
+ * change, snapshot what is being replaced for rollback, and check that the
+ * first byte of a file mapping is readable. Every failure releases @fresh
+ * itself, so the caller returns the errno as is.
+ */
+static int64_t mmap_fixed_prepare(guest_t *g,
+                                  mmap_fresh_t *fresh,
+                                  uint64_t result_off,
+                                  uint64_t length,
+                                  bool is_anon,
+                                  bool is_prot_none,
+                                  int fd,
+                                  int64_t offset)
+{
+    int host_backing_fd = -1;
+    if (!is_anon) {
+        int64_t ref_err = host_fd_ref_open(fd, &fresh->backing_ref);
+        if (ref_err < 0) {
+            mmap_fresh_dispose(fresh);
+            return ref_err;
+        }
+        host_backing_fd = fresh->backing_ref.fd;
+    }
+
+    remove_range_t replaced = {result_off, result_off + length};
+    if (!region_has_capacity_after_removes(g, &replaced, 1, 1)) {
+        mmap_fresh_dispose(fresh);
+        return -LINUX_ENOMEM;
+    }
+    if (guest_region_remove_prepare(g, result_off, result_off + length,
+                                    &fresh->replaced_remove_fd) < 0) {
+        mmap_fresh_dispose(fresh);
+        return -LINUX_ENOMEM;
+    }
+    fresh->replaced_snaps =
+        malloc(GUEST_MAX_REGIONS * sizeof(*fresh->replaced_snaps));
+    if (!fresh->replaced_snaps) {
+        mmap_fresh_dispose(fresh);
+        return -LINUX_ENOMEM;
+    }
+    fresh->replaced_nsnaps = capture_region_snapshots(
+        g, result_off, result_off + length, fresh->replaced_snaps,
+        GUEST_MAX_REGIONS, NULL);
+    if (fresh->replaced_nsnaps < 0) {
+        int64_t capture_err = fresh->replaced_nsnaps;
+        mmap_fresh_dispose(fresh);
+        return capture_err;
+    }
+    if (!is_anon) {
+        fresh->track_backing_fd = dup(host_backing_fd);
+        if (fresh->track_backing_fd < 0) {
+            mmap_fresh_dispose(fresh);
+            return -LINUX_ENOMEM;
+        }
+        if (!is_prot_none) {
+            char probe;
+            ssize_t nr;
+            do {
+                nr = pread(host_backing_fd, &probe, sizeof(probe), offset);
+            } while (nr < 0 && errno == EINTR);
+            if (nr < 0) {
+                mmap_fresh_dispose(fresh);
+                return linux_errno();
+            }
+        }
+    }
+    return 0;
+}
+
+/* Put back the slab backing under overlays a failed MAP_FIXED had already torn
+ * down, release @fresh, and report @err. Used before the replaced regions are
+ * dropped, so the region table itself needs no restore.
+ */
+static int64_t mmap_fixed_undo_overlays(guest_t *g,
+                                        mmap_fresh_t *fresh,
+                                        int64_t err)
+{
+    (void) restore_snapshot_overlays_in_place(g, fresh->replaced_snaps,
+                                              fresh->replaced_nsnaps);
+    mmap_fresh_dispose(fresh);
+    return err;
+}
+
+/* Put back what a failed MAP_FIXED replaced: the region tracking and page
+ * tables from the snapshots taken in mmap_fixed_prepare. Releases @fresh and
+ * reports @err, or the restore's own failure if it had one.
+ */
+static int64_t mmap_fixed_undo(guest_t *g,
+                               mmap_fresh_t *fresh,
+                               uint64_t start,
+                               uint64_t length,
+                               int64_t err)
+{
+    int restore_err = restore_region_snapshots(g, fresh->replaced_snaps,
+                                               fresh->replaced_nsnaps);
+    if (restore_err == 0)
+        restore_err = restore_snapshot_page_tables(g, start, start + length,
+                                                   fresh->replaced_snaps,
+                                                   fresh->replaced_nsnaps);
+    mmap_fresh_dispose(fresh);
+    return restore_err < 0 ? restore_err : err;
+}
+
+/* Validate a mmap request and page-align its length in place. The checks run in
+ * a fixed order because the first to fail picks the errno the guest sees.
+ */
+static int64_t mmap_check_args(const guest_t *g,
+                               uint64_t addr,
+                               uint64_t *length_io,
+                               int flags,
+                               int fd,
+                               int64_t offset,
+                               bool is_anon)
+{
+    /* Linux rejects zero-length mmap */
+    if (*length_io == 0)
+        return -LINUX_EINVAL;
+
+    /* Linux requires page-aligned offset for file-backed mmap */
+    if (!is_anon && (offset & 4095))
+        return -LINUX_EINVAL;
+
+    if (!is_anon && fuse_fd_refuse_mmap(fd)) {
+        bool allow_materialized_fuse_mmap =
+            g->is_rosetta &&
+            ((flags & LINUX_MAP_FIXED) ||
+             (flags & LINUX_MAP_FIXED_NOREPLACE)) &&
+            addr >= g->guest_size && !(flags & LINUX_MAP_SHARED);
+        if (!allow_materialized_fuse_mmap)
+            return -LINUX_ENODEV;
+    }
+
+    /* Round length up to page size (overflow-safe) */
+    if (*length_io > UINT64_MAX - 4095)
+        return -LINUX_ENOMEM;
+    *length_io = PAGE_ALIGN_UP(*length_io);
+    if (*length_io == 0)
+        return -LINUX_ENOMEM;
+
+    /* Linux kernel rejects MAP_FIXED with non-page-aligned address */
+    if (((flags & LINUX_MAP_FIXED) || (flags & LINUX_MAP_FIXED_NOREPLACE)) &&
+        (addr & 4095))
+        return -LINUX_EINVAL;
+    return 0;
+}
+
+/* Record on a freshly added MAP_SHARED file region what msync and mprotect need
+ * to know. An aligned mapping is marked overlay-backed so msync skips the
+ * snapshot-style pwrite and refresh paths, because the kernel keeps it coherent
+ * with the file's page cache. A mapping whose backing fd cannot be written has
+ * its maximum protection capped to read, whether or not a live overlay was
+ * installed, so a later PROT_WRITE upgrade fails with EACCES.
+ */
+static void mmap_mark_shared_file_region(guest_t *g,
+                                         uint64_t result_off,
+                                         uint64_t length,
+                                         int64_t offset,
+                                         int host_backing_fd)
+{
+    size_t hps = host_page_size_cached();
+    if ((result_off % hps == 0) && ((uint64_t) offset % hps == 0)) {
+        int i = guest_region_first_end_above(g, result_off);
+        if (i < g->nregions && g->regions[i].start == result_off &&
+            g->regions[i].end == result_off + length) {
+            g->regions[i].overlay_active = true;
+            g->regions[i].overlay_start = result_off;
+            g->regions[i].overlay_end = result_off + ALIGN_UP(length, hps);
+        }
+    }
+    if (!overlay_fd_writable(host_backing_fd))
+        mark_region_backing_ro(g, result_off, result_off + length);
+}
+
+/* Commit a MAP_FIXED mapping over [result_off, result_off + length) after
+ * mmap_fixed_prepare: drop the overlays and region records it replaces, bring
+ * the page tables and permissions in line, and fill the memory (zero for
+ * anonymous, a live overlay for aligned MAP_SHARED files, a pread snapshot
+ * otherwise). A PROT_NONE mapping only invalidates the old entries. Records an
+ * installed overlay in @overlay. Every failure undoes what it had changed and
+ * releases @fresh, so the caller returns the errno as is.
+ */
+static int64_t mmap_fixed_commit(guest_t *g,
+                                 mmap_fresh_t *fresh,
+                                 mmap_overlay_t *overlay,
+                                 int prot,
+                                 int flags,
+                                 int fd,
+                                 int64_t offset,
+                                 uint64_t result_off,
+                                 uint64_t length,
+                                 int host_backing_fd)
+{
+    if (prot != LINUX_PROT_NONE) {
+        /* Ensure page table entries exist for the fixed range. PROT_NONE
+         * reservations skip page table creation, so when MAP_FIXED commits
+         * pages within a PROT_NONE region (e.g., a runtime carves an RW slab
+         * out of its previously reserved PROT_NONE heap), the memory syscall
+         * layer must create L2 block descriptors first.
+         * guest_extend_page_tables is idempotent for already-mapped blocks.
+         */
+        int page_perms = prot_to_perms(prot);
+
+        uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
+        uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
+        if (ext_end > g->guest_size)
+            ext_end = g->guest_size;
+
+        /* Restore slab backing under any pre-existing MAP_SHARED file overlay
+         * in the replaced range. Without this, stale file pages leak into the
+         * new mapping. Must run before guest_region_remove because the cleanup
+         * walker reads the live region metadata.
+         */
+        int cleanup_err =
+            cleanup_overlays_in_range(g, result_off, result_off + length);
+        if (cleanup_err < 0)
+            return mmap_fixed_undo_overlays(g, fresh, cleanup_err);
+
+        if (guest_extend_page_tables(g, ext_start, ext_end, page_perms) < 0)
+            return mmap_fixed_undo_overlays(g, fresh, -LINUX_ENOMEM);
+
+        /* Remove old metadata only after fallible page-table preparation
+         * succeeds.
+         */
+        guest_region_remove_reserved(g, result_off, result_off + length,
+                                     fresh->replaced_remove_fd);
+        fresh->replaced_remove_fd = -1;
+
+        /* Fine-tune permissions for the exact range. Handles L3 splitting when
+         * MAP_FIXED overlays different permissions onto an existing 2MiB block
+         * (e.g., .data RW over .text RX).
+         */
+        guest_update_perms(g, result_off, result_off + length, page_perms);
+
+        /* For MAP_ANONYMOUS: zero the region (host memory may contain stale
+         * data from earlier mappings). For MAP_SHARED + regular file: install a
+         * real host mmap MAP_FIXED|MAP_SHARED overlay so the guest sees live
+         * host writes and its own writes hit the file directly. For MAP_PRIVATE
+         * file-backed: read file contents into guest memory; private writes
+         * stay in the slab. Short reads leave the remainder zeroed (memset
+         * first).
+         */
+        if (flags & LINUX_MAP_ANONYMOUS) {
+            memset((uint8_t *) g->host_base + result_off, 0, length);
+        } else if (fd >= 0 && (flags & LINUX_MAP_SHARED) &&
+                   (result_off % host_page_size_cached() == 0) &&
+                   ((uint64_t) offset % host_page_size_cached() == 0)) {
+            uint64_t fixed_overlay_len =
+                ALIGN_UP(length, host_page_size_cached());
+            int oerr = hvf_apply_file_overlay(g, result_off, fixed_overlay_len,
+                                              host_backing_fd, (off_t) offset);
+            if (oerr < 0)
+                return mmap_fixed_undo(g, fresh, result_off, length, oerr);
+            *overlay = (mmap_overlay_t) {true, result_off, fixed_overlay_len};
+        } else if (fd >= 0) {
+            memset((uint8_t *) g->host_base + result_off, 0, length);
+            int64_t read_io_err = pread_fill(
+                host_backing_fd, (uint8_t *) g->host_base + result_off, length,
+                (off_t) offset);
+            if (read_io_err < 0)
+                return mmap_fixed_undo(g, fresh, result_off, length,
+                                       read_io_err);
+        }
+    } else {
+        /* Restore slab backing under any pre-existing MAP_SHARED file overlay
+         * before dropping the region tracking.
+         */
+        int cleanup_err =
+            cleanup_overlays_in_range(g, result_off, result_off + length);
+        if (cleanup_err < 0)
+            return mmap_fixed_undo_overlays(g, fresh, cleanup_err);
+
+        /* Remove any existing region coverage in the fixed range. */
+        guest_region_remove_reserved(g, result_off, result_off + length,
+                                     fresh->replaced_remove_fd);
+        fresh->replaced_remove_fd = -1;
+
+        /* PROT_NONE with MAP_FIXED: invalidate existing page table entries so
+         * the region becomes truly inaccessible. Without this, stale PTEs from
+         * initial page table setup (e.g., ELF segment pre-mapping) remain
+         * valid, making pages accessible when they should fault on access. A
+         * real Linux kernel's mmap(MAP_FIXED, PROT_NONE) removes existing VMAs
+         * and their page table entries, making the range fault on access.
+         */
+        guest_invalidate_ptes(g, result_off, result_off + length);
+    }
+    return 0;
+}
+
+/* Give a fresh non-fixed mapping its page tables and zero its memory. Extends
+ * the tables over just this allocation (guest_extend_page_tables skips blocks
+ * that are already mapped, and doing it per allocation avoids creating entries
+ * for PROT_NONE gaps), sets the permissions on the range, raises the RX or RW
+ * limit the fork transfer reads, and zeroes the range. Executable-only mappings
+ * come from the RX region and everything else from the RW one.
+ * Returns 0 or -LINUX_ENOMEM; the caller releases the per-call state.
+ */
+static int mmap_extend_fresh(guest_t *g,
+                             uint64_t result_off,
+                             uint64_t length,
+                             int prot)
+{
+    /* Extend page tables for this specific allocation range only.
+     * guest_extend_page_tables skips already-mapped blocks, so calling it on
+     * pre-mapped regions is a no-op. This avoids creating entries for PROT_NONE
+     * gaps between allocations.
+     */
+    if ((prot & LINUX_PROT_EXEC) && !(prot & LINUX_PROT_WRITE)) {
+        uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
+        uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
+        if (ext_end > g->mmap_limit)
+            ext_end = g->mmap_limit;
+        if (guest_extend_page_tables(g, ext_start, ext_end, MEM_PERM_RX) < 0)
+            return -LINUX_ENOMEM;
+
+        /* Re-validate any previously-invalidated L3 entries (see the RW path
+         * comment below for the full explanation).
+         */
+        guest_update_perms(g, result_off, result_off + length, MEM_PERM_RX);
+        if (ext_end > g->mmap_rx_end)
+            g->mmap_rx_end = ext_end;
+    } else {
+        uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
+        uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
+        if (ext_end > g->mmap_limit)
+            ext_end = g->mmap_limit;
+
+        /* Preserve execute permission for RWX requests. Stage-2 (hv_vm_map) is
+         * RWX for the whole buffer; stage-1 PTEs set AP=RW_EL0 with UXN/PXN=0
+         * for combined W+X. HVF allows this in stage-1 even though normal W^X
+         * enforcement disallows it per HV_MEMORY flags.
+         */
+        int ext_perms = MEM_PERM_RW;
+        if (prot & LINUX_PROT_EXEC)
+            ext_perms |= MEM_PERM_X;
+        if (guest_extend_page_tables(g, ext_start, ext_end, ext_perms) < 0)
+            return -LINUX_ENOMEM;
+
+        /* Update permissions on the allocated range. This handles two cases:
+         * 1. RWX: pre-existing RW blocks need execute permission added
+         * 2. L3 split entries: if an L2 block was previously split into
+         *    L3 page entries (e.g., via mprotect(PROT_NONE) on a sub-block
+         *    range), guest_extend_page_tables skips the L2 entry (it sees
+         *    a valid table descriptor). The L3 entries may be invalidated,
+         *    so the memory syscall layer must re-create them with the
+         *    correct permissions.
+         */
+        guest_update_perms(g, result_off, result_off + length, ext_perms);
+        if (ext_end > g->mmap_end)
+            g->mmap_end = ext_end;
+    }
+
+    /* Zero the mapped region */
+    memset((uint8_t *) g->host_base + result_off, 0, length);
+    return 0;
+}
+
+/* Why this stays one function.
  *
  * Flag combinations, not steps: MAP_FIXED, MAP_SHARED, the file-backed overlay
  * and the anonymous path each qualify the others. Splitting by flag duplicates
  * the interactions between them.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,
                  uint64_t length,
@@ -2856,23 +3455,9 @@ int64_t sys_mmap(guest_t *g,
      * region tracking, and the next operation in that range would memset zeros
      * directly into the user's file.
      */
-    bool overlay_installed = false;
-    uint64_t overlay_ipa = 0;
-    uint64_t overlay_len = 0;
-    uint64_t saved_mmap_next = g->mmap_next;
-    uint64_t saved_mmap_end = g->mmap_end;
-    uint64_t saved_mmap_rx_next = g->mmap_rx_next;
-    uint64_t saved_mmap_rx_end = g->mmap_rx_end;
-    uint64_t saved_rw_gap_hint = g->mmap_rw_gap_hint;
-    uint64_t saved_rx_gap_hint = g->mmap_rx_gap_hint;
+    mmap_overlay_t overlay = {0};
+    const mmap_alloc_state_t saved = mmap_alloc_save(g);
 
-    /* Heap-allocated to avoid blowing the ~512 KiB default stack on macOS
-     * worker threads: GUEST_MAX_REGIONS * sizeof(region_snapshot_t) is on the
-     * order of half a megabyte. Allocated lazily inside the FIXED path that
-     * actually consumes it; non-FIXED mmaps never touch this pointer. Always
-     * free()'d (free(NULL) is a no-op) before return.
-     */
-    bool replaced_regions_removed = false;
     int track_flags =
         ((flags & LINUX_MAP_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE);
     if (is_anon)
@@ -2889,36 +3474,12 @@ int64_t sys_mmap(guest_t *g,
      * (CLONE_VM semantics).
      */
 
-    /* Linux rejects zero-length mmap */
-    if (length == 0)
-        return -LINUX_EINVAL;
-
-    /* Linux requires page-aligned offset for file-backed mmap */
-    if (!is_anon && (offset & 4095))
-        return -LINUX_EINVAL;
-
-    if (!is_anon && fuse_fd_refuse_mmap(fd)) {
-        bool allow_materialized_fuse_mmap =
-            g->is_rosetta &&
-            ((flags & LINUX_MAP_FIXED) ||
-             (flags & LINUX_MAP_FIXED_NOREPLACE)) &&
-            addr >= g->guest_size && !(flags & LINUX_MAP_SHARED);
-        if (!allow_materialized_fuse_mmap)
-            return -LINUX_ENODEV;
-    }
-
-    /* Round length up to page size (overflow-safe) */
-    if (length > UINT64_MAX - 4095)
-        return -LINUX_ENOMEM;
-    length = PAGE_ALIGN_UP(length);
-    if (length == 0)
-        return -LINUX_ENOMEM;
-
-    /* Linux kernel rejects MAP_FIXED with non-page-aligned address */
+    int64_t arg_err =
+        mmap_check_args(g, addr, &length, flags, fd, offset, is_anon);
+    if (arg_err < 0)
+        return arg_err;
     bool is_fixed =
         (flags & LINUX_MAP_FIXED) || (flags & LINUX_MAP_FIXED_NOREPLACE);
-    if (is_fixed && (addr & 4095))
-        return -LINUX_EINVAL;
 
     /* MAP_FIXED_NOREPLACE: like MAP_FIXED but fail with -EEXIST if the range
      * overlaps any existing mapping.
@@ -2937,267 +3498,30 @@ int64_t sys_mmap(guest_t *g,
             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset,
                                     true, is_noreplace);
 
-        /* High-VA MAP_FIXED (rosetta's JIT slabs at 240 TiB, code caches at 85
-         * TiB, etc.) is not safe to expose yet. The previous draft could
-         * install TTBR0 aliases for addresses above the primary guest buffer,
-         * but munmap/mprotect/fork bookkeeping still track regions by low GPA
-         * and mmap_next only. Returning success here therefore created mappings
-         * that later teardown paths could not manage and let overflow-backed
-         * aliases corrupt the fork snapshot high-water mark. Fail closed until
-         * the region metadata and teardown paths are made VA-aware end-to-end.
-         * MAP_FIXED: addr is IPA-based, convert to offset
-         */
-        uint64_t off = addr - g->ipa_base;
-
-        /* Use subtraction-based check to avoid off+length overflow. Stays
-         * primary-buffer-only for the low-VA path because the body below issues
-         * raw host_base+off arithmetic (memset, pread, etc.). The high-VA path
-         * above is the alternate route for rosetta.
-         */
-        if (off > g->guest_size || length > g->guest_size - off)
-            return -LINUX_ENOMEM;
-
-        /* Reject MAP_FIXED targeting VM infrastructure: page table pool, shim
-         * code, and shim data/stack regions. A guest must not be able to
-         * overwrite EL1 exception vectors or page tables. The reserve sits at
-         * high IPA (just below g->interp_base) so the range check uses the
-         * runtime fields rather than compile-time low-memory constants.
-         */
+        uint64_t off;
+        int64_t range_err = mmap_fixed_range(g, addr, length, &off);
+        if (range_err < 0)
+            return range_err;
         uint64_t fix_end = off + length;
-        if (guest_range_hits_infra(g, off, fix_end))
-            return -LINUX_EINVAL;
 
         result_off = off;
 
-        /* MAP_FIXED_NOREPLACE: reject if any existing region overlaps. Use
-         * binary search (regions are sorted by start address) to find the first
-         * region that could overlap [result_off, result_off+length).
-         */
-        if (is_noreplace) {
-            int lo = 0, hi = g->nregions - 1, first = g->nregions;
-            while (lo <= hi) {
-                int mid = (lo + hi) / 2;
-                if (g->regions[mid].end > result_off) {
-                    first = mid;
-                    hi = mid - 1;
-                } else {
-                    lo = mid + 1;
-                }
-            }
-            if (first < g->nregions &&
-                g->regions[first].start < result_off + length)
-                return -LINUX_EEXIST;
-        }
+        /* MAP_FIXED_NOREPLACE: reject if any region overlaps the range. */
+        if (is_noreplace && region_range_overlaps(g, result_off, fix_end))
+            return -LINUX_EEXIST;
 
-        if (!is_anon) {
-            int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
-            if (ref_err < 0) {
-                mmap_fresh_dispose(&fresh);
-                return ref_err;
-            }
+        int64_t prep_err = mmap_fixed_prepare(
+            g, &fresh, result_off, length, is_anon, is_prot_none, fd, offset);
+        if (prep_err < 0)
+            return prep_err;
+        if (!is_anon)
             host_backing_fd = fresh.backing_ref.fd;
-        }
 
-        remove_range_t replaced = {result_off, result_off + length};
-        if (!region_has_capacity_after_removes(g, &replaced, 1, 1)) {
-            mmap_fresh_dispose(&fresh);
-            return -LINUX_ENOMEM;
-        }
-        if (guest_region_remove_prepare(g, result_off, result_off + length,
-                                        &fresh.replaced_remove_fd) < 0) {
-            mmap_fresh_dispose(&fresh);
-            return -LINUX_ENOMEM;
-        }
-        fresh.replaced_snaps =
-            malloc(GUEST_MAX_REGIONS * sizeof(*fresh.replaced_snaps));
-        if (!fresh.replaced_snaps) {
-            mmap_fresh_dispose(&fresh);
-            return -LINUX_ENOMEM;
-        }
-        fresh.replaced_nsnaps = capture_region_snapshots(
-            g, result_off, result_off + length, fresh.replaced_snaps,
-            GUEST_MAX_REGIONS, NULL);
-        if (fresh.replaced_nsnaps < 0) {
-            int64_t capture_err = fresh.replaced_nsnaps;
-            mmap_fresh_dispose(&fresh);
-            return capture_err;
-        }
-        if (!is_anon) {
-            fresh.track_backing_fd = dup(host_backing_fd);
-            if (fresh.track_backing_fd < 0) {
-                mmap_fresh_dispose(&fresh);
-                return -LINUX_ENOMEM;
-            }
-            if (!is_prot_none) {
-                char probe;
-                ssize_t nr;
-                do {
-                    nr = pread(host_backing_fd, &probe, sizeof(probe), offset);
-                } while (nr < 0 && errno == EINTR);
-                if (nr < 0) {
-                    mmap_fresh_dispose(&fresh);
-                    return linux_errno();
-                }
-            }
-        }
-
-        if (!is_prot_none) {
-            /* Ensure page table entries exist for the fixed range. PROT_NONE
-             * reservations skip page table creation, so when MAP_FIXED commits
-             * pages within a PROT_NONE region (e.g., a runtime carves an RW
-             * slab out of its previously reserved PROT_NONE heap), the memory
-             * syscall layer must create L2 block descriptors first.
-             * guest_extend_page_tables is idempotent for already-mapped blocks.
-             */
-            int page_perms = prot_to_perms(prot);
-
-            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
-            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
-            if (ext_end > g->guest_size)
-                ext_end = g->guest_size;
-
-            /* Restore slab backing under any pre-existing MAP_SHARED file
-             * overlay in the replaced range. Without this, stale file pages
-             * leak into the new mapping. Must run before guest_region_remove
-             * because the cleanup walker reads the live region metadata.
-             */
-            int cleanup_err =
-                cleanup_overlays_in_range(g, result_off, result_off + length);
-            if (cleanup_err < 0) {
-                (void) restore_snapshot_overlays_in_place(
-                    g, fresh.replaced_snaps, fresh.replaced_nsnaps);
-                mmap_fresh_dispose(&fresh);
-                return cleanup_err;
-            }
-
-            if (guest_extend_page_tables(g, ext_start, ext_end, page_perms) <
-                0) {
-                (void) restore_snapshot_overlays_in_place(
-                    g, fresh.replaced_snaps, fresh.replaced_nsnaps);
-                mmap_fresh_dispose(&fresh);
-                return -LINUX_ENOMEM;
-            }
-
-            /* Remove old metadata only after fallible page-table preparation
-             * succeeds.
-             */
-            guest_region_remove_reserved(g, result_off, result_off + length,
-                                         fresh.replaced_remove_fd);
-            fresh.replaced_remove_fd = -1;
-            replaced_regions_removed = true;
-
-            /* Fine-tune permissions for the exact range. Handles L3 splitting
-             * when MAP_FIXED overlays different permissions onto an existing
-             * 2MiB block (e.g., .data RW over .text RX).
-             */
-            guest_update_perms(g, result_off, result_off + length, page_perms);
-
-            /* For MAP_ANONYMOUS: zero the region (host memory may contain stale
-             * data from earlier mappings). For MAP_SHARED + regular file:
-             * install a real host mmap MAP_FIXED|MAP_SHARED overlay so the
-             * guest sees live host writes and its own writes hit the file
-             * directly. For MAP_PRIVATE file-backed: read file contents into
-             * guest memory; private writes stay in the slab. Short reads leave
-             * the remainder zeroed (memset first).
-             */
-            if (is_anon) {
-                memset((uint8_t *) g->host_base + result_off, 0, length);
-            } else if (fd >= 0 && (flags & LINUX_MAP_SHARED) &&
-                       (result_off % host_page_size_cached() == 0) &&
-                       ((uint64_t) offset % host_page_size_cached() == 0)) {
-                uint64_t fixed_overlay_len =
-                    ALIGN_UP(length, host_page_size_cached());
-                int oerr =
-                    hvf_apply_file_overlay(g, result_off, fixed_overlay_len,
-                                           host_backing_fd, (off_t) offset);
-                if (oerr < 0) {
-                    int restore_err = restore_region_snapshots(
-                        g, fresh.replaced_snaps, fresh.replaced_nsnaps);
-                    if (restore_err == 0)
-                        restore_err = restore_snapshot_page_tables(
-                            g, result_off, result_off + length,
-                            fresh.replaced_snaps, fresh.replaced_nsnaps);
-                    mmap_fresh_dispose(&fresh);
-                    if (restore_err < 0)
-                        return restore_err;
-                    return oerr;
-                }
-                overlay_installed = true;
-                overlay_ipa = result_off;
-                overlay_len = fixed_overlay_len;
-            } else if (fd >= 0) {
-                memset((uint8_t *) g->host_base + result_off, 0, length);
-                uint8_t *dst = (uint8_t *) g->host_base + result_off;
-                size_t remaining = length;
-                off_t file_off = offset;
-                bool read_io_err = false;
-                int saved_errno = 0;
-                while (remaining > 0) {
-                    ssize_t nr =
-                        pread(host_backing_fd, dst, remaining, file_off);
-                    if (nr < 0) {
-                        if (errno == EINTR)
-                            continue;
-
-                        /* Real host I/O error (not EINTR). EOF zero- fill stays
-                         * an accepted outcome (nr == 0 below); an I/O failure
-                         * returning a "successful" partially-zero mapping is
-                         * not. Restore the prior region/PTE state and surface
-                         * the errno to the caller.
-                         */
-                        read_io_err = true;
-                        saved_errno = errno;
-                        break;
-                    }
-                    if (nr == 0)
-                        break; /* EOF; remaining bytes stay zeroed */
-                    dst += nr;
-                    remaining -= (size_t) nr;
-                    file_off += nr;
-                }
-                if (read_io_err) {
-                    int restore_err = restore_region_snapshots(
-                        g, fresh.replaced_snaps, fresh.replaced_nsnaps);
-                    if (restore_err == 0)
-                        restore_err = restore_snapshot_page_tables(
-                            g, result_off, result_off + length,
-                            fresh.replaced_snaps, fresh.replaced_nsnaps);
-                    mmap_fresh_dispose(&fresh);
-                    if (restore_err < 0)
-                        return restore_err;
-                    errno = saved_errno;
-                    return linux_errno();
-                }
-            }
-        } else {
-            /* Restore slab backing under any pre-existing MAP_SHARED file
-             * overlay before dropping the region tracking.
-             */
-            int cleanup_err =
-                cleanup_overlays_in_range(g, result_off, result_off + length);
-            if (cleanup_err < 0) {
-                (void) restore_snapshot_overlays_in_place(
-                    g, fresh.replaced_snaps, fresh.replaced_nsnaps);
-                mmap_fresh_dispose(&fresh);
-                return cleanup_err;
-            }
-
-            /* Remove any existing region coverage in the fixed range. */
-            guest_region_remove_reserved(g, result_off, result_off + length,
-                                         fresh.replaced_remove_fd);
-            fresh.replaced_remove_fd = -1;
-            replaced_regions_removed = true;
-
-            /* PROT_NONE with MAP_FIXED: invalidate existing page table entries
-             * so the region becomes truly inaccessible. Without this, stale
-             * PTEs from initial page table setup (e.g., ELF segment
-             * pre-mapping) remain valid, making pages accessible when they
-             * should fault on access. A real Linux kernel's mmap(MAP_FIXED,
-             * PROT_NONE) removes existing VMAs and their page table entries,
-             * making the range fault on access.
-             */
-            guest_invalidate_ptes(g, result_off, result_off + length);
-        }
+        int64_t commit_err =
+            mmap_fixed_commit(g, &fresh, &overlay, prot, flags, fd, offset,
+                              result_off, length, host_backing_fd);
+        if (commit_err < 0)
+            return commit_err;
     }
 
     /* Non-fixed mmap: allocate from the gap-finding allocator and snapshot file
@@ -3245,93 +3569,12 @@ int64_t sys_mmap(guest_t *g,
             overlay_fd_writable(host_backing_fd))
             align = BLOCK_2MIB;
         uint64_t fallback_align = (uint64_t) hps;
-        if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
-            /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region.
-             * Apple HVF enforces W^X on 2MiB block page table entries, so
-             * executable mappings must be in separate 2MiB blocks from writable
-             * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
-             * permission.
-             */
-            result_off =
-                find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit, align);
-            if (result_off == UINT64_MAX && align != fallback_align)
-                result_off = find_free_gap(g, length, MMAP_RX_BASE,
-                                           g->mmap_limit, fallback_align);
-            if (result_off == UINT64_MAX) {
-                log_debug(
-                    "mmap: RX address space exhausted "
-                    "(len=0x%llx, limit=0x%llx, %u-bit IPA / %llu GiB)",
-                    (unsigned long long) length,
-                    (unsigned long long) g->mmap_limit, g->ipa_bits,
-                    (unsigned long long) (g->guest_size >> 30));
-                mmap_fresh_dispose(&fresh);
-                return -LINUX_ENOMEM;
-            }
-            /* High-water mark for fork IPC state transfer */
-            uint64_t rx_hwm = result_off + length;
-            if (rx_hwm > g->mmap_rx_next)
-                g->mmap_rx_next = rx_hwm;
-        } else {
-            /* RW (or PROT_NONE, or PROT_READ): allocate from main mmap region.
-             * Honor the address hint if provided and within bounds. Some
-             * managed-runtime allocators need the heap at a specific high
-             * address range (e.g., ~264GiB for a megablock-style map) and
-             * spin-retry if they get a low address instead. On real Linux, mmap
-             * tries the hint first and falls back to any suitable address.
-             */
-            result_off = UINT64_MAX;
-            if (addr != 0) {
-                uint64_t hint_off = addr - g->ipa_base;
-                if (hint_off >= ELF_DEFAULT_BASE && hint_off <= g->mmap_limit &&
-                    length <= g->mmap_limit - hint_off) {
-                    /* Real Linux treats non-fixed mmap(addr!=0) as a strong
-                     * hint, including low canonical addresses such as the
-                     * traditional x86-64 ET_EXEC base at 0x400000. box64 uses
-                     * this pattern when reserving address space for static
-                     * ET_EXEC binaries; forcing every hint below MMAP_BASE into
-                     * the high RW arena breaks that expectation and the guest
-                     * later still dereferences the low address.
-                     *
-                     * Probe the hinted range first. Keep low-hint searches
-                     * below MMAP_BASE so an unresolved low hint does not
-                     * silently spill into the high arena on this fast path.
-                     */
-                    uint64_t hint_max =
-                        (hint_off < MMAP_BASE) ? MMAP_BASE : g->mmap_limit;
-                    if (align != fallback_align) {
-                        uint64_t exact_hint_max = hint_off + length;
-                        result_off =
-                            find_free_gap_inner(g, length, hint_off,
-                                                exact_hint_max, fallback_align);
-                    }
-                    if (result_off == UINT64_MAX)
-                        result_off = find_free_gap_inner(g, length, hint_off,
-                                                         hint_max, align);
-                    if (result_off == UINT64_MAX && align != fallback_align)
-                        result_off = find_free_gap_inner(
-                            g, length, hint_off, hint_max, fallback_align);
-                }
-            }
-            if (result_off == UINT64_MAX)
-                result_off =
-                    find_free_gap(g, length, MMAP_BASE, g->mmap_limit, align);
-            if (result_off == UINT64_MAX && align != fallback_align)
-                result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit,
-                                           fallback_align);
-            if (result_off == UINT64_MAX) {
-                log_debug(
-                    "mmap: RW address space exhausted "
-                    "(len=0x%llx, limit=0x%llx, %u-bit IPA / %llu GiB)",
-                    (unsigned long long) length,
-                    (unsigned long long) g->mmap_limit, g->ipa_bits,
-                    (unsigned long long) (g->guest_size >> 30));
-                mmap_fresh_dispose(&fresh);
-                return -LINUX_ENOMEM;
-            }
-            /* High-water mark for fork IPC state transfer */
-            uint64_t rw_hwm = result_off + length;
-            if (rw_hwm > g->mmap_next)
-                g->mmap_next = rw_hwm;
+        result_off = mmap_pick_gap(g, addr, length,
+                                   needs_exec && !(prot & LINUX_PROT_WRITE),
+                                   align, fallback_align);
+        if (result_off == UINT64_MAX) {
+            mmap_fresh_dispose(&fresh);
+            return -LINUX_ENOMEM;
         }
         if (!region_has_capacity_after_removes(g, NULL, 0, 1)) {
             mmap_fresh_dispose(&fresh);
@@ -3352,70 +3595,13 @@ int64_t sys_mmap(guest_t *g,
      * RW page table entries, letting the guest read/write what should be
      * inaccessible memory.
      */
-    if (is_prot_none && !is_fixed) {
+    if (is_prot_none && !is_fixed)
         guest_invalidate_ptes(g, result_off, result_off + length);
-    }
 
-    if (!is_prot_none && !is_fixed && !is_noreserve) {
-        /* Extend page tables for this specific allocation range only.
-         * guest_extend_page_tables skips already-mapped blocks, so calling it
-         * on pre-mapped regions is a no-op. This avoids creating entries for
-         * PROT_NONE gaps between allocations.
-         */
-        if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
-            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
-            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
-            if (ext_end > g->mmap_limit)
-                ext_end = g->mmap_limit;
-            if (guest_extend_page_tables(g, ext_start, ext_end, MEM_PERM_RX) <
-                0) {
-                mmap_fresh_dispose(&fresh);
-                return -LINUX_ENOMEM;
-            }
-
-            /* Re-validate any previously-invalidated L3 entries (see the RW
-             * path comment below for the full explanation).
-             */
-            guest_update_perms(g, result_off, result_off + length, MEM_PERM_RX);
-            if (ext_end > g->mmap_rx_end)
-                g->mmap_rx_end = ext_end;
-        } else {
-            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
-            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
-            if (ext_end > g->mmap_limit)
-                ext_end = g->mmap_limit;
-
-            /* Preserve execute permission for RWX requests. Stage-2 (hv_vm_map)
-             * is RWX for the whole buffer; stage-1 PTEs set AP=RW_EL0 with
-             * UXN/PXN=0 for combined W+X. HVF allows this in stage-1 even
-             * though normal W^X enforcement disallows it per HV_MEMORY flags.
-             */
-            int ext_perms = MEM_PERM_RW;
-            if (prot & LINUX_PROT_EXEC)
-                ext_perms |= MEM_PERM_X;
-            if (guest_extend_page_tables(g, ext_start, ext_end, ext_perms) <
-                0) {
-                mmap_fresh_dispose(&fresh);
-                return -LINUX_ENOMEM;
-            }
-
-            /* Update permissions on the allocated range. This handles two
-             * cases:
-             * 1. RWX: pre-existing RW blocks need execute permission added
-             * 2. L3 split entries: if an L2 block was previously split into
-             *    L3 page entries (e.g., via mprotect(PROT_NONE) on a sub-block
-             *    range), guest_extend_page_tables skips the L2 entry (it sees
-             *    a valid table descriptor). The L3 entries may be invalidated,
-             *    so the memory syscall layer must re-create them with the
-             *    correct permissions.
-             */
-            guest_update_perms(g, result_off, result_off + length, ext_perms);
-            if (ext_end > g->mmap_end)
-                g->mmap_end = ext_end;
-        }
-
-        /* Zero the mapped region */
-        memset((uint8_t *) g->host_base + result_off, 0, length);
+    if (!is_prot_none && !is_fixed && !is_noreserve &&
+        mmap_extend_fresh(g, result_off, length, prot) < 0) {
+        mmap_fresh_dispose(&fresh);
+        return -LINUX_ENOMEM;
     }
 
     /* MAP_NORESERVE: invalidate any stale PTEs (like PROT_NONE path) but track
@@ -3451,14 +3637,8 @@ int64_t sys_mmap(guest_t *g,
          */
         if ((flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
             !overlay_fd_writable(host_backing_fd)) {
-            int rollback_err = rollback_fresh_mmap_allocation(
-                g, result_off, length, false, 0, 0, saved_mmap_next,
-                saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
-                saved_rw_gap_hint, saved_rx_gap_hint);
-            mmap_fresh_dispose(&fresh);
-            if (rollback_err < 0)
-                return rollback_err;
-            return -LINUX_EACCES;
+            return mmap_abort_alloc(g, result_off, length, &saved, &fresh,
+                                    -LINUX_EACCES);
         }
 
         /* overlay_fd_writable rejects read-only backing fds inside
@@ -3476,55 +3656,23 @@ int64_t sys_mmap(guest_t *g,
             int oerr = hvf_apply_file_overlay(g, result_off, nf_overlay_len,
                                               host_backing_fd, (off_t) offset);
             if (oerr < 0) {
-                int rollback_err = rollback_fresh_mmap_allocation(
-                    g, result_off, length, false, 0, 0, saved_mmap_next,
-                    saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
-                    saved_rw_gap_hint, saved_rx_gap_hint);
-                mmap_fresh_dispose(&fresh);
-                if (rollback_err < 0)
-                    return rollback_err;
-                return oerr;
+                return mmap_abort_alloc(g, result_off, length, &saved, &fresh,
+                                        oerr);
             }
-            overlay_installed = true;
-            overlay_ipa = result_off;
-            overlay_len = nf_overlay_len;
+            overlay = (mmap_overlay_t) {true, result_off, nf_overlay_len};
         } else {
-            uint8_t *dst = (uint8_t *) g->host_base + result_off;
-            size_t remaining = length;
-            off_t file_off = offset;
-            bool read_err = false;
-            int saved_errno = 0;
-            while (remaining > 0) {
-                ssize_t nr = pread(host_backing_fd, dst, remaining, file_off);
-                if (nr < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    read_err = true;
-                    saved_errno = errno;
-                    break;
-                }
-                if (nr == 0)
-                    break; /* EOF; remaining pages stay zeroed */
-                dst += nr;
-                remaining -= (size_t) nr;
-                file_off += nr;
-            }
-            if (read_err) {
+            int64_t read_err = pread_fill(host_backing_fd,
+                                          (uint8_t *) g->host_base + result_off,
+                                          length, (off_t) offset);
+            if (read_err < 0) {
                 /* Any host I/O error (total OR partial) is fatal. The previous
                  * "remaining == length" gate silently kept partial-read
                  * mappings with a zeroed tail when an I/O error fired
                  * mid-stream, which made truncated file contents visible to the
                  * guest as a successful mmap.
                  */
-                int rollback_err = rollback_fresh_mmap_allocation(
-                    g, result_off, length, false, 0, 0, saved_mmap_next,
-                    saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
-                    saved_rw_gap_hint, saved_rx_gap_hint);
-                mmap_fresh_dispose(&fresh);
-                if (rollback_err < 0)
-                    return rollback_err;
-                errno = saved_errno;
-                return linux_errno();
+                return mmap_abort_alloc(g, result_off, length, &saved, &fresh,
+                                        read_err);
             }
         }
     }
@@ -3548,9 +3696,9 @@ int64_t sys_mmap(guest_t *g,
          * into the user's file via the leaked overlay.
          */
         int rollback_err = 0;
-        if (replaced_regions_removed) {
-            if (overlay_installed)
-                hvf_remove_file_overlay(g, overlay_ipa, overlay_len);
+        if (is_fixed) {
+            if (overlay.installed)
+                hvf_remove_file_overlay(g, overlay.ipa, overlay.len);
             rollback_err = restore_region_snapshots(g, fresh.replaced_snaps,
                                                     fresh.replaced_nsnaps);
             if (rollback_err == 0)
@@ -3558,11 +3706,8 @@ int64_t sys_mmap(guest_t *g,
                     g, result_off, result_off + length, fresh.replaced_snaps,
                     fresh.replaced_nsnaps);
         } else {
-            rollback_err = rollback_fresh_mmap_allocation(
-                g, result_off, length, overlay_installed, overlay_ipa,
-                overlay_len, saved_mmap_next, saved_mmap_end,
-                saved_mmap_rx_next, saved_mmap_rx_end, saved_rw_gap_hint,
-                saved_rx_gap_hint);
+            rollback_err = rollback_fresh_mmap_allocation(g, result_off, length,
+                                                          &overlay, &saved);
         }
         mmap_fresh_dispose(&fresh);
         if (rollback_err < 0)
@@ -3570,32 +3715,9 @@ int64_t sys_mmap(guest_t *g,
         return -LINUX_ENOMEM;
     }
 
-    /* Mark the region as overlay-backed when sys_mmap installed a real
-     * MAP_FIXED|MAP_SHARED overlay on the host VA. Used by msync to skip the
-     * snapshot-style pwrite/refresh paths for regions that the kernel already
-     * keeps coherent with the file's page cache.
-     */
-    if (!is_anon && fd >= 0 && !is_prot_none && (flags & LINUX_MAP_SHARED)) {
-        size_t hps = host_page_size_cached();
-        if ((result_off % hps == 0) && ((uint64_t) offset % hps == 0)) {
-            int i = guest_region_first_end_above(g, result_off);
-            if (i < g->nregions && g->regions[i].start == result_off &&
-                g->regions[i].end == result_off + length) {
-                g->regions[i].overlay_active = true;
-                g->regions[i].overlay_start = result_off;
-                g->regions[i].overlay_end = result_off + ALIGN_UP(length, hps);
-            }
-        }
-    }
-
-    /* A MAP_SHARED mapping whose backing fd cannot be written to has Linux
-     * max_prot capped to PROT_READ, whether or not the pread snapshot path
-     * above actually installed a live overlay. sys_mprotect consults this to
-     * reject a later PROT_WRITE upgrade with EACCES.
-     */
-    if (!is_anon && fd >= 0 && !is_prot_none && (flags & LINUX_MAP_SHARED) &&
-        !overlay_fd_writable(host_backing_fd))
-        mark_region_backing_ro(g, result_off, result_off + length);
+    if (!is_anon && fd >= 0 && !is_prot_none && (flags & LINUX_MAP_SHARED))
+        mmap_mark_shared_file_region(g, result_off, length, offset,
+                                     host_backing_fd);
 
     mmap_fresh_dispose(&fresh);
 
@@ -3605,28 +3727,29 @@ int64_t sys_mmap(guest_t *g,
 
 /* sys_mremap. */
 
-/* Over the function-size limit on purpose.
- *
- * Same shape as sys_mmap, with the grow-in-place and move cases sharing one
- * rollback of the region table.
+/* Reject an mremap request the guest could not make sense of, before any region
+ * state is read. Page-aligns both sizes in place and returns the source offset
+ * from ipa_base. The checks run in a fixed order because the first to fail
+ * picks the errno the guest sees.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
-int64_t sys_mremap(guest_t *g,
-                   uint64_t old_addr,
-                   uint64_t old_size,
-                   uint64_t new_size,
-                   int flags,
-                   uint64_t new_addr)
+static int64_t mremap_check_args(const guest_t *g,
+                                 uint64_t old_addr,
+                                 uint64_t *old_size_io,
+                                 uint64_t *new_size_io,
+                                 int flags,
+                                 uint64_t *old_off_out)
 {
     /* Validate alignment */
     if (old_addr & 4095)
         return -LINUX_EINVAL;
 
     /* Round sizes to page boundary */
-    if (old_size > UINT64_MAX - 4095 || new_size > UINT64_MAX - 4095)
+    if (*old_size_io > UINT64_MAX - 4095 || *new_size_io > UINT64_MAX - 4095)
         return -LINUX_EINVAL;
-    old_size = PAGE_ALIGN_UP(old_size);
-    new_size = PAGE_ALIGN_UP(new_size);
+    uint64_t old_size = PAGE_ALIGN_UP(*old_size_io);
+    uint64_t new_size = PAGE_ALIGN_UP(*new_size_io);
+    *old_size_io = old_size;
+    *new_size_io = new_size;
     if (new_size == 0)
         return -LINUX_EINVAL;
 
@@ -3680,6 +3803,374 @@ int64_t sys_mremap(guest_t *g,
      */
     if (old_off < VDSO_BASE + VDSO_SIZE && old_off + old_size > VDSO_BASE)
         return -LINUX_EFAULT;
+    *old_off_out = old_off;
+    return 0;
+}
+
+/* Release the tail [tail_off, tail_end) of a shrinking mremap: drop its region
+ * tracking and page table entries, zero it, and pull the allocator gap hints
+ * back so the space is found again.
+ *
+ * Returns 0 or a negative errno; the caller owns the mremap source state.
+ */
+static int64_t mremap_shrink_tail(guest_t *g,
+                                  uint64_t tail_off,
+                                  uint64_t tail_end,
+                                  uint64_t src_gpa_base,
+                                  uint64_t src_start)
+{
+    int tail_remove_fd = -1;
+    if (guest_region_remove_prepare(g, tail_off, tail_end, &tail_remove_fd) < 0)
+        return -LINUX_ENOMEM;
+
+    /* Restore slab backing under any tail overlay before zeroing so the memset
+     * does not write zeros into a file.
+     */
+    int cleanup_err = cleanup_overlays_in_range(g, tail_off, tail_end);
+    if (cleanup_err < 0) {
+        if (tail_remove_fd >= 0)
+            close(tail_remove_fd);
+        return cleanup_err;
+    }
+
+    /* Zero the trimmed region on its real backing (high-VA tails live at
+     * gpa_base, not host_base + tail_off).
+     */
+    memset(host_ptr_for_gpa(g, src_gpa_base + (tail_off - src_start)), 0,
+           tail_end - tail_off);
+    guest_region_remove_reserved(g, tail_off, tail_end, tail_remove_fd);
+    guest_invalidate_ptes(g, tail_off, tail_end);
+    if (tail_off < g->mmap_rw_gap_hint)
+        g->mmap_rw_gap_hint = tail_off;
+    if (tail_off < g->mmap_rx_gap_hint)
+        g->mmap_rx_gap_hint = tail_off;
+    return 0;
+}
+
+/* Grow a mapping in place into the free space after it: extend the page tables,
+ * zero the new tail, replace the region record, and raise the allocator
+ * high-water mark. The caller has checked that the tail is free and clear of
+ * infrastructure.
+ *
+ * Returns 0 or a negative errno.
+ */
+static int64_t mremap_extend_in_place(guest_t *g,
+                                      const mremap_source_t *source,
+                                      const guest_region_t *src_reg,
+                                      uint64_t old_off,
+                                      uint64_t old_size,
+                                      uint64_t new_size,
+                                      uint64_t source_inherited_size,
+                                      uint64_t source_vma_id)
+{
+    uint64_t grow_off = old_off + old_size, grow_len = new_size - old_size;
+    remove_range_t removed = {old_off, old_off + old_size};
+    /* Extend in place */
+    mremap_track_t track;
+    if (!mremap_track_init(&track, src_reg, old_off, source_inherited_size,
+                           new_size, source_vma_id))
+        return -LINUX_ENOMEM;
+    bool old_backing_ro = src_reg->backing_ro;
+    int added_regions = mremap_track_splits(&track, new_size) ? 2 : 1;
+    if (!region_has_capacity_after_removes(g, &removed, 1, added_regions)) {
+        mremap_track_dispose(&track);
+        return -LINUX_ENOMEM;
+    }
+    int source_remove_fd = -1;
+    if (guest_region_remove_prepare(g, old_off, old_off + old_size,
+                                    &source_remove_fd) < 0) {
+        mremap_track_dispose(&track);
+        return -LINUX_ENOMEM;
+    }
+    if (mremap_extend_range(g, grow_off, grow_len, track.prot) < 0) {
+        mremap_track_dispose(&track);
+        if (source_remove_fd >= 0)
+            close(source_remove_fd);
+        return -LINUX_ENOMEM;
+    }
+
+    memset((uint8_t *) g->host_base + grow_off, 0, grow_len);
+
+    /* Update region tracking: remove old, add extended */
+    guest_region_remove_reserved(g, old_off, old_off + old_size,
+                                 source_remove_fd);
+    if (add_mremap_region(g, old_off, old_size, new_size, &track) < 0)
+        return -LINUX_ENOMEM;
+    mark_mremap_source_overlay_metadata(g, source);
+    if (old_backing_ro)
+        mark_region_backing_ro(g, old_off, old_off + new_size);
+
+    /* Update high-water marks */
+    uint64_t hwm = old_off + new_size;
+    if (old_off >= MMAP_RX_BASE && old_off < MMAP_BASE) {
+        if (hwm > g->mmap_rx_next)
+            g->mmap_rx_next = hwm;
+    } else if (old_off >= MMAP_BASE) {
+        if (hwm > g->mmap_next)
+            g->mmap_next = hwm;
+    }
+    return 0;
+}
+
+/* Take everything a MREMAP_FIXED move needs from the old and new ranges before
+ * any of it is changed: the region record for the new mapping, the snapshots of
+ * both ranges for rollback, and the backing fds both removals will use.
+ * Returns 0, or a negative errno with @move already released and any boundary
+ * splits undone. The caller reads the source's overlay and read-only state
+ * first, because the snapshots below may split regions under @src_reg.
+ */
+static int64_t mremap_move_prepare(guest_t *g,
+                                   mremap_move_t *move,
+                                   mremap_source_t *source,
+                                   const guest_region_t *src_reg,
+                                   uint64_t old_off,
+                                   uint64_t old_size,
+                                   uint64_t new_off,
+                                   uint64_t new_size,
+                                   uint64_t source_inherited_size,
+                                   uint64_t source_vma_id)
+{
+    remove_range_t removed[] = {
+        {old_off, old_off + old_size},
+        {new_off, new_off + new_size},
+    };
+
+    /* Capture old region metadata BEFORE modifying any regions. If mremap
+     * removed destination first, an overlapping source would lose its metadata.
+     * The overlap check above prevents this case, but capturing first is still
+     * the safe ordering.
+     */
+    if (!mremap_track_init(&move->track, src_reg, old_off,
+                           source_inherited_size, new_size, source_vma_id)) {
+        mremap_move_dispose(move);
+        return -LINUX_ENOMEM;
+    }
+    int added_regions = mremap_track_splits(&move->track, new_size) ? 2 : 1;
+    if (!region_has_capacity_after_removes(g, removed, 2, added_regions)) {
+        mremap_move_dispose(move);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Heap-allocated to avoid blowing the ~512 KiB default macOS thread stack:
+     * each region_snapshot_t array is GUEST_MAX_REGIONS *
+     * sizeof(region_snapshot_t), so two of them on the stack would be close to
+     * a megabyte. Released by mremap_move_dispose on every exit path below,
+     * including the successful one.
+     */
+
+    move->source_snaps =
+        malloc(GUEST_MAX_REGIONS * sizeof(*move->source_snaps));
+    move->dest_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*move->dest_snaps));
+    if (!move->source_snaps || !move->dest_snaps) {
+        mremap_move_dispose(move);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Keep both boundary captures in one transaction. The per-capture helper
+     * rolls back its own edits, while the recorded splits also undo a
+     * successful source capture if destination capture or the preflight
+     * shared-file flush fails afterward.
+     */
+    move->source_nsnaps = capture_region_snapshots(
+        g, old_off, old_off + old_size, move->source_snaps, GUEST_MAX_REGIONS,
+        move->source_splits);
+    if (move->source_nsnaps < 0) {
+        int snapshot_err = move->source_nsnaps;
+        mremap_move_dispose(move);
+        return snapshot_err;
+    }
+    int rebind_err = rebind_mremap_source_backings(source, move->source_snaps,
+                                                   move->source_nsnaps);
+    if (rebind_err < 0) {
+        mremap_move_undo_splits(g, move);
+        mremap_move_dispose(move);
+        return rebind_err;
+    }
+    move->dest_nsnaps = capture_region_snapshots(
+        g, new_off, new_off + new_size, move->dest_snaps, GUEST_MAX_REGIONS,
+        move->dest_splits);
+    if (move->dest_nsnaps < 0) {
+        int snapshot_err = move->dest_nsnaps;
+        mremap_move_undo_splits(g, move);
+        mremap_move_dispose(move);
+        return snapshot_err;
+    }
+
+    /* Reserve the backing descriptors needed by both removals before any
+     * overlay teardown, page-table changes, or host-memory copies. The
+     * snapshots above may split region boundaries, so prepare against the final
+     * metadata shape while the recorded splits can still undo it if either
+     * reservation fails.
+     */
+    if (guest_region_remove_prepare(g, old_off, old_off + old_size,
+                                    &move->source_remove_fd) < 0 ||
+        guest_region_remove_prepare(g, new_off, new_off + new_size,
+                                    &move->dest_remove_fd) < 0) {
+        mremap_move_undo_splits(g, move);
+        mremap_move_dispose(move);
+        return -LINUX_ENOMEM;
+    }
+    return 0;
+}
+
+/* Prepare to move a mapping that cannot grow in place: build the new region
+ * record, pick a destination gap (host-page aligned, because the data is copied
+ * and no file overlay is reinstalled there), check that the region table can
+ * absorb the change, flush shared-file sources, reserve the old range's
+ * removal, tear down the source's overlays, and extend the page tables under
+ * the destination. On success the track, the destination offset and the
+ * reserved remove fd are the caller's to commit or release. On failure it has
+ * released all of them and restored the source overlays; the caller returns the
+ * errno. The caller reads the source's overlay and read-only state before
+ * calling, since the steps here change the regions under them.
+ */
+static int64_t mremap_grow_move_prepare(guest_t *g,
+                                        mremap_source_t *source,
+                                        uint64_t old_off,
+                                        uint64_t old_size,
+                                        uint64_t new_size,
+                                        bool source_overlay,
+                                        mremap_track_t *track,
+                                        uint64_t *new_off_out,
+                                        int *remove_fd_out)
+{
+    if (!mremap_track_init(track, source->first, old_off,
+                           source->inherited_prefix, new_size,
+                           source->first->vma_id))
+        return -LINUX_ENOMEM;
+    int needs_exec = (track->prot & LINUX_PROT_EXEC) != 0;
+
+    uint64_t new_off;
+
+    /* mremap moves the data via read_file_range_to_guest and does not reinstall
+     * a file overlay at the destination, so 2 MiB alignment would not narrow
+     * segment-table growth. Stay at host-page alignment.
+     */
+    size_t mremap_align = host_page_size_cached();
+    if (needs_exec && !(track->prot & LINUX_PROT_WRITE))
+        new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit,
+                                mremap_align);
+    else
+        new_off =
+            find_free_gap(g, new_size, MMAP_BASE, g->mmap_limit, mremap_align);
+
+    if (new_off == UINT64_MAX) {
+        mremap_track_dispose(track);
+        return -LINUX_ENOMEM;
+    }
+
+    remove_range_t removed = {old_off, old_off + old_size};
+    int added_regions = mremap_track_splits(track, new_size) ? 2 : 1;
+    if (!region_has_capacity_after_removes(g, &removed, 1, added_regions)) {
+        mremap_track_dispose(track);
+        return -LINUX_ENOMEM;
+    }
+
+    int64_t flush_err = flush_mremap_source_shared(g, source);
+    if (flush_err < 0) {
+        mremap_track_dispose(track);
+        return flush_err;
+    }
+
+    int source_remove_fd = -1;
+    if (guest_region_remove_prepare(g, old_off, old_off + old_size,
+                                    &source_remove_fd) < 0) {
+        mremap_track_dispose(track);
+        return -LINUX_ENOMEM;
+    }
+
+    if (source_overlay) {
+        int cleanup_err =
+            cleanup_overlays_in_range(g, old_off, old_off + old_size);
+        if (cleanup_err < 0) {
+            int restore_err =
+                restore_mremap_source_overlays_in_place(g, source);
+            mremap_track_dispose(track);
+            if (source_remove_fd >= 0)
+                close(source_remove_fd);
+            if (restore_err < 0)
+                return restore_err;
+            return cleanup_err;
+        }
+    }
+
+    if (mremap_extend_range(g, new_off, new_size, track->prot) < 0) {
+        if (source_overlay) {
+            int restore_err =
+                restore_mremap_source_overlays_in_place(g, source);
+            if (restore_err < 0) {
+                mremap_track_dispose(track);
+                if (source_remove_fd >= 0)
+                    close(source_remove_fd);
+                return restore_err;
+            }
+        }
+        mremap_track_dispose(track);
+        if (source_remove_fd >= 0)
+            close(source_remove_fd);
+        return -LINUX_ENOMEM;
+    }
+    *new_off_out = new_off;
+    *remove_fd_out = source_remove_fd;
+    return 0;
+}
+
+/* A copy into the MREMAP_FIXED destination failed after the old mapping and the
+ * destination's regions were prepared: put back the source overlays, the
+ * destination's region records and its page tables from the snapshots, and
+ * release @move.
+ *
+ * Returns the copy's errno, or the restore's if that failed too, so the guest
+ * is told about the worse problem.
+ */
+static int64_t mremap_fixed_copy_failed(guest_t *g,
+                                        mremap_move_t *move,
+                                        uint64_t new_off,
+                                        uint64_t new_size,
+                                        int copy_err)
+{
+    int restore_err = restore_snapshot_overlays_in_place(g, move->source_snaps,
+                                                         move->source_nsnaps);
+    if (restore_err < 0)
+        copy_err = restore_err;
+    restore_err =
+        restore_region_snapshots(g, move->dest_snaps, move->dest_nsnaps);
+
+    /* Re-establish the destination's page-table state to match the regions we
+     * just restored. The caller's mremap_extend_range had filled in PTEs for
+     * the new mremap target; without this rollback those PTEs would outlive the
+     * regions and the guest would see live mappings where its own metadata
+     * (after the restore) says nothing is mapped.
+     */
+    int pt_err = restore_snapshot_page_tables(
+        g, new_off, new_off + new_size, move->dest_snaps, move->dest_nsnaps);
+    if (pt_err < 0 && restore_err >= 0)
+        restore_err = pt_err;
+    if (restore_err < 0) {
+        mremap_move_dispose(move);
+        return restore_err;
+    }
+    mremap_move_dispose(move);
+    return copy_err;
+}
+
+/* Why this stays one function.
+ *
+ * Same shape as sys_mmap, with the grow-in-place and move cases sharing one
+ * rollback of the region table.
+ */
+int64_t sys_mremap(guest_t *g,
+                   uint64_t old_addr,
+                   uint64_t old_size,
+                   uint64_t new_size,
+                   int flags,
+                   uint64_t new_addr)
+{
+    uint64_t old_off;
+    int64_t arg_err =
+        mremap_check_args(g, old_addr, &old_size, &new_size, flags, &old_off);
+    if (arg_err < 0)
+        return arg_err;
 
     /* Verify the whole source range is covered by one logical VMA. A fork-aware
      * growth can split that VMA at the inherited/private boundary, but no
@@ -3711,34 +4202,10 @@ int64_t sys_mremap(guest_t *g,
 
     /* Shrinking mremap keeps the base address and releases only the tail. */
     if (new_size < old_size && !(flags & LINUX_MREMAP_FIXED)) {
-        uint64_t tail_off = old_off + new_size, tail_end = old_off + old_size;
-        int tail_remove_fd = -1;
-        if (guest_region_remove_prepare(g, tail_off, tail_end,
-                                        &tail_remove_fd) < 0)
-            return finish_mremap(&source, -LINUX_ENOMEM);
-
-        /* Restore slab backing under any tail overlay before zeroing so the
-         * memset does not write zeros into a file.
-         */
-        int cleanup_err = cleanup_overlays_in_range(g, tail_off, tail_end);
-        if (cleanup_err < 0) {
-            if (tail_remove_fd >= 0)
-                close(tail_remove_fd);
-            return finish_mremap(&source, cleanup_err);
-        }
-
-        /* Zero the trimmed region on its real backing (high-VA tails live at
-         * gpa_base, not host_base + tail_off).
-         */
-        memset(host_ptr_for_gpa(g, src_gpa_base + (tail_off - src_start)), 0,
-               tail_end - tail_off);
-        guest_region_remove_reserved(g, tail_off, tail_end, tail_remove_fd);
-        guest_invalidate_ptes(g, tail_off, tail_end);
-        if (tail_off < g->mmap_rw_gap_hint)
-            g->mmap_rw_gap_hint = tail_off;
-        if (tail_off < g->mmap_rx_gap_hint)
-            g->mmap_rx_gap_hint = tail_off;
-        return finish_mremap(&source, (int64_t) old_addr);
+        int64_t shrink_err = mremap_shrink_tail(
+            g, old_off + new_size, old_off + old_size, src_gpa_base, src_start);
+        return finish_mremap(&source,
+                             shrink_err < 0 ? shrink_err : (int64_t) old_addr);
     }
 
     /* MREMAP_FIXED: move to a specific new address */
@@ -3766,91 +4233,15 @@ int64_t sys_mremap(guest_t *g,
         if (old_off < new_end && new_off < old_end)
             return finish_mremap(&source, -LINUX_EINVAL);
 
-        remove_range_t removed[] = {
-            {old_off, old_end},
-            {new_off, new_end},
-        };
-
-        /* Capture old region metadata BEFORE modifying any regions. If mremap
-         * removed destination first, an overlapping source would lose its
-         * metadata. The overlap check above prevents this case, but capturing
-         * first is still the safe ordering.
-         */
         mremap_move_t move;
         mremap_move_init(&move);
-        if (!mremap_track_init(&move.track, src_reg, old_off,
-                               source_inherited_size, new_size,
-                               source_vma_id)) {
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
         bool source_overlay = mremap_source_has_overlay(&source);
         bool source_backing_ro = src_reg->backing_ro;
-        int added_regions = mremap_track_splits(&move.track, new_size) ? 2 : 1;
-        if (!region_has_capacity_after_removes(g, removed, 2, added_regions)) {
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
-
-        /* Heap-allocated to avoid blowing the ~512 KiB default macOS thread
-         * stack: each region_snapshot_t array is GUEST_MAX_REGIONS *
-         * sizeof(region_snapshot_t), so two of them on the stack would be close
-         * to a megabyte. Released by mremap_move_dispose on every exit path
-         * below, including the successful one.
-         */
-
-        move.source_snaps =
-            malloc(GUEST_MAX_REGIONS * sizeof(*move.source_snaps));
-        move.dest_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*move.dest_snaps));
-        if (!move.source_snaps || !move.dest_snaps) {
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
-
-        /* Keep both boundary captures in one transaction. The per-capture
-         * helper rolls back its own edits, while the recorded splits also undo
-         * a successful source capture if destination capture or the preflight
-         * shared-file flush fails afterward.
-         */
-        move.source_nsnaps = capture_region_snapshots(
-            g, old_off, old_off + old_size, move.source_snaps,
-            GUEST_MAX_REGIONS, move.source_splits);
-        if (move.source_nsnaps < 0) {
-            int snapshot_err = move.source_nsnaps;
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, snapshot_err);
-        }
-        int rebind_err = rebind_mremap_source_backings(
-            &source, move.source_snaps, move.source_nsnaps);
-        if (rebind_err < 0) {
-            mremap_move_undo_splits(g, &move);
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, rebind_err);
-        }
-        move.dest_nsnaps = capture_region_snapshots(
-            g, new_off, new_off + new_size, move.dest_snaps, GUEST_MAX_REGIONS,
-            move.dest_splits);
-        if (move.dest_nsnaps < 0) {
-            int snapshot_err = move.dest_nsnaps;
-            mremap_move_undo_splits(g, &move);
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, snapshot_err);
-        }
-
-        /* Reserve the backing descriptors needed by both removals before any
-         * overlay teardown, page-table changes, or host-memory copies. The
-         * snapshots above may split region boundaries, so prepare against the
-         * final metadata shape while the recorded splits can still undo it if
-         * either reservation fails.
-         */
-        if (guest_region_remove_prepare(g, old_off, old_off + old_size,
-                                        &move.source_remove_fd) < 0 ||
-            guest_region_remove_prepare(g, new_off, new_off + new_size,
-                                        &move.dest_remove_fd) < 0) {
-            mremap_move_undo_splits(g, &move);
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
+        int64_t prep_err = mremap_move_prepare(
+            g, &move, &source, src_reg, old_off, old_size, new_off, new_size,
+            source_inherited_size, source_vma_id);
+        if (prep_err < 0)
+            return finish_mremap(&source, prep_err);
 
         int64_t flush_err = flush_mremap_source_shared(g, &source);
         if (flush_err < 0) {
@@ -3918,33 +4309,10 @@ int64_t sys_mremap(guest_t *g,
                 memset((uint8_t *) g->host_base + new_off, 0, new_size);
             int copy_err =
                 copy_mremap_source(g, new_off, old_off, copy_len, &source);
-            if (copy_err < 0) {
-                int restore_err = restore_snapshot_overlays_in_place(
-                    g, move.source_snaps, move.source_nsnaps);
-                if (restore_err < 0)
-                    copy_err = restore_err;
-                restore_err = restore_region_snapshots(g, move.dest_snaps,
-                                                       move.dest_nsnaps);
-
-                /* Re-establish the destination's page-table state to match the
-                 * regions we just restored. mremap_extend_range above had
-                 * filled in PTEs for the new mremap target; without this
-                 * rollback those PTEs would outlive the regions and the guest
-                 * would see live mappings where its own metadata (after the
-                 * restore) says nothing is mapped.
-                 */
-                int pt_err = restore_snapshot_page_tables(
-                    g, new_off, new_off + new_size, move.dest_snaps,
-                    move.dest_nsnaps);
-                if (pt_err < 0 && restore_err >= 0)
-                    restore_err = pt_err;
-                if (restore_err < 0) {
-                    mremap_move_dispose(&move);
-                    return finish_mremap(&source, restore_err);
-                }
-                mremap_move_dispose(&move);
-                return finish_mremap(&source, copy_err);
-            }
+            if (copy_err < 0)
+                return finish_mremap(
+                    &source, mremap_fixed_copy_failed(g, &move, new_off,
+                                                      new_size, copy_err));
         }
         /* Zero any extension beyond old data */
         if (new_size > old_size)
@@ -3996,58 +4364,11 @@ int64_t sys_mremap(guest_t *g,
                 !region_range_overlaps(g, grow_off, grow_off + grow_len);
 
             if (can_grow) {
-                remove_range_t removed = {old_off, old_off + old_size};
-                /* Extend in place */
-                mremap_track_t track;
-                if (!mremap_track_init(&track, src_reg, old_off,
-                                       source_inherited_size, new_size,
-                                       source_vma_id))
-                    return finish_mremap(&source, -LINUX_ENOMEM);
-                bool old_backing_ro = src_reg->backing_ro;
-                int added_regions =
-                    mremap_track_splits(&track, new_size) ? 2 : 1;
-                if (!region_has_capacity_after_removes(g, &removed, 1,
-                                                       added_regions)) {
-                    mremap_track_dispose(&track);
-                    return finish_mremap(&source, -LINUX_ENOMEM);
-                }
-                int source_remove_fd = -1;
-                if (guest_region_remove_prepare(g, old_off, old_off + old_size,
-                                                &source_remove_fd) < 0) {
-                    mremap_track_dispose(&track);
-                    return finish_mremap(&source, -LINUX_ENOMEM);
-                }
-                if (mremap_extend_range(g, grow_off, grow_len, track.prot) <
-                    0) {
-                    mremap_track_dispose(&track);
-                    if (source_remove_fd >= 0)
-                        close(source_remove_fd);
-                    return finish_mremap(&source, -LINUX_ENOMEM);
-                }
-
-                memset((uint8_t *) g->host_base + grow_off, 0, grow_len);
-
-                /* Update region tracking: remove old, add extended */
-                guest_region_remove_reserved(g, old_off, old_off + old_size,
-                                             source_remove_fd);
-                if (add_mremap_region(g, old_off, old_size, new_size, &track) <
-                    0)
-                    return finish_mremap(&source, -LINUX_ENOMEM);
-                mark_mremap_source_overlay_metadata(g, &source);
-                if (old_backing_ro)
-                    mark_region_backing_ro(g, old_off, old_off + new_size);
-
-                /* Update high-water marks */
-                uint64_t hwm = old_off + new_size;
-                if (old_off >= MMAP_RX_BASE && old_off < MMAP_BASE) {
-                    if (hwm > g->mmap_rx_next)
-                        g->mmap_rx_next = hwm;
-                } else if (old_off >= MMAP_BASE) {
-                    if (hwm > g->mmap_next)
-                        g->mmap_next = hwm;
-                }
-
-                return finish_mremap(&source, (int64_t) old_addr);
+                int64_t grow_err = mremap_extend_in_place(
+                    g, &source, src_reg, old_off, old_size, new_size,
+                    source_inherited_size, source_vma_id);
+                return finish_mremap(
+                    &source, grow_err < 0 ? grow_err : (int64_t) old_addr);
             }
         }
 
@@ -4056,84 +4377,16 @@ int64_t sys_mremap(guest_t *g,
             return finish_mremap(&source, -LINUX_ENOMEM);
 
         /* Allocate a new region and move */
-        mremap_track_t track;
-        if (!mremap_track_init(&track, src_reg, old_off, source_inherited_size,
-                               new_size, source_vma_id))
-            return finish_mremap(&source, -LINUX_ENOMEM);
         bool source_overlay = mremap_source_has_overlay(&source);
         bool source_backing_ro = src_reg->backing_ro;
-        int needs_exec = (track.prot & LINUX_PROT_EXEC) != 0;
-
+        mremap_track_t track;
         uint64_t new_off;
-
-        /* mremap moves the data via read_file_range_to_guest and does not
-         * reinstall a file overlay at the destination, so 2 MiB alignment would
-         * not narrow segment-table growth. Stay at host-page alignment.
-         */
-        size_t mremap_align = host_page_size_cached();
-        if (needs_exec && !(track.prot & LINUX_PROT_WRITE))
-            new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit,
-                                    mremap_align);
-        else
-            new_off = find_free_gap(g, new_size, MMAP_BASE, g->mmap_limit,
-                                    mremap_align);
-
-        if (new_off == UINT64_MAX) {
-            mremap_track_dispose(&track);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
-
-        remove_range_t removed = {old_off, old_off + old_size};
-        int added_regions = mremap_track_splits(&track, new_size) ? 2 : 1;
-        if (!region_has_capacity_after_removes(g, &removed, 1, added_regions)) {
-            mremap_track_dispose(&track);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
-
-        int64_t flush_err = flush_mremap_source_shared(g, &source);
-        if (flush_err < 0) {
-            mremap_track_dispose(&track);
-            return finish_mremap(&source, flush_err);
-        }
-
-        int source_remove_fd = -1;
-        if (guest_region_remove_prepare(g, old_off, old_off + old_size,
-                                        &source_remove_fd) < 0) {
-            mremap_track_dispose(&track);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
-
-        if (source_overlay) {
-            int cleanup_err =
-                cleanup_overlays_in_range(g, old_off, old_off + old_size);
-            if (cleanup_err < 0) {
-                int restore_err =
-                    restore_mremap_source_overlays_in_place(g, &source);
-                mremap_track_dispose(&track);
-                if (source_remove_fd >= 0)
-                    close(source_remove_fd);
-                if (restore_err < 0)
-                    return finish_mremap(&source, restore_err);
-                return finish_mremap(&source, cleanup_err);
-            }
-        }
-
-        if (mremap_extend_range(g, new_off, new_size, track.prot) < 0) {
-            if (source_overlay) {
-                int restore_err =
-                    restore_mremap_source_overlays_in_place(g, &source);
-                if (restore_err < 0) {
-                    mremap_track_dispose(&track);
-                    if (source_remove_fd >= 0)
-                        close(source_remove_fd);
-                    return finish_mremap(&source, restore_err);
-                }
-            }
-            mremap_track_dispose(&track);
-            if (source_remove_fd >= 0)
-                close(source_remove_fd);
-            return finish_mremap(&source, -LINUX_ENOMEM);
-        }
+        int source_remove_fd;
+        int64_t prep_err = mremap_grow_move_prepare(
+            g, &source, old_off, old_size, new_size, source_overlay, &track,
+            &new_off, &source_remove_fd);
+        if (prep_err < 0)
+            return finish_mremap(&source, prep_err);
 
         /* Copy each source segment according to its own backing state, then
          * zero the extension. The new range is a fresh gap and receives no live
@@ -4682,10 +4935,10 @@ static int same_backing_file(int fd_a, int fd_b)
     return st_a.st_dev == st_b.st_dev && st_a.st_ino == st_b.st_ino;
 }
 
-static int64_t pwrite_all_at(int fd,
-                             const uint8_t *src,
-                             uint64_t len,
-                             uint64_t file_off)
+int64_t pwrite_all_at(int fd,
+                      const uint8_t *src,
+                      uint64_t len,
+                      uint64_t file_off)
 {
     while (len > 0) {
         size_t chunk =
@@ -4806,23 +5059,7 @@ static int64_t refresh_shared_region_range(guest_t *g,
     if (!buf)
         return -LINUX_EFAULT;
 
-    while (len > 0) {
-        size_t chunk =
-            len > (uint64_t) SSIZE_MAX ? (size_t) SSIZE_MAX : (size_t) len;
-        ssize_t nr;
-        do {
-            nr = pread(r->backing_fd, buf, chunk, (off_t) file_off);
-        } while (nr < 0 && errno == EINTR);
-        if (nr < 0)
-            return linux_errno();
-        if (nr == 0)
-            break;
-        buf += nr;
-        file_off += (uint64_t) nr;
-        len -= (uint64_t) nr;
-    }
-
-    return 0;
+    return pread_fill(r->backing_fd, buf, (size_t) len, (off_t) file_off);
 }
 
 /* sys_msync. */

@@ -66,12 +66,10 @@ static int fork_exit_after_us(useconds_t usec)
     return pid;
 }
 
-int main(void)
+int passes = 0, fails = 0;
+
+static void test_timeouts_and_fdset(void)
 {
-    int passes = 0, fails = 0;
-
-    printf("test-poll: Batch 4 signals + I/O multiplexing tests\n");
-
     /* Test ppoll with pipe (should be ready for write) */
     TEST("ppoll (pipe write-ready)");
     {
@@ -196,7 +194,10 @@ int main(void)
             close(fds[1]);
         }
     }
+}
 
+static void test_process_probes(void)
+{
     /* Test kill(getpid(), 0): process existence check */
     TEST("kill(getpid, 0)");
     {
@@ -217,7 +218,10 @@ int main(void)
         else
             FAIL("sigprocmask failed");
     }
+}
 
+static void test_sigchld_ignored(void)
+{
     TEST("ppoll ignores default SIGCHLD");
     {
         int pid = fork_exit_after_us(20000);
@@ -279,7 +283,10 @@ int main(void)
                 FAIL("epoll_wait interrupted by ignored SIGCHLD");
         }
     }
+}
 
+static void test_signal_interrupts(void)
+{
     TEST("SA_RESTART read handler runs");
     {
         int pipefd[2];
@@ -387,7 +394,10 @@ int main(void)
             close(sv[1]);
         }
     }
+}
 
+static void test_sigaction_setpgid(void)
+{
     /* Test sigaction (should succeed as stub) */
     TEST("sigaction");
     {
@@ -411,7 +421,10 @@ int main(void)
         else
             FAIL("setpgid unexpected result");
     }
+}
 
+static void test_ppoll_devices_epoll(void)
+{
     /* ppoll on descriptors macOS poll() refuses. Linux polls character devices
      * and directories through the default always-ready mask, and an epoll
      * descriptor through its own readiness.
@@ -557,7 +570,10 @@ int main(void)
             FAIL("POLLWRNORM on /dev/null not reported ready");
         close(fd);
     }
+}
 
+static void test_pselect_high_fd(void)
+{
     /* pselect on the descriptors macOS poll() refuses. Linux select() reports
      * every one of them ready.
      */
@@ -693,6 +709,19 @@ int main(void)
         else
             FAIL("readable and writable socket counted once");
     }
+}
+
+int main(void)
+{
+    printf("test-poll: Batch 4 signals + I/O multiplexing tests\n");
+
+    test_timeouts_and_fdset();
+    test_process_probes();
+    test_sigchld_ignored();
+    test_signal_interrupts();
+    test_sigaction_setpgid();
+    test_ppoll_devices_epoll();
+    test_pselect_high_fd();
 
     SUMMARY("test-poll");
     return fails > 0 ? 1 : 0;

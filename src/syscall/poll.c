@@ -281,6 +281,288 @@ static bool ppoll_break_pending(uint32_t nfds,
     return false;
 }
 
+/* Everything one ppoll call tracks per entry, indexed like the guest array. The
+ * wakeup pipe takes host_fds[nfds] when nfds < 256.
+ */
+typedef struct {
+    uint32_t nfds;
+    linux_pollfd_t guest_fds[256];
+    struct pollfd host_fds[256];
+    host_fd_ref_t host_refs[256];
+    bool need_pollnval[256];
+
+    /* usbfs fds poll a completion pipe whose host readiness (POLLIN) means
+     * guest POLLOUT ("URBs reapable"); both directions are remapped through the
+     * usbdev helpers.
+     */
+    bool usbdev_remap[256];
+
+    /* Generation pinned per entry in the same fd_lock window as its host fd.
+     * The pty hangup checks re-resolve the guest fd, so each needs a witness
+     * that the slot still holds the very file this poll resolved; 0 marks
+     * entries with nothing pinned and never matches a live generation.
+     */
+    uint64_t guest_gen[256];
+    uint32_t invalid_count;
+
+    /* Entries host poll() refuses with POLLNVAL even though their reference
+     * resolved. See poll_eval_unpollable().
+     */
+    poll_unpollable_t unpollable[256];
+    uint32_t unpollable_count;
+    uint32_t unpollable_ready;
+    bool unpollable_checked;
+
+    /* Entries whose usbfs completion pipe woke the wait with nothing the guest
+     * asked to see. Their host interest is withdrawn (the unreaped completion
+     * keeps the pipe readable, so re-polling it would spin at 100% CPU) and the
+     * slice loop watches the disconnect map for them instead, mirroring the
+     * pty-hup slices.
+     */
+    bool usb_disarmed[256];
+    bool usb_pipe_fired[256];
+} ppoll_set_t;
+
+/* Pin a host fd for every guest entry and fill host_fds from them.
+ *
+ * Returns 0, or -LINUX_ENOMEM with every pin already released.
+ */
+static int64_t ppoll_resolve_fds(ppoll_set_t *s)
+{
+    memset(s->need_pollnval, 0, sizeof(s->need_pollnval));
+    memset(s->usbdev_remap, 0, sizeof(s->usbdev_remap));
+    memset(s->guest_gen, 0, sizeof(s->guest_gen));
+    memset(s->usb_disarmed, 0, sizeof(s->usb_disarmed));
+    memset(s->usb_pipe_fired, 0, sizeof(s->usb_pipe_fired));
+    for (uint32_t i = 0; i < s->nfds; i++) {
+        s->host_refs[i] = HOST_FD_REF_INIT;
+        s->unpollable[i] = (poll_unpollable_t) {.fd = -1};
+        int guest_fd = s->guest_fds[i].fd;
+        int host_fd = -1;
+        if (guest_fd >= 0) {
+            int64_t rc = host_fd_ref_open_io_gen(guest_fd, &s->host_refs[i],
+                                                 &s->guest_gen[i]);
+            if (rc == -LINUX_ENOMEM) {
+                /* The pin could not be allocated. POLLNVAL here would name a
+                 * descriptor that is still open, and the usual reaction to
+                 * POLLNVAL is to close it, so a guest under memory pressure
+                 * would tear down its own working fds. Fail the whole wait with
+                 * the errno Linux uses when it cannot build the tables for one.
+                 */
+                host_fd_refs_close(s->host_refs, i);
+                return -LINUX_ENOMEM;
+            }
+            if (rc < 0) {
+                s->need_pollnval[i] = true;
+                s->invalid_count++;
+            } else {
+                host_fd = s->host_refs[i].fd;
+            }
+        }
+        s->host_fds[i].fd = host_fd;
+        s->host_fds[i].events = s->guest_fds[i].events;
+        s->host_fds[i].revents = 0;
+        if (host_fd >= 0) {
+            short mapped;
+            if (usbdev_poll_host_events(guest_fd, s->guest_fds[i].events,
+                                        &mapped)) {
+                s->usbdev_remap[i] = true;
+                s->host_fds[i].events = mapped;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Log fd types for shutdown diagnostics (verbose only). */
+static void ppoll_log_infinite(const ppoll_set_t *s)
+{
+    char fdbuf[256];
+    int pos = 0;
+    for (uint32_t i = 0; i < s->nfds && i < 8; i++) {
+        int gfd = s->guest_fds[i].fd;
+        const char *type = "?";
+        if (RANGE_CHECK(gfd, 0, FD_TABLE_SIZE)) {
+            switch (fd_table[gfd].type) {
+            case FD_EVENTFD:
+                type = "efd";
+                break;
+            case FD_TIMERFD:
+                type = "tfd";
+                break;
+            case FD_EPOLL:
+                type = "epoll";
+                break;
+            case FD_SIGNALFD:
+                type = "sfd";
+                break;
+            default:
+                type = "fd";
+                break;
+            }
+        }
+        pos +=
+            snprintf(fdbuf + pos, sizeof(fdbuf) - (size_t) pos, "%s%d(%s->%d)",
+                     i ? "," : "", gfd, type, s->host_fds[i].fd);
+    }
+    log_debug("ppoll: nfds=%u infinite timeout, fds=[%s]", s->nfds, fdbuf);
+}
+
+/* Read the guest timeout into a poll() millisecond count (-1 is infinite).
+ * Returns 0, -LINUX_EFAULT, or -LINUX_EINVAL for a negative timespec.
+ */
+static int ppoll_read_timeout(guest_t *g, uint64_t timeout_gva, int *ms_out)
+{
+    *ms_out = -1;
+    if (timeout_gva == 0)
+        return 0;
+    linux_timespec_t lts;
+    if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
+        return -LINUX_EFAULT;
+    if (!linux_timespec_valid(&lts))
+        return -LINUX_EINVAL;
+
+    /* Rounds the sub-millisecond remainder up: truncating turned a 500 us ppoll
+     * into poll(0), which returns immediately, so a guest waiting in
+     * sub-millisecond ppoll spun instead of sleeping.
+     */
+    *ms_out = timespec_to_poll_ms(lts.tv_sec, lts.tv_nsec);
+    return 0;
+}
+
+/* Take the descriptors macOS refuses out of the poll set once, to be evaluated
+ * through select() from here on. A refused entry makes poll() return at once,
+ * so this costs no wait.
+ *
+ * Returns true when the set shrank and the caller should poll again.
+ */
+static bool ppoll_split_unpollable(ppoll_set_t *s)
+{
+    s->unpollable_checked = true;
+    for (uint32_t i = 0; i < s->nfds; i++) {
+        if (s->need_pollnval[i] || !(s->host_fds[i].revents & POLLNVAL))
+            continue;
+        s->unpollable[i].fd = s->host_refs[i].fd;
+        s->unpollable[i].events = s->host_fds[i].events;
+        s->host_fds[i].fd = -1;
+        s->unpollable_count++;
+    }
+    return s->unpollable_count > 0;
+}
+
+/* A pty master whose guest-side slaves have all closed is hung up, but the host
+ * still sees elfuse's keepalive slave and reports nothing. Stamp POLLHUP so a
+ * terminal waiting for its shell to exit -- foot polls for exactly this -- is
+ * not left waiting forever.
+ *
+ * Returns ret adjusted for the entries stamped.
+ */
+static int ppoll_stamp_pty_hangups(ppoll_set_t *s, int ret)
+{
+    for (uint32_t i = 0; i < s->nfds; i++) {
+        if (s->need_pollnval[i] || s->guest_fds[i].fd < 0)
+            continue;
+        if (!proc_pty_master_hung_up(s->guest_fds[i].fd, s->guest_gen[i]))
+            continue;
+        if (s->host_fds[i].revents == 0)
+            ret++;
+        s->host_fds[i].revents |= POLLHUP;
+    }
+    return ret;
+}
+
+/* Rewrite usbfs entries into guest-visible Linux bits (POLLIN on the completion
+ * pipe -> POLLOUT|POLLWRNORM; disconnect -> POLLERR|POLLHUP) and keep the ready
+ * count consistent with the rewritten revents. Runs before the re-block
+ * decisions: the pipe's host interest is always armed so a disconnect can wake
+ * a read-only poll, which means a completion wake can map to nothing the guest
+ * asked to see.
+ *
+ * Returns the adjusted ret.
+ */
+static int ppoll_remap_usb(ppoll_set_t *s, int ret)
+{
+    for (uint32_t i = 0; i < s->nfds; i++) {
+        if (!s->usbdev_remap[i] || s->need_pollnval[i])
+            continue;
+        short before = s->host_fds[i].revents;
+
+        /* A disarmed entry's pipe interest was withdrawn (fd -1, revents 0), so
+         * probe with a hypothetical POLLIN and let the disconnect and reapable
+         * maps decide what the guest sees. Armed entries record whether their
+         * pipe actually fired BEFORE the writeback below overwrites revents;
+         * the disarm pass keys off that.
+         */
+        s->usb_pipe_fired[i] = !s->usb_disarmed[i] && (before & POLLIN) != 0;
+        short probe = s->usb_disarmed[i] ? (short) (before | POLLIN) : before;
+        short after = usbdev_poll_guest_revents(s->guest_fds[i].fd,
+                                                s->guest_fds[i].events, probe);
+        s->host_fds[i].revents = after;
+        if (before != 0 && after == 0 && ret > 0)
+            ret--;
+        else if (before == 0 && after != 0)
+            ret++;
+    }
+    return ret;
+}
+
+/* Disarm each usbfs entry whose completion wake the guest cannot see: its pipe
+ * stays readable until the URBs are reaped, so leaving it armed would turn the
+ * re-block into a busy-spin. The slice loop's map probe (disconnect and
+ * reapable) stands in for the withdrawn interest, and ppoll_remap_usb
+ * re-derives the bits from the maps once it trips.
+ */
+static void ppoll_disarm_usb(ppoll_set_t *s)
+{
+    for (uint32_t i = 0; i < s->nfds; i++) {
+        if (!s->usbdev_remap[i] || s->usb_disarmed[i] || s->need_pollnval[i] ||
+            s->host_fds[i].fd < 0)
+            continue;
+
+        /* Withdraw only an interest whose pipe actually fired invisibly (that
+         * readable byte is what would busy-spin); an armed entry still waiting
+         * for its first byte keeps its zero-latency wake.
+         *
+         * The test is POLLIN and not "anything fired", so a wake carrying
+         * POLLHUP without POLLIN would leave the entry armed. That wake is not
+         * producible on the only fd this path sees: it is the read end of the
+         * readiness pipe, elfuse owns both ends, and macOS reports the EOF of a
+         * pipe whose write end has closed as POLLIN|POLLHUP (0x11) -- a
+         * readable EOF, not a bare hangup -- so the test is true and the entry
+         * disarms. That is the measured run: a sibling thread closing the write
+         * end under a parked blocking poll gives rc=1 revents=0x0011 and
+         * returns at the close, 3 runs of 3. A parked poll nothing ever wakes
+         * is a separate run, and it burns nothing either: rc=0 revents=0x0000
+         * at its own 3000 ms timeout, under 0.1 ms of CPU.
+         */
+        if (s->usb_pipe_fired[i] &&
+            usbdev_poll_guest_revents(s->guest_fds[i].fd,
+                                      s->guest_fds[i].events, POLLIN) == 0) {
+            s->usb_disarmed[i] = true;
+            s->host_fds[i].fd = -1;
+        }
+    }
+}
+
+/* Write revents back to the guest only when the guest-visible array changes.
+ * Tight ppoll(..., timeout=0) loops often come back with all-zero revents, in
+ * which case rewriting the whole pollfd array is wasted work.
+ */
+static int ppoll_writeback(guest_t *g, uint64_t fds_gva, ppoll_set_t *s)
+{
+    bool changed = false;
+    for (uint32_t i = 0; i < s->nfds; i++) {
+        if (s->guest_fds[i].revents != s->host_fds[i].revents)
+            changed = true;
+        s->guest_fds[i].revents = s->host_fds[i].revents;
+    }
+    if (changed && s->nfds > 0 &&
+        guest_write_small(g, fds_gva, s->guest_fds,
+                          s->nfds * sizeof(linux_pollfd_t)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
 int64_t sys_ppoll(guest_t *g,
                   uint64_t fds_gva,
                   uint32_t nfds,
@@ -290,130 +572,31 @@ int64_t sys_ppoll(guest_t *g,
     if (nfds > 256)
         return -LINUX_EINVAL;
 
+    ppoll_set_t set;
+    ppoll_set_t *s = &set;
+    s->nfds = nfds;
+    s->invalid_count = 0;
+    s->unpollable_count = 0;
+    s->unpollable_ready = 0;
+    s->unpollable_checked = false;
+
     /* Read pollfd array from guest (layout is identical to macOS) */
-    linux_pollfd_t guest_fds[256];
-    if (nfds > 0) {
-        if (guest_read_small(g, fds_gva, guest_fds,
-                             nfds * sizeof(linux_pollfd_t)) < 0)
-            return -LINUX_EFAULT;
-    }
+    if (nfds > 0 && guest_read_small(g, fds_gva, s->guest_fds,
+                                     nfds * sizeof(linux_pollfd_t)) < 0)
+        return -LINUX_EFAULT;
 
-    /* Translate guest FDs to host FDs */
-    struct pollfd host_fds[256];
-    host_fd_ref_t host_refs[256];
-    bool need_pollnval[256] = {false};
+    int64_t resolve_rc = ppoll_resolve_fds(s);
+    if (resolve_rc < 0)
+        return resolve_rc;
 
-    /* usbfs fds poll a completion pipe whose host readiness (POLLIN) means
-     * guest POLLOUT ("URBs reapable"); both directions are remapped through the
-     * usbdev helpers.
-     */
-    bool usbdev_remap[256] = {false};
+    if (timeout_gva == 0)
+        ppoll_log_infinite(s);
 
-    /* Generation pinned per entry in the same fd_lock window as its host fd.
-     * The pty hangup checks below re-resolve the guest fd, so each needs a
-     * witness that the slot still holds the very file this poll resolved; 0
-     * marks entries with nothing pinned and never matches a live generation.
-     */
-    uint64_t guest_gen[256] = {0};
-    uint32_t invalid_count = 0;
-
-    /* Entries host poll() refuses with POLLNVAL even though their reference
-     * resolved. See poll_eval_unpollable().
-     */
-    poll_unpollable_t unpollable[256];
-    uint32_t unpollable_count = 0;
-    bool unpollable_checked = false;
-    for (uint32_t i = 0; i < nfds; i++) {
-        host_refs[i] = HOST_FD_REF_INIT;
-        unpollable[i] = (poll_unpollable_t) {.fd = -1};
-        int guest_fd = guest_fds[i].fd;
-        int host_fd = -1;
-        if (guest_fd >= 0) {
-            int64_t rc =
-                host_fd_ref_open_io_gen(guest_fd, &host_refs[i], &guest_gen[i]);
-            if (rc == -LINUX_ENOMEM) {
-                /* The pin could not be allocated. POLLNVAL here would name a
-                 * descriptor that is still open, and the usual reaction to
-                 * POLLNVAL is to close it, so a guest under memory pressure
-                 * would tear down its own working fds. Fail the whole wait with
-                 * the errno Linux uses when it cannot build the tables for one.
-                 */
-                host_fd_refs_close(host_refs, i);
-                return -LINUX_ENOMEM;
-            }
-            if (rc < 0) {
-                need_pollnval[i] = true;
-                invalid_count++;
-            } else {
-                host_fd = host_refs[i].fd;
-            }
-        }
-        host_fds[i].fd = host_fd;
-        host_fds[i].events = guest_fds[i].events;
-        host_fds[i].revents = 0;
-        if (host_fd >= 0) {
-            short mapped;
-            if (usbdev_poll_host_events(guest_fd, guest_fds[i].events,
-                                        &mapped)) {
-                usbdev_remap[i] = true;
-                host_fds[i].events = mapped;
-            }
-        }
-    }
-
-    /* Log fd types for shutdown diagnostics (verbose only) */
-    if (timeout_gva == 0) {
-        char fdbuf[256];
-        int pos = 0;
-        for (uint32_t i = 0; i < nfds && i < 8; i++) {
-            int gfd = guest_fds[i].fd;
-            const char *type = "?";
-            if (RANGE_CHECK(gfd, 0, FD_TABLE_SIZE)) {
-                switch (fd_table[gfd].type) {
-                case FD_EVENTFD:
-                    type = "efd";
-                    break;
-                case FD_TIMERFD:
-                    type = "tfd";
-                    break;
-                case FD_EPOLL:
-                    type = "epoll";
-                    break;
-                case FD_SIGNALFD:
-                    type = "sfd";
-                    break;
-                default:
-                    type = "fd";
-                    break;
-                }
-            }
-            pos += snprintf(fdbuf + pos, sizeof(fdbuf) - (size_t) pos,
-                            "%s%d(%s->%d)", i ? "," : "", gfd, type,
-                            host_fds[i].fd);
-        }
-        log_debug("ppoll: nfds=%u infinite timeout, fds=[%s]", nfds, fdbuf);
-    }
-
-    /* Convert timeout (compute in int64_t to avoid overflow, clamp to INT_MAX)
-     */
-    int timeout_ms = -1; /* Infinite by default */
-    if (timeout_gva != 0) {
-        linux_timespec_t lts;
-        if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0) {
-            host_fd_refs_close(host_refs, nfds);
-            return -LINUX_EFAULT;
-        }
-        /* Linux returns EINVAL for negative timeout values */
-        if (!linux_timespec_valid(&lts)) {
-            host_fd_refs_close(host_refs, nfds);
-            return -LINUX_EINVAL;
-        }
-
-        /* Rounds the sub-millisecond remainder up: truncating turned a 500 us
-         * ppoll into poll(0), which returns immediately, so a guest waiting in
-         * sub-millisecond ppoll spun instead of sleeping.
-         */
-        timeout_ms = timespec_to_poll_ms(lts.tv_sec, lts.tv_nsec);
+    int timeout_ms;
+    int timeout_rc = ppoll_read_timeout(g, timeout_gva, &timeout_ms);
+    if (timeout_rc < 0) {
+        host_fd_refs_close(s->host_refs, nfds);
+        return timeout_rc;
     }
 
     /* Atomically install signal mask for the duration of the poll */
@@ -423,7 +606,7 @@ int64_t sys_ppoll(guest_t *g,
     if (sigmask_gva != 0) {
         uint64_t new_mask;
         if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) < 0) {
-            host_fd_refs_close(host_refs, nfds);
+            host_fd_refs_close(s->host_refs, nfds);
             return -LINUX_EFAULT;
         }
         saved_mask = signal_save_blocked();
@@ -443,9 +626,9 @@ int64_t sys_ppoll(guest_t *g,
     bool added_wakeup = false;
     int wake_fd = wakeup_pipe_read_fd();
     if (wake_fd >= 0 && nfds < 256) {
-        host_fds[nfds].fd = wake_fd;
-        host_fds[nfds].events = POLLIN;
-        host_fds[nfds].revents = 0;
+        s->host_fds[nfds].fd = wake_fd;
+        s->host_fds[nfds].events = POLLIN;
+        s->host_fds[nfds].revents = 0;
         added_wakeup = true;
     }
 
@@ -454,9 +637,7 @@ int64_t sys_ppoll(guest_t *g,
      * non-blocking poll() so valid fds with pending events still get reported
      * in the same call.
      */
-    int poll_timeout_ms = timeout_ms;
-    if (invalid_count > 0)
-        poll_timeout_ms = 0;
+    int poll_timeout_ms = s->invalid_count > 0 ? 0 : timeout_ms;
 
     /* A finite wait runs to this deadline in slices; an unbounded one has none
      * and re-arms forever. A zero timeout is a poll, not a wait, and keeps its
@@ -465,57 +646,32 @@ int64_t sys_ppoll(guest_t *g,
     int64_t deadline_ms =
         poll_timeout_ms > 0 ? poll_now_ms() + poll_timeout_ms : -1;
 
-    /* Entries whose usbfs completion pipe woke the wait with nothing the guest
-     * asked to see. Their host interest is withdrawn (the unreaped completion
-     * keeps the pipe readable, so re-polling it would spin at 100% CPU) and the
-     * slice loop watches the disconnect map for them instead, mirroring the
-     * pty-hup slices below.
-     */
-    bool usb_disarmed[256] = {false};
-    bool usb_pipe_fired[256] = {false};
-
     int ret;
-    uint32_t unpollable_ready = 0;
 ppoll_retry:
     do {
-        if (unpollable_count > 0)
-            unpollable_ready = poll_eval_unpollable(unpollable, nfds);
+        if (s->unpollable_count > 0)
+            s->unpollable_ready = poll_eval_unpollable(s->unpollable, nfds);
 
         /* A signal already pending when the wait starts ends it after one
          * non-blocking pass, the way Linux do_poll() finds it on its first
          * pass; parked instead, the wait would sit out a slice before looking.
          * The pass still runs, so ready descriptors win.
          */
-        int slice = (poll_timeout_ms == 0 || unpollable_ready > 0 ||
+        int slice = (poll_timeout_ms == 0 || s->unpollable_ready > 0 ||
                      signal_pending_interruption(NULL))
                         ? 0
                         : poll_slice_ms(deadline_ms);
-        ret = poll(host_fds, nfds + added_wakeup, slice);
+        ret = poll(s->host_fds, nfds + added_wakeup, slice);
 
-        /* Take the descriptors macOS refuses out of the set once and evaluate
-         * them through select() from here on. A refused entry makes poll()
-         * return at once, so this costs no wait.
-         */
-        if (ret > 0 && !unpollable_checked) {
-            unpollable_checked = true;
-            for (uint32_t i = 0; i < nfds; i++) {
-                if (need_pollnval[i] || !(host_fds[i].revents & POLLNVAL))
-                    continue;
-                unpollable[i].fd = host_refs[i].fd;
-                unpollable[i].events = host_fds[i].events;
-                host_fds[i].fd = -1;
-                unpollable_count++;
-            }
-            if (unpollable_count > 0)
-                goto ppoll_retry;
-        }
+        if (ret > 0 && !s->unpollable_checked && ppoll_split_unpollable(s))
+            goto ppoll_retry;
 
         /* Interrupts are checked after waking; see poll_wait_interrupted. */
         int wake_ready =
-            added_wakeup && ret > 0 && (host_fds[nfds].revents & POLLIN) ? 1
-                                                                         : 0;
+            added_wakeup && ret > 0 && (s->host_fds[nfds].revents & POLLIN) ? 1
+                                                                            : 0;
         bool events =
-            ret > wake_ready || unpollable_ready > 0 || invalid_count > 0;
+            ret > wake_ready || s->unpollable_ready > 0 || s->invalid_count > 0;
         if (poll_wait_interrupted(thread_stop_requested(), events,
                                   &signal_interrupted)) {
             /* Finite wait: part of the guest's timeout is already spent. */
@@ -530,71 +686,29 @@ ppoll_retry:
          * forever, a finite one until its deadline. Only a zero timeout, which
          * is a poll rather than a wait, gets a single call.
          */
-        if (ret == 0 && ppoll_break_pending(nfds, guest_fds, need_pollnval,
-                                            guest_gen, usb_disarmed))
+        if (ret == 0 &&
+            ppoll_break_pending(nfds, s->guest_fds, s->need_pollnval,
+                                s->guest_gen, s->usb_disarmed))
             break;
-    } while (ret == 0 && unpollable_ready == 0 && poll_timeout_ms != 0 &&
+    } while (ret == 0 && s->unpollable_ready == 0 && poll_timeout_ms != 0 &&
              (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0));
 
-    if (ret >= 0)
-        ret += ppoll_restamp_unseen(nfds, host_fds, need_pollnval,
-                                    invalid_count, unpollable, unpollable_count,
-                                    unpollable_ready);
-
-    /* A pty master whose guest-side slaves have all closed is hung up, but the
-     * host still sees elfuse's keepalive slave and reports nothing. Stamp
-     * POLLHUP here so a terminal waiting for its shell to exit -- foot polls
-     * for exactly this -- is not left waiting forever.
-     */
     if (ret >= 0) {
-        for (uint32_t i = 0; i < nfds; i++) {
-            if (need_pollnval[i] || guest_fds[i].fd < 0)
-                continue;
-            if (!proc_pty_master_hung_up(guest_fds[i].fd, guest_gen[i]))
-                continue;
-            if (host_fds[i].revents == 0)
-                ret++;
-            host_fds[i].revents |= POLLHUP;
-        }
+        ret += ppoll_restamp_unseen(nfds, s->host_fds, s->need_pollnval,
+                                    s->invalid_count, s->unpollable,
+                                    s->unpollable_count, s->unpollable_ready);
+        ret = ppoll_stamp_pty_hangups(s, ret);
     }
 
     int saved_errno = errno;
 
-    /* Rewrite usbfs entries into guest-visible Linux bits (POLLIN on the
-     * completion pipe -> POLLOUT|POLLWRNORM; disconnect -> POLLERR|POLLHUP)
-     * and keep the ready count consistent with the rewritten revents. Runs
-     * before the re-block decisions below: the pipe's host interest is always
-     * armed so a disconnect can wake a read-only poll, which means a completion
-     * wake can map to nothing the guest asked to see.
-     */
-    if (ret >= 0) {
-        for (uint32_t i = 0; i < nfds; i++) {
-            if (!usbdev_remap[i] || need_pollnval[i])
-                continue;
-            short before = host_fds[i].revents;
-
-            /* A disarmed entry's pipe interest was withdrawn (fd -1, revents
-             * 0), so probe with a hypothetical POLLIN and let the disconnect
-             * and reapable maps decide what the guest sees. Armed entries
-             * record whether their pipe actually fired BEFORE the writeback
-             * below overwrites revents; the disarm pass keys off that.
-             */
-            usb_pipe_fired[i] = !usb_disarmed[i] && (before & POLLIN) != 0;
-            short probe = usb_disarmed[i] ? (short) (before | POLLIN) : before;
-            short after = usbdev_poll_guest_revents(guest_fds[i].fd,
-                                                    guest_fds[i].events, probe);
-            host_fds[i].revents = after;
-            if (before != 0 && after == 0 && ret > 0)
-                ret--;
-            else if (before == 0 && after != 0)
-                ret++;
-        }
-    }
+    if (ret >= 0)
+        ret = ppoll_remap_usb(s, ret);
 
     /* Drain the wakeup pipe if it fired, and subtract from count since the
      * wakeup pipe is not visible to the guest.
      */
-    if (added_wakeup && (host_fds[nfds].revents & POLLIN)) {
+    if (added_wakeup && (s->host_fds[nfds].revents & POLLIN)) {
         wakeup_pipe_drain();
         if (ret > 0)
             ret--;
@@ -602,44 +716,11 @@ ppoll_retry:
 
     /* Re-block when the wake mapped to nothing guest-visible (the wakeup pipe
      * or a masked usbfs completion): a spurious 0 from a still-live wait is not
-     * a poll() outcome Linux produces. A usbfs entry whose completion wake the
-     * guest cannot see is disarmed first -- its pipe stays readable until the
-     * URBs are reaped, so leaving it armed would turn the re-block into a
-     * busy-spin. The slice loop's map probe (disconnect and reapable) stands in
-     * for the withdrawn interest, and the remap above re-derives the bits from
-     * the maps once it trips.
+     * a poll() outcome Linux produces.
      */
     if (ret == 0 && poll_timeout_ms != 0 &&
         (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0)) {
-        for (uint32_t i = 0; i < nfds; i++) {
-            if (!usbdev_remap[i] || usb_disarmed[i] || need_pollnval[i] ||
-                host_fds[i].fd < 0)
-                continue;
-
-            /* Withdraw only an interest whose pipe actually fired invisibly
-             * (that readable byte is what would busy-spin); an armed entry
-             * still waiting for its first byte keeps its zero-latency wake.
-             *
-             * The test is POLLIN and not "anything fired", so a wake carrying
-             * POLLHUP without POLLIN would leave the entry armed. That wake is
-             * not producible on the only fd this path sees: it is the read end
-             * of the readiness pipe, elfuse owns both ends, and macOS reports
-             * the EOF of a pipe whose write end has closed as POLLIN|POLLHUP
-             * (0x11) -- a readable EOF, not a bare hangup -- so the test is
-             * true and the entry disarms. That is the measured run: a sibling
-             * thread closing the write end under a parked blocking poll gives
-             * rc=1 revents=0x0011 and returns at the close, 3 runs of 3. A
-             * parked poll nothing ever wakes is a separate run, and it burns
-             * nothing either: rc=0 revents=0x0000 at its own 3000 ms timeout,
-             * under 0.1 ms of CPU.
-             */
-            if (usb_pipe_fired[i] &&
-                usbdev_poll_guest_revents(guest_fds[i].fd, guest_fds[i].events,
-                                          POLLIN) == 0) {
-                usb_disarmed[i] = true;
-                host_fds[i].fd = -1;
-            }
-        }
+        ppoll_disarm_usb(s);
         goto ppoll_retry;
     }
 
@@ -655,30 +736,14 @@ ppoll_retry:
             signal_restore_blocked(saved_mask);
     }
 
-    host_fd_refs_close(host_refs, nfds);
+    host_fd_refs_close(s->host_refs, nfds);
 
     if (ret < 0) {
         errno = saved_errno;
         return linux_errno();
     }
-
-    /* Write back revents to guest only when the guest-visible array changes.
-     * Tight ppoll(..., timeout=0) loops often come back with all-zero revents,
-     * in which case rewriting the whole pollfd array is wasted work.
-     */
-    bool changed = false;
-    for (uint32_t i = 0; i < nfds; i++) {
-        if (guest_fds[i].revents != host_fds[i].revents)
-            changed = true;
-        guest_fds[i].revents = host_fds[i].revents;
-    }
-    if (changed && nfds > 0) {
-        if (guest_write_small(g, fds_gva, guest_fds,
-                              nfds * sizeof(linux_pollfd_t)) < 0)
-            return -LINUX_EFAULT;
-    }
-
-    return ret;
+    int wb = ppoll_writeback(g, fds_gva, s);
+    return wb < 0 ? wb : ret;
 }
 
 /* State the pselect6 poll fallback carries across its passes. pselect6 falls
@@ -1012,6 +1077,241 @@ static int pselect_install_mask(guest_t *g,
     return 0;
 }
 
+/* Everything one pselect6 call owns: the host-side fd_sets, the per-request
+ * records, and the buffers behind them. The reqs and unp pointers aim into the
+ * stack buffers or the one heap block, so the struct must not be copied.
+ */
+typedef struct {
+    fd_set read_set, write_set, except_set;
+    fd_set *read_setp, *write_setp, *except_setp;
+    int max_host_fd;
+    pselect_req_t reqs_stack[64];
+    pselect_req_t *reqs;
+    pselect_req_t *reqs_heap;
+    int req_count;
+
+    /* One entry per request, filled in for the ones host poll() refuses. The
+     * heap copy rides in the reqs allocation so there is still one buffer to
+     * free.
+     */
+    poll_unpollable_t unp_stack[64];
+    poll_unpollable_t *unp;
+} pselect_call_t;
+
+static void pselect_call_init(pselect_call_t *c,
+                              uint64_t readfds_gva,
+                              uint64_t writefds_gva,
+                              uint64_t exceptfds_gva)
+{
+    FD_ZERO(&c->read_set);
+    FD_ZERO(&c->write_set);
+    FD_ZERO(&c->except_set);
+    c->read_setp = readfds_gva ? &c->read_set : NULL;
+    c->write_setp = writefds_gva ? &c->write_set : NULL;
+    c->except_setp = exceptfds_gva ? &c->except_set : NULL;
+    c->max_host_fd = -1;
+    c->reqs = c->reqs_stack;
+    c->reqs_heap = NULL;
+    c->req_count = 0;
+    c->unp = c->unp_stack;
+}
+
+static void pselect_call_close_refs(pselect_call_t *c)
+{
+    for (int i = 0; i < c->req_count; i++)
+        host_fd_ref_close(&c->reqs[i].ref);
+}
+
+/* Drop every pin and the heap block. Safe to call twice: the second call finds
+ * nothing left to close or free.
+ */
+static void pselect_call_release(pselect_call_t *c)
+{
+    pselect_call_close_refs(c);
+    c->req_count = 0;
+    free(c->reqs_heap);
+    c->reqs_heap = NULL;
+}
+
+/* Read the guest fd_sets, pin a host fd for every requested descriptor and arm
+ * the host-side interest it implies. fdset_words proved nfds_words <=
+ * FDSET_MAX_WORDS, so bitmask_bytes below cannot exceed what the bit buffers
+ * hold.
+ *
+ * Returns 0, or a guest errno with every pin and the heap block released.
+ */
+static int pselect_collect(guest_t *g,
+                           pselect_call_t *c,
+                           int nfds,
+                           int nfds_words,
+                           uint64_t readfds_gva,
+                           uint64_t writefds_gva,
+                           uint64_t exceptfds_gva)
+{
+    if (!readfds_gva && !writefds_gva && !exceptfds_gva)
+        return 0;
+
+    pselect_bits_t bits;
+    pselect_bits_init(&bits, readfds_gva, writefds_gva, exceptfds_gva);
+    int req_cap = 0;
+    size_t bitmask_bytes = (size_t) nfds_words * 8;
+    if (readfds_gva &&
+        guest_read_small(g, readfds_gva, bits.r, bitmask_bytes) < 0)
+        return -LINUX_EFAULT;
+    if (writefds_gva &&
+        guest_read_small(g, writefds_gva, bits.w, bitmask_bytes) < 0)
+        return -LINUX_EFAULT;
+    if (exceptfds_gva &&
+        guest_read_small(g, exceptfds_gva, bits.e, bitmask_bytes) < 0)
+        return -LINUX_EFAULT;
+
+    for (int word = 0; word < nfds_words; word++) {
+        uint64_t requested = (bits.r ? bits.r[word] : 0) |
+                             (bits.w ? bits.w[word] : 0) |
+                             (bits.e ? bits.e[word] : 0);
+        req_cap += bit_popcount64(requested);
+    }
+    if (req_cap > (int) ARRAY_SIZE(c->reqs_stack)) {
+        c->reqs_heap = malloc((size_t) req_cap *
+                              (sizeof(*c->reqs_heap) + sizeof(*c->unp)));
+        if (!c->reqs_heap)
+            return -LINUX_ENOMEM;
+        c->reqs = c->reqs_heap;
+        c->unp = (poll_unpollable_t *) (c->reqs_heap + req_cap);
+    }
+
+    for (int word = 0; word < nfds_words; word++) {
+        uint64_t requested = (bits.r ? bits.r[word] : 0) |
+                             (bits.w ? bits.w[word] : 0) |
+                             (bits.e ? bits.e[word] : 0);
+        while (requested) {
+            int bit_index = bit_ctz64(requested);
+            uint64_t fd_index;
+            uint64_t bit = BIT64(bit_index);
+
+            /* Bits above nfds in the last word are the guest's to set and Linux
+             * ignores them (fs/select.c bounds its per-word loop by n).
+             * Honoring them polled an fd the caller never asked about, and
+             * returned EBADF when it was not open.
+             */
+            if (!fdset_fd_index(nfds, (uint64_t) word, (uint64_t) bit_index,
+                                &fd_index)) {
+                requested &= requested - 1;
+                continue;
+            }
+            int i = (int) fd_index;
+            host_fd_ref_t ref = HOST_FD_REF_INIT;
+            int64_t rc = host_fd_ref_open_io(i, &ref);
+            if (rc < 0) {
+                pselect_call_release(c);
+                return rc == -LINUX_ENOMEM ? -LINUX_ENOMEM : -LINUX_EBADF;
+            }
+            pselect_req_t *req = &c->reqs[c->req_count];
+            req->host_fd = ref.fd;
+            req->word = (uint16_t) word;
+            req->bit_index = (uint8_t) bit_index;
+            req->revents = 0;
+            req->ref = ref;
+            pselect_req_arm(req, i, &bits, word, bit, &c->read_set,
+                            &c->read_setp, c->write_setp, c->except_setp,
+                            &c->max_host_fd);
+            c->unp[c->req_count] = (poll_unpollable_t) {.fd = -1};
+            c->req_count++;
+            requested &= requested - 1;
+        }
+    }
+    return 0;
+}
+
+/* Write the result fd_sets back to the guest (zero, then set the bits for the
+ * matching fds) and fold the ready count into *ret.
+ *
+ * Returns 0 or -LINUX_EFAULT.
+ */
+static int pselect_writeback(guest_t *g,
+                             pselect_call_t *c,
+                             int nfds_words,
+                             uint64_t readfds_gva,
+                             uint64_t writefds_gva,
+                             uint64_t exceptfds_gva,
+                             bool use_poll_fallback,
+                             int *ret)
+{
+    if (!readfds_gva && !writefds_gva && !exceptfds_gva)
+        return 0;
+
+    pselect_bits_t bits;
+    pselect_bits_init(&bits, readfds_gva, writefds_gva, exceptfds_gva);
+    int ready_bits = 0, usb_adjust = 0;
+    for (int i = 0; i < c->req_count; i++) {
+        pselect_req_t *req = &c->reqs[i];
+        int host_fd = req->host_fd, word = req->word;
+        uint64_t bit = BIT64(req->bit_index);
+        if (req->usbdev) {
+            int counted = 0;
+            int b = pselect_usb_writeback(req, use_poll_fallback, &c->read_set,
+                                          &bits, &counted);
+            ready_bits += b;
+            usb_adjust += b - counted;
+            continue;
+        }
+        if (use_poll_fallback) {
+            /* An entry poll() refused holds its select() answer in unp, the
+             * poll set having left req->revents at zero.
+             */
+            short revents =
+                c->unp[i].fd >= 0 ? c->unp[i].revents : req->revents;
+            if (bits.r && (revents & (POLLIN | POLLHUP | POLLERR))) {
+                bits.r[word] |= bit;
+                ready_bits++;
+            }
+            if (bits.w && (revents & (POLLOUT | POLLHUP | POLLERR))) {
+                bits.w[word] |= bit;
+                ready_bits++;
+            }
+            if (bits.e && (revents & POLLPRI)) {
+                bits.e[word] |= bit;
+                ready_bits++;
+            }
+        } else if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
+            if (bits.r && FD_ISSET(host_fd, &c->read_set))
+                bits.r[word] |= bit;
+            if (bits.w && FD_ISSET(host_fd, c->write_setp))
+                bits.w[word] |= bit;
+            if (bits.e && FD_ISSET(host_fd, c->except_setp))
+                bits.e[word] |= bit;
+        }
+    }
+
+    /* poll() counts a descriptor once however many events it reports; select()
+     * counts it once per set it is reported in, so a descriptor ready to read
+     * and to write counts twice. The bits just written are that count for the
+     * descriptors the fallback answered.
+     *
+     * The native path keeps the host's count for everything else, since host
+     * select() already counted those per set, and swaps in the same per-set
+     * count for its usbfs entries alone: the host saw only their completion
+     * pipes, in the READ set, so a disconnected fd the guest put in both sets
+     * came back 1 where Linux answers 2. A disarmed entry -- one whose host
+     * interest this call withdrew -- was charged nothing, so its bits are added
+     * outright, which is also the credit the wait needs when a disconnect lands
+     * while it sits disarmed and the host count is zero.
+     */
+    if (use_poll_fallback)
+        *ret = ready_bits;
+    else
+        *ret += usb_adjust;
+
+    int bytes = nfds_words * 8;
+    if (bits.r && guest_write_small(g, readfds_gva, bits.r, bytes) < 0)
+        return -LINUX_EFAULT;
+    if (bits.w && guest_write_small(g, writefds_gva, bits.w, bytes) < 0)
+        return -LINUX_EFAULT;
+    if (bits.e && guest_write_small(g, exceptfds_gva, bits.e, bytes) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
 int64_t sys_pselect6(guest_t *g,
                      int nfds,
                      uint64_t readfds_gva,
@@ -1039,113 +1339,18 @@ int64_t sys_pselect6(guest_t *g,
             return 0;
     }
 
-    fd_set read_set, write_set, except_set;
-    fd_set *read_setp = NULL;
-    fd_set *write_setp = NULL;
-    fd_set *except_setp = NULL;
-    FD_ZERO(&read_set);
-    if (writefds_gva)
-        FD_ZERO(&write_set);
-    if (exceptfds_gva)
-        FD_ZERO(&except_set);
-
-    if (readfds_gva)
-        read_setp = &read_set;
-    if (writefds_gva)
-        write_setp = &write_set;
-    if (exceptfds_gva)
-        except_setp = &except_set;
-
-    int max_host_fd = -1, nfds_words = (int) nfds_words_u;
-    pselect_req_t reqs_stack[64];
-    pselect_req_t *reqs = reqs_stack;
-    pselect_req_t *reqs_heap = NULL;
-    int req_count = 0;
-
-    /* One entry per request, filled in for the ones host poll() refuses. The
-     * heap copy rides in the reqs allocation so there is still one buffer to
-     * free.
-     */
-    poll_unpollable_t unp_stack[64];
-    poll_unpollable_t *unp = unp_stack;
-
-    /* Translate fd_sets from guest. Linux fd_set uses unsigned long bitmask.
-     * fdset_words proved nfds_words <= FDSET_MAX_WORDS, so bitmask_bytes below
-     * cannot exceed what these three buffers hold.
-     */
-    if (readfds_gva || writefds_gva || exceptfds_gva) {
-        pselect_bits_t bits;
-        pselect_bits_init(&bits, readfds_gva, writefds_gva, exceptfds_gva);
-        int req_cap = 0;
-        size_t bitmask_bytes = (size_t) nfds_words * 8;
-        if (readfds_gva &&
-            guest_read_small(g, readfds_gva, bits.r, bitmask_bytes) < 0)
-            return -LINUX_EFAULT;
-        if (writefds_gva &&
-            guest_read_small(g, writefds_gva, bits.w, bitmask_bytes) < 0)
-            return -LINUX_EFAULT;
-        if (exceptfds_gva &&
-            guest_read_small(g, exceptfds_gva, bits.e, bitmask_bytes) < 0)
-            return -LINUX_EFAULT;
-
-        for (int word = 0; word < nfds_words; word++) {
-            uint64_t requested = (bits.r ? bits.r[word] : 0) |
-                                 (bits.w ? bits.w[word] : 0) |
-                                 (bits.e ? bits.e[word] : 0);
-            req_cap += bit_popcount64(requested);
-        }
-        if (req_cap > (int) (ARRAY_SIZE(reqs_stack))) {
-            reqs_heap =
-                malloc((size_t) req_cap * (sizeof(*reqs_heap) + sizeof(*unp)));
-            if (!reqs_heap)
-                return -LINUX_ENOMEM;
-            reqs = reqs_heap;
-            unp = (poll_unpollable_t *) (reqs_heap + req_cap);
-        }
-
-        for (int word = 0; word < nfds_words; word++) {
-            uint64_t requested = (bits.r ? bits.r[word] : 0) |
-                                 (bits.w ? bits.w[word] : 0) |
-                                 (bits.e ? bits.e[word] : 0);
-            while (requested) {
-                int bit_index = bit_ctz64(requested);
-                uint64_t fd_index;
-                uint64_t bit = BIT64(bit_index);
-
-                /* Bits above nfds in the last word are the guest's to set and
-                 * Linux ignores them (fs/select.c bounds its per-word loop by
-                 * n). Honoring them polled an fd the caller never asked about,
-                 * and returned EBADF when it was not open.
-                 */
-                if (!fdset_fd_index(nfds, (uint64_t) word, (uint64_t) bit_index,
-                                    &fd_index)) {
-                    requested &= requested - 1;
-                    continue;
-                }
-                int i = (int) fd_index;
-                host_fd_ref_t ref = HOST_FD_REF_INIT;
-                int64_t rc = host_fd_ref_open_io(i, &ref);
-                if (rc == -LINUX_ENOMEM)
-                    goto pselect_nomem;
-                if (rc < 0)
-                    goto pselect_badf;
-                reqs[req_count].host_fd = ref.fd;
-                reqs[req_count].word = (uint16_t) word;
-                reqs[req_count].bit_index = (uint8_t) bit_index;
-                reqs[req_count].revents = 0;
-                reqs[req_count].ref = ref;
-                pselect_req_arm(&reqs[req_count], i, &bits, word, bit,
-                                &read_set, &read_setp, write_setp, except_setp,
-                                &max_host_fd);
-                unp[req_count] = (poll_unpollable_t) {.fd = -1};
-                req_count++;
-                requested &= requested - 1;
-            }
-        }
-    }
+    pselect_call_t call;
+    pselect_call_t *c = &call;
+    pselect_call_init(c, readfds_gva, writefds_gva, exceptfds_gva);
+    int nfds_words = (int) nfds_words_u;
+    int collect_rc = pselect_collect(g, c, nfds, nfds_words, readfds_gva,
+                                     writefds_gva, exceptfds_gva);
+    if (collect_rc < 0)
+        return collect_rc;
 
     bool has_timeout = (timeout_gva != 0);
     struct timespec ts;
+    int64_t err;
     if (has_timeout) {
         linux_timespec_t lts;
         if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
@@ -1194,12 +1399,12 @@ int64_t sys_pselect6(guest_t *g,
     bool zero_timeout = has_timeout && ts.tv_sec == 0 && ts.tv_nsec == 0;
     if (!zero_timeout && wake_fd >= 0) {
         if (RANGE_CHECK(wake_fd, 0, FD_SETSIZE)) {
-            FD_SET(wake_fd, &read_set);
-            if (wake_fd > max_host_fd)
-                max_host_fd = wake_fd;
+            FD_SET(wake_fd, &c->read_set);
+            if (wake_fd > c->max_host_fd)
+                c->max_host_fd = wake_fd;
         }
         added_wakeup = true;
-        read_setp = &read_set;
+        c->read_setp = &c->read_set;
     }
 
     /* Save fd_sets because pselect modifies them in-place to indicate ready
@@ -1208,35 +1413,35 @@ int64_t sys_pselect6(guest_t *g,
      * corrupted (zeroed) fd_sets.
      */
     fd_set saved_read, saved_write, saved_except;
-    if (read_setp)
-        saved_read = read_set;
-    if (write_setp)
-        saved_write = write_set;
-    if (except_setp)
-        saved_except = except_set;
+    if (c->read_setp)
+        saved_read = c->read_set;
+    if (c->write_setp)
+        saved_write = c->write_set;
+    if (c->except_setp)
+        saved_except = c->except_set;
 
-    bool use_poll_fallback =
-        pselect_needs_poll_fallback(reqs, req_count, added_wakeup, wake_fd);
+    bool use_poll_fallback = pselect_needs_poll_fallback(c->reqs, c->req_count,
+                                                         added_wakeup, wake_fd);
 
     pselect_fallback_t fb = {
-        .reqs = reqs,
-        .unp = unp,
-        .req_count = req_count,
+        .reqs = c->reqs,
+        .unp = c->unp,
+        .req_count = c->req_count,
         .wake_fd = added_wakeup ? wake_fd : -1,
     };
 
     int ret;
 pselect_retry:
     fb.wakeup_fired = false;
-    for (int i = 0; i < req_count; i++)
-        reqs[i].revents = 0;
+    for (int i = 0; i < c->req_count; i++)
+        c->reqs[i].revents = 0;
     do {
-        if (read_setp)
-            read_set = saved_read;
-        if (write_setp)
-            write_set = saved_write;
-        if (except_setp)
-            except_set = saved_except;
+        if (c->read_setp)
+            c->read_set = saved_read;
+        if (c->write_setp)
+            c->write_set = saved_write;
+        if (c->except_setp)
+            c->except_set = saved_except;
 
         /* A signal already pending ends the wait after one non-blocking pass;
          * see ppoll. Parked instead, the wait would sit out a slice before
@@ -1259,14 +1464,14 @@ pselect_retry:
             if (restart)
                 goto pselect_retry;
         } else {
-            ret = pselect(max_host_fd + 1, read_setp, write_setp, except_setp,
-                          &slice_ts, NULL);
+            ret = pselect(c->max_host_fd + 1, c->read_setp, c->write_setp,
+                          c->except_setp, &slice_ts, NULL);
         }
 
         /* Ready descriptors outrank the signal; see poll_wait_interrupted. */
         bool wake_hit = added_wakeup && ret > 0 &&
                         (use_poll_fallback ? fb.wakeup_fired
-                                           : FD_ISSET(wake_fd, &read_set));
+                                           : FD_ISSET(wake_fd, &c->read_set));
         bool events = ret > (wake_hit ? 1 : 0) || fb.ready > 0;
         if (poll_wait_interrupted(thread_stop_requested(), events,
                                   &signal_interrupted)) {
@@ -1278,7 +1483,7 @@ pselect_retry:
             break;
         }
 
-        if (ret == 0 && pselect_usb_wake_pending(reqs, req_count))
+        if (ret == 0 && pselect_usb_wake_pending(c->reqs, c->req_count))
             break;
     } while (ret == 0 && fb.ready == 0 &&
              (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0));
@@ -1290,11 +1495,11 @@ pselect_retry:
      */
     bool wakeup_fired =
         added_wakeup &&
-        (use_poll_fallback ? fb.wakeup_fired : FD_ISSET(wake_fd, &read_set));
+        (use_poll_fallback ? fb.wakeup_fired : FD_ISSET(wake_fd, &c->read_set));
     if (wakeup_fired) {
         wakeup_pipe_drain();
         if (!use_poll_fallback)
-            FD_CLR(wake_fd, &read_set);
+            FD_CLR(wake_fd, &c->read_set);
         if (ret > 0)
             ret--;
         if (ret == 0 && (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0))
@@ -1302,8 +1507,9 @@ pselect_retry:
     }
 
     if (ret > 0) {
-        ret -= pselect_usb_discount_invisible(
-            reqs, req_count, use_poll_fallback, &read_set, &saved_read);
+        ret -= pselect_usb_discount_invisible(c->reqs, c->req_count,
+                                              use_poll_fallback, &c->read_set,
+                                              &saved_read);
         if (ret == 0 && (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0))
             goto pselect_retry;
     }
@@ -1316,107 +1522,31 @@ pselect_retry:
             signal_restore_blocked(saved_blocked);
     }
 
-    for (int i = 0; i < req_count; i++)
-        host_fd_ref_close(&reqs[i].ref);
+    pselect_call_close_refs(c);
 
     if (ret < 0) {
         errno = save_errno;
-        free(reqs_heap);
+        free(c->reqs_heap);
         return linux_errno();
     }
 
-    /* Write back result fd_sets (zero then set bits for matching fds) */
-    if (readfds_gva || writefds_gva || exceptfds_gva) {
-        pselect_bits_t bits;
-        pselect_bits_init(&bits, readfds_gva, writefds_gva, exceptfds_gva);
-        int ready_bits = 0, usb_adjust = 0;
-        for (int i = 0; i < req_count; i++) {
-            int host_fd = reqs[i].host_fd, word = reqs[i].word;
-            uint64_t bit = BIT64(reqs[i].bit_index);
-            if (reqs[i].usbdev) {
-                int counted = 0;
-                int b = pselect_usb_writeback(&reqs[i], use_poll_fallback,
-                                              &read_set, &bits, &counted);
-                ready_bits += b;
-                usb_adjust += b - counted;
-                continue;
-            }
-            if (use_poll_fallback) {
-                /* An entry poll() refused holds its select() answer in unp, the
-                 * poll set having left reqs[i].revents at zero.
-                 */
-                short revents =
-                    unp[i].fd >= 0 ? unp[i].revents : reqs[i].revents;
-                if (bits.r && (revents & (POLLIN | POLLHUP | POLLERR))) {
-                    bits.r[word] |= bit;
-                    ready_bits++;
-                }
-                if (bits.w && (revents & (POLLOUT | POLLHUP | POLLERR))) {
-                    bits.w[word] |= bit;
-                    ready_bits++;
-                }
-                if (bits.e && (revents & POLLPRI)) {
-                    bits.e[word] |= bit;
-                    ready_bits++;
-                }
-            } else if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
-                if (bits.r && FD_ISSET(host_fd, &read_set))
-                    bits.r[word] |= bit;
-                if (bits.w && FD_ISSET(host_fd, write_setp))
-                    bits.w[word] |= bit;
-                if (bits.e && FD_ISSET(host_fd, except_setp))
-                    bits.e[word] |= bit;
-            }
-        }
-
-        /* poll() counts a descriptor once however many events it reports;
-         * select() counts it once per set it is reported in, so a descriptor
-         * ready to read and to write counts twice. The bits just written are
-         * that count for the descriptors the fallback answered.
-         *
-         * The native path keeps the host's count for everything else, since
-         * host select() already counted those per set, and swaps in the same
-         * per-set count for its usbfs entries alone: the host saw only their
-         * completion pipes, in the READ set, so a disconnected fd the guest put
-         * in both sets came back 1 where Linux answers 2. A disarmed entry --
-         * one whose host interest this call withdrew -- was charged nothing, so
-         * its bits are added outright, which is also the credit the wait needs
-         * when a disconnect lands while it sits disarmed and the host count is
-         * zero.
-         */
-        if (use_poll_fallback)
-            ret = ready_bits;
-        else
-            ret += usb_adjust;
-
-        int bytes = nfds_words * 8;
-        if (bits.r && guest_write_small(g, readfds_gva, bits.r, bytes) < 0)
-            goto pselect_fault;
-        if (bits.w && guest_write_small(g, writefds_gva, bits.w, bytes) < 0)
-            goto pselect_fault;
-        if (bits.e && guest_write_small(g, exceptfds_gva, bits.e, bytes) < 0)
-            goto pselect_fault;
+    int wb = pselect_writeback(g, c, nfds_words, readfds_gva, writefds_gva,
+                               exceptfds_gva, use_poll_fallback, &ret);
+    if (wb < 0) {
+        err = wb;
+        goto pselect_cleanup;
     }
 
-    free(reqs_heap);
+    free(c->reqs_heap);
     return ret;
 
-    int64_t err;
 pselect_fault:
     err = -LINUX_EFAULT;
     goto pselect_cleanup;
 pselect_inval:
     err = -LINUX_EINVAL;
-    goto pselect_cleanup;
-pselect_badf:
-    err = -LINUX_EBADF;
-    goto pselect_cleanup;
-pselect_nomem:
-    err = -LINUX_ENOMEM;
 pselect_cleanup:
-    for (int i = 0; i < req_count; i++)
-        host_fd_ref_close(&reqs[i].ref);
-    free(reqs_heap);
+    pselect_call_release(c);
     return err;
 }
 
@@ -2035,6 +2165,217 @@ static int64_t epoll_einval_unless_unsupported(const fd_entry_t *snap)
                                                    : -LINUX_EPERM;
 }
 
+/* Remove every filter a registration holds on the target. EPOLLRDHUP alone
+ * registers EVFILT_READ, so the read pair and EPOLLRDHUP are checked together.
+ * Each delete goes in its own kevent call: a batched call with a NULL eventlist
+ * stops at the first failed change and leaks the survivor, and events names a
+ * filter that may not be registered -- a dropped write filter, or the one
+ * EPOLLONESHOT already removed. Errors are ignored either way, since the fd may
+ * already be closed.
+ */
+static void epoll_delete_filters(int kq, int host_fd, const epoll_reg_t *reg)
+{
+    struct kevent del;
+
+    /* A usbdev registration always holds an EVFILT_READ on the completion pipe,
+     * whatever the guest asked for, and never holds an EVFILT_WRITE: the pipe's
+     * readability is what carries "URBs reapable", which the wait reports as
+     * EPOLLOUT.
+     */
+    if (reg->usbdev ||
+        (reg->events & (LINUX_EPOLL_READABLE | LINUX_EPOLLRDHUP))) {
+        EV_SET(&del, host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        kevent(kq, &del, 1, NULL, 0, NULL);
+    }
+    if (!reg->usbdev && (reg->events & LINUX_EPOLL_WRITABLE)) {
+        EV_SET(&del, host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        kevent(kq, &del, 1, NULL, 0, NULL);
+    }
+}
+
+/* Translate an epoll event mask into the kevent changes that arm it.
+ *
+ * Returns how many of changes[] (room for 2) were filled.
+ */
+static int epoll_build_changes(const linux_epoll_event_t *ev_p,
+                               int fd,
+                               const fd_entry_t *snap,
+                               struct kevent *changes)
+{
+    const linux_epoll_event_t ev = *ev_p;
+    const int target_host_fd = snap->host_fd;
+    const bool target_usbdev = snap->type == FD_USBDEV;
+    int nchanges = 0;
+
+    /* EPOLLET maps to EV_CLEAR. Idle re-poll, full drain, and post-drain
+     * new-data edges all match Linux EPOLLET. Narrow divergence: a partial read
+     * (without draining to EAGAIN) is a data-count state change that re-arms
+     * kqueue, so the next kevent fires while Linux EPOLLET stays silent.
+     * Distinguishing "partial-read remainder" from "drained-then-refilled"
+     * would require a unified drain signal across every data-consuming path
+     * (read / recv* / splice / ...) feeding back into this layer, which the
+     * epoll/kqueue bridge does not maintain. Apps that follow the documented
+     * EPOLLET contract (drain to EAGAIN) are unaffected; tests/test-epoll-
+     * edge.c locks in that contract.
+     */
+    uint16_t kflags = EV_ADD;
+    if (ev.events & LINUX_EPOLLET)
+        kflags |= EV_CLEAR;
+    if (ev.events & LINUX_EPOLLONESHOT)
+        kflags |= EV_ONESHOT;
+
+    /* Use (void*)(uintptr_t)fd as udata to identify the guest fd */
+    void *udata = (void *) (uintptr_t) fd;
+
+    if (target_usbdev) {
+        /* EVFILT_READ on the completion pipe is always registered, whatever the
+         * guest asked for: EPOLLOUT (completions reapable) is gated by
+         * reg->events in epoll_merge_event, and the unmaskable
+         * EPOLLERR|EPOLLHUP of a disconnect (devio.c:2842-2845) must wake even
+         * a read-only registration -- the disconnect stamp in sys_epoll_pwait
+         * only runs for fds kqueue reported.
+         */
+        EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags, 0, 0,
+               udata);
+        nchanges++;
+    } else {
+        if (ev.events & (LINUX_EPOLL_READABLE | LINUX_EPOLLRDHUP)) {
+            /* A mask naming EPOLLRDHUP but no readable bit is waiting for the
+             * EOF, not for data. A plain read filter would wake the wait on
+             * every readable byte, and the merge above has nothing that
+             * registration asked for to report, so the wait either invents a
+             * bit or returns 0 ahead of its timeout -- and Linux does neither,
+             * it waits the caller out. A low-water mark no readable byte can
+             * reach draws exactly that line: kqueue holds the filter silent
+             * while data merely sits in the pipe, and still activates it for
+             * EV_EOF, which is the hangup this registration is waiting for.
+             * Measured on pipes and on stream sockets. It also costs no target:
+             * every type that takes a plain EVFILT_READ here takes it with
+             * NOTE_LOWAT too, and the types that refuse the low-water mark (a
+             * directory, /dev/null, /dev/random) refuse the plain filter with
+             * the same EINVAL, so the refusal paths below see no case they did
+             * not see before.
+             */
+            bool eof_only = !(ev.events & LINUX_EPOLL_READABLE);
+            EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags,
+                   eof_only ? NOTE_LOWAT : 0, eof_only ? INT_MAX : 0, udata);
+            nchanges++;
+        }
+        if (ev.events & LINUX_EPOLL_WRITABLE) {
+            EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE, kflags, 0,
+                   0, udata);
+            nchanges++;
+        }
+    }
+    return nchanges;
+}
+
+/* Register the changes with the kqueue one filter at a time.
+ *
+ * Returns 0 or a guest errno with nothing left armed; *read_refused is set when
+ * the target's read filter was refused but its path settled that it is pollable
+ * anyway.
+ */
+static int64_t epoll_arm_changes(int kq,
+                                 const struct kevent *changes,
+                                 int nchanges,
+                                 const fd_entry_t *snap,
+                                 bool *read_refused)
+{
+    /* A mask naming no readiness filter registers nothing, so the loop below
+     * never asks kqueue whether the target takes a knote at all. Linux tests
+     * poll support before it reads the event, and answers EPERM for a directory
+     * or a character device whatever the mask says, so ask here.
+     */
+    if (nchanges == 0 && !epoll_target_pollable(kq, snap->host_fd))
+        return -LINUX_EPERM;
+
+    /* Linux decides EPERM from the target alone, never from the requested
+     * events: epoll_ctl(2) accepts EPOLLOUT on a timerfd or on a nested epoll
+     * fd, neither of which ever reports itself writable. Both are kqueues here,
+     * and kqueue refuses EVFILT_WRITE on a kqueue with EINVAL, so register one
+     * filter per call and drop a refused write filter instead of failing the
+     * whole ADD. A batched call would also stop at the first failed change and
+     * leave the survivor registered. EINVAL on the read filter, or on a write
+     * filter whose target takes no knote at all, is the EPERM case.
+     *
+     * A target the path already settled is never that case: /dev/random is
+     * pollable on Linux and takes no knote here, so its refusal drops the
+     * filter the way a kqueue's write filter does. Read readiness then has no
+     * knote to arrive on, which always_readable carries to the wait.
+     *
+     * An error that is not EINVAL abandons a registration this loop may have
+     * already armed filters for, each carrying the udata of an entry the bail
+     * never activates. Undo them: sys_epoll_pwait does reap such a knote, but
+     * only after it has woken the wait and counted the event, so the call
+     * returns 0 ahead of its timeout. MOD arrives here with its old filters
+     * already deleted, so this is also what keeps a half-failed re-registration
+     * from leaving one behind. The EPERM arm below needs no undo: it is
+     * reachable only while nothing is armed, since a refused read filter is the
+     * first change and a refused write filter without a registered read one
+     * means the mask named no read filter at all.
+     */
+    bool read_registered = false;
+    *read_refused = false;
+    for (int i = 0; i < nchanges; i++) {
+        if (kevent(kq, &changes[i], 1, NULL, 0, NULL) == 0) {
+            if (changes[i].filter == EVFILT_READ)
+                read_registered = true;
+            continue;
+        }
+        if (errno != EINVAL) {
+            int64_t err = linux_errno();
+            epoll_undo_changes(kq, changes, i);
+            return err;
+        }
+        if (snap->path_poll_capable) {
+            if (changes[i].filter == EVFILT_READ)
+                *read_refused = true;
+            continue;
+        }
+        if (changes[i].filter == EVFILT_READ ||
+            !(read_registered || epoll_target_pollable(kq, snap->host_fd)))
+            return -LINUX_EPERM;
+    }
+    return 0;
+}
+
+/* Record an accepted registration in the per-instance table. */
+static void epoll_store_reg(epoll_instance_t *inst,
+                            epoll_reg_t *reg,
+                            const linux_epoll_event_t *ev,
+                            const fd_entry_t *snap,
+                            bool target_pty_master,
+                            bool read_refused)
+{
+    /* Store registration data in per-instance table. Clear oneshot_armed when
+     * MOD successfully re-arms. Stamp the snapshot's generation so a later
+     * close+reopen of this guest fd is detected as a stale registration by the
+     * generation check in sys_epoll_ctl.
+     */
+    reg->events = ev->events;
+    reg->data = ev->data;
+    reg->usbdev = snap->type == FD_USBDEV;
+    reg->generation = snap->generation;
+    reg->ofd_id = snap->ofd_id;
+    if (!reg->active)
+        inst->active_count++;
+    if (target_pty_master && !reg->pty_master)
+        inst->pty_master_count++;
+    else if (!target_pty_master && reg->pty_master &&
+             inst->pty_master_count > 0)
+        inst->pty_master_count--;
+    if (read_refused && !reg->always_readable)
+        inst->always_readable_count++;
+    else if (!read_refused && reg->always_readable &&
+             inst->always_readable_count > 0)
+        inst->always_readable_count--;
+    reg->active = true;
+    reg->oneshot_armed = false;
+    reg->pty_master = target_pty_master;
+    reg->always_readable = read_refused;
+}
+
 int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 {
     /* The event is copied before anything else, because that is where the
@@ -2129,13 +2470,6 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     bool target_pty_master =
         proc_pty_master_pts_num(target_host_fd) != UINT32_MAX;
 
-    /* usbfs fds always register EVFILT_READ on the completion pipe (EPOLLIN is
-     * never signaled, but a disconnect must wake any registration). The
-     * report-side remap is in epoll_merge_event plus the disconnect stamp in
-     * sys_epoll_pwait.
-     */
-    bool target_usbdev = target_snap.type == FD_USBDEV;
-
     /* Serialize all regs[] access and the paired kqueue mutation against a
      * concurrent close hook or a sibling epoll_ctl on the same instance. The
      * kevent() calls below are change-only (non-blocking), so holding the lock
@@ -2170,36 +2504,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
             goto out_locked;
         }
 
-        /* Remove all filters for this fd. EPOLLRDHUP alone registers
-         * EVFILT_READ (see ADD path), so check the read pair and EPOLLRDHUP.
-         * Each delete goes in its own kevent call for the reason the MOD path
-         * below already states: a batched call with a NULL eventlist stops at
-         * the first failed change and leaks the survivor, and events names a
-         * filter that may not be registered -- a dropped write filter, or the
-         * one EPOLLONESHOT already removed. Errors are ignored either way,
-         * since the fd may already be closed.
-         */
-        {
-            struct kevent del;
-
-            /* A usbdev registration always holds an EVFILT_READ on the
-             * completion pipe, whatever the guest asked for, and never holds an
-             * EVFILT_WRITE: the pipe's readability is what carries "URBs
-             * reapable", which the wait reports as EPOLLOUT.
-             */
-            if (reg->usbdev ||
-                (reg->events & (LINUX_EPOLL_READABLE | LINUX_EPOLLRDHUP))) {
-                EV_SET(&del, target_host_fd, EVFILT_READ, EV_DELETE, 0, 0,
-                       NULL);
-                kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
-            }
-            if (!reg->usbdev && (reg->events & LINUX_EPOLL_WRITABLE)) {
-                EV_SET(&del, target_host_fd, EVFILT_WRITE, EV_DELETE, 0, 0,
-                       NULL);
-                kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
-            }
-            epoll_reg_deactivate_locked(inst, reg);
-        }
+        epoll_delete_filters(epoll_ref.fd, target_host_fd, reg);
+        epoll_reg_deactivate_locked(inst, reg);
         ret = 0;
         goto out_locked;
     }
@@ -2246,184 +2552,25 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      */
     linux_epoll_event_t ev = ev_in;
 
-    /* For MOD, remove old registrations first if they exist in kqueue.
-     * EPOLLRDHUP alone registers EVFILT_READ (see ADD path), so check the read
-     * pair and EPOLLRDHUP (same logic as CTL_DEL). Always attempt the deletes
+    /* For MOD, remove the old registrations first. Always attempt the deletes
      * even when oneshot_armed: with multi-filter EPOLLONESHOT, only the filter
-     * that fired was removed by EV_ONESHOT; the other filter is still
-     * registered and must be cleaned. Issue each delete in its own kevent call
-     * so an ENOENT on one filter does not abort the other -- with a single
-     * batched call and NULL eventlist, kevent stops at the first failed change
-     * and leaks the survivor.
+     * that fired was removed by EV_ONESHOT; the other is still registered and
+     * must be cleaned.
      */
-    if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
-        struct kevent del;
-        if (reg->usbdev /* usbdev always holds an EVFILT_READ */
-                ? true
-                : (reg->events & (LINUX_EPOLL_READABLE | LINUX_EPOLLRDHUP)) !=
-                      0) {
-            EV_SET(&del, target_host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-            kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
-        }
-        if (!reg->usbdev && (reg->events & LINUX_EPOLL_WRITABLE)) {
-            EV_SET(&del, target_host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-            kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
-        }
-    }
+    if (op == LINUX_EPOLL_CTL_MOD && reg->active)
+        epoll_delete_filters(epoll_ref.fd, target_host_fd, reg);
 
-    /* Build kevent changes */
     struct kevent changes[2];
-    int nchanges = 0;
+    int nchanges = epoll_build_changes(&ev, fd, &target_snap, changes);
 
-    /* EPOLLET maps to EV_CLEAR. Idle re-poll, full drain, and post-drain
-     * new-data edges all match Linux EPOLLET. Narrow divergence: a partial read
-     * (without draining to EAGAIN) is a data-count state change that re-arms
-     * kqueue, so the next kevent fires while Linux EPOLLET stays silent.
-     * Distinguishing "partial-read remainder" from "drained-then-refilled"
-     * would require a unified drain signal across every data-consuming path
-     * (read / recv* / splice / ...) feeding back into this layer, which the
-     * epoll/kqueue bridge does not maintain. Apps that follow the documented
-     * EPOLLET contract (drain to EAGAIN) are unaffected; tests/test-epoll-
-     * edge.c locks in that contract.
-     */
-    uint16_t kflags = EV_ADD;
-    if (ev.events & LINUX_EPOLLET)
-        kflags |= EV_CLEAR;
-    if (ev.events & LINUX_EPOLLONESHOT)
-        kflags |= EV_ONESHOT;
-
-    /* Use (void*)(uintptr_t)fd as udata to identify the guest fd */
-    void *udata = (void *) (uintptr_t) fd;
-
-    if (target_usbdev) {
-        /* EVFILT_READ on the completion pipe is always registered, whatever the
-         * guest asked for: EPOLLOUT (completions reapable) is gated by
-         * reg->events in epoll_merge_event, and the unmaskable
-         * EPOLLERR|EPOLLHUP of a disconnect (devio.c:2842-2845) must wake even
-         * a read-only registration -- the disconnect stamp in sys_epoll_pwait
-         * only runs for fds kqueue reported.
-         */
-        EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags, 0, 0,
-               udata);
-        nchanges++;
-    } else {
-        if (ev.events & (LINUX_EPOLL_READABLE | LINUX_EPOLLRDHUP)) {
-            /* A mask naming EPOLLRDHUP but no readable bit is waiting for the
-             * EOF, not for data. A plain read filter would wake the wait on
-             * every readable byte, and the merge above has nothing that
-             * registration asked for to report, so the wait either invents a
-             * bit or returns 0 ahead of its timeout -- and Linux does neither,
-             * it waits the caller out. A low-water mark no readable byte can
-             * reach draws exactly that line: kqueue holds the filter silent
-             * while data merely sits in the pipe, and still activates it for
-             * EV_EOF, which is the hangup this registration is waiting for.
-             * Measured on pipes and on stream sockets. It also costs no target:
-             * every type that takes a plain EVFILT_READ here takes it with
-             * NOTE_LOWAT too, and the types that refuse the low-water mark (a
-             * directory, /dev/null, /dev/random) refuse the plain filter with
-             * the same EINVAL, so the refusal paths below see no case they did
-             * not see before.
-             */
-            bool eof_only = !(ev.events & LINUX_EPOLL_READABLE);
-            EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags,
-                   eof_only ? NOTE_LOWAT : 0, eof_only ? INT_MAX : 0, udata);
-            nchanges++;
-        }
-        if (ev.events & LINUX_EPOLL_WRITABLE) {
-            EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE, kflags, 0,
-                   0, udata);
-            nchanges++;
-        }
-    }
-
-    /* A mask naming no readiness filter registers nothing, so the loop below
-     * never asks kqueue whether the target takes a knote at all. Linux tests
-     * poll support before it reads the event, and answers EPERM for a directory
-     * or a character device whatever the mask says, so ask here.
-     */
-    if (nchanges == 0 && !epoll_target_pollable(epoll_ref.fd, target_host_fd)) {
-        ret = -LINUX_EPERM;
-        goto out_locked;
-    }
-
-    /* Linux decides EPERM from the target alone, never from the requested
-     * events: epoll_ctl(2) accepts EPOLLOUT on a timerfd or on a nested epoll
-     * fd, neither of which ever reports itself writable. Both are kqueues here,
-     * and kqueue refuses EVFILT_WRITE on a kqueue with EINVAL, so register one
-     * filter per call and drop a refused write filter instead of failing the
-     * whole ADD. A batched call would also stop at the first failed change and
-     * leave the survivor registered. EINVAL on the read filter, or on a write
-     * filter whose target takes no knote at all, is the EPERM case.
-     *
-     * A target the path already settled is never that case: /dev/random is
-     * pollable on Linux and takes no knote here, so its refusal drops the
-     * filter the way a kqueue's write filter does. Read readiness then has no
-     * knote to arrive on, which always_readable carries to the wait.
-     *
-     * An error that is not EINVAL abandons a registration this loop may have
-     * already armed filters for, each carrying the udata of an entry the bail
-     * never activates. Undo them: sys_epoll_pwait does reap such a knote, but
-     * only after it has woken the wait and counted the event, so the call
-     * returns 0 ahead of its timeout. MOD arrives here with its old filters
-     * already deleted, so this is also what keeps a half-failed re-registration
-     * from leaving one behind. The EPERM arm below needs no undo: it is
-     * reachable only while nothing is armed, since a refused read filter is the
-     * first change and a refused write filter without a registered read one
-     * means the mask named no read filter at all.
-     */
-    bool read_registered = false;
     bool read_refused = false;
-    for (int i = 0; i < nchanges; i++) {
-        if (kevent(epoll_ref.fd, &changes[i], 1, NULL, 0, NULL) == 0) {
-            if (changes[i].filter == EVFILT_READ)
-                read_registered = true;
-            continue;
-        }
-        if (errno != EINVAL) {
-            ret = linux_errno();
-            epoll_undo_changes(epoll_ref.fd, changes, i);
-            goto out_locked;
-        }
-        if (target_snap.path_poll_capable) {
-            if (changes[i].filter == EVFILT_READ)
-                read_refused = true;
-            continue;
-        }
-        if (changes[i].filter == EVFILT_READ ||
-            !(read_registered ||
-              epoll_target_pollable(epoll_ref.fd, target_host_fd))) {
-            ret = -LINUX_EPERM;
-            goto out_locked;
-        }
-    }
+    ret = epoll_arm_changes(epoll_ref.fd, changes, nchanges, &target_snap,
+                            &read_refused);
+    if (ret < 0)
+        goto out_locked;
 
-    /* Store registration data in per-instance table. Clear oneshot_armed when
-     * MOD successfully re-arms. Stamp the snapshot's generation so a later
-     * close+reopen of this guest fd is detected as a stale registration by the
-     * ABA guard above.
-     */
-    reg->events = ev.events;
-    reg->data = ev.data;
-    reg->usbdev = target_usbdev;
-    reg->generation = target_snap.generation;
-    reg->ofd_id = target_snap.ofd_id;
-    if (!reg->active)
-        inst->active_count++;
-    if (target_pty_master && !reg->pty_master)
-        inst->pty_master_count++;
-    else if (!target_pty_master && reg->pty_master &&
-             inst->pty_master_count > 0)
-        inst->pty_master_count--;
-    if (read_refused && !reg->always_readable)
-        inst->always_readable_count++;
-    else if (!read_refused && reg->always_readable &&
-             inst->always_readable_count > 0)
-        inst->always_readable_count--;
-    reg->active = true;
-    reg->oneshot_armed = false;
-    reg->pty_master = target_pty_master;
-    reg->always_readable = read_refused;
-
+    epoll_store_reg(inst, reg, &ev, &target_snap, target_pty_master,
+                    read_refused);
     ret = 0;
 
 out_locked:
@@ -2678,6 +2825,229 @@ static int epoll_wait_slice(int kq,
     return kevent(kq, NULL, 0, kevents, cap, &slice_ts);
 }
 
+/* The events one sys_epoll_pwait is about to hand the guest, merged by guest
+ * fd. Only [0, n) of the parallel arrays is meaningful. index maps a guest fd
+ * to its slot, -1 when it has none yet, and is initialized by the caller.
+ */
+typedef struct {
+    linux_epoll_event_t ev[256];
+    uint16_t gfds[256];
+    int16_t index[FD_TABLE_SIZE];
+    int n;
+} epoll_out_t;
+
+static void epoll_out_init(epoll_out_t *o)
+{
+    memset(o->index, 0xff, sizeof(o->index));
+    o->n = 0;
+}
+
+/* The slot for @gfd, opened with @data when it has none yet.
+ *
+ * Returns -1 when the fd needs a new slot and @maxevents are already in use.
+ */
+static int epoll_out_slot(epoll_out_t *o, int gfd, uint64_t data, int maxevents)
+{
+    int idx = o->index[gfd];
+    if (idx < 0) {
+        if (o->n >= maxevents)
+            return -1;
+        idx = o->n++;
+        o->index[gfd] = (int16_t) idx;
+        o->gfds[idx] = (uint16_t) gfd;
+        o->ev[idx].events = 0;
+        o->ev[idx]._pad = 0;
+        o->ev[idx].data = data;
+    }
+    return idx;
+}
+
+/* Merge the kevents into epoll events. Multiple kevents for the same fd (READ +
+ * WRITE) merge into one epoll_event, keyed by guest fd rather than user data
+ * since two different fds could legitimately share the same epoll_data value.
+ * Called with the instance lock held.
+ */
+static void epoll_collect_ready(epoll_instance_t *inst,
+                                int kq,
+                                const struct kevent *kevents,
+                                int nready,
+                                epoll_out_t *o,
+                                int maxevents)
+{
+    for (int i = 0; i < nready && o->n < maxevents; i++) {
+        int gfd = (int) (uintptr_t) kevents[i].udata;
+        if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE) || !inst->regs[gfd].active) {
+            struct kevent del;
+            EV_SET(&del, kevents[i].ident, kevents[i].filter, EV_DELETE, 0, 0,
+                   NULL);
+            kevent(kq, &del, 1, NULL, 0, NULL);
+            continue;
+        }
+
+        /* EPOLLONESHOT semantics: once any event fired and was reported, the fd
+         * stays disarmed until EPOLL_CTL_MOD re-arms it. With multi-filter
+         * registrations (e.g. EPOLLIN | EPOLLOUT), EV_ONESHOT only removed the
+         * filter that fired; surviving filters can still fire later and would
+         * be reported here without this guard.
+         */
+        if (inst->regs[gfd].oneshot_armed)
+            continue;
+
+        epoll_reg_t *reg = &inst->regs[gfd];
+        int idx = epoll_out_slot(o, gfd, reg->data, maxevents);
+        if (idx < 0)
+            break;
+        epoll_merge_event(&o->ev[idx], &kevents[i], reg, gfd);
+
+        /* A disconnected usbfs device reports the hangup pair alongside any
+         * remaining reapable completions (devio.c:2842-2845; EPOLLHUP and
+         * EPOLLERR are unmaskable).
+         */
+        if (reg->usbdev && usbdev_fd_disconnected(gfd))
+            o->ev[idx].events |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
+    }
+}
+
+/* Stamp EPOLLIN for the registrations whose read readiness kqueue cannot
+ * deliver. /dev/random is the only such target: Linux reports it readable once
+ * the pool is seeded and from then on always, so the answer is a property of
+ * the registration rather than something to sample. Unlike the hangup scan this
+ * reads regs[] under the lock the caller holds, so there is no unlocked
+ * snapshot to re-verify against a generation.
+ */
+static void epoll_stamp_always_readable(epoll_instance_t *inst,
+                                        epoll_out_t *o,
+                                        int maxevents)
+{
+    if (inst->always_readable_count <= 0)
+        return;
+    for (int gfd = 0; gfd < FD_TABLE_SIZE && o->n < maxevents; gfd++) {
+        epoll_reg_t *areg = &inst->regs[gfd];
+        if (!areg->always_readable || !areg->active || areg->oneshot_armed)
+            continue;
+        if (!(areg->events & LINUX_EPOLL_READABLE))
+            continue;
+        int idx = epoll_out_slot(o, gfd, areg->data, maxevents);
+        if (idx < 0)
+            break;
+        o->ev[idx].events |= areg->events & LINUX_EPOLL_READABLE;
+    }
+}
+
+/* Whether the registration at @gfd still carries the generation an unlocked
+ * scan saw and has not been disarmed. The generation match is what rejects a
+ * DEL + re-ADD of the same fd number in between. Called with the instance lock
+ * held.
+ */
+static bool epoll_reg_live(const epoll_instance_t *inst, int gfd, uint64_t gen)
+{
+    const epoll_reg_t *reg = &inst->regs[gfd];
+    return reg->active && !reg->oneshot_armed && reg->generation == gen;
+}
+
+/* Stamp EPOLLHUP for the masters the host cannot report on. Linux delivers
+ * EPOLLHUP whether or not the caller asked for it, so this ignores reg->events.
+ * Merging into an existing entry keeps a hangup that lands alongside queued
+ * output reported as EPOLLIN | EPOLLHUP, the way Linux does it -- the reader
+ * drains the shell's parting output before acting on the hangup. Runs before
+ * the oneshot marking so an fd that fired this round still carries the hangup
+ * into that same report.
+ */
+static void epoll_stamp_hangups(epoll_instance_t *inst,
+                                epoll_out_t *o,
+                                const int *hup_gfds,
+                                const uint64_t *hup_gens,
+                                int nhup,
+                                int maxevents)
+{
+    for (int i = 0; i < nhup; i++) {
+        int gfd = hup_gfds[i];
+
+        /* Re-check under the lock: the collector tested unlocked, so a
+         * concurrent epoll_ctl or close hook may have retired the entry since.
+         * The generation match is what rejects a DEL + re-ADD of the same fd
+         * number in that window, which would otherwise report this hangup
+         * against the new registration's epoll_data.
+         */
+        if (!epoll_reg_live(inst, gfd, hup_gens[i]))
+            continue;
+        int idx = epoll_out_slot(o, gfd, inst->regs[gfd].data, maxevents);
+        if (idx < 0)
+            break;
+        o->ev[idx].events |= LINUX_EPOLLHUP;
+    }
+}
+
+/* Stamp what the muted registrations can no longer learn from kqueue: their
+ * knote is silenced, so the slice loop's map-driven break lands here with
+ * nready == 0. A disconnect stamps the unmaskable hangup pair; a completion
+ * that became reapable after the mute (the mute races a concurrent reap
+ * emptying the list) stamps the writable bits it asked for. Re-validated like
+ * the hangups; the generation match rejects a DEL + re-ADD since the mute.
+ */
+static void epoll_stamp_muted(epoll_instance_t *inst,
+                              epoll_out_t *o,
+                              const epoll_mute_set_t *muted,
+                              int maxevents)
+{
+    for (int i = 0; i < muted->n; i++) {
+        int gfd = muted->gfds[i];
+        bool disc = usbdev_fd_disconnected(gfd);
+        uint32_t wr = muted->wantout[i] & inst->regs[gfd].events;
+        bool reap = wr != 0 && usbdev_fd_reapable(gfd);
+        if (!disc && !reap)
+            continue;
+        if (!epoll_reg_live(inst, gfd, muted->gens[i]))
+            continue;
+        int idx = epoll_out_slot(o, gfd, inst->regs[gfd].data, maxevents);
+        if (idx < 0)
+            break;
+        if (disc)
+            o->ev[idx].events |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
+        if (reap)
+            o->ev[idx].events |= wr;
+    }
+}
+
+/* Drop the entries that carry no events, compacting the rest in place.
+ *
+ * Returns how many went.
+ */
+static int epoll_drop_empty(epoll_out_t *o)
+{
+    int w = 0, ndropped = 0;
+    for (int i = 0; i < o->n; i++) {
+        if (o->ev[i].events == 0) {
+            o->index[o->gfds[i]] = -1;
+            ndropped++;
+            continue;
+        }
+        if (w != i) {
+            o->ev[w] = o->ev[i];
+            o->gfds[w] = o->gfds[i];
+            o->index[o->gfds[w]] = (int16_t) w;
+        }
+        w++;
+    }
+    o->n = w;
+    return ndropped;
+}
+
+/* Mark EPOLLONESHOT fds as armed (fired but waiting for MOD re-arm). kqueue
+ * already removed the event (EV_ONESHOT), so poll emulation marks the
+ * registration as oneshot_armed to allow MOD but prevent further event
+ * reporting until re-armed.
+ */
+static void epoll_mark_oneshot(epoll_instance_t *inst, const epoll_out_t *o)
+{
+    for (int i = 0; i < o->n; i++) {
+        int gfd = o->gfds[i];
+        if (inst->regs[gfd].active &&
+            (inst->regs[gfd].events & LINUX_EPOLLONESHOT))
+            inst->regs[gfd].oneshot_armed = true;
+    }
+}
+
 int64_t sys_epoll_pwait(guest_t *g,
                         int epfd,
                         uint64_t events_gva,
@@ -2825,22 +3195,8 @@ epoll_rewait:
         return ret;
     }
 
-    /* Merge kevent results into epoll_event results. Multiple kevents for the
-     * same fd (READ + WRITE) merge into one epoll_event. Use guest FD (not user
-     * data) as the merge key, since two different FDs could legitimately share
-     * the same epoll_data value.
-     */
-    linux_epoll_event_t out[256];
-
-    /* Parallel arrays tracking which guest FD each output entry represents and
-     * the host ident that produced it (the mute arm below needs the ident).
-     */
-    uint16_t out_gfds[256];
-    uintptr_t out_idents[256];
-    int16_t out_index[FD_TABLE_SIZE];
-    int nout = 0;
-
-    memset(out_index, 0xff, sizeof(out_index));
+    epoll_out_t o;
+    epoll_out_init(&o);
 
     /* Gather hung-up masters before taking inst->lock: the collector takes that
      * lock itself, and it is not recursive.
@@ -2851,150 +3207,18 @@ epoll_rewait:
 
     /* Serialize the regs[] reads and the oneshot re-arm against a concurrent
      * epoll_ctl or the close hook. Held only for this bookkeeping, never across
-     * the blocking kevent() above; out[] is a local snapshot, so the guest
-     * write happens after the unlock. Mirrors Linux dropping ep->mtx before
-     * copyout.
+     * the blocking kevent() above; o is a local snapshot, so the guest write
+     * happens after the unlock. Mirrors Linux dropping ep->mtx before copyout.
      */
     pthread_mutex_lock(&inst->lock);
 
-    for (int i = 0; i < nready && nout < maxevents; i++) {
-        int gfd = (int) (uintptr_t) kevents[i].udata;
-        if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE) || !inst->regs[gfd].active) {
-            struct kevent del;
-            EV_SET(&del, kevents[i].ident, kevents[i].filter, EV_DELETE, 0, 0,
-                   NULL);
-            kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
-            continue;
-        }
+    epoll_collect_ready(inst, epoll_ref.fd, kevents, nready, &o, maxevents);
 
-        /* EPOLLONESHOT semantics: once any event fired and was reported, the fd
-         * stays disarmed until EPOLL_CTL_MOD re-arms it. With multi-filter
-         * registrations (e.g. EPOLLIN | EPOLLOUT), EV_ONESHOT only removed the
-         * filter that fired; surviving filters can still fire later and would
-         * be reported here without this guard.
-         */
-        if (inst->regs[gfd].oneshot_armed)
-            continue;
+    epoll_stamp_always_readable(inst, &o, maxevents);
 
-        epoll_reg_t *reg = &inst->regs[gfd];
+    epoll_stamp_hangups(inst, &o, hup_gfds, hup_gens, nhup, maxevents);
 
-        int idx = out_index[gfd];
-        if (idx < 0) {
-            idx = nout++;
-            out_index[gfd] = idx;
-            out_gfds[idx] = gfd;
-            out_idents[idx] = kevents[i].ident;
-            out[idx].events = 0;
-            out[idx]._pad = 0;
-            out[idx].data = reg->data;
-        }
-        epoll_merge_event(&out[idx], &kevents[i], reg, gfd);
-
-        /* A disconnected usbfs device reports the hangup pair alongside any
-         * remaining reapable completions (devio.c:2842-2845; EPOLLHUP and
-         * EPOLLERR are unmaskable).
-         */
-        if (reg->usbdev && usbdev_fd_disconnected(gfd))
-            out[idx].events |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
-    }
-
-    /* Stamp EPOLLIN for the registrations whose read readiness kqueue cannot
-     * deliver. /dev/random is the only such target: Linux reports it readable
-     * once the pool is seeded and from then on always, so the answer is a
-     * property of the registration rather than something to sample. Unlike the
-     * hangup scan below this reads regs[] under the lock it already holds, so
-     * there is no unlocked snapshot to re-verify against a generation.
-     */
-    if (inst->always_readable_count > 0) {
-        for (int gfd = 0; gfd < FD_TABLE_SIZE && nout < maxevents; gfd++) {
-            epoll_reg_t *areg = &inst->regs[gfd];
-            if (!areg->always_readable || !areg->active || areg->oneshot_armed)
-                continue;
-            if (!(areg->events & LINUX_EPOLL_READABLE))
-                continue;
-            int idx = out_index[gfd];
-            if (idx < 0) {
-                idx = nout++;
-                out_index[gfd] = (int16_t) idx;
-                out_gfds[idx] = gfd;
-                out[idx].events = 0;
-                out[idx]._pad = 0;
-                out[idx].data = areg->data;
-            }
-            out[idx].events |= areg->events & LINUX_EPOLL_READABLE;
-        }
-    }
-
-    /* Stamp EPOLLHUP for the masters the host cannot report on. Linux delivers
-     * EPOLLHUP whether or not the caller asked for it, so this ignores
-     * reg->events. Merging into an existing entry keeps a hangup that lands
-     * alongside queued output reported as EPOLLIN | EPOLLHUP, the way Linux
-     * does it -- the reader drains the shell's parting output before acting on
-     * the hangup. Runs before the oneshot marking below so an fd that fired
-     * this round still carries the hangup into that same report.
-     */
-    for (int i = 0; i < nhup; i++) {
-        int gfd = hup_gfds[i];
-
-        /* Re-check under the lock: the collector tested unlocked, so a
-         * concurrent epoll_ctl or close hook may have retired the entry since.
-         * The generation match is what rejects a DEL + re-ADD of the same fd
-         * number in that window, which would otherwise report this hangup
-         * against the new registration's epoll_data.
-         */
-        if (!inst->regs[gfd].active || inst->regs[gfd].oneshot_armed ||
-            inst->regs[gfd].generation != hup_gens[i])
-            continue;
-        int idx = out_index[gfd];
-        if (idx < 0) {
-            if (nout >= maxevents)
-                break;
-            idx = nout++;
-            out_index[gfd] = idx;
-            out_gfds[idx] = gfd;
-            out_idents[idx] = 0;
-            out[idx].events = 0;
-            out[idx]._pad = 0;
-            out[idx].data = inst->regs[gfd].data;
-        }
-        out[idx].events |= LINUX_EPOLLHUP;
-    }
-
-    /* Stamp what the muted registrations can no longer learn from kqueue: their
-     * knote is silenced, so the slice loop's map-driven break lands here with
-     * nready == 0. A disconnect stamps the unmaskable hangup pair; a completion
-     * that became reapable after the mute (the mute races a concurrent reap
-     * emptying the list) stamps the writable bits it asked for. Re-validated
-     * like the hangups above; the generation match rejects a DEL + re-ADD since
-     * the mute.
-     */
-    for (int i = 0; i < muted.n; i++) {
-        int gfd = muted.gfds[i];
-        bool disc = usbdev_fd_disconnected(gfd);
-        uint32_t wr = muted.wantout[i] & inst->regs[gfd].events;
-        bool reap = wr != 0 && usbdev_fd_reapable(gfd);
-        if (!disc && !reap)
-            continue;
-        if (!inst->regs[gfd].active || inst->regs[gfd].oneshot_armed ||
-            inst->regs[gfd].generation != muted.gens[i])
-            continue;
-        int idx = out_index[gfd];
-        if (idx < 0) {
-            if (nout >= maxevents)
-                break;
-            idx = nout++;
-            out_index[gfd] = idx;
-            out_gfds[idx] = gfd;
-            out_idents[idx] = muted.idents[i];
-            out[idx].events = 0;
-            out[idx]._pad = 0;
-            out[idx].data = inst->regs[gfd].data;
-        }
-        if (disc)
-            out[idx].events |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
-        if (reap)
-            out[idx].events |= wr;
-    }
+    epoll_stamp_muted(inst, &o, &muted, maxevents);
 
     /* An always-armed usbfs completion pipe can report a kevent that maps to no
      * guest-visible bits (completions ready, EPOLLOUT not requested, no
@@ -3002,25 +3226,7 @@ epoll_rewait:
      * the mute arm below then re-enters the wait rather than returning a 0
      * count before the timeout.
      */
-    int ndropped = 0;
-    {
-        int w = 0;
-        for (int i = 0; i < nout; i++) {
-            if (out[i].events == 0) {
-                out_index[out_gfds[i]] = -1;
-                ndropped++;
-                continue;
-            }
-            if (w != i) {
-                out[w] = out[i];
-                out_gfds[w] = out_gfds[i];
-                out_idents[w] = out_idents[i];
-                out_index[out_gfds[w]] = (int16_t) w;
-            }
-            w++;
-        }
-        nout = w;
-    }
+    int ndropped = epoll_drop_empty(&o);
 
     /* Drop-compaction zeroed a positive nready: every wake was a masked usbfs
      * completion. Mute the knotes that fired and re-enter the slice loop
@@ -3030,7 +3236,7 @@ epoll_rewait:
      * EPOLLONESHOT one -- its fired EV_ONESHOT already consumed the knote, and
      * a wake the guest never saw must not consume the arm silently.
      */
-    if (nout == 0 && ndropped > 0 &&
+    if (o.n == 0 && ndropped > 0 &&
         (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0)) {
         if (epoll_mute_usb_wakes(epoll_ref.fd, inst, kevents, nready, &muted) >
             0) {
@@ -3039,18 +3245,7 @@ epoll_rewait:
         }
     }
 
-    /* Mark EPOLLONESHOT FDs as armed (fired but waiting for MOD re-arm). kqueue
-     * already removed the event (EV_ONESHOT), so poll emulation marks the
-     * registration as oneshot_armed to allow MOD but prevent further event
-     * reporting until re-armed.
-     */
-    for (int i = 0; i < nout; i++) {
-        int gfd = out_gfds[i];
-        if (RANGE_CHECK(gfd, 0, FD_TABLE_SIZE) && inst->regs[gfd].active) {
-            if (inst->regs[gfd].events & LINUX_EPOLLONESHOT)
-                inst->regs[gfd].oneshot_armed = true;
-        }
-    }
+    epoll_mark_oneshot(inst, &o);
 
     pthread_mutex_unlock(&inst->lock);
 
@@ -3067,17 +3262,14 @@ epoll_rewait:
     epoll_unmute(epoll_ref.fd, inst, &muted);
 
     /* Write results to guest */
-    if (nout > 0) {
-        for (int i = 0; i < nout; i++)
-            if (guest_write_small(g, events_gva, out,
-                                  nout * sizeof(linux_epoll_event_t)) < 0) {
-                host_fd_ref_close(&epoll_ref);
-                epoll_instance_release(inst);
-                return -LINUX_EFAULT;
-            }
+    if (o.n > 0 && guest_write_small(g, events_gva, o.ev,
+                                     o.n * sizeof(linux_epoll_event_t)) < 0) {
+        host_fd_ref_close(&epoll_ref);
+        epoll_instance_release(inst);
+        return -LINUX_EFAULT;
     }
 
     host_fd_ref_close(&epoll_ref);
     epoll_instance_release(inst);
-    return nout;
+    return o.n;
 }

@@ -1743,6 +1743,160 @@ static int64_t fcntl_host_ref_open(int fd,
     return 0;
 }
 
+/* fcntl(F_SETFL): replace the settable status flags. O_APPEND, O_ASYNC,
+ * O_DIRECT, O_NOATIME and O_NONBLOCK are the writable ones; the rest of @arg is
+ * dropped as Linux drops it, except on a FUSE fd, whose shadow keeps every bit
+ * outside the preserved open flags. Where the flag lives depends on the fd: a
+ * FUSE shadow, elfuse's own anon-inode emulation, or a real host description
+ * plus the shadow for the bits macOS has no equivalent for. @snap is the slot
+ * as the caller snapshotted it, so a close and reopen in between is EBADF and
+ * not a change to an unrelated fd.
+ */
+static int64_t fcntl_setfl(int fd, const fd_entry_t *snap, uint64_t arg)
+{
+    bool fuse_fd = (snap->type == FD_FUSE_DEV || snap->type == FD_FUSE_FILE ||
+                    snap->type == FD_FUSE_DIR);
+    if (fuse_fd) {
+        /* Preserve LINUX_O_ACCMODE: F_SETFL is not allowed to change the access
+         * mode in the Linux kernel, and without preserving it here a stray
+         * F_SETFL(0) would silently flip an O_RDWR FUSE shadow to O_RDONLY,
+         * surfacing the wrong mode through F_GETFL.
+         *
+         * Hold fd_lock across the read-modify-write so the update is atomic
+         * against a concurrent F_SETFD and any fd_lock-protected reader.
+         * Revalidate against the snapshot generation so a close+reopen returns
+         * EBADF.
+         */
+        pthread_mutex_lock(&fd_lock);
+        if (fd_table[fd].type != snap->type ||
+            fd_table[fd].generation != snap->generation) {
+            pthread_mutex_unlock(&fd_lock);
+            return -LINUX_EBADF;
+        }
+        int preserved = fd_table[fd].linux_flags &
+                        (LINUX_O_ACCMODE | LINUX_O_CLOEXEC | LINUX_O_PATH |
+                         LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
+                         LINUX_O_LARGEFILE);
+        fd_table[fd].linux_flags =
+            preserved |
+            ((int) arg & ~(LINUX_O_ACCMODE | LINUX_O_CLOEXEC | LINUX_O_PATH |
+                           LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+                           LINUX_O_DIRECT | LINUX_O_LARGEFILE));
+        pthread_mutex_unlock(&fd_lock);
+        asyncio_apply(fd, snap->generation, ((int) arg & LINUX_O_ASYNC));
+        return 0;
+    }
+
+    /* An fd elfuse emulates whole has no host description to tell. The fd
+     * behind it is elfuse's own pipe or kqueue, held at the flags the emulation
+     * needs, and a kqueue rejects fcntl(F_SETFL) outright: this used to be a
+     * hand-written timerfd branch, while signalfd, inotify, eventfd, epoll,
+     * pidfd and netlink fell through to the host call below and set flags on
+     * elfuse's own descriptor. fd_host_flag_mask says which types those are,
+     * and answers the same question F_GETFL asks it.
+     *
+     * Of Linux's writable status flags (O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME,
+     * O_NONBLOCK) these anon-inode objects honor O_APPEND, O_NONBLOCK and
+     * O_NOATIME. O_DIRECT is refused because the inode lacks FMODE_CAN_ODIRECT.
+     * Bits outside the writable set (access mode, CLOEXEC, O_PATH and friends)
+     * are silently dropped, as Linux drops them.
+     */
+    if (fd_host_flag_mask(snap->type) == 0) {
+        const int setfl_mask =
+            LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME;
+        if ((int) arg & LINUX_O_DIRECT)
+            return -LINUX_EINVAL;
+
+        /* The sweep below revalidates the generation and does nothing when it
+         * moved, which would report success for a write that never happened; a
+         * closed or reopened slot owes the guest EBADF.
+         */
+        pthread_mutex_lock(&fd_lock);
+        bool live = fd_table[fd].type == snap->type &&
+                    fd_table[fd].generation == snap->generation;
+        pthread_mutex_unlock(&fd_lock);
+        if (!live)
+            return -LINUX_EBADF;
+
+        /* Every bit here is answered from the shadow, and each one is per open
+         * file description, so the sweep has to reach every alias rather than
+         * only the name the guest passed. O_NONBLOCK needs no second pass for
+         * that: it is in setfl_mask like the rest.
+         *
+         * The sweep revalidates the generation itself, so a close+reopen
+         * between the snapshot and here changes nothing and the separate
+         * lock-and-check this replaced is gone.
+         */
+        fd_set_shadow_flags(fd, snap->generation, setfl_mask, (int) arg);
+        asyncio_apply(fd, snap->generation, ((int) arg & LINUX_O_ASYNC));
+        return 0;
+    }
+
+    /* A socket has no O_DIRECT to set: Linux answers EINVAL, since the inode
+     * has no FMODE_CAN_ODIRECT. A pipe does accept it -- that is packet mode,
+     * not a filesystem property -- so the reject is by type and not by "regular
+     * files only". Measured against qemu-aarch64: pipe rc=0 reported=1, socket
+     * rc=-1 errno=22, regular rc=0.
+     *
+     * Rejected before anything is applied, as Linux rejects it: setfl() checks
+     * O_DIRECT ahead of the flag store, so a call that fails here must not have
+     * landed the other bits it carried.
+     */
+    if (((int) arg & LINUX_O_DIRECT) && snap->type == FD_SOCKET)
+        return -LINUX_EINVAL;
+
+    host_fd_ref_t host_ref;
+    int64_t ref_err = fcntl_host_ref_open(fd, snap, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
+
+    /* An owned fd keeps O_NONBLOCK on the host whatever the guest asks; the
+     * request is recorded in the shadow below and the transfer paths read it
+     * from there.
+     */
+    int mac_fl = linux_to_mac_status_flags((int) arg);
+
+    /* The host flag is not the guest's to change on these: elfuse holds it set,
+     * either to keep the transfer non-parking or because the host fd is its own
+     * pipe behind a synthetic fd. The request is recorded in the shadow below
+     * instead.
+     */
+    if (fd_nonblock_shadowed(snap->type, snap->nonblock_owned))
+        mac_fl |= O_NONBLOCK;
+    int rc = fcntl(host_ref.fd, F_SETFL, mac_fl);
+    if (rc < 0) {
+        int64_t err = linux_errno();
+        host_fd_ref_close(&host_ref);
+        return err;
+    }
+
+    /* The settable bits macOS has no equivalent for are answered from the
+     * shadow (fd_host_flag_mask), so F_SETFL has to write them there or F_GETFL
+     * keeps reporting whatever open() recorded. O_DIRECT and O_NOATIME are
+     * those two; O_NONBLOCK and O_ASYNC have their own paths below. Measured
+     * before this: Linux takes O_NOATIME from 0 to 1 and back, elfuse stayed at
+     * 0 throughout.
+     */
+    int shadow_setfl =
+        (LINUX_O_DIRECT | LINUX_O_NOATIME) & ~fd_host_flag_mask(snap->type);
+    if (shadow_setfl)
+        fd_set_shadow_flags(fd, snap->generation, shadow_setfl, (int) arg);
+
+    /* The guest's O_NONBLOCK for an owned fd lives in the shadow, which is what
+     * the transfer paths and F_GETFL read. It reaches every dup alias because
+     * Linux keeps O_NONBLOCK on the open file description.
+     */
+    fd_apply_guest_nonblock(fd, ((int) arg & LINUX_O_NONBLOCK) != 0);
+
+    /* O_ASYNC is elfuse-managed: track the armed bit and (dis)arm the SIGIO
+     * watcher. asyncio_apply rescans the slot under fd_lock and uses each
+     * alias's real backing fd rather than the one this call pinned.
+     */
+    asyncio_apply(fd, snap->generation, ((int) arg & LINUX_O_ASYNC));
+    host_fd_ref_close(&host_ref);
+    return 0;
+}
+
 int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -1756,10 +1910,6 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     fd_entry_t fd_snap;
     if (!fd_snapshot(fd, &fd_snap))
         return -LINUX_EBADF;
-
-    int fd_type = fd_snap.type;
-    bool fuse_fd = (fd_type == FD_FUSE_DEV || fd_type == FD_FUSE_FILE ||
-                    fd_type == FD_FUSE_DIR);
 
     /* Linux F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4,
      * F_DUPFD_CLOEXEC=1030
@@ -1829,149 +1979,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
                (mac_to_linux_status_flags(mac_fl) & host_mask);
     }
     case 4: /* F_SETFL */
-    {
-        if (fuse_fd) {
-            /* Preserve LINUX_O_ACCMODE: F_SETFL is not allowed to change the
-             * access mode in the Linux kernel, and without preserving it here a
-             * stray F_SETFL(0) would silently flip an O_RDWR FUSE shadow to
-             * O_RDONLY, surfacing the wrong mode through F_GETFL.
-             *
-             * Hold fd_lock across the read-modify-write so the update is atomic
-             * against a concurrent F_SETFD and any fd_lock-protected reader.
-             * Revalidate against the snapshot generation so a close+reopen
-             * returns EBADF.
-             */
-            pthread_mutex_lock(&fd_lock);
-            if (fd_table[fd].type != fd_type ||
-                fd_table[fd].generation != fd_snap.generation) {
-                pthread_mutex_unlock(&fd_lock);
-                return -LINUX_EBADF;
-            }
-            int preserved = fd_table[fd].linux_flags &
-                            (LINUX_O_ACCMODE | LINUX_O_CLOEXEC | LINUX_O_PATH |
-                             LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-                             LINUX_O_DIRECT | LINUX_O_LARGEFILE);
-            fd_table[fd].linux_flags =
-                preserved | ((int) arg & ~(LINUX_O_ACCMODE | LINUX_O_CLOEXEC |
-                                           LINUX_O_PATH | LINUX_O_DIRECTORY |
-                                           LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
-                                           LINUX_O_LARGEFILE));
-            pthread_mutex_unlock(&fd_lock);
-            asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
-            return 0;
-        }
-
-        /* An fd elfuse emulates whole has no host description to tell. The fd
-         * behind it is elfuse's own pipe or kqueue, held at the flags the
-         * emulation needs, and a kqueue rejects fcntl(F_SETFL) outright: this
-         * used to be a hand-written timerfd branch, while signalfd, inotify,
-         * eventfd, epoll, pidfd and netlink fell through to the host call below
-         * and set flags on elfuse's own descriptor. fd_host_flag_mask says
-         * which types those are, and answers the same question F_GETFL asks it.
-         *
-         * Of Linux's writable status flags (O_APPEND, O_ASYNC, O_DIRECT,
-         * O_NOATIME, O_NONBLOCK) these anon-inode objects honor O_APPEND,
-         * O_NONBLOCK and O_NOATIME. O_DIRECT is refused because the inode lacks
-         * FMODE_CAN_ODIRECT. Bits outside the writable set (access mode,
-         * CLOEXEC, O_PATH and friends) are silently dropped, as Linux drops
-         * them.
-         */
-        if (fd_host_flag_mask(fd_snap.type) == 0) {
-            const int setfl_mask =
-                LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME;
-            if ((int) arg & LINUX_O_DIRECT)
-                return -LINUX_EINVAL;
-
-            /* The sweep below revalidates the generation and does nothing when
-             * it moved, which would report success for a write that never
-             * happened; a closed or reopened slot owes the guest EBADF.
-             */
-            pthread_mutex_lock(&fd_lock);
-            bool live = fd_table[fd].type == fd_snap.type &&
-                        fd_table[fd].generation == fd_snap.generation;
-            pthread_mutex_unlock(&fd_lock);
-            if (!live)
-                return -LINUX_EBADF;
-
-            /* Every bit here is answered from the shadow, and each one is per
-             * open file description, so the sweep has to reach every alias
-             * rather than only the name the guest passed. O_NONBLOCK needs no
-             * second pass for that: it is in setfl_mask like the rest.
-             *
-             * The sweep revalidates the generation itself, so a close+reopen
-             * between the snapshot and here changes nothing and the separate
-             * lock-and-check this replaced is gone.
-             */
-            fd_set_shadow_flags(fd, fd_snap.generation, setfl_mask, (int) arg);
-            asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
-            return 0;
-        }
-
-        /* A socket has no O_DIRECT to set: Linux answers EINVAL, since the
-         * inode has no FMODE_CAN_ODIRECT. A pipe does accept it -- that is
-         * packet mode, not a filesystem property -- so the reject is by type
-         * and not by "regular files only". Measured against qemu-aarch64: pipe
-         * rc=0 reported=1, socket rc=-1 errno=22, regular rc=0.
-         *
-         * Rejected before anything is applied, as Linux rejects it: setfl()
-         * checks O_DIRECT ahead of the flag store, so a call that fails here
-         * must not have landed the other bits it carried.
-         */
-        if (((int) arg & LINUX_O_DIRECT) && fd_snap.type == FD_SOCKET)
-            return -LINUX_EINVAL;
-
-        host_fd_ref_t host_ref;
-        int64_t ref_err = fcntl_host_ref_open(fd, &fd_snap, &host_ref);
-        if (ref_err < 0)
-            return ref_err;
-
-        /* An owned fd keeps O_NONBLOCK on the host whatever the guest asks; the
-         * request is recorded in the shadow below and the transfer paths read
-         * it from there.
-         */
-        int mac_fl = linux_to_mac_status_flags((int) arg);
-
-        /* The host flag is not the guest's to change on these: elfuse holds it
-         * set, either to keep the transfer non-parking or because the host fd
-         * is its own pipe behind a synthetic fd. The request is recorded in the
-         * shadow below instead.
-         */
-        if (fd_nonblock_shadowed(fd_snap.type, fd_snap.nonblock_owned))
-            mac_fl |= O_NONBLOCK;
-        int rc = fcntl(host_ref.fd, F_SETFL, mac_fl);
-        if (rc < 0) {
-            int64_t err = linux_errno();
-            host_fd_ref_close(&host_ref);
-            return err;
-        }
-
-        /* The settable bits macOS has no equivalent for are answered from the
-         * shadow (fd_host_flag_mask), so F_SETFL has to write them there or
-         * F_GETFL keeps reporting whatever open() recorded. O_DIRECT and
-         * O_NOATIME are those two; O_NONBLOCK and O_ASYNC have their own paths
-         * below. Measured before this: Linux takes O_NOATIME from 0 to 1 and
-         * back, elfuse stayed at 0 throughout.
-         */
-        int shadow_setfl = (LINUX_O_DIRECT | LINUX_O_NOATIME) &
-                           ~fd_host_flag_mask(fd_snap.type);
-        if (shadow_setfl)
-            fd_set_shadow_flags(fd, fd_snap.generation, shadow_setfl,
-                                (int) arg);
-
-        /* The guest's O_NONBLOCK for an owned fd lives in the shadow, which is
-         * what the transfer paths and F_GETFL read. It reaches every dup alias
-         * because Linux keeps O_NONBLOCK on the open file description.
-         */
-        fd_apply_guest_nonblock(fd, ((int) arg & LINUX_O_NONBLOCK) != 0);
-
-        /* O_ASYNC is elfuse-managed: track the armed bit and (dis)arm the SIGIO
-         * watcher. asyncio_apply rescans the slot under fd_lock and uses each
-         * alias's real backing fd rather than the one this call pinned.
-         */
-        asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
-        host_fd_ref_close(&host_ref);
-        return 0;
-    }
+        return fcntl_setfl(fd, &fd_snap, arg);
     case 5:   /* F_GETLK */
     case 6:   /* F_SETLK */
     case 7: { /* F_SETLKW */
@@ -3833,6 +3841,24 @@ int64_t sys_fchmod(int fd, uint32_t mode)
     return 0;
 }
 
+/* Guard for an AT_EMPTY_PATH operation on AT_FDCWD. That form never reaches
+ * path_translate_at, so the FUSE interception it normally gets has to be asked
+ * by hand: a FUSE-backed cwd is ENOSYS, a failed probe is its errno.
+ *
+ * Returns 0 when the host cwd can be used directly.
+ */
+static int64_t fuse_cwd_empty_path_check(void)
+{
+    char fuse_buf[LINUX_PATH_MAX];
+    int fuse_rc =
+        fuse_resolve_at_path(LINUX_AT_FDCWD, ".", fuse_buf, sizeof(fuse_buf));
+    if (fuse_rc < 0)
+        return linux_errno();
+    if (fuse_rc > 0)
+        return -LINUX_ENOSYS;
+    return 0;
+}
+
 int64_t sys_fchmodat(guest_t *g,
                      int dirfd,
                      uint64_t path_gva,
@@ -3854,13 +3880,9 @@ int64_t sys_fchmodat(guest_t *g,
      */
     if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
         if (dirfd == LINUX_AT_FDCWD) {
-            char fuse_buf[LINUX_PATH_MAX];
-            int fuse_rc = fuse_resolve_at_path(LINUX_AT_FDCWD, ".", fuse_buf,
-                                               sizeof(fuse_buf));
-            if (fuse_rc < 0)
-                return linux_errno();
-            if (fuse_rc > 0)
-                return -LINUX_ENOSYS;
+            int64_t fuse_err = fuse_cwd_empty_path_check();
+            if (fuse_err < 0)
+                return fuse_err;
             if (fchmodat(AT_FDCWD, ".", mode, translate_at_flags(flags)) < 0)
                 return linux_errno();
             return 0;
@@ -4005,13 +4027,9 @@ int64_t sys_fchownat(guest_t *g,
      */
     if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
         if (dirfd == LINUX_AT_FDCWD) {
-            char fuse_buf[LINUX_PATH_MAX];
-            int fuse_rc = fuse_resolve_at_path(LINUX_AT_FDCWD, ".", fuse_buf,
-                                               sizeof(fuse_buf));
-            if (fuse_rc < 0)
-                return linux_errno();
-            if (fuse_rc > 0)
-                return -LINUX_ENOSYS;
+            int64_t fuse_err = fuse_cwd_empty_path_check();
+            if (fuse_err < 0)
+                return fuse_err;
 
             /* Open "." once so fchown and the follow-up stat operate on the
              * same descriptor. Resolving "." twice (fchownat then fstatat)

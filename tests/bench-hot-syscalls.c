@@ -592,6 +592,341 @@ static void run_case(const bench_case_t *bc, unsigned long iters)
     printf("%-20s %10.1f ns/op  last=%ld\n", bc->name, ns_per_op, last);
 }
 
+/* Everything the benchmark cases borrow: open descriptors, scratch buffers and
+ * the per-case argument records. The descriptors start at -1 so one close
+ * function releases whatever setup got as far as opening.
+ */
+typedef struct {
+    int nullfd, sock, zerofd, regfd, epfd;
+    int msg_sv[2], dgram_sv[2], pipefd[2], ep_pipefd[2];
+    char tmp_path[32];
+    struct timespec ts;
+    struct timeval tv;
+    unsigned char randbuf8[8], randbuf256[256];
+    uint64_t affinity_mask;
+    getrandom_ctx_t getrandom8_ctx, getrandom256_ctx;
+    dup_ctx_t dup3_ctx;
+    path_ctx_t path_ctx;
+    statx_ctx_t statx_ctx;
+    iov_ctx_t writev_ctx, readv_ctx, preadv_ctx, pwritev_ctx;
+    pwritev2_ctx_t pwritev2_append_ctx;
+    msg_ctx_t sendmsg_ctx, recvmsg_ctx, sendmsg2_ctx, recvmsg2_ctx;
+    mmsg_ctx_t sendmmsg_ctx, recvmmsg_ctx;
+    sockname_ctx_t getsockname_ctx, getpeername_ctx;
+    sockaddr_io_ctx_t sendto_ctx, recvfrom_ctx;
+    sockopt_ctx_t reuseaddr, nodelay, sndbuf;
+    ppoll_ctx_t ppoll_ctx;
+    pselect_ctx_t pselect_ctx;
+    sysquery_ctx_t sysquery_ctx;
+    epoll_ctx_t epoll_ctx;
+} bench_fx_t;
+
+static void close_fd(int *fd)
+{
+    if (*fd >= 0)
+        close(*fd);
+    *fd = -1;
+}
+
+static void bench_fx_close(bench_fx_t *fx)
+{
+    close_fd(&fx->epfd);
+    close_fd(&fx->ep_pipefd[0]);
+    close_fd(&fx->ep_pipefd[1]);
+    close_fd(&fx->pipefd[0]);
+    close_fd(&fx->pipefd[1]);
+    close_fd(&fx->dgram_sv[0]);
+    close_fd(&fx->dgram_sv[1]);
+    close_fd(&fx->msg_sv[0]);
+    close_fd(&fx->msg_sv[1]);
+    if (fx->regfd >= 0) {
+        close(fx->regfd);
+        unlink(fx->tmp_path);
+        fx->regfd = -1;
+    }
+    close_fd(&fx->zerofd);
+    close_fd(&fx->sock);
+    close_fd(&fx->nullfd);
+}
+
+/* Open every descriptor the cases need, in the order the cases were written.
+ * Returns 0, or -1 after reporting the failing call; the caller closes whatever
+ * was opened.
+ */
+static int bench_fx_open(bench_fx_t *fx)
+{
+    fx->nullfd = open("/dev/null", O_RDONLY);
+    if (fx->nullfd < 0) {
+        perror("open /dev/null");
+        return -1;
+    }
+    fx->sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (fx->sock < 0) {
+        perror("socket");
+        return -1;
+    }
+    fx->zerofd = open("/dev/zero", O_RDONLY);
+    if (fx->zerofd < 0) {
+        perror("open /dev/zero");
+        return -1;
+    }
+    memcpy(fx->tmp_path, "/tmp/elfuse-bench-iov-XXXXXX",
+           sizeof("/tmp/elfuse-bench-iov-XXXXXX"));
+    fx->regfd = mkstemp(fx->tmp_path);
+    if (fx->regfd < 0) {
+        perror("mkstemp");
+        return -1;
+    }
+    char reg_seed[32];
+    memset(reg_seed, 'R', sizeof(reg_seed));
+    if (write(fx->regfd, reg_seed, sizeof(reg_seed)) !=
+        (ssize_t) sizeof(reg_seed)) {
+        perror("seed write");
+        return -1;
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fx->msg_sv) < 0) {
+        perror("socketpair");
+        return -1;
+    }
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fx->dgram_sv) < 0) {
+        perror("socketpair dgram");
+        return -1;
+    }
+    if (pipe(fx->pipefd) < 0 || pipe(fx->ep_pipefd) < 0) {
+        perror("pipe");
+        return -1;
+    }
+    fx->epfd = epoll_create1(0);
+    if (fx->epfd < 0) {
+        perror("epoll_create1");
+        return -1;
+    }
+    struct epoll_event setup_ev = {
+        .events = EPOLLIN,
+        .data.fd = fx->ep_pipefd[0],
+    };
+    if (epoll_ctl(fx->epfd, EPOLL_CTL_ADD, fx->ep_pipefd[0], &setup_ev) < 0) {
+        perror("epoll_ctl");
+        return -1;
+    }
+    if (write(fx->pipefd[1], "f", 1) != 1) {
+        perror("pipe seed");
+        return -1;
+    }
+    return 0;
+}
+
+static void bench_fx_init(bench_fx_t *fx)
+{
+    memset(fx, 0, sizeof(*fx));
+    fx->nullfd = fx->sock = fx->zerofd = fx->regfd = fx->epfd = -1;
+    fx->msg_sv[0] = fx->msg_sv[1] = -1;
+    fx->dgram_sv[0] = fx->dgram_sv[1] = -1;
+    fx->pipefd[0] = fx->pipefd[1] = -1;
+    fx->ep_pipefd[0] = fx->ep_pipefd[1] = -1;
+}
+
+/* Fill the per-case argument records from the descriptors just opened. The
+ * records point into fx itself, so fx must not be copied afterwards.
+ */
+static void bench_fx_setup_ctxs(bench_fx_t *fx)
+{
+    fx->getrandom8_ctx = (getrandom_ctx_t) {
+        .buf = fx->randbuf8,
+        .len = sizeof(fx->randbuf8),
+    };
+    fx->getrandom256_ctx = (getrandom_ctx_t) {
+        .buf = fx->randbuf256,
+        .len = sizeof(fx->randbuf256),
+    };
+    fx->affinity_mask = 1;
+    fx->dup3_ctx = (dup_ctx_t) {
+        .oldfd = fx->nullfd,
+        .newfd = 200,
+    };
+
+    fx->path_ctx = (path_ctx_t) {
+        .path = fx->tmp_path,
+        .dirfd = AT_FDCWD,
+    };
+    fx->statx_ctx = (statx_ctx_t) {
+        .path = fx->tmp_path,
+        .dirfd = AT_FDCWD,
+        .flags = 0,
+        .mask = 0x7ff,
+    };
+
+    static char writev_buf0[8] = "abcd123", writev_buf1[8] = "WXYZ789";
+    static char readv_buf0[8], readv_buf1[8];
+    fx->writev_ctx = (iov_ctx_t) {
+        .fd = fx->nullfd,
+        .iov =
+            {
+                {.iov_base = writev_buf0, .iov_len = sizeof(writev_buf0)},
+                {.iov_base = writev_buf1, .iov_len = sizeof(writev_buf1)},
+            },
+    };
+    fx->readv_ctx = (iov_ctx_t) {
+        .fd = fx->zerofd,
+        .iov =
+            {
+                {.iov_base = readv_buf0, .iov_len = sizeof(readv_buf0)},
+                {.iov_base = readv_buf1, .iov_len = sizeof(readv_buf1)},
+            },
+    };
+    fx->preadv_ctx = (iov_ctx_t) {
+        .fd = fx->regfd,
+        .iov =
+            {
+                {.iov_base = readv_buf0, .iov_len = sizeof(readv_buf0)},
+                {.iov_base = readv_buf1, .iov_len = sizeof(readv_buf1)},
+            },
+    };
+    fx->pwritev_ctx = (iov_ctx_t) {
+        .fd = fx->regfd,
+        .iov =
+            {
+                {.iov_base = writev_buf0, .iov_len = sizeof(writev_buf0)},
+                {.iov_base = writev_buf1, .iov_len = sizeof(writev_buf1)},
+            },
+    };
+    fx->pwritev2_append_ctx = (pwritev2_ctx_t) {
+        .fd = fx->regfd,
+        .flags = RWF_APPEND,
+        .iov =
+            {
+                {.iov_base = writev_buf0, .iov_len = sizeof(writev_buf0)},
+                {.iov_base = writev_buf1, .iov_len = sizeof(writev_buf1)},
+            },
+    };
+    fx->sendmsg_ctx = (msg_ctx_t) {
+        .txfd = fx->msg_sv[0],
+        .rxfd = fx->msg_sv[1],
+        .msg = {.msg_iov = NULL, .msg_iovlen = 1},
+        .send_len = 8,
+    };
+    memcpy(fx->sendmsg_ctx.payload0, "sendmsg1", 8);
+    fx->sendmsg_ctx.iov[0].iov_base = fx->sendmsg_ctx.payload0;
+    fx->sendmsg_ctx.iov[0].iov_len = fx->sendmsg_ctx.send_len;
+    fx->sendmsg_ctx.msg.msg_iov = &fx->sendmsg_ctx.iov[0];
+
+    fx->recvmsg_ctx = (msg_ctx_t) {
+        .txfd = fx->msg_sv[0],
+        .rxfd = fx->msg_sv[1],
+        .msg = {.msg_iov = NULL, .msg_iovlen = 1},
+        .send_len = 8,
+    };
+    memcpy(fx->recvmsg_ctx.payload0, "recvmsg1", 8);
+    fx->recvmsg_ctx.iov[0].iov_base = fx->recvmsg_ctx.drain0;
+    fx->recvmsg_ctx.iov[0].iov_len = fx->recvmsg_ctx.send_len;
+    fx->recvmsg_ctx.msg.msg_iov = &fx->recvmsg_ctx.iov[0];
+
+    fx->sendmsg2_ctx = (msg_ctx_t) {
+        .txfd = fx->msg_sv[0],
+        .rxfd = fx->msg_sv[1],
+        .msg = {.msg_iov = NULL, .msg_iovlen = 2},
+        .send_len = 12,
+    };
+    memcpy(fx->sendmsg2_ctx.payload0, "send", 4);
+    memcpy(fx->sendmsg2_ctx.payload1, "msg-2iov", 8);
+    fx->sendmsg2_ctx.iov[0].iov_base = fx->sendmsg2_ctx.payload0;
+    fx->sendmsg2_ctx.iov[0].iov_len = 4;
+    fx->sendmsg2_ctx.iov[1].iov_base = fx->sendmsg2_ctx.payload1;
+    fx->sendmsg2_ctx.iov[1].iov_len = 8;
+    fx->sendmsg2_ctx.msg.msg_iov = &fx->sendmsg2_ctx.iov[0];
+
+    fx->recvmsg2_ctx = (msg_ctx_t) {
+        .txfd = fx->msg_sv[0],
+        .rxfd = fx->msg_sv[1],
+        .msg = {.msg_iov = NULL, .msg_iovlen = 2},
+        .send_len = 12,
+    };
+    memcpy(fx->recvmsg2_ctx.payload0, "recv", 4);
+    memcpy(fx->recvmsg2_ctx.payload1, "msg-2iov", 8);
+    fx->recvmsg2_ctx.iov[0].iov_base = fx->recvmsg2_ctx.drain0;
+    fx->recvmsg2_ctx.iov[0].iov_len = 4;
+    fx->recvmsg2_ctx.iov[1].iov_base = fx->recvmsg2_ctx.drain1;
+    fx->recvmsg2_ctx.iov[1].iov_len = 8;
+    fx->recvmsg2_ctx.msg.msg_iov = &fx->recvmsg2_ctx.iov[0];
+    fx->sendmmsg_ctx = (mmsg_ctx_t) {
+        .txfd = fx->msg_sv[0],
+        .rxfd = fx->msg_sv[1],
+        .send_len = 8,
+    };
+    memcpy(fx->sendmmsg_ctx.payload, "sendmmsg", 8);
+    fx->sendmmsg_ctx.iov.iov_base = fx->sendmmsg_ctx.payload;
+    fx->sendmmsg_ctx.iov.iov_len = fx->sendmmsg_ctx.send_len;
+    fx->sendmmsg_ctx.mmsg.msg_hdr.msg_iov = &fx->sendmmsg_ctx.iov;
+    fx->sendmmsg_ctx.mmsg.msg_hdr.msg_iovlen = 1;
+
+    fx->recvmmsg_ctx = (mmsg_ctx_t) {
+        .txfd = fx->msg_sv[0],
+        .rxfd = fx->msg_sv[1],
+        .send_len = 8,
+    };
+    memcpy(fx->recvmmsg_ctx.payload, "recvmmsg", 8);
+    fx->recvmmsg_ctx.iov.iov_base = fx->recvmmsg_ctx.drain;
+    fx->recvmmsg_ctx.iov.iov_len = fx->recvmmsg_ctx.send_len;
+    fx->recvmmsg_ctx.mmsg.msg_hdr.msg_iov = &fx->recvmmsg_ctx.iov;
+    fx->recvmmsg_ctx.mmsg.msg_hdr.msg_iovlen = 1;
+    fx->getsockname_ctx = (sockname_ctx_t) {
+        .fd = fx->msg_sv[0],
+        .len = sizeof(struct sockaddr_un),
+    };
+    fx->getpeername_ctx = (sockname_ctx_t) {
+        .fd = fx->msg_sv[0],
+        .len = sizeof(struct sockaddr_un),
+    };
+    fx->sendto_ctx = (sockaddr_io_ctx_t) {
+        .txfd = fx->dgram_sv[0],
+        .rxfd = fx->dgram_sv[1],
+        .addrlen = sizeof(struct sockaddr_un),
+    };
+    memcpy(fx->sendto_ctx.payload, "sendto!!", sizeof(fx->sendto_ctx.payload));
+    fx->recvfrom_ctx = (sockaddr_io_ctx_t) {
+        .txfd = fx->dgram_sv[0],
+        .rxfd = fx->dgram_sv[1],
+        .addrlen = sizeof(struct sockaddr_un),
+    };
+    memcpy(fx->recvfrom_ctx.payload, "reply!!!",
+           sizeof(fx->recvfrom_ctx.payload));
+
+    fx->reuseaddr = (sockopt_ctx_t) {
+        .fd = fx->sock,
+        .level = SOL_SOCKET,
+        .optname = SO_REUSEADDR,
+        .value = 1,
+        .len = sizeof(int),
+    };
+    fx->nodelay = (sockopt_ctx_t) {
+        .fd = fx->sock,
+        .level = IPPROTO_TCP,
+        .optname = TCP_NODELAY,
+        .value = 1,
+        .len = sizeof(int),
+    };
+    fx->sndbuf = (sockopt_ctx_t) {
+        .fd = fx->sock,
+        .level = SOL_SOCKET,
+        .optname = SO_SNDBUF,
+        .value = 0,
+        .len = sizeof(int),
+    };
+    fx->ppoll_ctx = (ppoll_ctx_t) {
+        .pfd = {.fd = fx->pipefd[1], .events = POLLOUT, .revents = 0},
+        .ts = {.tv_sec = 0, .tv_nsec = 0},
+    };
+    fx->pselect_ctx = (pselect_ctx_t) {
+        .ts = {.tv_sec = 0, .tv_nsec = 0},
+    };
+    fx->sysquery_ctx = (sysquery_ctx_t) {0};
+    fx->sysquery_ctx.ioctl_value = fx->pipefd[0];
+    fx->epoll_ctx = (epoll_ctx_t) {
+        .epfd = fx->epfd,
+        .ts = {.tv_sec = 0, .tv_nsec = 0},
+    };
+}
+
 int main(int argc, char **argv)
 {
     /* Line-buffer stdout so each completed case is visible immediately when the
@@ -609,341 +944,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    struct timespec ts = {0};
-    struct timeval tv = {0};
-    unsigned char randbuf8[8] = {0};
-    unsigned char randbuf256[256] = {0};
-    getrandom_ctx_t getrandom8_ctx = {
-        .buf = randbuf8,
-        .len = sizeof(randbuf8),
-    };
-    getrandom_ctx_t getrandom256_ctx = {
-        .buf = randbuf256,
-        .len = sizeof(randbuf256),
-    };
-    uint64_t affinity_mask = 1;
-    int nullfd = open("/dev/null", O_RDONLY);
-    if (nullfd < 0) {
-        perror("open /dev/null");
+    bench_fx_t fxs;
+    bench_fx_t *fx = &fxs;
+    bench_fx_init(fx);
+    if (bench_fx_open(fx) < 0) {
+        bench_fx_close(fx);
         return 1;
     }
-    dup_ctx_t dup3_ctx = {
-        .oldfd = nullfd,
-        .newfd = 200,
-    };
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        close(nullfd);
-        return 1;
-    }
-    int zerofd = open("/dev/zero", O_RDONLY);
-    if (zerofd < 0) {
-        perror("open /dev/zero");
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    char tmp_path[] = "/tmp/elfuse-bench-iov-XXXXXX";
-    int regfd = mkstemp(tmp_path);
-    if (regfd < 0) {
-        perror("mkstemp");
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    char reg_seed[32];
-    memset(reg_seed, 'R', sizeof(reg_seed));
-    if (write(regfd, reg_seed, sizeof(reg_seed)) !=
-        (ssize_t) sizeof(reg_seed)) {
-        perror("seed write");
-        close(regfd);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    path_ctx_t path_ctx = {
-        .path = tmp_path,
-        .dirfd = AT_FDCWD,
-    };
-    statx_ctx_t statx_ctx = {
-        .path = tmp_path,
-        .dirfd = AT_FDCWD,
-        .flags = 0,
-        .mask = 0x7ff,
-    };
-
-    static char writev_buf0[8] = "abcd123", writev_buf1[8] = "WXYZ789";
-    static char readv_buf0[8], readv_buf1[8];
-    iov_ctx_t writev_ctx = {
-        .fd = nullfd,
-        .iov =
-            {
-                {.iov_base = writev_buf0, .iov_len = sizeof(writev_buf0)},
-                {.iov_base = writev_buf1, .iov_len = sizeof(writev_buf1)},
-            },
-    };
-    iov_ctx_t readv_ctx = {
-        .fd = zerofd,
-        .iov =
-            {
-                {.iov_base = readv_buf0, .iov_len = sizeof(readv_buf0)},
-                {.iov_base = readv_buf1, .iov_len = sizeof(readv_buf1)},
-            },
-    };
-    iov_ctx_t preadv_ctx = {
-        .fd = regfd,
-        .iov =
-            {
-                {.iov_base = readv_buf0, .iov_len = sizeof(readv_buf0)},
-                {.iov_base = readv_buf1, .iov_len = sizeof(readv_buf1)},
-            },
-    };
-    iov_ctx_t pwritev_ctx = {
-        .fd = regfd,
-        .iov =
-            {
-                {.iov_base = writev_buf0, .iov_len = sizeof(writev_buf0)},
-                {.iov_base = writev_buf1, .iov_len = sizeof(writev_buf1)},
-            },
-    };
-    pwritev2_ctx_t pwritev2_append_ctx = {
-        .fd = regfd,
-        .flags = RWF_APPEND,
-        .iov =
-            {
-                {.iov_base = writev_buf0, .iov_len = sizeof(writev_buf0)},
-                {.iov_base = writev_buf1, .iov_len = sizeof(writev_buf1)},
-            },
-    };
-    int msg_sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, msg_sv) < 0) {
-        perror("socketpair");
-        close(regfd);
-        unlink(tmp_path);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    msg_ctx_t sendmsg_ctx = {
-        .txfd = msg_sv[0],
-        .rxfd = msg_sv[1],
-        .msg = {.msg_iov = NULL, .msg_iovlen = 1},
-        .send_len = 8,
-    };
-    memcpy(sendmsg_ctx.payload0, "sendmsg1", 8);
-    sendmsg_ctx.iov[0].iov_base = sendmsg_ctx.payload0;
-    sendmsg_ctx.iov[0].iov_len = sendmsg_ctx.send_len;
-    sendmsg_ctx.msg.msg_iov = &sendmsg_ctx.iov[0];
-
-    msg_ctx_t recvmsg_ctx = {
-        .txfd = msg_sv[0],
-        .rxfd = msg_sv[1],
-        .msg = {.msg_iov = NULL, .msg_iovlen = 1},
-        .send_len = 8,
-    };
-    memcpy(recvmsg_ctx.payload0, "recvmsg1", 8);
-    recvmsg_ctx.iov[0].iov_base = recvmsg_ctx.drain0;
-    recvmsg_ctx.iov[0].iov_len = recvmsg_ctx.send_len;
-    recvmsg_ctx.msg.msg_iov = &recvmsg_ctx.iov[0];
-
-    msg_ctx_t sendmsg2_ctx = {
-        .txfd = msg_sv[0],
-        .rxfd = msg_sv[1],
-        .msg = {.msg_iov = NULL, .msg_iovlen = 2},
-        .send_len = 12,
-    };
-    memcpy(sendmsg2_ctx.payload0, "send", 4);
-    memcpy(sendmsg2_ctx.payload1, "msg-2iov", 8);
-    sendmsg2_ctx.iov[0].iov_base = sendmsg2_ctx.payload0;
-    sendmsg2_ctx.iov[0].iov_len = 4;
-    sendmsg2_ctx.iov[1].iov_base = sendmsg2_ctx.payload1;
-    sendmsg2_ctx.iov[1].iov_len = 8;
-    sendmsg2_ctx.msg.msg_iov = &sendmsg2_ctx.iov[0];
-
-    msg_ctx_t recvmsg2_ctx = {
-        .txfd = msg_sv[0],
-        .rxfd = msg_sv[1],
-        .msg = {.msg_iov = NULL, .msg_iovlen = 2},
-        .send_len = 12,
-    };
-    memcpy(recvmsg2_ctx.payload0, "recv", 4);
-    memcpy(recvmsg2_ctx.payload1, "msg-2iov", 8);
-    recvmsg2_ctx.iov[0].iov_base = recvmsg2_ctx.drain0;
-    recvmsg2_ctx.iov[0].iov_len = 4;
-    recvmsg2_ctx.iov[1].iov_base = recvmsg2_ctx.drain1;
-    recvmsg2_ctx.iov[1].iov_len = 8;
-    recvmsg2_ctx.msg.msg_iov = &recvmsg2_ctx.iov[0];
-    mmsg_ctx_t sendmmsg_ctx = {
-        .txfd = msg_sv[0],
-        .rxfd = msg_sv[1],
-        .send_len = 8,
-    };
-    memcpy(sendmmsg_ctx.payload, "sendmmsg", 8);
-    sendmmsg_ctx.iov.iov_base = sendmmsg_ctx.payload;
-    sendmmsg_ctx.iov.iov_len = sendmmsg_ctx.send_len;
-    sendmmsg_ctx.mmsg.msg_hdr.msg_iov = &sendmmsg_ctx.iov;
-    sendmmsg_ctx.mmsg.msg_hdr.msg_iovlen = 1;
-
-    mmsg_ctx_t recvmmsg_ctx = {
-        .txfd = msg_sv[0],
-        .rxfd = msg_sv[1],
-        .send_len = 8,
-    };
-    memcpy(recvmmsg_ctx.payload, "recvmmsg", 8);
-    recvmmsg_ctx.iov.iov_base = recvmmsg_ctx.drain;
-    recvmmsg_ctx.iov.iov_len = recvmmsg_ctx.send_len;
-    recvmmsg_ctx.mmsg.msg_hdr.msg_iov = &recvmmsg_ctx.iov;
-    recvmmsg_ctx.mmsg.msg_hdr.msg_iovlen = 1;
-    sockname_ctx_t getsockname_ctx = {
-        .fd = msg_sv[0],
-        .len = sizeof(struct sockaddr_un),
-    };
-    sockname_ctx_t getpeername_ctx = {
-        .fd = msg_sv[0],
-        .len = sizeof(struct sockaddr_un),
-    };
-    int dgram_sv[2];
-    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dgram_sv) < 0) {
-        perror("socketpair dgram");
-        close(msg_sv[0]);
-        close(msg_sv[1]);
-        close(regfd);
-        unlink(tmp_path);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    sockaddr_io_ctx_t sendto_ctx = {
-        .txfd = dgram_sv[0],
-        .rxfd = dgram_sv[1],
-        .addrlen = sizeof(struct sockaddr_un),
-    };
-    memcpy(sendto_ctx.payload, "sendto!!", sizeof(sendto_ctx.payload));
-    sockaddr_io_ctx_t recvfrom_ctx = {
-        .txfd = dgram_sv[0],
-        .rxfd = dgram_sv[1],
-        .addrlen = sizeof(struct sockaddr_un),
-    };
-    memcpy(recvfrom_ctx.payload, "reply!!!", sizeof(recvfrom_ctx.payload));
-
-    sockopt_ctx_t reuseaddr = {
-        .fd = sock,
-        .level = SOL_SOCKET,
-        .optname = SO_REUSEADDR,
-        .value = 1,
-        .len = sizeof(int),
-    };
-    sockopt_ctx_t nodelay = {
-        .fd = sock,
-        .level = IPPROTO_TCP,
-        .optname = TCP_NODELAY,
-        .value = 1,
-        .len = sizeof(int),
-    };
-    sockopt_ctx_t sndbuf = {
-        .fd = sock,
-        .level = SOL_SOCKET,
-        .optname = SO_SNDBUF,
-        .value = 0,
-        .len = sizeof(int),
-    };
-    int pipefd[2];
-    if (pipe(pipefd) < 0) {
-        perror("pipe");
-        close(msg_sv[0]);
-        close(msg_sv[1]);
-        close(regfd);
-        unlink(tmp_path);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    ppoll_ctx_t ppoll_ctx = {
-        .pfd = {.fd = pipefd[1], .events = POLLOUT, .revents = 0},
-        .ts = {.tv_sec = 0, .tv_nsec = 0},
-    };
-    pselect_ctx_t pselect_ctx = {
-        .ts = {.tv_sec = 0, .tv_nsec = 0},
-    };
-    sysquery_ctx_t sysquery_ctx = {0};
-    int ep_pipefd[2];
-    if (pipe(ep_pipefd) < 0) {
-        perror("pipe");
-        close(pipefd[0]);
-        close(pipefd[1]);
-        close(msg_sv[0]);
-        close(msg_sv[1]);
-        close(regfd);
-        unlink(tmp_path);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    int epfd = epoll_create1(0);
-    if (epfd < 0) {
-        perror("epoll_create1");
-        close(ep_pipefd[0]);
-        close(ep_pipefd[1]);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        close(msg_sv[0]);
-        close(msg_sv[1]);
-        close(regfd);
-        unlink(tmp_path);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    struct epoll_event setup_ev = {
-        .events = EPOLLIN,
-        .data.fd = ep_pipefd[0],
-    };
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, ep_pipefd[0], &setup_ev) < 0) {
-        perror("epoll_ctl");
-        close(epfd);
-        close(ep_pipefd[0]);
-        close(ep_pipefd[1]);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        close(msg_sv[0]);
-        close(msg_sv[1]);
-        close(regfd);
-        unlink(tmp_path);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    sysquery_ctx.ioctl_value = pipefd[0];
-    if (write(pipefd[1], "f", 1) != 1) {
-        perror("pipe seed");
-        close(epfd);
-        close(ep_pipefd[0]);
-        close(ep_pipefd[1]);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        close(msg_sv[0]);
-        close(msg_sv[1]);
-        close(regfd);
-        unlink(tmp_path);
-        close(zerofd);
-        close(sock);
-        close(nullfd);
-        return 1;
-    }
-    epoll_ctx_t epoll_ctx = {
-        .epfd = epfd,
-        .ts = {.tv_sec = 0, .tv_nsec = 0},
-    };
+    bench_fx_setup_ctxs(fx);
 
     const bench_case_t cases[] = {
         {"getpid", bench_getpid, NULL},
@@ -953,79 +961,66 @@ int main(int argc, char **argv)
         {"geteuid", bench_geteuid, NULL},
         {"getgid", bench_getgid, NULL},
         {"getegid", bench_getegid, NULL},
-        {"getresuid", bench_getresuid, &sysquery_ctx},
-        {"getresgid", bench_getresgid, &sysquery_ctx},
+        {"getresuid", bench_getresuid, &fx->sysquery_ctx},
+        {"getresgid", bench_getresgid, &fx->sysquery_ctx},
         {"getpriority", bench_getpriority, NULL},
-        {"fadvise64", bench_fadvise64, &nullfd},
-        {"fcntl-getfd", bench_fcntl_getfd, &nullfd},
-        {"fcntl-getfl", bench_fcntl_getfl, &nullfd},
-        {"dup-close", bench_dup_close, &nullfd},
-        {"dup3-close", bench_dup3_close, &dup3_ctx},
-        {"ioctl-tiocgsid", bench_ioctl_tiocgsid, &sysquery_ctx},
-        {"ioctl-fionread", bench_ioctl_fionread, &sysquery_ctx},
-        {"prctl-pdeathsig", bench_prctl_get_pdeathsig, &sysquery_ctx},
-        {"getsockname", bench_getsockname, &getsockname_ctx},
-        {"getpeername", bench_getpeername, &getpeername_ctx},
-        {"sendto-unix", bench_sendto_unix, &sendto_ctx},
-        {"recvfrom-unix", bench_recvfrom_unix, &recvfrom_ctx},
-        {"sched_setaffinity", bench_sched_setaffinity, &affinity_mask},
-        {"clock_gettime", bench_clock_gettime, &ts},
-        {"gettimeofday", bench_gettimeofday, &tv},
-        {"getrandom8", bench_getrandom, &getrandom8_ctx},
-        {"getrandom256", bench_getrandom, &getrandom256_ctx},
-        {"uname", bench_uname, &sysquery_ctx},
-        {"getcwd", bench_getcwd, &sysquery_ctx},
-        {"sysinfo", bench_sysinfo, &sysquery_ctx},
-        {"getrlimit-nofile", bench_getrlimit_nofile, &sysquery_ctx},
-        {"prlimit64-nofile", bench_prlimit64_nofile, &sysquery_ctx},
-        {"getrusage-self", bench_getrusage_self, &sysquery_ctx},
-        {"getrusage-thread", bench_getrusage_thread, &sysquery_ctx},
+        {"fadvise64", bench_fadvise64, &fx->nullfd},
+        {"fcntl-getfd", bench_fcntl_getfd, &fx->nullfd},
+        {"fcntl-getfl", bench_fcntl_getfl, &fx->nullfd},
+        {"dup-close", bench_dup_close, &fx->nullfd},
+        {"dup3-close", bench_dup3_close, &fx->dup3_ctx},
+        {"ioctl-tiocgsid", bench_ioctl_tiocgsid, &fx->sysquery_ctx},
+        {"ioctl-fionread", bench_ioctl_fionread, &fx->sysquery_ctx},
+        {"prctl-pdeathsig", bench_prctl_get_pdeathsig, &fx->sysquery_ctx},
+        {"getsockname", bench_getsockname, &fx->getsockname_ctx},
+        {"getpeername", bench_getpeername, &fx->getpeername_ctx},
+        {"sendto-unix", bench_sendto_unix, &fx->sendto_ctx},
+        {"recvfrom-unix", bench_recvfrom_unix, &fx->recvfrom_ctx},
+        {"sched_setaffinity", bench_sched_setaffinity, &fx->affinity_mask},
+        {"clock_gettime", bench_clock_gettime, &fx->ts},
+        {"gettimeofday", bench_gettimeofday, &fx->tv},
+        {"getrandom8", bench_getrandom, &fx->getrandom8_ctx},
+        {"getrandom256", bench_getrandom, &fx->getrandom256_ctx},
+        {"uname", bench_uname, &fx->sysquery_ctx},
+        {"getcwd", bench_getcwd, &fx->sysquery_ctx},
+        {"sysinfo", bench_sysinfo, &fx->sysquery_ctx},
+        {"getrlimit-nofile", bench_getrlimit_nofile, &fx->sysquery_ctx},
+        {"prlimit64-nofile", bench_prlimit64_nofile, &fx->sysquery_ctx},
+        {"getrusage-self", bench_getrusage_self, &fx->sysquery_ctx},
+        {"getrusage-thread", bench_getrusage_thread, &fx->sysquery_ctx},
         {"getgroups0", bench_getgroups0, NULL},
-        {"setsockopt-reuseaddr", bench_setsockopt, &reuseaddr},
-        {"getsockopt-reuseaddr", bench_getsockopt, &reuseaddr},
-        {"setsockopt-nodelay", bench_setsockopt, &nodelay},
-        {"getsockopt-nodelay", bench_getsockopt, &nodelay},
-        {"getsockopt-sndbuf", bench_getsockopt, &sndbuf},
-        {"ppoll1-nowait", bench_ppoll1, &ppoll_ctx},
-        {"pselect0-nowait", bench_pselect0, &pselect_ctx},
-        {"epollpwait2-0", bench_epoll_pwait2_0, &epoll_ctx},
-        {"writev1-null", bench_writev1, &writev_ctx},
-        {"writev2-null", bench_writev2, &writev_ctx},
-        {"readv1-zero", bench_readv1, &readv_ctx},
-        {"readv2-zero", bench_readv2, &readv_ctx},
-        {"pwritev1-reg", bench_pwritev1, &pwritev_ctx},
-        {"pwritev2-reg", bench_pwritev2v, &pwritev_ctx},
-        {"preadv1-reg", bench_preadv1, &preadv_ctx},
-        {"preadv2-reg", bench_preadv2v, &preadv_ctx},
-        {"pwritev2app1", bench_pwritev2_append1, &pwritev2_append_ctx},
-        {"pwritev2app2", bench_pwritev2_append2, &pwritev2_append_ctx},
-        {"sendmsg1-rt", bench_sendmsg1_roundtrip, &sendmsg_ctx},
-        {"recvmsg1-rt", bench_recvmsg1_roundtrip, &recvmsg_ctx},
-        {"sendmsg2-rt", bench_sendmsg2_roundtrip, &sendmsg2_ctx},
-        {"recvmsg2-rt", bench_recvmsg2_roundtrip, &recvmsg2_ctx},
-        {"sendmmsg1-rt", bench_sendmmsg1_roundtrip, &sendmmsg_ctx},
-        {"recvmmsg1-rt", bench_recvmmsg1_roundtrip, &recvmmsg_ctx},
-        {"newfstatat", bench_newfstatat, &path_ctx},
-        {"statx", bench_statx, &statx_ctx},
-        {"openat-close", bench_openat_close, &path_ctx},
+        {"setsockopt-reuseaddr", bench_setsockopt, &fx->reuseaddr},
+        {"getsockopt-reuseaddr", bench_getsockopt, &fx->reuseaddr},
+        {"setsockopt-nodelay", bench_setsockopt, &fx->nodelay},
+        {"getsockopt-nodelay", bench_getsockopt, &fx->nodelay},
+        {"getsockopt-sndbuf", bench_getsockopt, &fx->sndbuf},
+        {"ppoll1-nowait", bench_ppoll1, &fx->ppoll_ctx},
+        {"pselect0-nowait", bench_pselect0, &fx->pselect_ctx},
+        {"epollpwait2-0", bench_epoll_pwait2_0, &fx->epoll_ctx},
+        {"writev1-null", bench_writev1, &fx->writev_ctx},
+        {"writev2-null", bench_writev2, &fx->writev_ctx},
+        {"readv1-zero", bench_readv1, &fx->readv_ctx},
+        {"readv2-zero", bench_readv2, &fx->readv_ctx},
+        {"pwritev1-reg", bench_pwritev1, &fx->pwritev_ctx},
+        {"pwritev2-reg", bench_pwritev2v, &fx->pwritev_ctx},
+        {"preadv1-reg", bench_preadv1, &fx->preadv_ctx},
+        {"preadv2-reg", bench_preadv2v, &fx->preadv_ctx},
+        {"pwritev2app1", bench_pwritev2_append1, &fx->pwritev2_append_ctx},
+        {"pwritev2app2", bench_pwritev2_append2, &fx->pwritev2_append_ctx},
+        {"sendmsg1-rt", bench_sendmsg1_roundtrip, &fx->sendmsg_ctx},
+        {"recvmsg1-rt", bench_recvmsg1_roundtrip, &fx->recvmsg_ctx},
+        {"sendmsg2-rt", bench_sendmsg2_roundtrip, &fx->sendmsg2_ctx},
+        {"recvmsg2-rt", bench_recvmsg2_roundtrip, &fx->recvmsg2_ctx},
+        {"sendmmsg1-rt", bench_sendmmsg1_roundtrip, &fx->sendmmsg_ctx},
+        {"recvmmsg1-rt", bench_recvmmsg1_roundtrip, &fx->recvmmsg_ctx},
+        {"newfstatat", bench_newfstatat, &fx->path_ctx},
+        {"statx", bench_statx, &fx->statx_ctx},
+        {"openat-close", bench_openat_close, &fx->path_ctx},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         run_case(&cases[i], iters);
 
-    close(regfd);
-    unlink(tmp_path);
-    close(msg_sv[0]);
-    close(msg_sv[1]);
-    close(dgram_sv[0]);
-    close(dgram_sv[1]);
-    close(epfd);
-    close(ep_pipefd[0]);
-    close(ep_pipefd[1]);
-    close(pipefd[0]);
-    close(pipefd[1]);
-    close(sock);
-    close(zerofd);
-    close(nullfd);
+    bench_fx_close(fx);
     return 0;
 }

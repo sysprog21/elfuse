@@ -191,23 +191,10 @@ static void check_linkat(const char *base,
     }
 }
 
-int main(void)
+static void test_exchange_readdir_cases(const char *base,
+                                        const char *dir_a,
+                                        const char *dir_b)
 {
-    char base[256];
-    char dir_a[320];
-    char dir_b[320];
-    snprintf(base, sizeof(base), "/tmp/elfuse-case-collision-%ld",
-             (long) getpid());
-    snprintf(dir_a, sizeof(dir_a), "%s/dir-a", base);
-    snprintf(dir_b, sizeof(dir_b), "%s/dir-b", base);
-
-    mkdir("/tmp", 0777);
-    mkdir(base, 0777);
-    mkdir(dir_a, 0777);
-    mkdir(dir_b, 0777);
-
-    printf("test-case-collision: case collision tests\n");
-
     TEST("readdir lists Foo and foo distinctly");
     {
         char upper[320];
@@ -276,7 +263,10 @@ int main(void)
             PASS();
         }
     }
+}
 
+static void test_link_stat_xattr_getdents(const char *base)
+{
     TEST("linkat creates second colliding spelling");
     {
         char src[320];
@@ -373,7 +363,10 @@ int main(void)
             }
         }
     }
+}
 
+static void test_rename_cases(const char *base)
+{
     TEST("plain rename moves a colliding source to its new spelling");
     {
         char old_path[320];
@@ -423,7 +416,10 @@ int main(void)
             PASS();
         }
     }
+}
 
+static void test_linkat_follow(const char *base)
+{
     /* AT_SYMLINK_FOLLOW hard-links what the symlink points at, so the result is
      * a regular file; without it linkat(2) links the symlink itself, and that
      * holds for an absolute target too: nothing has to resolve the target to
@@ -462,7 +458,10 @@ int main(void)
                 errno == EINVAL,
             "unsupported linkat flags were accepted");
     }
+}
 
+static void test_name_edge_cases(const char *base)
+{
     /* Deriving the on-disk spelling from the guest name alone means the sysroot
      * keeps no bookkeeping file of its own, so no basename is reserved and the
      * guest may create any name Linux allows. An earlier scheme did reserve
@@ -515,6 +514,30 @@ int main(void)
             PASS();
         }
     }
+}
+
+int main(void)
+{
+    char base[256];
+    char dir_a[320];
+    char dir_b[320];
+    snprintf(base, sizeof(base), "/tmp/elfuse-case-collision-%ld",
+             (long) getpid());
+    snprintf(dir_a, sizeof(dir_a), "%s/dir-a", base);
+    snprintf(dir_b, sizeof(dir_b), "%s/dir-b", base);
+
+    mkdir("/tmp", 0777);
+    mkdir(base, 0777);
+    mkdir(dir_a, 0777);
+    mkdir(dir_b, 0777);
+
+    printf("test-case-collision: case collision tests\n");
+
+    test_exchange_readdir_cases(base, dir_a, dir_b);
+    test_link_stat_xattr_getdents(base);
+    test_rename_cases(base);
+    test_linkat_follow(base);
+    test_name_edge_cases(base);
 
     SUMMARY("test-case-collision");
     return fails > 0 ? 1 : 0;

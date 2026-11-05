@@ -39,6 +39,15 @@
 #define SYS_renameat2 276
 #endif
 
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
+
+int passes = 0, fails = 0;
+
 static int create_test_file(const char *path, const char *contents)
 {
     int rc = -1;
@@ -59,34 +68,10 @@ static int create_test_file(const char *path, const char *contents)
     return rc;
 }
 
-int main(void)
+static void test_mode_and_symlink(const char *testfile,
+                                  const char *symlink_path)
 {
-    int passes = 0, fails = 0;
-
-    char tmpdir[] = "/tmp/elfuse-file-ops-XXXXXX";
-    if (!mkdtemp(tmpdir)) {
-        perror("mkdtemp");
-        return 1;
-    }
-    char testfile[256], symlink_path[256], hardlink_path[256];
-    char renamed_path[256], no_such_path[256], noreplace_dest[256];
-    snprintf(testfile, sizeof(testfile), "%s/file.txt", tmpdir);
-    snprintf(symlink_path, sizeof(symlink_path), "%s/symlink", tmpdir);
-    snprintf(hardlink_path, sizeof(hardlink_path), "%s/hardlink", tmpdir);
-    snprintf(renamed_path, sizeof(renamed_path), "%s/renamed.txt", tmpdir);
-    snprintf(no_such_path, sizeof(no_such_path), "%s/no-such.txt", tmpdir);
-    snprintf(noreplace_dest, sizeof(noreplace_dest), "%s/noreplace.txt",
-             tmpdir);
-
-    printf("test-file-ops: Batch 1 file manipulation tests\n");
-
-    /* Create a test file */
     int fd;
-    if (create_test_file(testfile, "hello\n") < 0) {
-        printf("FATAL: cannot create %s\n", testfile);
-        rmdir(tmpdir);
-        return 1;
-    }
 
     /* Test fchmod */
     TEST("fchmod");
@@ -127,7 +112,12 @@ int main(void)
             FAIL("not a symlink");
     } else
         FAIL("symlink failed");
+}
 
+static void test_readlinkat(const char *testfile,
+                            const char *symlink_path,
+                            const char *tmpdir)
+{
     TEST("readlinkat absolute path");
     {
         char buf[256];
@@ -168,7 +158,10 @@ int main(void)
         EXPECT_ERRNO(syscall(SYS_readlinkat, -1, "symlink", buf, sizeof(buf)),
                      EBADF, "expected EBADF for invalid dirfd");
     }
+}
 
+static void test_link_and_times(const char *testfile, const char *hardlink_path)
+{
     /* Test hardlink */
     TEST("hardlink (link)");
     if (link(testfile, hardlink_path) == 0) {
@@ -223,7 +216,10 @@ int main(void)
         } else
             FAIL("stat failed");
     }
+}
 
+static void test_statx_and_access(const char *testfile)
+{
     TEST("statx");
     {
         struct stat st;
@@ -275,7 +271,13 @@ int main(void)
         long r = syscall(SYS_faccessat2, AT_FDCWD, testfile, F_OK, 0);
         EXPECT_TRUE(r == 0, "faccessat2 failed");
     }
+}
 
+static void test_renameat2(const char *testfile,
+                           const char *renamed_path,
+                           const char *no_such_path,
+                           const char *noreplace_dest)
+{
     TEST("renameat2");
     {
         struct stat renamed_st, old_st;
@@ -291,13 +293,6 @@ int main(void)
         }
         unlink(renamed_path);
     }
-
-#ifndef RENAME_NOREPLACE
-#define RENAME_NOREPLACE (1 << 0)
-#endif
-#ifndef RENAME_EXCHANGE
-#define RENAME_EXCHANGE (1 << 1)
-#endif
 
     TEST("renameat2 conflicting flags EINVAL");
     EXPECT_ERRNO(syscall(SYS_renameat2, AT_FDCWD, testfile, AT_FDCWD,
@@ -365,6 +360,39 @@ int main(void)
         if (dir_created)
             rmdir(dir_template);
     }
+}
+
+int main(void)
+{
+    char tmpdir[] = "/tmp/elfuse-file-ops-XXXXXX";
+    if (!mkdtemp(tmpdir)) {
+        perror("mkdtemp");
+        return 1;
+    }
+    char testfile[256], symlink_path[256], hardlink_path[256];
+    char renamed_path[256], no_such_path[256], noreplace_dest[256];
+    snprintf(testfile, sizeof(testfile), "%s/file.txt", tmpdir);
+    snprintf(symlink_path, sizeof(symlink_path), "%s/symlink", tmpdir);
+    snprintf(hardlink_path, sizeof(hardlink_path), "%s/hardlink", tmpdir);
+    snprintf(renamed_path, sizeof(renamed_path), "%s/renamed.txt", tmpdir);
+    snprintf(no_such_path, sizeof(no_such_path), "%s/no-such.txt", tmpdir);
+    snprintf(noreplace_dest, sizeof(noreplace_dest), "%s/noreplace.txt",
+             tmpdir);
+
+    printf("test-file-ops: Batch 1 file manipulation tests\n");
+
+    /* Create a test file */
+    if (create_test_file(testfile, "hello\n") < 0) {
+        printf("FATAL: cannot create %s\n", testfile);
+        rmdir(tmpdir);
+        return 1;
+    }
+
+    test_mode_and_symlink(testfile, symlink_path);
+    test_readlinkat(testfile, symlink_path, tmpdir);
+    test_link_and_times(testfile, hardlink_path);
+    test_statx_and_access(testfile);
+    test_renameat2(testfile, renamed_path, no_such_path, noreplace_dest);
 
     /* Cleanup */
     unlink(hardlink_path);

@@ -228,8 +228,14 @@ INVENTORY = {
     ),
     "syscall/net-msg.c::sys_recvmsg": (
         "restartable",
-        "The first wait precedes recvmsg, and later interrupted waits return "
-        "the accumulated count instead of EINTR.",
+        "The general path: the first wait precedes recvmsg, and later "
+        "interrupted waits return the accumulated count instead of EINTR.",
+    ),
+    "syscall/net-msg.c::recvmsg_single_iov": (
+        "restartable",
+        "The single-iovec path sys_recvmsg hands off to: the first wait "
+        "precedes recvmsg, and later interrupted waits return the accumulated "
+        "count instead of EINTR.",
     ),
     "syscall/net-msg.c::sys_recvmmsg": (
         "forbids",
@@ -356,15 +362,22 @@ INVENTORY = {
         "not-a-wait",
         "Refuses the unmap window because an execve is reaping this thread.",
     ),
-    "syscall/mem.c::sys_mmap_high_va": (
+    "syscall/mem.c::high_va_populate": (
         "not-a-wait",
-        "Refuses the overlay because an execve is reaping this thread.",
+        "Refuses the overlay because an execve is reaping this thread. It is "
+        "the replace-existing step of sys_mmap_high_va, which forwards it.",
     ),
     "runtime/forkipc.c::sys_clone": (
         "not-a-wait",
         "Refuses the fork because an execve is reaping this thread.",
     ),
-    "syscall/syscall.c::syscall_dispatch": (
+    "syscall/syscall.c::syscall_fast_rw": (
+        "not-a-wait",
+        "Inline read/write: io_xfer's interrupted wait diverts to the slow "
+        "path, and a host EINTR is passed through for the dispatcher to "
+        "classify.",
+    ),
+    "syscall/syscall.c::syscall_restart_try_arm": (
         "not-a-wait",
         "Tests a handler's EINTR result to decide the restart; produces none "
         "of its own.",

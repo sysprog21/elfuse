@@ -163,11 +163,10 @@ static pid_t spawn_leader_then_fork(int ready_wfd, int go_rfd, int forked_wfd)
     _exit(wait_flag(2000) ? 0 : 1);
 }
 
-int main(void)
-{
-    int failed = 0;
-    install();
+static int failed = 0;
 
+static void test_setpgid_args(void)
+{
     /* 0: setpgid argument validation. The kernel defaults pgid==0 to pid before
      * checking pgid < 0, so a negative pid with pgid==0 becomes a negative pgid
      * and fails EINVAL, not ESRCH; ESRCH needs a valid pgid alongside the
@@ -185,7 +184,10 @@ int main(void)
         fprintf(stderr, "FAIL: setpgid(-9,self-pgid) should be ESRCH\n");
         failed++;
     }
+}
 
+static int test_own_group_kill(void)
+{
     /* 1: kill(-childpgid) reaches a child in its own group. */
     int p1[2];
     if (pipe(p1) != 0)
@@ -261,6 +263,11 @@ int main(void)
         failed++;
     }
 
+    return 0;
+}
+
+static int test_pipeline_and_child_origin(void)
+{
     /* 4: pipeline. c4 leads group c4; c5 joins group c4. kill(-c4) reaches
      * both, exercising the "join an existing tracked group" path.
      */
@@ -337,6 +344,11 @@ int main(void)
         failed++;
     }
 
+    return 0;
+}
+
+static int test_setsid_and_setpgid(void)
+{
     /* 6: a child that calls setsid() leaves the caller's group, so kill(0) (the
      * caller's group) must no longer reach it. Passes only if setsid refreshed
      * the registry entry to the child's new group.
@@ -461,6 +473,11 @@ int main(void)
         failed++;
     }
 
+    return 0;
+}
+
+static int test_leader_fork(void)
+{
     /* 10: a leader forks after the parent set its group. Its fork-time registry
      * republish must not revert the entry to the stale inherited group, so
      * kill(-leaderpgid) still reaches it.
@@ -502,6 +519,23 @@ int main(void)
             "FAIL: kill(-pgid) missed a leader that forked after setpgid\n");
         failed++;
     }
+
+    return 0;
+}
+
+int main(void)
+{
+    install();
+
+    test_setpgid_args();
+    if (test_own_group_kill())
+        return 1;
+    if (test_pipeline_and_child_origin())
+        return 1;
+    if (test_setsid_and_setpgid())
+        return 1;
+    if (test_leader_fork())
+        return 1;
 
     printf("%s: %d failed\n", failed == 0 ? "PASS" : "FAIL", failed);
     return failed == 0 ? 0 : 1;

@@ -2796,6 +2796,106 @@ void signal_publish_live_x8(hv_vcpu_t vcpu, const guest_t *g)
     shim_publish_frame_x8(vcpu, g, vcpu_get_gpr(vcpu, 8));
 }
 
+/* Fill the rt_sigframe for delivering @signum: siginfo from the pending fault
+ * or the queued RT metadata, a ucontext carrying a fresh SROP cookie (also
+ * returned in *cookie_out) and the mask rt_sigreturn must restore, the saved
+ * register file, the extended context chain, and the thread's altstack
+ * description. Consumes the pending fault and the sigsuspend saved mask, so it
+ * runs once per delivery, after the vCPU state has been captured.
+ */
+static void signal_build_frame(hv_vcpu_t vcpu,
+                               int signum,
+                               signal_rt_info_t rt_info,
+                               const uint64_t saved_regs[31],
+                               uint64_t saved_sp,
+                               uint64_t saved_pc,
+                               uint64_t saved_pstate,
+                               linux_rt_sigframe_t *frame,
+                               uint64_t *cookie_out)
+{
+    _Atomic uint64_t *blocked = thread_blocked_ptr();
+    uint64_t *saved_ptr = thread_saved_blocked_ptr();
+    bool *valid_ptr = thread_saved_valid_ptr();
+
+    memset(frame, 0, sizeof(*frame));
+
+    /* siginfo: fault signals use si_code/si_addr from pending_fault; queued RT
+     * signals preserve sender metadata and sigval.
+     */
+    frame->info.si_signo = signum;
+    if (pending_fault.valid) {
+        frame->info.si_code = pending_fault.si_code;
+
+        /* si_addr overlaps si_pid/si_uid at offset 16 in the siginfo union. On
+         * aarch64-linux, si_addr is a 64-bit pointer occupying both int32_t
+         * fields. Write it via memcpy to avoid strict aliasing.
+         */
+        memcpy(&frame->info.si_pid, &pending_fault.addr, 8);
+    } else {
+        frame->info.si_code = rt_info.si_code;
+        frame->info.si_pid = rt_info.si_pid;
+        frame->info.si_uid = (int32_t) rt_info.si_uid;
+        frame->info.si_value = rt_info.si_ptr;
+    }
+
+    /* ucontext: embed a per-delivery cookie in uc_flags for SROP validation.
+     * rt_sigreturn checks this before restoring state. Low priority (guest is
+     * same trust domain) but prevents accidental frame corruption from
+     * redirecting execution.
+     */
+    uint64_t cookie;
+    arc4random_buf(&cookie, sizeof(cookie));
+    cookie |=
+        1; /* Ensure nonzero because zero uc_flags means uncookied frame */
+    frame->uc.uc_flags = cookie;
+    *cookie_out = cookie;
+    frame->uc.uc_link = 0;
+
+    /* If delivering from sigsuspend, store the ORIGINAL blocked mask so
+     * rt_sigreturn restores it (not the temporary sigsuspend mask).
+     */
+    if (*valid_ptr) {
+        frame->uc.uc_sigmask = *saved_ptr;
+        *valid_ptr = false;
+    } else {
+        frame->uc.uc_sigmask =
+            atomic_load_explicit(blocked, memory_order_relaxed);
+    }
+
+    /* sigcontext: save all registers. fault_address: for synchronous faults
+     * (BRK, segfault), set to the faulting address; for asynchronous signals,
+     * zero. frame_esr: raw ESR_EL1 for the extended context chain. SIGTRAP
+     * handlers read this to determine the BRK immediate value.
+     */
+    uint64_t frame_esr = 0;
+    if (pending_fault.valid) {
+        frame->uc.uc_mcontext.fault_address = pending_fault.addr;
+        frame_esr = pending_fault.esr;
+        pending_fault.valid = false; /* Consume (one-shot) */
+    }
+
+    memcpy(frame->uc.uc_mcontext.regs, saved_regs, 31 * sizeof(uint64_t));
+    frame->uc.uc_mcontext.sp = saved_sp;
+    frame->uc.uc_mcontext.pc = saved_pc;
+    frame->uc.uc_mcontext.pstate = saved_pstate;
+
+    /* Extended context chain in __reserved area (FPSIMD + optional ESR). The
+     * ESR context lets signal handlers read the exception syndrome (e.g., BRK
+     * immediate from ESR ISS[15:0]) to determine trap type.
+     */
+    build_sigcontext_reserved(frame->uc.uc_mcontext.__reserved, frame_esr,
+                              vcpu);
+
+    /* Save the per-thread altstack info in uc_stack for gdb/tools */
+    thread_entry_t *thr = current_thread;
+    frame->uc.uc_stack.ss_sp = thr ? thr->altstack_sp : 0;
+    frame->uc.uc_stack.ss_flags = thr ? thr->altstack_flags : LINUX_SS_DISABLE;
+    frame->uc.uc_stack._pad = 0;
+    frame->uc.uc_stack.ss_size = thr ? thr->altstack_size : 0;
+    if (thr && thr->on_altstack)
+        frame->uc.uc_stack.ss_flags |= LINUX_SS_ONSTACK;
+}
+
 /* Build and install the rt_sigframe for `signum` on the current thread, with
  * sig_lock held on entry and released on every return path. Shared by
  * signal_deliver() (signal selected from the process-wide pending set) and
@@ -2813,8 +2913,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
                                  int *exit_code)
 {
     _Atomic uint64_t *blocked = thread_blocked_ptr();
-    uint64_t *saved_ptr = thread_saved_blocked_ptr();
-    bool *valid_ptr = thread_saved_valid_ptr();
 
     /* signum is 1..64 from the caller; the static analyzer cannot see the
      * bound, so gate the array access defensively.
@@ -2946,81 +3044,10 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
 
     /* 2. Build the rt_sigframe */
     linux_rt_sigframe_t frame;
-    memset(&frame, 0, sizeof(frame));
-
-    /* siginfo: fault signals use si_code/si_addr from pending_fault; queued RT
-     * signals preserve sender metadata and sigval.
-     */
-    frame.info.si_signo = signum;
-    if (pending_fault.valid) {
-        frame.info.si_code = pending_fault.si_code;
-
-        /* si_addr overlaps si_pid/si_uid at offset 16 in the siginfo union. On
-         * aarch64-linux, si_addr is a 64-bit pointer occupying both int32_t
-         * fields. Write it via memcpy to avoid strict aliasing.
-         */
-        memcpy(&frame.info.si_pid, &pending_fault.addr, 8);
-    } else {
-        frame.info.si_code = rt_info.si_code;
-        frame.info.si_pid = rt_info.si_pid;
-        frame.info.si_uid = (int32_t) rt_info.si_uid;
-        frame.info.si_value = rt_info.si_ptr;
-    }
-
-    /* ucontext: embed a per-delivery cookie in uc_flags for SROP validation.
-     * rt_sigreturn checks this before restoring state. Low priority (guest is
-     * same trust domain) but prevents accidental frame corruption from
-     * redirecting execution.
-     */
     uint64_t cookie;
-    arc4random_buf(&cookie, sizeof(cookie));
-    cookie |=
-        1; /* Ensure nonzero because zero uc_flags means uncookied frame */
-    frame.uc.uc_flags = cookie;
-    frame.uc.uc_link = 0;
-
-    /* If delivering from sigsuspend, store the ORIGINAL blocked mask so
-     * rt_sigreturn restores it (not the temporary sigsuspend mask).
-     */
-    if (*valid_ptr) {
-        frame.uc.uc_sigmask = *saved_ptr;
-        *valid_ptr = false;
-    } else {
-        frame.uc.uc_sigmask =
-            atomic_load_explicit(blocked, memory_order_relaxed);
-    }
-
-    /* sigcontext: save all registers. fault_address: for synchronous faults
-     * (BRK, segfault), set to the faulting address; for asynchronous signals,
-     * zero. frame_esr: raw ESR_EL1 for the extended context chain. SIGTRAP
-     * handlers read this to determine the BRK immediate value.
-     */
-    uint64_t frame_esr = 0;
-    if (pending_fault.valid) {
-        frame.uc.uc_mcontext.fault_address = pending_fault.addr;
-        frame_esr = pending_fault.esr;
-        pending_fault.valid = false; /* Consume (one-shot) */
-    }
-
-    memcpy(frame.uc.uc_mcontext.regs, saved_regs, sizeof(saved_regs));
-    frame.uc.uc_mcontext.sp = saved_sp;
-    frame.uc.uc_mcontext.pc = saved_pc;
-    frame.uc.uc_mcontext.pstate = saved_pstate;
-
-    /* Extended context chain in __reserved area (FPSIMD + optional ESR). The
-     * ESR context lets signal handlers read the exception syndrome (e.g., BRK
-     * immediate from ESR ISS[15:0]) to determine trap type.
-     */
-    build_sigcontext_reserved(frame.uc.uc_mcontext.__reserved, frame_esr, vcpu);
-
-    /* Save the per-thread altstack info in uc_stack for gdb/tools */
+    signal_build_frame(vcpu, signum, rt_info, saved_regs, saved_sp, saved_pc,
+                       saved_pstate, &frame, &cookie);
     thread_entry_t *thr = current_thread;
-    frame.uc.uc_stack.ss_sp = thr ? thr->altstack_sp : 0;
-    frame.uc.uc_stack.ss_flags = thr ? thr->altstack_flags : LINUX_SS_DISABLE;
-    frame.uc.uc_stack._pad = 0;
-    frame.uc.uc_stack.ss_size = thr ? thr->altstack_size : 0;
-    if (thr && thr->on_altstack)
-        frame.uc.uc_stack.ss_flags |= LINUX_SS_ONSTACK;
 
     /* 3. Determine stack for signal frame: use altstack if SA_ONSTACK is set,
      * an altstack is configured, and the thread is not already on it. Across

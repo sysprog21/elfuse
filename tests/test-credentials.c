@@ -13,8 +13,10 @@
 #include <sys/wait.h>  /* waitpid */
 #include <unistd.h>    /* getgroups */
 
-#include "test-harness.h"
 #include "raw-syscall.h"
+#include "test-harness.h"
+
+int passes = 0, fails = 0;
 
 /* aarch64 Linux syscall numbers */
 #define __NR_setuid 146
@@ -125,15 +127,8 @@ static long wait_for_dead_priority_tid(int tid)
     }
 }
 
-int main(void)
+static void test_uid_calls(long expected_id)
 {
-    int passes = 0, fails = 0;
-
-    printf("test-credentials: UID/GID, capabilities, priority, affinity\n");
-
-    long uid = raw_syscall0(__NR_getuid);
-    long expected_id = (uid == 0) ? 0 : 1000;
-
     /* Baseline: UID/GID should match expected_id */
     TEST("getuid matches expected");
     EXPECT_TRUE(raw_syscall0(__NR_getuid) == expected_id, "unexpected uid");
@@ -230,7 +225,10 @@ int main(void)
             EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 1,
                         "expected -EPERM");
     }
+}
 
+static void test_gid_and_groups(long expected_id)
+{
     /* getresgid */
     TEST("getresgid coherent");
     {
@@ -296,7 +294,10 @@ int main(void)
         else
             EXPECT_TRUE(rc == -1, "expected -EPERM");
     }
+}
 
+static void test_fsid_and_caps(long expected_id)
+{
     /* setfsuid / setfsgid: Linux contract is to return the previous fsuid /
      * fsgid.
      */
@@ -344,7 +345,10 @@ int main(void)
         else
             FAIL("expected -EPERM");
     }
+}
 
+static void test_groups_and_priority(long expected_id)
+{
     /* getgroups supplementary groups check */
     TEST("getgroups returns expected groups");
     {
@@ -422,7 +426,10 @@ int main(void)
             EXPECT_TRUE(dead_prio == -3, "getpriority(dead tid) succeeded");
         }
     }
+}
 
+static void test_affinity(void)
+{
     /* sched_setaffinity: mask with CPU 0 should succeed */
     TEST("sched_setaffinity(CPU0)");
     {
@@ -449,7 +456,10 @@ int main(void)
             raw_syscall3(__NR_sched_getaffinity, 0, sizeof(mask), (long) &mask);
         EXPECT_TRUE(rc > 0 && (mask & 1), "CPU0 not in mask");
     }
+}
 
+static void test_privileged_setid(long expected_id)
+{
     if (expected_id == 0) {
         TEST("privileged setreuid(1000, -1) sets real ID");
         {
@@ -485,6 +495,21 @@ int main(void)
                         "uid triple not fully updated");
         }
     }
+}
+
+int main(void)
+{
+    printf("test-credentials: UID/GID, capabilities, priority, affinity\n");
+
+    long uid = raw_syscall0(__NR_getuid);
+    long expected_id = (uid == 0) ? 0 : 1000;
+
+    test_uid_calls(expected_id);
+    test_gid_and_groups(expected_id);
+    test_fsid_and_caps(expected_id);
+    test_groups_and_priority(expected_id);
+    test_affinity();
+    test_privileged_setid(expected_id);
 
     SUMMARY("test-credentials");
     return fails ? 1 : 0;

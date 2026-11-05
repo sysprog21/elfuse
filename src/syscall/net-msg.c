@@ -93,13 +93,20 @@ static void close_scm_rights_dups(uint8_t *ctrl, size_t len)
     }
 }
 
-static void recvmsg_cleanup_scm_rights(const int *scm_gfds,
-                                       const int *scm_hfds,
-                                       int scm_nfds)
+/* The guest fds recvmsg installed from SCM_RIGHTS, with the host fds they wrap,
+ * so a later failure can retire every one. One message carries at most
+ * LINUX_SCM_MAX_FD; n accumulates across its control messages.
+ */
+typedef struct {
+    int gfds[LINUX_SCM_MAX_FD];
+    int hfds[LINUX_SCM_MAX_FD];
+    int n;
+} recvmsg_scm_t;
+
+static void recvmsg_cleanup_scm_rights(const recvmsg_scm_t *scm)
 {
-    for (int i = 0; i < scm_nfds; i++) {
-        fd_retire_published(scm_gfds[i], scm_hfds[i]);
-    }
+    for (int i = 0; i < scm->n; i++)
+        fd_retire_published(scm->gfds[i], scm->hfds[i]);
 }
 
 static void recvmsg_close_host_rights(const void *data_src, size_t data_len)
@@ -108,6 +115,110 @@ static void recvmsg_close_host_rights(const void *data_src, size_t data_len)
     const int *fds = (const int *) data_src;
     for (size_t i = 0; i < nfds; i++)
         close(fds[i]);
+}
+
+/* Publish each received host descriptor as a guest fd, rewriting fds[] in place
+ * to the guest numbers (-1 where the descriptor was dropped: allocation failed,
+ * or the scm table was full, after closing the host descriptor). Every
+ * installed fd is recorded in @scm so a later failure can retire all of them.
+ */
+static void recvmsg_install_rights(int *fds,
+                                   size_t nfds,
+                                   int flags,
+                                   recvmsg_scm_t *scm)
+{
+    for (size_t i = 0; i < nfds; i++) {
+        int host_recv_fd = fds[i];
+
+        /* An fd that cannot be recorded cannot be rolled back, so it is dropped
+         * like a failed allocation instead of installed. One message carries at
+         * most LINUX_SCM_MAX_FD, so this only triggers for several SCM_RIGHTS
+         * cmsgs that together exceed it.
+         */
+        if (scm->n >= (int) ARRAY_SIZE(scm->gfds)) {
+            close(fds[i]);
+            fds[i] = -1;
+            continue;
+        }
+
+        /* A received descriptor belongs to whoever sent it, so elfuse never
+         * sets O_NONBLOCK on one: that would mutate a description this process
+         * did not create, and a guest that passes fd 0 to itself would leave
+         * the launching shell's terminal nonblocking after exit. Marked foreign
+         * so a dup of it inherits the same restraint.
+         *
+         * Which view of the flag is the guest's still has to be decided, and
+         * the flag as found answers it. A description already carrying
+         * O_NONBLOCK is one elfuse itself owns: every pipe and fifo it opens
+         * carries the flag precisely because it emulates blocking on top, and
+         * an ordinary program's description does not. Adopting that emulation
+         * here sets nothing (the flag is already there) and gives a plain read
+         * the wait it asked for. Reading the host flag as the guest's view
+         * instead would hand a blocking read a spurious EAGAIN, which a program
+         * that never requested O_NONBLOCK has no handling for.
+         *
+         * What stays wrong is a sender that meant the description to be
+         * nonblocking: the receiver sees blocking. The O_NONBLOCK shadow is per
+         * process, and this is the survivable direction of that divergence: a
+         * wait the sender would not have waited, rather than an error on an fd
+         * that has none.
+         */
+        int recv_fl = fcntl(host_recv_fd, F_GETFL);
+        fd_alias_spec_t spec =
+            fd_alias_carried(true, recv_fl >= 0 && (recv_fl & O_NONBLOCK));
+        int gfd = fd_alloc_alias(&spec, FD_REGULAR, fds[i], NULL);
+        if (gfd < 0) {
+            close(fds[i]);
+            fds[i] = -1;
+            continue;
+        }
+        fds[i] = gfd;
+        scm->gfds[scm->n] = gfd;
+        scm->hfds[scm->n] = host_recv_fd;
+        scm->n++;
+        if (flags & LINUX_MSG_CMSG_CLOEXEC)
+            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
+    }
+}
+
+/* Write the peer address and its length back to the guest msghdr.
+ *
+ * Returns 0 or -LINUX_EFAULT; the caller owns every cleanup.
+ */
+static int64_t recvmsg_write_name(guest_t *g,
+                                  uint64_t msg_gva,
+                                  const linux_msghdr_t *lmsg,
+                                  const struct sockaddr_storage *mac_sa,
+                                  socklen_t mac_namelen)
+{
+    /* Stays 0 when the host reported no address, and when one could not be
+     * converted: either way nothing was written for a length to describe.
+     */
+    uint32_t nl = 0;
+    if (mac_namelen > 0) {
+        uint8_t linux_sa[128];
+        int out_len =
+            net_sockaddr_from_mac((const struct sockaddr *) mac_sa, mac_namelen,
+                                  linux_sa, (uint32_t) sizeof(linux_sa));
+        if (out_len > 0) {
+            /* The length must describe the bytes written, which are the
+             * translated address rather than the host one: a pathname socket's
+             * host spelling is the longer of the two, so passing the host
+             * length on leaves the guest reading past the address it was given.
+             * Reported untruncated, per recvmsg(2).
+             */
+            nl = (uint32_t) out_len;
+            uint32_t write_len = nl;
+            if (write_len > lmsg->msg_namelen)
+                write_len = lmsg->msg_namelen;
+            if (guest_write_small(g, lmsg->msg_name, linux_sa, write_len) < 0)
+                return -LINUX_EFAULT;
+        }
+    }
+    if (guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_namelen),
+                          &nl, sizeof(nl)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
 }
 
 /* Wire size of a Linux SCM_CREDENTIALS control message: cmsghdr plus ucred,
@@ -503,13 +614,325 @@ static size_t msg_iov_total(const struct iovec *iov, int iovcnt)
     return total;
 }
 
-/* Over the function-size limit on purpose.
+/* recvmsg with no name, no control buffer and a single iovec: one host recvmsg
+ * straight into guest memory, with the MSG_WAITALL gathering and EAGAIN retry a
+ * blocking guest socket needs. Takes ownership of @host_ref and closes it on
+ * every path.
+ *
+ * Returns the byte count or a negative errno.
+ */
+static int64_t recvmsg_single_iov(guest_t *g,
+                                  int fd,
+                                  uint64_t msg_gva,
+                                  const linux_msghdr_t *lmsg,
+                                  int flags,
+                                  int mac_flags,
+                                  host_fd_ref_t *host_ref,
+                                  fd_block_state_t *sock_st)
+{
+    struct {
+        uint64_t iov_base, iov_len;
+    } guest_iov;
+
+    if (guest_read_small(g, lmsg->msg_iov, &guest_iov, sizeof(guest_iov)) < 0) {
+        host_fd_ref_close(host_ref);
+        return -LINUX_EFAULT;
+    }
+
+    void *base = NULL;
+    size_t len = 0;
+    if (guest_iov.iov_len > 0) {
+        uint64_t avail = 0;
+        base = guest_ptr_bound(g, guest_iov.iov_base, &avail, MEM_PERM_W,
+                               guest_iov.iov_len);
+        if (!base) {
+            host_fd_ref_close(host_ref);
+            return -LINUX_EFAULT;
+        }
+        len = guest_iov.iov_len;
+        if (len > avail)
+            len = (size_t) avail;
+    }
+
+    int64_t waited =
+        len > 0 ? net_wait_or_interrupted(sock_st, host_ref->fd, POLLIN, flags)
+                : net_recv_zero_payload_gate(sock_st, host_ref->fd, flags);
+    if (waited < 0) {
+        host_fd_ref_close(host_ref);
+        return waited;
+    }
+
+    struct iovec host_iov = {
+        .iov_base = base,
+        .iov_len = len,
+    };
+    struct msghdr msg = {
+        .msg_iov = &host_iov,
+        .msg_iovlen = 1,
+        .msg_flags = 0,
+    };
+
+    /* Retry the EAGAIN a blocking guest socket must not see: elfuse owns
+     * O_NONBLOCK on the host descriptor, so it reports one for a readiness a
+     * sibling took. MSG_WAITALL is gathered here rather than handed to the
+     * host, which does not answer for it (msg_gathers_waitall). This branch
+     * carries no ancillary buffer, so the gather is unconditional once the
+     * predicate holds.
+     */
+    bool gather = msg_gathers_waitall(host_ref->fd, flags, 0);
+    if (recv_strip_waitall(flags))
+        mac_flags &= ~MSG_WAITALL;
+
+    ssize_t ret;
+    uint64_t total = 0;
+    for (;;) {
+        msg.msg_flags = 0;
+        ret = recvmsg(host_ref->fd, &msg, mac_flags);
+
+        if (ret > 0 && gather) {
+            total += (uint64_t) ret;
+            if (total >= len ||
+                !sock_op_should_block(sock_st, host_ref->fd, flags))
+                break;
+            host_iov.iov_base = (char *) base + total;
+            host_iov.iov_len = len - total;
+            waited =
+                net_wait_or_interrupted(sock_st, host_ref->fd, POLLIN, flags);
+            if (waited < 0)
+                break; /* interrupted after moving bytes: report the count
+                        */
+            continue;
+        }
+
+        if (!net_recv_should_retry(sock_st, host_ref->fd, flags, ret))
+            break;
+        waited = net_wait_or_interrupted(sock_st, host_ref->fd, POLLIN, flags);
+        if (waited < 0) {
+            if (total > 0)
+                break;
+            host_fd_ref_close(host_ref);
+            return waited;
+        }
+    }
+    if (total > 0)
+        ret = (ssize_t) total;
+    if (ret < 0) {
+        int64_t r = recv_eof_or_errno(host_ref->fd, fd);
+        if (r != 0) {
+            host_fd_ref_close(host_ref);
+            return r;
+        }
+
+        /* SEQPACKET-over-DGRAM EOF: fall through with an empty result so the
+         * guest sees msg_controllen 0 and msg_flags 0 like a real EOF.
+         */
+        ret = 0;
+        msg.msg_flags = 0;
+    }
+    uint64_t zero64 = 0;
+    int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags);
+    if (guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
+                          &zero64, sizeof(zero64)) < 0 ||
+        guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_flags),
+                          &mflags, sizeof(mflags)) < 0) {
+        host_fd_ref_close(host_ref);
+        return -LINUX_EFAULT;
+    }
+    host_fd_ref_close(host_ref);
+    return ret;
+}
+
+/* Write the control data back to the guest msghdr: translate each host cmsg to
+ * its Linux spelling (installing received SCM_RIGHTS descriptors as guest fds),
+ * append the SCM_CREDENTIALS message a SO_PASSCRED unix socket owes, copy the
+ * result into the guest buffer and set msg_controllen. *ctrl_truncated is set
+ * when the guest buffer could not hold everything. It frees the Linux control
+ * buffer it allocated and, on a failed write, retires the fds it installed; the
+ * caller owns the host control buffer, the iovec and the host fd reference.
+ *
+ * Returns 0 or a negative errno.
+ */
+static int64_t recvmsg_write_control(guest_t *g,
+                                     int fd,
+                                     uint64_t msg_gva,
+                                     const linux_msghdr_t *lmsg,
+                                     struct msghdr *msg,
+                                     int host_fd,
+                                     int flags,
+                                     socklen_t ctrl_alloc,
+                                     recvmsg_scm_t *scm,
+                                     int *ctrl_truncated)
+{
+    *ctrl_truncated = 0;
+    if (ctrl_alloc > 0 && msg->msg_controllen > 0 && lmsg->msg_control) {
+        size_t lctrl_size =
+            lmsg->msg_controllen > 512 ? lmsg->msg_controllen : 512;
+        uint8_t lctrl_stack[512];
+        uint8_t *linux_ctrl = lctrl_stack;
+        uint8_t *lctrl_heap = NULL;
+        if (lctrl_size > sizeof(lctrl_stack)) {
+            lctrl_heap = malloc(lctrl_size);
+            if (!lctrl_heap) {
+                return -LINUX_ENOMEM;
+            }
+            linux_ctrl = lctrl_heap;
+        }
+        size_t lpos = 0;
+
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg); cmsg;
+             cmsg = CMSG_NXTHDR(msg, cmsg)) {
+            if (cmsg->cmsg_len < CMSG_LEN(0))
+                continue;
+            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            if (data_len > lctrl_size - CMSG_LINUX_HDR_BYTES) {
+                *ctrl_truncated = 1;
+                break;
+            }
+            uint64_t lcmsg_len = CMSG_LINUX_HDR_BYTES + data_len;
+
+            /* Same align-up as cmsg_entry_bounds, in the same subtract-the-
+             * remainder form. This direction builds the buffer rather than
+             * walking a guest-supplied one, so it is not covered by
+             * verify-cmsg; keeping the spelling identical avoids the two
+             * directions drifting apart.
+             */
+            size_t lcmsg_space =
+                (size_t) (lcmsg_len + (CMSG_LINUX_ALIGN - 1) -
+                          (lcmsg_len + (CMSG_LINUX_ALIGN - 1)) %
+                              CMSG_LINUX_ALIGN);
+
+            if (lpos + lcmsg_space > lctrl_size ||
+                lpos + lcmsg_space > lmsg->msg_controllen) {
+                *ctrl_truncated = 1;
+                break;
+            }
+
+            int32_t llevel =
+                (cmsg->cmsg_level == SOL_SOCKET) ? 1 : cmsg->cmsg_level;
+            int32_t ltype = cmsg->cmsg_type;
+            if (cmsg->cmsg_level == IPPROTO_IP) {
+                int translated = translate_ip_cmsg_to_linux(cmsg->cmsg_type);
+                if (translated < 0)
+                    continue;
+                llevel = LINUX_IPPROTO_IP;
+                ltype = translated;
+            }
+
+            uint8_t data_copy_stack[128];
+            uint8_t *data_copy = data_copy_stack;
+            uint8_t *data_copy_heap = NULL;
+            uint8_t *data_src = CMSG_DATA(cmsg);
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SCM_RIGHTS) {
+                if (data_len > LINUX_SCM_MAX_FD * sizeof(int)) {
+                    recvmsg_close_host_rights(data_src, data_len);
+                    recvmsg_cleanup_scm_rights(scm);
+                    free(lctrl_heap);
+                    return -LINUX_EINVAL;
+                }
+                if (data_len > sizeof(data_copy_stack)) {
+                    data_copy_heap = malloc(data_len);
+                    if (!data_copy_heap) {
+                        recvmsg_close_host_rights(data_src, data_len);
+                        break;
+                    }
+                    data_copy = data_copy_heap;
+                }
+                memcpy(data_copy, data_src, data_len);
+                recvmsg_install_rights((int *) data_copy,
+                                       data_len / sizeof(int), flags, scm);
+                data_src = data_copy;
+            }
+
+            memset(linux_ctrl + lpos, 0, lcmsg_space);
+            memcpy(linux_ctrl + lpos, &lcmsg_len, 8);
+            memcpy(linux_ctrl + lpos + 8, &llevel, 4);
+            memcpy(linux_ctrl + lpos + 12, &ltype, 4);
+            memcpy(linux_ctrl + lpos + CMSG_LINUX_HDR_BYTES, data_src,
+                   data_len);
+            free(data_copy_heap);
+
+            lpos += lcmsg_space;
+        }
+
+        int passcred_val = 0;
+        if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
+                                      &passcred_val) &&
+            passcred_val && host_socket_is_unix(host_fd)) {
+            if (lpos + SCM_CRED_CMSG_SPACE <= lctrl_size &&
+                lpos + SCM_CRED_CMSG_SPACE <= lmsg->msg_controllen) {
+                build_scm_cred_cmsg(linux_ctrl + lpos);
+                lpos += SCM_CRED_CMSG_SPACE;
+            }
+        }
+
+        if (lpos > 0) {
+            if (guest_write_small(g, lmsg->msg_control, linux_ctrl, lpos) < 0) {
+                recvmsg_cleanup_scm_rights(scm);
+                free(lctrl_heap);
+                return -LINUX_EFAULT;
+            }
+            uint64_t lctl = lpos;
+            if (guest_write_small(
+                    g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
+                    &lctl, sizeof(lctl)) < 0) {
+                recvmsg_cleanup_scm_rights(scm);
+                free(lctrl_heap);
+                return -LINUX_EFAULT;
+            }
+        } else {
+            uint64_t zero64 = 0;
+            if (guest_write_small(
+                    g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
+                    &zero64, sizeof(zero64)) < 0) {
+                free(lctrl_heap);
+                return -LINUX_EFAULT;
+            }
+        }
+        free(lctrl_heap);
+    } else if (lmsg->msg_control && lmsg->msg_controllen > 0) {
+        bool injected = false;
+        int passcred_val = 0;
+        if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
+                                      &passcred_val) &&
+            passcred_val && host_socket_is_unix(host_fd)) {
+            if (SCM_CRED_CMSG_SPACE <= lmsg->msg_controllen &&
+                SCM_CRED_CMSG_SPACE <= 64) {
+                uint8_t cred_buf[64];
+                build_scm_cred_cmsg(cred_buf);
+                if (guest_write_small(g, lmsg->msg_control, cred_buf,
+                                      SCM_CRED_CMSG_SPACE) == 0) {
+                    uint64_t cred_ctl_len = SCM_CRED_CMSG_SPACE;
+                    guest_write_small(
+                        g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
+                        &cred_ctl_len, sizeof(cred_ctl_len));
+                    injected = true;
+                }
+            }
+        }
+        if (!injected) {
+            uint64_t zero64 = 0;
+            guest_write_small(
+                g, msg_gva + offsetof(linux_msghdr_t, msg_controllen), &zero64,
+                sizeof(zero64));
+        }
+    } else {
+        uint64_t zero64 = 0;
+        if (guest_write_small(
+                g, msg_gva + offsetof(linux_msghdr_t, msg_controllen), &zero64,
+                sizeof(zero64)) < 0) {
+            return -LINUX_EFAULT;
+        }
+    }
+    return 0;
+}
+
+/* Why this stays one function.
  *
  * The msghdr round trip: read the guest structure, transfer, then write back
  * name, control and flags. The write-back has to see what the read established,
  * and the SCM_RIGHTS arm has to unwind fds it installed.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 {
     if (fd_get_type(fd) == FD_NETLINK)
@@ -530,122 +953,9 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     int mac_flags = translate_msg_flags(flags);
 
     if (!lmsg.msg_name && (!lmsg.msg_control || lmsg.msg_controllen == 0) &&
-        lmsg.msg_iovlen == 1) {
-        struct {
-            uint64_t iov_base, iov_len;
-        } guest_iov;
-
-        if (guest_read_small(g, lmsg.msg_iov, &guest_iov, sizeof(guest_iov)) <
-            0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
-
-        void *base = NULL;
-        size_t len = 0;
-        if (guest_iov.iov_len > 0) {
-            uint64_t avail = 0;
-            base = guest_ptr_bound(g, guest_iov.iov_base, &avail, MEM_PERM_W,
-                                   guest_iov.iov_len);
-            if (!base) {
-                host_fd_ref_close(&host_ref);
-                return -LINUX_EFAULT;
-            }
-            len = guest_iov.iov_len;
-            if (len > avail)
-                len = (size_t) avail;
-        }
-
-        int64_t waited =
-            len > 0
-                ? net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags)
-                : net_recv_zero_payload_gate(&sock_st, host_ref.fd, flags);
-        if (waited < 0) {
-            host_fd_ref_close(&host_ref);
-            return waited;
-        }
-
-        struct iovec host_iov = {
-            .iov_base = base,
-            .iov_len = len,
-        };
-        struct msghdr msg = {
-            .msg_iov = &host_iov,
-            .msg_iovlen = 1,
-            .msg_flags = 0,
-        };
-
-        /* Retry the EAGAIN a blocking guest socket must not see: elfuse owns
-         * O_NONBLOCK on the host descriptor, so it reports one for a readiness
-         * a sibling took. MSG_WAITALL is gathered here rather than handed to
-         * the host, which does not answer for it (msg_gathers_waitall). This
-         * branch carries no ancillary buffer, so the gather is unconditional
-         * once the predicate holds.
-         */
-        bool gather = msg_gathers_waitall(host_ref.fd, flags, 0);
-        if (recv_strip_waitall(flags))
-            mac_flags &= ~MSG_WAITALL;
-
-        ssize_t ret;
-        uint64_t total = 0;
-        for (;;) {
-            msg.msg_flags = 0;
-            ret = recvmsg(host_ref.fd, &msg, mac_flags);
-
-            if (ret > 0 && gather) {
-                total += (uint64_t) ret;
-                if (total >= len ||
-                    !sock_op_should_block(&sock_st, host_ref.fd, flags))
-                    break;
-                host_iov.iov_base = (char *) base + total;
-                host_iov.iov_len = len - total;
-                waited = net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN,
-                                                 flags);
-                if (waited < 0)
-                    break; /* interrupted after moving bytes: report the count
-                            */
-                continue;
-            }
-
-            if (!net_recv_should_retry(&sock_st, host_ref.fd, flags, ret))
-                break;
-            waited =
-                net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags);
-            if (waited < 0) {
-                if (total > 0)
-                    break;
-                host_fd_ref_close(&host_ref);
-                return waited;
-            }
-        }
-        if (total > 0)
-            ret = (ssize_t) total;
-        if (ret < 0) {
-            int64_t r = recv_eof_or_errno(host_ref.fd, fd);
-            if (r != 0) {
-                host_fd_ref_close(&host_ref);
-                return r;
-            }
-
-            /* SEQPACKET-over-DGRAM EOF: fall through with an empty result so
-             * the guest sees msg_controllen 0 and msg_flags 0 like a real EOF.
-             */
-            ret = 0;
-            msg.msg_flags = 0;
-        }
-        uint64_t zero64 = 0;
-        int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags);
-        if (guest_write_small(
-                g, msg_gva + offsetof(linux_msghdr_t, msg_controllen), &zero64,
-                sizeof(zero64)) < 0 ||
-            guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_flags),
-                              &mflags, sizeof(mflags)) < 0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
-        host_fd_ref_close(&host_ref);
-        return ret;
-    }
+        lmsg.msg_iovlen == 1)
+        return recvmsg_single_iov(g, fd, msg_gva, &lmsg, flags, mac_flags,
+                                  &host_ref, &sock_st);
 
     /* See sys_sendmsg above: bound msg_iovlen before the int narrowing. */
     if (lmsg.msg_iovlen > SYSCALL_IOV_MAX) {
@@ -708,9 +1018,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         .msg_flags = 0,
     };
 
-    int scm_gfds[128];
-    int scm_hfds[128];
-    int scm_nfds = 0;
+    recvmsg_scm_t scm = {0};
 
     /* Retry the EAGAIN a blocking guest socket must not see; see the single-iov
      * branch above.
@@ -796,270 +1104,25 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     }
 
     if (lmsg.msg_name) {
-        /* Stays 0 when the host reported no address, and when one could not be
-         * converted: either way nothing was written for a length to describe.
-         */
-        uint32_t nl = 0;
-        if (msg.msg_namelen > 0) {
-            uint8_t linux_sa[128];
-            int out_len = net_sockaddr_from_mac((struct sockaddr *) &mac_sa,
-                                                msg.msg_namelen, linux_sa,
-                                                (uint32_t) sizeof(linux_sa));
-            if (out_len > 0) {
-                /* The length must describe the bytes written, which are the
-                 * translated address rather than the host one: a pathname
-                 * socket's host spelling is the longer of the two, so passing
-                 * the host length on leaves the guest reading past the address
-                 * it was given. Reported untruncated, per recvmsg(2).
-                 */
-                nl = (uint32_t) out_len;
-                uint32_t write_len = nl;
-                if (write_len > lmsg.msg_namelen)
-                    write_len = lmsg.msg_namelen;
-                if (guest_write_small(g, lmsg.msg_name, linux_sa, write_len) <
-                    0) {
-                    free(mac_ctrl_heap);
-                    host_iov_free(&host_iov);
-                    host_fd_ref_close(&host_ref);
-                    return -LINUX_EFAULT;
-                }
-            }
-        }
-        if (guest_write_small(g,
-                              msg_gva + offsetof(linux_msghdr_t, msg_namelen),
-                              &nl, sizeof(nl)) < 0) {
+        int64_t name_err =
+            recvmsg_write_name(g, msg_gva, &lmsg, &mac_sa, msg.msg_namelen);
+        if (name_err < 0) {
             free(mac_ctrl_heap);
             host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
+            return name_err;
         }
     }
 
     int ctrl_truncated = 0;
-    if (ctrl_alloc > 0 && msg.msg_controllen > 0 && lmsg.msg_control) {
-        size_t lctrl_size =
-            lmsg.msg_controllen > 512 ? lmsg.msg_controllen : 512;
-        uint8_t lctrl_stack[512];
-        uint8_t *linux_ctrl = lctrl_stack;
-        uint8_t *lctrl_heap = NULL;
-        if (lctrl_size > sizeof(lctrl_stack)) {
-            lctrl_heap = malloc(lctrl_size);
-            if (!lctrl_heap) {
-                free(mac_ctrl_heap);
-                host_iov_free(&host_iov);
-                host_fd_ref_close(&host_ref);
-                return -LINUX_ENOMEM;
-            }
-            linux_ctrl = lctrl_heap;
-        }
-        size_t lpos = 0;
-
-        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg;
-             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-            if (cmsg->cmsg_len < CMSG_LEN(0))
-                continue;
-            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
-            if (data_len > lctrl_size - CMSG_LINUX_HDR_BYTES) {
-                ctrl_truncated = 1;
-                break;
-            }
-            uint64_t lcmsg_len = CMSG_LINUX_HDR_BYTES + data_len;
-
-            /* Same align-up as cmsg_entry_bounds, in the same subtract-the-
-             * remainder form. This direction builds the buffer rather than
-             * walking a guest-supplied one, so it is not covered by
-             * verify-cmsg; keeping the spelling identical avoids the two
-             * directions drifting apart.
-             */
-            size_t lcmsg_space =
-                (size_t) (lcmsg_len + (CMSG_LINUX_ALIGN - 1) -
-                          (lcmsg_len + (CMSG_LINUX_ALIGN - 1)) %
-                              CMSG_LINUX_ALIGN);
-
-            if (lpos + lcmsg_space > lctrl_size ||
-                lpos + lcmsg_space > lmsg.msg_controllen) {
-                ctrl_truncated = 1;
-                break;
-            }
-
-            int32_t llevel =
-                (cmsg->cmsg_level == SOL_SOCKET) ? 1 : cmsg->cmsg_level;
-            int32_t ltype = cmsg->cmsg_type;
-            if (cmsg->cmsg_level == IPPROTO_IP) {
-                int translated = translate_ip_cmsg_to_linux(cmsg->cmsg_type);
-                if (translated < 0)
-                    continue;
-                llevel = LINUX_IPPROTO_IP;
-                ltype = translated;
-            }
-
-            uint8_t data_copy_stack[128];
-            uint8_t *data_copy = data_copy_stack;
-            uint8_t *data_copy_heap = NULL;
-            uint8_t *data_src = CMSG_DATA(cmsg);
-            if (cmsg->cmsg_level == SOL_SOCKET &&
-                cmsg->cmsg_type == SCM_RIGHTS) {
-                if (data_len > LINUX_SCM_MAX_FD * sizeof(int)) {
-                    recvmsg_close_host_rights(data_src, data_len);
-                    recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
-                    free(lctrl_heap);
-                    free(mac_ctrl_heap);
-                    host_iov_free(&host_iov);
-                    host_fd_ref_close(&host_ref);
-                    return -LINUX_EINVAL;
-                }
-                if (data_len > sizeof(data_copy_stack)) {
-                    data_copy_heap = malloc(data_len);
-                    if (!data_copy_heap) {
-                        recvmsg_close_host_rights(data_src, data_len);
-                        break;
-                    }
-                    data_copy = data_copy_heap;
-                }
-                memcpy(data_copy, data_src, data_len);
-                int *fds = (int *) data_copy;
-                size_t nfds = data_len / sizeof(int);
-                for (size_t i = 0; i < nfds; i++) {
-                    int host_recv_fd = fds[i];
-
-                    /* A received descriptor belongs to whoever sent it, so
-                     * elfuse never sets O_NONBLOCK on one: that would mutate a
-                     * description this process did not create, and a guest that
-                     * passes fd 0 to itself would leave the launching shell's
-                     * terminal nonblocking after exit. Marked foreign so a dup
-                     * of it inherits the same restraint.
-                     *
-                     * Which view of the flag is the guest's still has to be
-                     * decided, and the flag as found answers it. A description
-                     * already carrying O_NONBLOCK is one elfuse itself owns:
-                     * every pipe and fifo it opens carries the flag precisely
-                     * because it emulates blocking on top, and an ordinary
-                     * program's description does not. Adopting that emulation
-                     * here sets nothing (the flag is already there) and gives a
-                     * plain read the wait it asked for. Reading the host flag
-                     * as the guest's view instead would hand a blocking read a
-                     * spurious EAGAIN, which a program that never requested
-                     * O_NONBLOCK has no handling for.
-                     *
-                     * What stays wrong is a sender that meant the description
-                     * to be nonblocking: the receiver sees blocking. The
-                     * O_NONBLOCK shadow is per process, and this is the
-                     * survivable direction of that divergence: a wait the
-                     * sender would not have waited, rather than an error on an
-                     * fd that has none.
-                     */
-                    int recv_fl = fcntl(host_recv_fd, F_GETFL);
-                    fd_alias_spec_t spec = fd_alias_carried(
-                        true, recv_fl >= 0 && (recv_fl & O_NONBLOCK));
-                    int gfd = fd_alloc_alias(&spec, FD_REGULAR, fds[i], NULL);
-                    if (gfd < 0) {
-                        close(fds[i]);
-                        fds[i] = -1;
-                    } else {
-                        fds[i] = gfd;
-                        if (scm_nfds < (int) ARRAY_SIZE(scm_gfds)) {
-                            scm_gfds[scm_nfds] = gfd;
-                            scm_hfds[scm_nfds] = host_recv_fd;
-                            scm_nfds++;
-                        }
-                        if (flags & LINUX_MSG_CMSG_CLOEXEC)
-                            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
-                    }
-                }
-                data_src = data_copy;
-            }
-
-            memset(linux_ctrl + lpos, 0, lcmsg_space);
-            memcpy(linux_ctrl + lpos, &lcmsg_len, 8);
-            memcpy(linux_ctrl + lpos + 8, &llevel, 4);
-            memcpy(linux_ctrl + lpos + 12, &ltype, 4);
-            memcpy(linux_ctrl + lpos + CMSG_LINUX_HDR_BYTES, data_src,
-                   data_len);
-            free(data_copy_heap);
-
-            lpos += lcmsg_space;
-        }
-
-        int passcred_val = 0;
-        if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
-                                      &passcred_val) &&
-            passcred_val && host_socket_is_unix(host_ref.fd)) {
-            if (lpos + SCM_CRED_CMSG_SPACE <= lctrl_size &&
-                lpos + SCM_CRED_CMSG_SPACE <= lmsg.msg_controllen) {
-                build_scm_cred_cmsg(linux_ctrl + lpos);
-                lpos += SCM_CRED_CMSG_SPACE;
-            }
-        }
-
-        if (lpos > 0) {
-            if (guest_write_small(g, lmsg.msg_control, linux_ctrl, lpos) < 0) {
-                recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
-                free(lctrl_heap);
-                free(mac_ctrl_heap);
-                host_iov_free(&host_iov);
-                host_fd_ref_close(&host_ref);
-                return -LINUX_EFAULT;
-            }
-            uint64_t lctl = lpos;
-            if (guest_write_small(
-                    g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
-                    &lctl, sizeof(lctl)) < 0) {
-                recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
-                free(lctrl_heap);
-                free(mac_ctrl_heap);
-                host_iov_free(&host_iov);
-                host_fd_ref_close(&host_ref);
-                return -LINUX_EFAULT;
-            }
-        } else {
-            uint64_t zero64 = 0;
-            if (guest_write_small(
-                    g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
-                    &zero64, sizeof(zero64)) < 0) {
-                free(lctrl_heap);
-                free(mac_ctrl_heap);
-                host_iov_free(&host_iov);
-                host_fd_ref_close(&host_ref);
-                return -LINUX_EFAULT;
-            }
-        }
-        free(lctrl_heap);
-    } else if (lmsg.msg_control && lmsg.msg_controllen > 0) {
-        bool injected = false;
-        int passcred_val = 0;
-        if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
-                                      &passcred_val) &&
-            passcred_val && host_socket_is_unix(host_ref.fd)) {
-            if (SCM_CRED_CMSG_SPACE <= lmsg.msg_controllen &&
-                SCM_CRED_CMSG_SPACE <= 64) {
-                uint8_t cred_buf[64];
-                build_scm_cred_cmsg(cred_buf);
-                if (guest_write_small(g, lmsg.msg_control, cred_buf,
-                                      SCM_CRED_CMSG_SPACE) == 0) {
-                    uint64_t cred_ctl_len = SCM_CRED_CMSG_SPACE;
-                    guest_write_small(
-                        g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
-                        &cred_ctl_len, sizeof(cred_ctl_len));
-                    injected = true;
-                }
-            }
-        }
-        if (!injected) {
-            uint64_t zero64 = 0;
-            guest_write_small(
-                g, msg_gva + offsetof(linux_msghdr_t, msg_controllen), &zero64,
-                sizeof(zero64));
-        }
-    } else {
-        uint64_t zero64 = 0;
-        if (guest_write_small(
-                g, msg_gva + offsetof(linux_msghdr_t, msg_controllen), &zero64,
-                sizeof(zero64)) < 0) {
-            free(mac_ctrl_heap);
-            host_iov_free(&host_iov);
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
+    int64_t ctl_err =
+        recvmsg_write_control(g, fd, msg_gva, &lmsg, &msg, host_ref.fd, flags,
+                              ctrl_alloc, &scm, &ctrl_truncated);
+    if (ctl_err < 0) {
+        free(mac_ctrl_heap);
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return ctl_err;
     }
 
     int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags);
@@ -1067,7 +1130,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         mflags |= 0x08;
     if (guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_flags),
                           &mflags, sizeof(mflags)) < 0) {
-        recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
+        recvmsg_cleanup_scm_rights(&scm);
         free(mac_ctrl_heap);
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);

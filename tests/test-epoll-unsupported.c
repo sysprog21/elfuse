@@ -179,10 +179,8 @@ static void expect_accepted(const char *label, int fd, uint32_t events)
     EXPECT_EQ(add_to_fresh_epoll(fd, events), 0, "ADD was refused");
 }
 
-int main(void)
+static void test_unsupported_targets(void)
 {
-    printf("epoll_ctl target-support tests\n");
-
     /* No poll support: EPERM whichever events are asked for. The EPOLLOUT-only
      * case is the one that cannot read the answer off the write filter alone.
      */
@@ -244,7 +242,10 @@ int main(void)
                     ENOENT);
     expect_op_errno("unregistered DEL", "/proc/self/mountinfo", EPOLL_CTL_DEL,
                     ENOENT);
+}
 
+static void test_path_classes(void)
+{
     /* A private directory: guest pids restart at 1, so a pid-derived name was
      * the same name in every concurrent run.
      */
@@ -309,7 +310,10 @@ int main(void)
     expect_eperm_path(pidpath);
     snprintf(pidpath, sizeof(pidpath), "/proc/%d/mountinfo", (int) getpid());
     expect_accepted_path(pidpath);
+}
 
+static int test_dup_and_magic_links(void)
+{
     /* The marker belongs to the open file description, so a dup answers the
      * same way its source does. fd_init_entry clears it for every fresh slot,
      * which without the alias carry would make the copy read as a plain file.
@@ -386,6 +390,11 @@ int main(void)
     close(pipefds[0]);
     close(pipefds[1]);
 
+    return 0;
+}
+
+static int test_timerfd_and_pipe(void)
+{
     /* Never writable, still accepted. */
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
     expect_accepted("timerfd EPOLLOUT", tfd, EPOLLOUT);
@@ -456,6 +465,11 @@ int main(void)
     close(p[0]);
     close(p[1]);
 
+    return 0;
+}
+
+static void test_marker_survives_fork(void)
+{
     /* The intercept marker travels in the fd table, which fork rebuilds over
      * IPC. A child that loses it would refuse a synthesized target its parent
      * accepts, so this pins both answers on the far side of a fork.
@@ -481,7 +495,10 @@ int main(void)
     }
     close(sysfd);
     close(regfd);
+}
 
+static void test_eperm_outranks_einval(void)
+{
     /* do_epoll_ctl tests file_can_poll before is_file_epoll and before the op
      * switch, so a target with no poll method outranks both EINVALs this
      * syscall would otherwise answer first.
@@ -500,6 +517,20 @@ int main(void)
         close(ep);
         close(notep);
     }
+}
+
+int main(void)
+{
+    printf("epoll_ctl target-support tests\n");
+
+    test_unsupported_targets();
+    test_path_classes();
+    if (test_dup_and_magic_links())
+        return 1;
+    if (test_timerfd_and_pipe())
+        return 1;
+    test_marker_survives_fork();
+    test_eperm_outranks_einval();
 
     SUMMARY("test-epoll-unsupported");
     return fails > 0 ? 1 : 0;

@@ -72,6 +72,17 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t);
 int mmap_fork_prepare_anon_shared_locked(guest_t *g,
                                          mmap_fork_anon_shared_txn_t **txn_out);
 
+/* Write all @len bytes of @src to @fd at @file_off, retrying EINTR and clamping
+ * each write to SSIZE_MAX.
+ *
+ * Returns 0, or the translated negative errno of a failed write; a write that
+ * makes no progress is -LINUX_EIO.
+ */
+int64_t pwrite_all_at(int fd,
+                      const uint8_t *src,
+                      uint64_t len,
+                      uint64_t file_off);
+
 /* Finalize or roll back mmap_fork_prepare_anon_shared_locked(). Callers must
  * still have sibling vCPUs quiesced when aborting so the host overlay removal
  * cannot race guest accesses. Abort takes mmap_lock itself, so the caller

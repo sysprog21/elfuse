@@ -2309,8 +2309,19 @@ static int64_t sc_clone(guest_t *g,
         (unsigned long long) x0, (unsigned long long) x1,
         (unsigned long long) x2, (unsigned long long) x3,
         (unsigned long long) x4);
-    return sys_clone(current_thread->vcpu, g, x0, x1, 0, 0, x2, x2, x3, x4,
-                     verbose);
+
+    /* clone(2) shares one argument between CLONE_PARENT_SETTID and CLONE_PIDFD,
+     * and gives no stack mapping range, so the clone paths resolve it.
+     */
+    const clone_req_t req = {
+        .flags = x0,
+        .child_stack = x1,
+        .ptid_gva = x2,
+        .pidfd_gva = x2,
+        .tls = x3,
+        .ctid_gva = x4,
+    };
+    return sys_clone(current_thread->vcpu, g, &req, verbose);
 }
 
 static int64_t sc_clone3(guest_t *g,
@@ -2545,44 +2556,41 @@ void syscall_restart_cancel(hv_vcpu_t vcpu)
     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) cpu_restart_req.result);
 }
 
-int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
+/* A restart that survived to here was taken, and ELR_EL1 plus the syscall
+ * number prove it: on SVC entry ELR is the address after the instruction, which
+ * matches only if this is the same SVC the arm rewound to. Anything that moved
+ * on in between (a cancel, or a handed-off execve that succeeded and reloaded
+ * the image) fails the compare and reads as a fresh call. ELR is read only when
+ * armed, and the number is the X8 the dispatch reads anyway, so the common path
+ * pays nothing.
+ *
+ * The number is checked too, because ELR alone is not a witness once a syscall
+ * can be answered without reaching here. An EL1 fast path serves a rewound SVC
+ * entirely in the shim, so this record survives into a later call; musl funnels
+ * every cancellable syscall through one svc in __syscall_cp_asm, so that later
+ * call arrives at the same ELR and would read as the restart. It is a real
+ * sequence: park in an untimed FUTEX_WAIT, take a leader-work EINTR, have the
+ * handed-off execve fail, then have futex_wait_fast answer the re-executed SVC
+ * with EAGAIN, and connect() at net.c is the reader that would swallow a
+ * genuine EISCONN.
+ *
+ * The shim restores X8 from its saved frame, so a rewound SVC re-executes the
+ * same syscall. Requiring the number to match therefore admits only the call
+ * the arm was for.
+ *
+ * That leaves one standing obligation on future work: no syscall served by an
+ * EL1 fast path may read syscall_is_restarted(). A stale record can outlive its
+ * arm (any fast path prolongs it, not just the futex one), and the number match
+ * is what keeps it from being read as a restart of an unrelated call. Today the
+ * two readers are sys_connect and the netlink receive, neither of which has a
+ * fast path. A fast path added to either, or a restart-reading branch added to
+ * a syscall that has one, needs a per-vCPU gate forcing the rewound SVC through
+ * the HVC instead.
+ */
+static void syscall_restart_note_entry(hv_vcpu_t vcpu, uint64_t x8)
 {
-    uint64_t x0, x1, x2, x3, x4, x5, x8;
-
-    /* A restart that survived to here was taken, and ELR_EL1 plus the syscall
-     * number prove it: on SVC entry ELR is the address after the instruction,
-     * which matches only if this is the same SVC the arm rewound to. Anything
-     * that moved on in between (a cancel, or a handed-off execve that succeeded
-     * and reloaded the image) fails the compare and reads as a fresh call. ELR
-     * is read only when armed, and the number is the X8 the dispatch reads
-     * anyway, so the common path pays nothing.
-     *
-     * The number is checked too, because ELR alone is not a witness once a
-     * syscall can be answered without reaching here. An EL1 fast path serves a
-     * rewound SVC entirely in the shim, so this record survives into a later
-     * call; musl funnels every cancellable syscall through one svc in
-     * __syscall_cp_asm, so that later call arrives at the same ELR and would
-     * read as the restart. It is a real sequence: park in an untimed
-     * FUTEX_WAIT, take a leader-work EINTR, have the handed-off execve fail,
-     * then have futex_wait_fast answer the re-executed SVC with EAGAIN, and
-     * connect() at net.c is the reader that would swallow a genuine EISCONN.
-     *
-     * The shim restores X8 from its saved frame, so a rewound SVC re-executes
-     * the same syscall. Requiring the number to match therefore admits only the
-     * call the arm was for.
-     *
-     * That leaves one standing obligation on future work: no syscall served by
-     * an EL1 fast path may read syscall_is_restarted(). A stale record can
-     * outlive its arm (any fast path prolongs it, not just the futex one), and
-     * the number match is what keeps it from being read as a restart of an
-     * unrelated call. Today the two readers are sys_connect and the netlink
-     * receive, neither of which has a fast path. A fast path added to either,
-     * or a restart-reading branch added to a syscall that has one, needs a
-     * per-vCPU gate forcing the rewound SVC through the HVC instead.
-     */
     cpu_restart_req.forbidden = false;
     cpu_restart_req.restarted = false;
-    hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
     if (cpu_restart_req.armed) {
         uint64_t entry_elr = 0;
         cpu_restart_req.armed = false;
@@ -2591,6 +2599,211 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             entry_elr == cpu_restart_req.elr_after_svc &&
             x8 == cpu_restart_req.nr;
     }
+}
+
+/* The inline read/write path: trivial transfers on fd types that map 1:1 to
+ * host read/write skip the table lookup and wrapper call, but not the X0
+ * writeback, TLBI or signal checks that follow the dispatch.
+ *
+ * The descriptor is pinned under fd_lock, which holds it valid against a
+ * CLONE_THREAD sibling's close.
+ *
+ * Returns true with *result set when the call was served, false when the slow
+ * path has to take it.
+ */
+static bool syscall_fast_rw(guest_t *g,
+                            int nr,
+                            uint64_t x0,
+                            uint64_t x1,
+                            uint64_t x2,
+                            int64_t *result)
+{
+    int fd = (int) x0;
+    if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
+        return false;
+
+    /* Pre-filter: only fast-path fd types that map 1:1 to host read/write. This
+     * read is racy but benign; if the type changed, host_fd_ref_open_state will
+     * either fail or the slow path handles it correctly on fallthrough.
+     */
+    int tp = fd_table[fd].type;
+    if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE && tp != FD_SOCKET)
+        return false;
+
+    /* Proc-backed fds may need synthetic read/write handling (for example,
+     * oom_* rereads recompute content on each read and proc dirfds steer
+     * relative *at() resolution). Keep them on the slow path so the proc
+     * interceptors run.
+     */
+    if (fd_table[fd].proc_path[0] != '\0')
+        return false;
+
+    /* Pin the descriptor and classify it together: io_xfer would otherwise look
+     * the slot up again, and a sibling reusing this fd number in between makes
+     * the two describe different objects.
+     */
+    host_fd_ref_t host_ref;
+    fd_block_state_t fast_st;
+    if (host_fd_ref_open_state(fd, &host_ref, &fast_st) != 0)
+        return false;
+
+    /* Both of the decisions below come from fast_st, the state taken with the
+     * descriptor, and not from a second look at the table. The pre-filter above
+     * can afford its racy read because a wrong answer only costs a diversion to
+     * the slow path; these two cannot. A can_block read that disagrees with the
+     * pinned fd picks the wrong transfer form for it, which is the parked-vCPU
+     * failure this path is built to avoid, and a seals read that disagrees
+     * enforces the seal of whatever occupied the slot a moment ago.
+     */
+    if (nr == SYS_write && (fast_st.seals & LINUX_F_SEAL_WRITE)) {
+        host_fd_ref_close(&host_ref);
+        return false;
+    }
+
+    /* sys_write is where RLIMIT_FSIZE is applied, to regular files only;
+     * inherited stdio may be one.
+     */
+    if (nr == SYS_write &&
+        (fast_st.type == FD_REGULAR || fast_st.type == FD_STDIO) &&
+        sys_rlimit_cur(LINUX_RLIMIT_FSIZE) != LINUX_RLIM_INFINITY) {
+        host_fd_ref_close(&host_ref);
+        return false;
+    }
+    uint64_t count = x2;
+    if (count == 0) {
+        host_fd_ref_close(&host_ref);
+        return false;
+    }
+
+    /* read() writes into the buffer (needs W); write() reads from the buffer
+     * (needs R).
+     */
+    int perms = (nr == SYS_read) ? MEM_PERM_W : MEM_PERM_R;
+    uint64_t avail = 0;
+    void *buf = guest_ptr_bound(g, x1, &avail, perms, count);
+    if (!buf || avail < count) {
+        host_fd_ref_close(&host_ref);
+        return false;
+    }
+
+    /* Readiness is not a reservation: a sibling thread or a forked process on
+     * the same open file description can take the bytes before this thread gets
+     * to them, and a transfer that then blocks parks this vCPU where
+     * hv_vcpus_exit and the wakeup pipe cannot reach it. io_xfer runs the
+     * transfer without that risk, waiting interruptibly when it has to, and
+     * reports a negative only for the cases the slow path has to answer: an
+     * interrupted wait, and a read on a pty master whose slaves are gone.
+     *
+     * Regular files never block (can_block is false) and go straight to the
+     * host call.
+     */
+    ssize_t ret;
+    if (fast_st.can_block) {
+        short ev = (nr == SYS_read) ? POLLIN : POLLOUT;
+        struct iovec iov = {.iov_base = buf, .iov_len = count};
+        if (io_xfer(fd, host_ref.fd, ev, &iov, 1, &ret, &fast_st) < 0) {
+            host_fd_ref_close(&host_ref);
+            return false;
+        }
+    } else {
+        ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
+                               : write(host_ref.fd, buf, count);
+    }
+    if (ret >= 0) {
+        host_fd_ref_close(&host_ref);
+        *result = ret;
+        return true;
+    }
+
+    /* SEQPACKET-over-DGRAM peer close is ECONNRESET on the host datagram
+     * socket; Linux reports a clean EOF. recv_eof_or_errno probes the pinned
+     * host fd, so keep it open until after the check.
+     */
+    if (nr == SYS_read) {
+        *result = recv_eof_or_errno(host_ref.fd, fd);
+        host_fd_ref_close(&host_ref);
+        return true;
+    }
+    int fast_errno = errno;
+    host_fd_ref_close(&host_ref);
+    if (fast_errno == EPIPE)
+        signal_queue(LINUX_SIGPIPE);
+    errno = fast_errno;
+    *result = linux_errno();
+    return true;
+}
+
+/* Record one latency sample. Guard the subtraction: syscall_hist_now_ns returns
+ * 0 if clock_gettime fails, and an unsigned 0 minus a non-zero start would
+ * underflow to a huge value and pollute the histogram with a bogus sample.
+ */
+static void syscall_hist_sample(int nr, uint64_t start_ns)
+{
+    uint64_t end_ns = syscall_hist_now_ns();
+    if (end_ns >= start_ns)
+        syscall_hist_record(nr, end_ns - start_ns);
+}
+
+/* Verbose only: log the syscall return value and, for the calls that take one,
+ * the guest path arguments.
+ */
+static void syscall_log_result(guest_t *g,
+                               uint64_t x0,
+                               uint64_t x1,
+                               uint64_t x2,
+                               uint64_t x8,
+                               int64_t result)
+{
+    log_debug("  -> %lld (0x%llx)", (long long) result,
+              (unsigned long long) (uint64_t) result);
+    if ((int) x8 == SYS_openat || (int) x8 == SYS_readlinkat ||
+        (int) x8 == SYS_faccessat) {
+        char pathbuf[256], escaped_path[512];
+        if (guest_read_str(g, x1, pathbuf, sizeof(pathbuf)) >= 0) {
+            escape_log_string(escaped_path, pathbuf, sizeof(escaped_path));
+            log_debug("  path=\"%s\"", escaped_path);
+        }
+    } else if ((int) x8 == SYS_symlinkat) {
+        char target[256], linkpath[256];
+        char escaped_target[512], escaped_linkpath[512];
+        if (guest_read_str(g, x0, target, sizeof(target)) >= 0 &&
+            guest_read_str(g, x2, linkpath, sizeof(linkpath)) >= 0) {
+            escape_log_string(escaped_target, target, sizeof(escaped_target));
+            escape_log_string(escaped_linkpath, linkpath,
+                              sizeof(escaped_linkpath));
+            log_debug("  symlink target=\"%s\" linkpath=\"%s\"", escaped_target,
+                      escaped_linkpath);
+        }
+    }
+}
+
+/* Arm a restart rather than report EINTR; syscall_restart_arm in syscall/proc.h
+ * holds the contract, and syscall_restart_forbid the waits that opt out.
+ *
+ * No signal test here, deliberately. A queued signal may still be discarded at
+ * delivery (SIG_IGN, default-ignore), so refusing on one would hand back the
+ * very EINTR this removes. Only a delivery that commits to a handler frame
+ * cancels.
+ */
+static bool syscall_restart_try_arm(hv_vcpu_t vcpu, uint64_t x8, int64_t result)
+{
+    if (result != -LINUX_EINTR || cpu_restart_req.forbidden ||
+        !thread_stop_is_leader_work_only())
+        return false;
+    uint64_t elr = 0;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
+    if (elr < 4)
+        return false;
+    syscall_restart_arm(vcpu, elr, x8, result);
+    return true;
+}
+
+int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
+{
+    uint64_t x0, x1, x2, x3, x4, x5, x8;
+
+    hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
+    syscall_restart_note_entry(vcpu, x8);
 
     x0 = 0;
     x1 = 0;
@@ -2601,15 +2814,12 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
 
     int64_t result = -LINUX_ENOSYS;
     bool should_exit = false;
+    bool args_read = false;
 
     /* Fast-path hot syscalls: bypass the full dispatch for trivial process
      * identity queries and short helper cases. Skips the table lookup and
      * wrapper call, but NOT the X0 writeback / TLBI / signal checks that follow
      * it.
-     *
-     * Single-threaded guests can use the raw host fd directly because there is
-     * no concurrent close() race. Multi-threaded guests pin it under fd_lock
-     * instead, which holds it valid against a CLONE_THREAD sibling's close.
      */
     int nr = (int) x8;
     const syscall_entry_t *entry = NULL;
@@ -2646,127 +2856,12 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
             hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
             hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
-            int fd = (int) x0;
-            if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
-                goto slow_path;
-
-            /* Pre-filter: only fast-path fd types that map 1:1 to host
-             * read/write. This read is racy but benign; if the type changed,
-             * host_fd_ref_open_state will either fail or the slow path handles
-             * it correctly on fallthrough.
-             */
-            int tp = fd_table[fd].type;
-            if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE &&
-                tp != FD_SOCKET)
-                goto slow_path;
-
-            /* Proc-backed fds may need synthetic read/write handling (for
-             * example, oom_* rereads recompute content on each read and proc
-             * dirfds steer relative *at() resolution). Keep them on the slow
-             * path so the proc interceptors run.
-             */
-            if (fd_table[fd].proc_path[0] != '\0')
-                goto slow_path;
-
-            /* Pin the descriptor and classify it together: io_xfer would
-             * otherwise look the slot up again, and a sibling reusing this fd
-             * number in between makes the two describe different objects.
-             */
-            host_fd_ref_t host_ref;
-            fd_block_state_t fast_st;
-            if (host_fd_ref_open_state(fd, &host_ref, &fast_st) != 0)
-                goto slow_path;
-
-            /* Both of the decisions below come from fast_st, the state taken
-             * with the descriptor, and not from a second look at the table. The
-             * pre-filter above can afford its racy read because a wrong answer
-             * only costs a diversion to the slow path; these two cannot. A
-             * can_block read that disagrees with the pinned fd picks the wrong
-             * transfer form for it, which is the parked-vCPU failure this path
-             * is built to avoid, and a seals read that disagrees enforces the
-             * seal of whatever occupied the slot a moment ago.
-             */
-            if (nr == SYS_write && (fast_st.seals & LINUX_F_SEAL_WRITE)) {
-                host_fd_ref_close(&host_ref);
-                goto slow_path;
-            }
-
-            /* sys_write is where RLIMIT_FSIZE is applied, to regular files
-             * only; inherited stdio may be one.
-             */
-            if (nr == SYS_write &&
-                (fast_st.type == FD_REGULAR || fast_st.type == FD_STDIO) &&
-                sys_rlimit_cur(LINUX_RLIMIT_FSIZE) != LINUX_RLIM_INFINITY) {
-                host_fd_ref_close(&host_ref);
-                goto slow_path;
-            }
-            uint64_t count = x2;
-            if (count == 0) {
-                host_fd_ref_close(&host_ref);
-                goto slow_path;
-            }
-
-            /* read() writes into the buffer (needs W); write() reads from the
-             * buffer (needs R).
-             */
-            int perms = (nr == SYS_read) ? MEM_PERM_W : MEM_PERM_R;
-            uint64_t avail = 0;
-            void *buf = guest_ptr_bound(g, x1, &avail, perms, count);
-            if (!buf || avail < count) {
-                host_fd_ref_close(&host_ref);
-                goto slow_path;
-            }
-
-            /* Readiness is not a reservation: a sibling thread or a forked
-             * process on the same open file description can take the bytes
-             * before this thread gets to them, and a transfer that then blocks
-             * parks this vCPU where hv_vcpus_exit and the wakeup pipe cannot
-             * reach it. io_xfer runs the transfer without that risk, waiting
-             * interruptibly when it has to, and reports a negative only for the
-             * cases the slow path has to answer: an interrupted wait, and a
-             * read on a pty master whose slaves are gone.
-             *
-             * Regular files never block (can_block is false) and go straight to
-             * the host call.
-             */
-            ssize_t ret;
-            if (fast_st.can_block) {
-                short ev = (nr == SYS_read) ? POLLIN : POLLOUT;
-                struct iovec iov = {.iov_base = buf, .iov_len = count};
-                if (io_xfer(fd, host_ref.fd, ev, &iov, 1, &ret, &fast_st) < 0) {
-                    host_fd_ref_close(&host_ref);
-                    goto slow_path;
-                }
-            } else {
-                ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
-                                       : write(host_ref.fd, buf, count);
-            }
-            if (ret >= 0) {
-                host_fd_ref_close(&host_ref);
-                result = ret;
+            args_read = true;
+            if (syscall_fast_rw(g, nr, x0, x1, x2, &result))
                 goto fast_done;
-            }
-
-            /* SEQPACKET-over-DGRAM peer close is ECONNRESET on the host
-             * datagram socket; Linux reports a clean EOF. recv_eof_or_errno
-             * probes the pinned host fd, so keep it open until after the check.
-             */
-            if (nr == SYS_read) {
-                result = recv_eof_or_errno(host_ref.fd, fd);
-                host_fd_ref_close(&host_ref);
-                goto fast_done;
-            }
-            int fast_errno = errno;
-            host_fd_ref_close(&host_ref);
-            if (fast_errno == EPIPE)
-                signal_queue(LINUX_SIGPIPE);
-            errno = fast_errno;
-            result = linux_errno();
-            goto fast_done;
         }
     }
 
-slow_path:
     entry = RANGE_CHECK(nr, 0, SC_TABLE_SIZE) ? &syscall_table[nr] : NULL;
 
 /* Private embedder pseudo-syscall for translated guests.
@@ -2799,9 +2894,11 @@ slow_path:
     }
 #endif
 
-    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
-    hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
-    hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+    if (!args_read) {
+        hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+        hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
+        hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+    }
 
     if (verbose || !entry || !entry->handler || entry->needs_extra_regs) {
         hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
@@ -2832,14 +2929,7 @@ slow_path:
             result = 0; /* Not written back, but keep clean */
         } else if (result == SYSCALL_EXEC_HAPPENED) {
             if (hist_start_ns) {
-                /* Guard the subtraction: syscall_hist_now_ns returns 0 if
-                 * clock_gettime fails. An unsigned 0 minus a non-zero start
-                 * would underflow to a huge value and pollute the histogram
-                 * with a bogus latency sample.
-                 */
-                uint64_t hist_end_ns = syscall_hist_now_ns();
-                if (hist_end_ns >= hist_start_ns)
-                    syscall_hist_record(nr, hist_end_ns - hist_start_ns);
+                syscall_hist_sample(nr, hist_start_ns);
                 syscall_hist_freeze("frozen at first execve");
             }
             thread_note_syscall(-1);
@@ -2862,51 +2952,10 @@ fast_done:
     thread_note_syscall(-1);
 
     if (!should_exit) {
-        /* Verbose: log syscall return value and file paths */
-        if (verbose) {
-            log_debug("  -> %lld (0x%llx)", (long long) result,
-                      (unsigned long long) (uint64_t) result);
-            if ((int) x8 == SYS_openat || (int) x8 == SYS_readlinkat ||
-                (int) x8 == SYS_faccessat) {
-                char pathbuf[256], escaped_path[512];
-                if (guest_read_str(g, x1, pathbuf, sizeof(pathbuf)) >= 0) {
-                    escape_log_string(escaped_path, pathbuf,
-                                      sizeof(escaped_path));
-                    log_debug("  path=\"%s\"", escaped_path);
-                }
-            } else if ((int) x8 == SYS_symlinkat) {
-                char target[256], linkpath[256];
-                char escaped_target[512], escaped_linkpath[512];
-                if (guest_read_str(g, x0, target, sizeof(target)) >= 0 &&
-                    guest_read_str(g, x2, linkpath, sizeof(linkpath)) >= 0) {
-                    escape_log_string(escaped_target, target,
-                                      sizeof(escaped_target));
-                    escape_log_string(escaped_linkpath, linkpath,
-                                      sizeof(escaped_linkpath));
-                    log_debug("  symlink target=\"%s\" linkpath=\"%s\"",
-                              escaped_target, escaped_linkpath);
-                }
-            }
-        }
+        if (verbose)
+            syscall_log_result(g, x0, x1, x2, x8, result);
 
-        /* Arm rather than report; syscall_restart_arm in syscall/proc.h holds
-         * the contract, and syscall_restart_forbid the waits that opt out.
-         *
-         * No signal test here, deliberately. A queued signal may still be
-         * discarded at delivery (SIG_IGN, default-ignore), so refusing on one
-         * would hand back the very EINTR this removes. Only a delivery that
-         * commits to a handler frame cancels.
-         */
-        bool restart_armed = false;
-        if (result == -LINUX_EINTR && !cpu_restart_req.forbidden &&
-            thread_stop_is_leader_work_only()) {
-            uint64_t elr = 0;
-            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
-            if (elr >= 4) {
-                syscall_restart_arm(vcpu, elr, x8, result);
-                restart_armed = true;
-            }
-        }
+        bool restart_armed = syscall_restart_try_arm(vcpu, x8, result);
 
         /* Write result back to X0 */
         if (!restart_armed)
@@ -2926,11 +2975,8 @@ fast_done:
         tlbi_request_emit_to_vcpu(vcpu);
     }
 
-    if (hist_start_ns) {
-        uint64_t hist_end_ns = syscall_hist_now_ns();
-        if (hist_end_ns >= hist_start_ns)
-            syscall_hist_record(nr, hist_end_ns - hist_start_ns);
-    }
+    if (hist_start_ns)
+        syscall_hist_sample(nr, hist_start_ns);
 
     return should_exit;
 }

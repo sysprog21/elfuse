@@ -44,23 +44,11 @@ static int xattr_probe(const char *path)
     return -1;
 }
 
-int main(int argc, char **argv)
+static void test_tmp_redirect_and_fallback(const char *guest_tmp_path,
+                                           const char *mounted_host_tmp_path,
+                                           const char *host_fallback_path)
 {
-    if (argc != 5) {
-        fprintf(stderr,
-                "usage: %s <guest-tmp-path> <mounted-host-tmp-path> "
-                "<host-fallback-path> <mounted-sysroot-root>\n",
-                argv[0]);
-        return 2;
-    }
-
-    const char *guest_tmp_path = argv[1];
-    const char *mounted_host_tmp_path = argv[2];
-    const char *host_fallback_path = argv[3];
-    const char *mounted_sysroot_root = argv[4];
     char buf[256];
-
-    printf("test-sysroot-create-paths: create-path routing tests\n");
 
     TEST("root create path stays inside sysroot");
     {
@@ -134,7 +122,10 @@ int main(int argc, char **argv)
             PASS();
         }
     }
+}
 
+static void test_relative_xattr(void)
+{
     TEST("relative xattr uses guest cwd");
     {
         const char *rel_dir = "/tmp/elfuse-sysroot-create-paths";
@@ -165,7 +156,11 @@ int main(int argc, char **argv)
             }
         }
     }
+}
 
+static void test_create_symlink_escape(const char *mounted_sysroot_root,
+                                       const char *host_fallback_path)
+{
     TEST("redirected /tmp create rejects sysroot symlink escape");
     {
         char sysroot_tmp[512];
@@ -222,7 +217,11 @@ int main(int argc, char **argv)
         }
     symlink_escape_done:;
     }
+}
 
+static void test_unlink_paths(const char *mounted_sysroot_root,
+                              const char *host_fallback_path)
+{
     TEST("failed unlink does not create redirected parent dirs");
     {
         char sysroot_tmp[512];
@@ -299,7 +298,10 @@ int main(int argc, char **argv)
         unlink(sysroot_tmp);
         mkdir(sysroot_tmp, 0755);
     }
+}
 
+static void test_nonexistent_parent(const char *mounted_sysroot_root)
+{
     TEST("open file in non-existent parent returns ENOENT, not ELOOP");
     {
         int fd = open("/etc/nonexistent_parent_dir_123/sub/file.txt",
@@ -369,6 +371,31 @@ int main(int argc, char **argv)
          */
         EXPECT_TRUE(!hit_eloop, "TOCTOU race returned ELOOP");
     }
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 5) {
+        fprintf(stderr,
+                "usage: %s <guest-tmp-path> <mounted-host-tmp-path> "
+                "<host-fallback-path> <mounted-sysroot-root>\n",
+                argv[0]);
+        return 2;
+    }
+
+    const char *guest_tmp_path = argv[1];
+    const char *mounted_host_tmp_path = argv[2];
+    const char *host_fallback_path = argv[3];
+    const char *mounted_sysroot_root = argv[4];
+
+    printf("test-sysroot-create-paths: create-path routing tests\n");
+
+    test_tmp_redirect_and_fallback(guest_tmp_path, mounted_host_tmp_path,
+                                   host_fallback_path);
+    test_relative_xattr();
+    test_create_symlink_escape(mounted_sysroot_root, host_fallback_path);
+    test_unlink_paths(mounted_sysroot_root, host_fallback_path);
+    test_nonexistent_parent(mounted_sysroot_root);
 
     SUMMARY("test-sysroot-create-paths");
     return fails > 0 ? 1 : 0;

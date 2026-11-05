@@ -839,6 +839,301 @@ static unsigned max_power_unit(const char *speed)
     return atoi(speed) >= 5000 ? 8 : 2;
 }
 
+/* Checks the active-configuration attributes of one device directory. */
+static void check_device_config_attrs(const char *dir)
+{
+    char val[128];
+
+    /* The five attributes lsusb -t reads. Their absence is not a crash, it is a
+     * warning per device and a topology listing with holes in it.
+     *
+     * bmAttributes, bMaxPower and configuration are checked against the
+     * device's own `descriptors` blob rather than merely for being present:
+     * each is a field copied out of the active configuration descriptor, so the
+     * blob is the only thing that can say whether the right byte was copied.
+     * Asserting shape alone -- "parses as hex", "is present" -- passes for a
+     * wrong value and for a garbage string alike.
+     */
+    unsigned char *blob = NULL;
+    char cfgpath[600];
+    ssize_t blen = -1;
+    if (snprintf(cfgpath, sizeof(cfgpath), "%s/descriptors", dir) <
+        (int) sizeof(cfgpath))
+        blen = slurp(cfgpath, &blob);
+
+    char cfgvalbuf[64], speedbuf[64];
+    const unsigned char *cfg = NULL;
+    if (blen > 0 &&
+        attr_str(dir, "bConfigurationValue", cfgvalbuf, sizeof(cfgvalbuf)) == 0)
+        cfg = active_cfg(blob, (size_t) blen, (unsigned) atoi(cfgvalbuf));
+
+    TEST("bmAttributes equals the active config descriptor's byte");
+    if (!cfg) {
+        FAIL("no active configuration in descriptors");
+    } else {
+        char *end = NULL;
+        long got = attr_str(dir, "bmAttributes", val, sizeof(val)) == 0
+                       ? strtol(val, &end, 16)
+                       : -1;
+
+        /* endptr, not just the value: strtol returns 0 for a string with no
+         * digits at all, which is what made the old check unfalsifiable.
+         */
+        EXPECT_VALUE(end && end != val && *end == '\0' && got == (long) cfg[7],
+                     "bmAttributes matches descriptor");
+    }
+
+    TEST("bMaxPower equals the descriptor field scaled by the speed unit");
+    if (!cfg || attr_str(dir, "speed", speedbuf, sizeof(speedbuf)) != 0) {
+        FAIL("no active configuration or speed");
+    } else if (attr_str(dir, "bMaxPower", val, sizeof(val)) != 0) {
+        FAIL("bMaxPower missing");
+    } else {
+        char expect[64];
+        snprintf(expect, sizeof(expect), "%umA",
+                 (unsigned) cfg[8] * max_power_unit(speedbuf));
+        EXPECT_VALUE(!strcmp(val, expect), "bMaxPower matches descriptor");
+    }
+
+    /* configuration against iConfiguration, in the one direction Linux actually
+     * guarantees.
+     *
+     * An earlier version of this asserted the biconditional -- empty exactly
+     * when iConfiguration is 0 -- and that is not Linux's rule.
+     * configuration_show emits nothing whenever actconfig->string is NULL
+     * (sysfs.c:83-84), and usb_cache_string returns NULL "if the index is 0 or
+     * the string could not be read" (message.c:1074-1075). An empty
+     * configuration therefore means "no cached string", which a non-zero
+     * iConfiguration does not rule out: a device that NAKs its own string
+     * descriptor reads empty on real sysfs too, so the biconditional fails
+     * against Linux itself. It failed here for the same reason -- this layer
+     * has no ep0 and so never has a string -- and that made it look like an
+     * implementation bug when the assertion was the wrong one.
+     *
+     * What does hold in both directions is the index-0 half: index 0
+     * short-circuits usb_cache_string before any transfer, so a non-empty
+     * configuration on a configuration with no string index is a value this
+     * layer invented. That is the falsifiable claim, and it is what stays.
+     *
+     * The other branch -- a non-zero index whose string was read -- has no
+     * device here to produce it (both attached devices report iConfiguration 0)
+     * and no code path to produce it either. It is covered against a
+     * synthesized descriptor in test-usb-desc-host.c.
+     */
+    TEST("configuration is empty when iConfiguration is 0");
+    if (!cfg) {
+        FAIL("no active configuration in descriptors");
+    } else if (attr_str(dir, "configuration", val, sizeof(val)) != 0) {
+        FAIL("configuration missing");
+    } else {
+        char why[256];
+        snprintf(why, sizeof(why),
+                 "iConfiguration=%u but configuration reads \"%s\"",
+                 (unsigned) cfg[6], val);
+        EXPECT_VALUE(cfg[6] != 0 || val[0] == '\0', why);
+    }
+
+    /* Presence, separately from contents. Linux keeps these four in
+     * dev_attr_grp (sysfs.c:782-786), an attribute group with no .is_visible
+     * (sysfs.c:815-817), so they exist on every USB device directory whether or
+     * not the kernel has a value to put in them -- a value it lacks is a
+     * zero-length read, never an ENOENT. Emitting them only when the descriptor
+     * parsed, or leaving `configuration` out because no string could be
+     * fetched, would both be caught here.
+     */
+    TEST("the four active-config attributes are all present");
+    {
+        static const char *const names[] = {"bNumInterfaces", "bmAttributes",
+                                            "bMaxPower", "configuration"};
+        const char *absent = NULL;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            if (attr_str(dir, names[i], val, sizeof(val)) != 0)
+                absent = names[i];
+        char why[128];
+        snprintf(why, sizeof(why), "%s is absent, not empty",
+                 absent ? absent : "?");
+        EXPECT_TRUE(!absent, why);
+    }
+
+    /* An attribute this tree really does not carry answers ENOENT, the way
+     * sysfs answers for a name that is not an attribute. The read path has no
+     * business reporting EACCES for an absent file: the tree's EACCES is the
+     * read-only refusal of a *mutating* open, and the two must not be
+     * confusable -- a reader probing for an optional attribute takes ENOENT as
+     * "not supported" and EACCES as "supported but denied".
+     */
+    TEST("an absent device attribute is ENOENT, not EACCES");
+    {
+        char probe[600];
+        snprintf(probe, sizeof(probe), "%s/elfuse-no-such-attribute", dir);
+        EXPECT_ERRNO(open(probe, O_RDONLY), ENOENT, "absent attr errno");
+    }
+
+    TEST("maxchild is present and numeric");
+    EXPECT_TRUE(attr_str(dir, "maxchild", val, sizeof(val)) == 0 &&
+                    val[0] >= '0' && val[0] <= '9',
+                "maxchild");
+
+    TEST("rx_lanes is at least one");
+    EXPECT_TRUE(
+        attr_str(dir, "rx_lanes", val, sizeof(val)) == 0 && atoi(val) >= 1,
+        "rx_lanes");
+
+    TEST("tx_lanes is at least one");
+    EXPECT_TRUE(
+        attr_str(dir, "tx_lanes", val, sizeof(val)) == 0 && atoi(val) >= 1,
+        "tx_lanes");
+
+    free(blob);
+}
+
+/* Checks the interface directories of one device against bNumInterfaces. */
+static void check_device_interfaces(const char *dir, const char *name)
+{
+    char val[128];
+
+    /* bNumInterfaces and the emitted :c.i directories describe the same
+     * configuration, so they have to count the same. Reading the attribute off
+     * the first config while the directories came from the active one would
+     * show up right here.
+     */
+    TEST("bNumInterfaces matches the interface dirs");
+    int declared = -1;
+    if (attr_str(dir, "bNumInterfaces", val, sizeof(val)) == 0)
+        declared = atoi(val);
+    int seen = 0;
+    char ifdir[600];
+    ifdir[0] = '\0';
+    DIR *idp = opendir(DEVICES_DIR);
+    if (idp) {
+        size_t nlen = strlen(name);
+        struct dirent *ient;
+        while ((ient = readdir(idp))) {
+            if (!strncmp(ient->d_name, name, nlen) &&
+                ient->d_name[nlen] == ':') {
+                seen++;
+                if (!ifdir[0])
+                    snprintf(ifdir, sizeof(ifdir), "%s/%s", DEVICES_DIR,
+                             ient->d_name);
+            }
+        }
+        closedir(idp);
+    }
+    EXPECT_EQ(seen, declared, "interface dir count");
+
+    /* Both depths carry a `subsystem` link, and both are walked in the field:
+     * libudev from the interface, pyserial from the device.
+     */
+    check_subsystem_link(dir, "device");
+    if (ifdir[0])
+        check_subsystem_link(ifdir, "interface");
+    check_link_containment(dir);
+}
+
+/* Checks the usbdevfs node of one device against its sysfs directory. */
+static void check_device_node(const char *dir, int busnum, int devnum)
+{
+    char val[128];
+
+    /* The dev attribute, the node's name, and the node's own st_rdev are three
+     * spellings of one identity.
+     */
+    TEST("dev attribute matches the node's rdev");
+    char node[64];
+    snprintf(node, sizeof(node), "/dev/bus/usb/%03d/%03d", busnum, devnum);
+    struct stat nst;
+    int want_minor = (busnum - 1) * 128 + (devnum - 1);
+    char want_dev[64];
+    snprintf(want_dev, sizeof(want_dev), "%d:%d", USB_MAJOR, want_minor);
+    EXPECT_TRUE(attr_str(dir, "dev", val, sizeof(val)) == 0 &&
+                    !strcmp(val, want_dev) && stat(node, &nst) == 0 &&
+                    S_ISCHR(nst.st_mode) &&
+                    (int) major(nst.st_rdev) == USB_MAJOR &&
+                    (int) minor(nst.st_rdev) == want_minor,
+                "dev / node / rdev agree");
+
+    /* The invariant this whole layer rests on: one blob, two views. */
+    TEST("descriptors and the node read the same bytes");
+    unsigned char *a = NULL, *b = NULL;
+    char dpath[600];
+    snprintf(dpath, sizeof(dpath), "%s/descriptors", dir);
+    ssize_t na = slurp(dpath, &a);
+    ssize_t nb = slurp(node, &b);
+    EXPECT_TRUE(na > 0 && na == nb && a && b && memcmp(a, b, (size_t) na) == 0,
+                "byte-identical descriptor blobs");
+
+    /* The device descriptor is the first 18 bytes of that blob, and its
+     * idVendor/idProduct have to be the ones sysfs advertises.
+     */
+    TEST("the blob's device descriptor matches idVendor/idProduct");
+    unsigned vid = 0, pid = 0;
+    if (attr_str(dir, "idVendor", val, sizeof(val)) == 0)
+        vid = (unsigned) strtoul(val, NULL, 16);
+    if (attr_str(dir, "idProduct", val, sizeof(val)) == 0)
+        pid = (unsigned) strtoul(val, NULL, 16);
+    EXPECT_TRUE(a && na >= 18 && a[0] == 18 && a[1] == 1 &&
+                    (unsigned) (a[8] | (a[9] << 8)) == vid &&
+                    (unsigned) (a[10] | (a[11] << 8)) == pid,
+                "device descriptor header");
+
+    /* A char device used as a directory is ENOTDIR on Linux, whichever way the
+     * extra component is spelled. Answering ENOENT, or worse handing back the
+     * blob, tells a path walker the wrong thing about the node.
+     */
+    TEST("a trailing slash on the node is ENOTDIR");
+    char trail[80];
+    snprintf(trail, sizeof(trail), "%s/", node);
+    EXPECT_TRUE(open(trail, O_RDONLY) < 0 && errno == ENOTDIR,
+                "open node with a trailing slash");
+
+    TEST("a component below the node is ENOTDIR");
+    snprintf(trail, sizeof(trail), "%s/anything", node);
+    EXPECT_TRUE(open(trail, O_RDONLY) < 0 && errno == ENOTDIR,
+                "open below the node");
+
+    TEST("O_DIRECTORY on the node is ENOTDIR");
+    EXPECT_TRUE(open(node, O_RDONLY | O_DIRECTORY) < 0 && errno == ENOTDIR,
+                "O_DIRECTORY on a char device");
+
+    /* The usbdevfs fd now serves writable opens, and it has to keep the
+     * one-blob invariant: reading it must still return exactly what the
+     * descriptors attribute does, or the two views have drifted apart the
+     * moment a second generator appeared.
+     */
+    TEST("a writable open of the node serves the same blob");
+    int wfd = na > 0 ? open(node, O_RDWR) : -1;
+    if (wfd < 0) {
+        FAIL("O_RDWR on the node");
+    } else {
+        /* One byte over the attribute's length, so a node serving more than the
+         * attribute does is a failure rather than a prefix that silently
+         * compares equal.
+         */
+        size_t cap = (size_t) na + 1;
+        unsigned char *w = malloc(cap);
+        ssize_t nw = 0;
+        if (!w) {
+            FAIL("malloc");
+        } else {
+            while ((size_t) nw < cap) {
+                ssize_t r = read(wfd, w + nw, cap - (size_t) nw);
+                if (r < 0 && errno == EINTR)
+                    continue;
+                if (r <= 0)
+                    break;
+                nw += r;
+            }
+            EXPECT_TRUE(nw == na && memcmp(w, a, (size_t) na) == 0,
+                        "usbdevfs fd read matches descriptors");
+            free(w);
+        }
+        close(wfd);
+    }
+
+    free(a);
+    free(b);
+}
+
 /* Assertions that need a device. Returns the number examined. */
 static int check_devices(void)
 {
@@ -860,7 +1155,7 @@ static int check_devices(void)
             continue;
         ndev++;
 
-        char busbuf[64], devbuf[64], val[128];
+        char busbuf[64], devbuf[64];
         if (attr_str(dir, "busnum", busbuf, sizeof(busbuf)) < 0 ||
             attr_str(dir, "devnum", devbuf, sizeof(devbuf)) < 0) {
             TEST("device carries busnum and devnum");
@@ -869,283 +1164,9 @@ static int check_devices(void)
         }
         int busnum = atoi(busbuf), devnum = atoi(devbuf);
 
-        /* The five attributes lsusb -t reads. Their absence is not a crash, it
-         * is a warning per device and a topology listing with holes in it.
-         *
-         * bmAttributes, bMaxPower and configuration are checked against the
-         * device's own `descriptors` blob rather than merely for being present:
-         * each is a field copied out of the active configuration descriptor, so
-         * the blob is the only thing that can say whether the right byte was
-         * copied. Asserting shape alone -- "parses as hex", "is present" --
-         * passes for a wrong value and for a garbage string alike.
-         */
-        unsigned char *blob = NULL;
-        char cfgpath[600];
-        ssize_t blen = -1;
-        if (snprintf(cfgpath, sizeof(cfgpath), "%s/descriptors", dir) <
-            (int) sizeof(cfgpath))
-            blen = slurp(cfgpath, &blob);
-
-        char cfgvalbuf[64], speedbuf[64];
-        const unsigned char *cfg = NULL;
-        if (blen > 0 && attr_str(dir, "bConfigurationValue", cfgvalbuf,
-                                 sizeof(cfgvalbuf)) == 0)
-            cfg = active_cfg(blob, (size_t) blen, (unsigned) atoi(cfgvalbuf));
-
-        TEST("bmAttributes equals the active config descriptor's byte");
-        if (!cfg) {
-            FAIL("no active configuration in descriptors");
-        } else {
-            char *end = NULL;
-            long got = attr_str(dir, "bmAttributes", val, sizeof(val)) == 0
-                           ? strtol(val, &end, 16)
-                           : -1;
-
-            /* endptr, not just the value: strtol returns 0 for a string with no
-             * digits at all, which is what made the old check unfalsifiable.
-             */
-            EXPECT_VALUE(
-                end && end != val && *end == '\0' && got == (long) cfg[7],
-                "bmAttributes matches descriptor");
-        }
-
-        TEST("bMaxPower equals the descriptor field scaled by the speed unit");
-        if (!cfg || attr_str(dir, "speed", speedbuf, sizeof(speedbuf)) != 0) {
-            FAIL("no active configuration or speed");
-        } else if (attr_str(dir, "bMaxPower", val, sizeof(val)) != 0) {
-            FAIL("bMaxPower missing");
-        } else {
-            char expect[64];
-            snprintf(expect, sizeof(expect), "%umA",
-                     (unsigned) cfg[8] * max_power_unit(speedbuf));
-            EXPECT_VALUE(!strcmp(val, expect), "bMaxPower matches descriptor");
-        }
-
-        /* configuration against iConfiguration, in the one direction Linux
-         * actually guarantees.
-         *
-         * An earlier version of this asserted the biconditional -- empty
-         * exactly when iConfiguration is 0 -- and that is not Linux's rule.
-         * configuration_show emits nothing whenever actconfig->string is NULL
-         * (sysfs.c:83-84), and usb_cache_string returns NULL "if the index is 0
-         * or the string could not be read" (message.c:1074-1075). An empty
-         * configuration therefore means "no cached string", which a non-zero
-         * iConfiguration does not rule out: a device that NAKs its own string
-         * descriptor reads empty on real sysfs too, so the biconditional fails
-         * against Linux itself. It failed here for the same reason -- this
-         * layer has no ep0 and so never has a string -- and that made it look
-         * like an implementation bug when the assertion was the wrong one.
-         *
-         * What does hold in both directions is the index-0 half: index 0
-         * short-circuits usb_cache_string before any transfer, so a non-empty
-         * configuration on a configuration with no string index is a value this
-         * layer invented. That is the falsifiable claim, and it is what stays.
-         *
-         * The other branch -- a non-zero index whose string was read -- has no
-         * device here to produce it (both attached devices report
-         * iConfiguration 0) and no code path to produce it either. It is
-         * covered against a synthesized descriptor in test-usb-desc-host.c.
-         */
-        TEST("configuration is empty when iConfiguration is 0");
-        if (!cfg) {
-            FAIL("no active configuration in descriptors");
-        } else if (attr_str(dir, "configuration", val, sizeof(val)) != 0) {
-            FAIL("configuration missing");
-        } else {
-            char why[256];
-            snprintf(why, sizeof(why),
-                     "iConfiguration=%u but configuration reads \"%s\"",
-                     (unsigned) cfg[6], val);
-            EXPECT_VALUE(cfg[6] != 0 || val[0] == '\0', why);
-        }
-
-        /* Presence, separately from contents. Linux keeps these four in
-         * dev_attr_grp (sysfs.c:782-786), an attribute group with no
-         * .is_visible (sysfs.c:815-817), so they exist on every USB device
-         * directory whether or not the kernel has a value to put in them -- a
-         * value it lacks is a zero-length read, never an ENOENT. Emitting them
-         * only when the descriptor parsed, or leaving `configuration` out
-         * because no string could be fetched, would both be caught here.
-         */
-        TEST("the four active-config attributes are all present");
-        {
-            static const char *const names[] = {
-                "bNumInterfaces", "bmAttributes", "bMaxPower", "configuration"};
-            const char *absent = NULL;
-            for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-                if (attr_str(dir, names[i], val, sizeof(val)) != 0)
-                    absent = names[i];
-            char why[128];
-            snprintf(why, sizeof(why), "%s is absent, not empty",
-                     absent ? absent : "?");
-            EXPECT_TRUE(!absent, why);
-        }
-
-        /* An attribute this tree really does not carry answers ENOENT, the way
-         * sysfs answers for a name that is not an attribute. The read path has
-         * no business reporting EACCES for an absent file: the tree's EACCES is
-         * the read-only refusal of a *mutating* open, and the two must not be
-         * confusable -- a reader probing for an optional attribute takes ENOENT
-         * as "not supported" and EACCES as "supported but denied".
-         */
-        TEST("an absent device attribute is ENOENT, not EACCES");
-        {
-            char probe[600];
-            snprintf(probe, sizeof(probe), "%s/elfuse-no-such-attribute", dir);
-            EXPECT_ERRNO(open(probe, O_RDONLY), ENOENT, "absent attr errno");
-        }
-
-        TEST("maxchild is present and numeric");
-        EXPECT_TRUE(attr_str(dir, "maxchild", val, sizeof(val)) == 0 &&
-                        val[0] >= '0' && val[0] <= '9',
-                    "maxchild");
-
-        TEST("rx_lanes is at least one");
-        EXPECT_TRUE(
-            attr_str(dir, "rx_lanes", val, sizeof(val)) == 0 && atoi(val) >= 1,
-            "rx_lanes");
-
-        TEST("tx_lanes is at least one");
-        EXPECT_TRUE(
-            attr_str(dir, "tx_lanes", val, sizeof(val)) == 0 && atoi(val) >= 1,
-            "tx_lanes");
-
-        /* bNumInterfaces and the emitted :c.i directories describe the same
-         * configuration, so they have to count the same. Reading the attribute
-         * off the first config while the directories came from the active one
-         * would show up right here.
-         */
-        TEST("bNumInterfaces matches the interface dirs");
-        int declared = -1;
-        if (attr_str(dir, "bNumInterfaces", val, sizeof(val)) == 0)
-            declared = atoi(val);
-        int seen = 0;
-        char ifdir[600];
-        ifdir[0] = '\0';
-        DIR *idp = opendir(DEVICES_DIR);
-        if (idp) {
-            size_t nlen = strlen(ent->d_name);
-            struct dirent *ient;
-            while ((ient = readdir(idp))) {
-                if (!strncmp(ient->d_name, ent->d_name, nlen) &&
-                    ient->d_name[nlen] == ':') {
-                    seen++;
-                    if (!ifdir[0])
-                        snprintf(ifdir, sizeof(ifdir), "%s/%s", DEVICES_DIR,
-                                 ient->d_name);
-                }
-            }
-            closedir(idp);
-        }
-        EXPECT_EQ(seen, declared, "interface dir count");
-
-        /* Both depths carry a `subsystem` link, and both are walked in the
-         * field: libudev from the interface, pyserial from the device.
-         */
-        check_subsystem_link(dir, "device");
-        if (ifdir[0])
-            check_subsystem_link(ifdir, "interface");
-        check_link_containment(dir);
-
-        /* The dev attribute, the node's name, and the node's own st_rdev are
-         * three spellings of one identity.
-         */
-        TEST("dev attribute matches the node's rdev");
-        char node[64];
-        snprintf(node, sizeof(node), "/dev/bus/usb/%03d/%03d", busnum, devnum);
-        struct stat nst;
-        int want_minor = (busnum - 1) * 128 + (devnum - 1);
-        char want_dev[64];
-        snprintf(want_dev, sizeof(want_dev), "%d:%d", USB_MAJOR, want_minor);
-        EXPECT_TRUE(attr_str(dir, "dev", val, sizeof(val)) == 0 &&
-                        !strcmp(val, want_dev) && stat(node, &nst) == 0 &&
-                        S_ISCHR(nst.st_mode) &&
-                        (int) major(nst.st_rdev) == USB_MAJOR &&
-                        (int) minor(nst.st_rdev) == want_minor,
-                    "dev / node / rdev agree");
-
-        /* The invariant this whole layer rests on: one blob, two views. */
-        TEST("descriptors and the node read the same bytes");
-        unsigned char *a = NULL, *b = NULL;
-        char dpath[600];
-        snprintf(dpath, sizeof(dpath), "%s/descriptors", dir);
-        ssize_t na = slurp(dpath, &a);
-        ssize_t nb = slurp(node, &b);
-        EXPECT_TRUE(
-            na > 0 && na == nb && a && b && memcmp(a, b, (size_t) na) == 0,
-            "byte-identical descriptor blobs");
-
-        /* The device descriptor is the first 18 bytes of that blob, and its
-         * idVendor/idProduct have to be the ones sysfs advertises.
-         */
-        TEST("the blob's device descriptor matches idVendor/idProduct");
-        unsigned vid = 0, pid = 0;
-        if (attr_str(dir, "idVendor", val, sizeof(val)) == 0)
-            vid = (unsigned) strtoul(val, NULL, 16);
-        if (attr_str(dir, "idProduct", val, sizeof(val)) == 0)
-            pid = (unsigned) strtoul(val, NULL, 16);
-        EXPECT_TRUE(a && na >= 18 && a[0] == 18 && a[1] == 1 &&
-                        (unsigned) (a[8] | (a[9] << 8)) == vid &&
-                        (unsigned) (a[10] | (a[11] << 8)) == pid,
-                    "device descriptor header");
-
-        /* A char device used as a directory is ENOTDIR on Linux, whichever way
-         * the extra component is spelled. Answering ENOENT, or worse handing
-         * back the blob, tells a path walker the wrong thing about the node.
-         */
-        TEST("a trailing slash on the node is ENOTDIR");
-        char trail[80];
-        snprintf(trail, sizeof(trail), "%s/", node);
-        EXPECT_TRUE(open(trail, O_RDONLY) < 0 && errno == ENOTDIR,
-                    "open node with a trailing slash");
-
-        TEST("a component below the node is ENOTDIR");
-        snprintf(trail, sizeof(trail), "%s/anything", node);
-        EXPECT_TRUE(open(trail, O_RDONLY) < 0 && errno == ENOTDIR,
-                    "open below the node");
-
-        TEST("O_DIRECTORY on the node is ENOTDIR");
-        EXPECT_TRUE(open(node, O_RDONLY | O_DIRECTORY) < 0 && errno == ENOTDIR,
-                    "O_DIRECTORY on a char device");
-
-        /* The usbdevfs fd now serves writable opens, and it has to keep the
-         * one-blob invariant: reading it must still return exactly what the
-         * descriptors attribute does, or the two views have drifted apart the
-         * moment a second generator appeared.
-         */
-        TEST("a writable open of the node serves the same blob");
-        int wfd = na > 0 ? open(node, O_RDWR) : -1;
-        if (wfd < 0) {
-            FAIL("O_RDWR on the node");
-        } else {
-            /* One byte over the attribute's length, so a node serving more than
-             * the attribute does is a failure rather than a prefix that
-             * silently compares equal.
-             */
-            size_t cap = (size_t) na + 1;
-            unsigned char *w = malloc(cap);
-            ssize_t nw = 0;
-            if (!w) {
-                FAIL("malloc");
-            } else {
-                while ((size_t) nw < cap) {
-                    ssize_t r = read(wfd, w + nw, cap - (size_t) nw);
-                    if (r < 0 && errno == EINTR)
-                        continue;
-                    if (r <= 0)
-                        break;
-                    nw += r;
-                }
-                EXPECT_TRUE(nw == na && memcmp(w, a, (size_t) na) == 0,
-                            "usbdevfs fd read matches descriptors");
-                free(w);
-            }
-            close(wfd);
-        }
-
-        free(a);
-        free(b);
-        free(blob);
+        check_device_config_attrs(dir);
+        check_device_interfaces(dir, ent->d_name);
+        check_device_node(dir, busnum, devnum);
     }
     closedir(dp);
     return ndev;

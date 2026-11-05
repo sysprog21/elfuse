@@ -85,10 +85,17 @@ static void *waker(void *arg)
 }
 
 static uint32_t count_word;
+static uint32_t count_ready;
 
+/* Announce arrival before parking, so the main thread knows all three have at
+ * least started. A thread cannot announce that it is inside FUTEX_WAIT, so the
+ * main thread still settles after the last arrival; a waiter that is late then
+ * costs a missed detection, never a false failure.
+ */
 static void *count_waiter(void *arg)
 {
     (void) arg;
+    __atomic_fetch_add(&count_ready, 1, __ATOMIC_SEQ_CST);
     wait_on(&count_word, 0);
     return NULL;
 }
@@ -155,20 +162,32 @@ int main(void)
      */
     pthread_t cw[3];
     int started = 0;
-    for (; started < 3; started++)
-        if (pthread_create(&cw[started], NULL, count_waiter, NULL) != 0)
+    int create_rc = 0;
+    for (; started < 3; started++) {
+        create_rc = pthread_create(&cw[started], NULL, count_waiter, NULL);
+        if (create_rc != 0)
             break;
-    struct timespec park = {0, 300000000L};
-    nanosleep(&park, NULL);
+    }
+    if (create_rc != 0) {
+        errno = create_rc;
+        TEST("start three waiters for the wake count");
+        FAIL("pthread_create");
+    } else {
+        struct timespec park = {0, 10000000L};
+        while (__atomic_load_n(&count_ready, __ATOMIC_SEQ_CST) < 3)
+            nanosleep(&park, NULL);
+        park.tv_nsec = 100000000L;
+        nanosleep(&park, NULL);
 
-    TEST("wake with count 0 wakes one waiter");
-    EXPECT_RAW_ERRNO(wake_three_count(0), 1, "expected 1 woken");
+        TEST("wake with count 0 wakes one waiter");
+        EXPECT_RAW_ERRNO(wake_three_count(0), 1, "expected 1 woken");
 
-    TEST("wake with a negative count wakes one waiter");
-    EXPECT_RAW_ERRNO(wake_three_count(-1), 1, "expected 1 woken");
+        TEST("wake with a negative count wakes one waiter");
+        EXPECT_RAW_ERRNO(wake_three_count(-1), 1, "expected 1 woken");
 
-    TEST("wake with INT_MAX wakes the rest");
-    EXPECT_RAW_ERRNO(wake_three_count(0x7fffffff), 1, "expected 1 woken");
+        TEST("wake with INT_MAX wakes the rest");
+        EXPECT_RAW_ERRNO(wake_three_count(0x7fffffff), 1, "expected 1 woken");
+    }
 
     /* A waiter the wakes above missed would hang the join. */
     wake(&count_word, 0x7fffffff);

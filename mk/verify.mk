@@ -490,7 +490,10 @@ VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-cove
 #                  futex_requeue_counts_valid at the top of futex_requeue. The
 #                  sum itself is exact for any pair; the requires buys the
 #                  no_overflow claim that it fits in 32 bits
-#   walk state:    futex_requeue_step, kept inside the counts by its own result
+#   walk state:    futex_requeue_step, discharged by the walk loop in
+#                  futex_requeue: both counters start at 0 and each pass bumps
+#                  only the one the step named, so its own result keeps them
+#                  inside the counts
 #   op <= 4, cmp <= 5: futex_wake_op_apply and futex_wake_op_cmp, discharged by
 #                  the *_supported gates in futex_wake_op
 #   valid timespec: linux_timespec_is_valid, futex_remaining_ns and
@@ -525,8 +528,9 @@ VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-cove
 #      futex_bucket_insert. Requeue orders its two locks by comparing indices;
 #      test-covered.
 #   6. A guest word is read and compared under the bucket lock that orders it
-#      against a wake, and a mismatch answers EAGAIN. Test-covered:
-#      test-futex-ops.
+#      against a wake, and a mismatch answers EAGAIN. The EAGAIN answer is
+#      test-covered by test-futex-timed and test-futex-waitv; that the compare
+#      runs under the lock is review-only, since a test cannot place it.
 # Invariants 3, 4 and 6 are concurrent. WP cannot state them over pthread
 # interleavings. An EVA run over the requeue walk with unconstrained counts
 # (interval domain) could not prove even the relational bound of invariant 1,

@@ -138,7 +138,7 @@ typedef struct {
     void *host_addr;    /* shmat() return on host */
     uint64_t guest_gva; /* guest virtual address */
     uint64_t size;      /* segment size */
-    uint64_t vma_id;    /* region vma_id of the guest mapping */
+    uint64_t attach;    /* serial the guest mapping's regions carry */
     bool rdonly;        /* attached read-only */
 } shm_attach_t;
 
@@ -250,7 +250,9 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
     /* Always allocate RW initially so the code can copy shm content in. For
      * SHM_RDONLY, downgrade to read-only via mprotect after the copy.
      */
-    int64_t gva = sys_mmap_shm(g, seg_size, LINUX_PROT_READ | LINUX_PROT_WRITE);
+    uint64_t attach;
+    int64_t gva = sys_mmap_shm(g, seg_size, LINUX_PROT_READ | LINUX_PROT_WRITE,
+                               (int32_t) info.shm_perm._key, &attach);
     if (gva < 0) {
         shmdt(host_addr);
         return gva; /* propagate mmap error */
@@ -290,7 +292,7 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
     entry->host_addr = host_addr;
     entry->guest_gva = (uint64_t) gva;
     entry->size = seg_size;
-    entry->vma_id = mem_vma_id_at(g, (uint64_t) gva);
+    entry->attach = attach;
     entry->rdonly = rdonly;
     pthread_mutex_unlock(&shm_lock);
 
@@ -317,21 +319,21 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
     pthread_mutex_unlock(&shm_lock);
 
     /* The guest may have unmapped the attach, or mapped over it, since it was
-     * made. Linux then finds no attach at the address and fails with EINVAL,
-     * and the mapping that is there now is neither copied nor unmapped. When
-     * only part of the attach is gone, the write-back and the unmap below take
-     * the parts that remain, the regions that still have the attach's vma_id.
+     * made. When none of it is left, Linux finds no attach at the address and
+     * fails with EINVAL, and what is mapped there now is neither copied nor
+     * unmapped. When only part of it is gone, the write-back and the unmap take
+     * the parts that remain, the regions that still carry the attach's serial.
      */
     uint64_t gva = entry.guest_gva, lo, hi;
     uint64_t end = gva + PAGE_ALIGN_UP(entry.size);
-    if (mem_vma_id_at(g, gva) != entry.vma_id) {
+    if (!mem_attach_next(g, gva, end, entry.attach, &lo, &hi)) {
         shmdt(entry.host_addr);
         return -LINUX_EINVAL;
     }
 
     /* Write back guest modifications to host shm (unless read-only) */
     for (uint64_t cur = gva;
-         !entry.rdonly && mem_vma_next(g, cur, end, entry.vma_id, &lo, &hi);
+         !entry.rdonly && mem_attach_next(g, cur, end, entry.attach, &lo, &hi);
          cur = hi) {
         uint64_t copy_end = hi < gva + entry.size ? hi : gva + entry.size;
         guest_read(g, lo, (char *) entry.host_addr + (lo - gva), copy_end - lo);
@@ -341,13 +343,18 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
     shmdt(entry.host_addr);
 
     /* Release the guest mapping as Linux does at detach, so it stops counting
-     * toward RLIMIT_AS. The caller holds mmap_lock.
+     * toward RLIMIT_AS. A piece that fails to unmap does not stop the others,
+     * and the first error is returned. The caller holds mmap_lock.
      */
-    for (uint64_t cur = gva; mem_vma_next(g, cur, end, entry.vma_id, &lo, &hi);
-         cur = hi)
-        sys_munmap(g, lo, hi - lo);
+    int64_t err = 0;
+    for (uint64_t cur = gva;
+         mem_attach_next(g, cur, end, entry.attach, &lo, &hi); cur = hi) {
+        int64_t rc = sys_munmap(g, lo, hi - lo);
+        if (rc < 0 && err == 0)
+            err = rc;
+    }
 
-    return 0;
+    return err;
 }
 
 int64_t sys_shmctl(guest_t *g, int shmid, int cmd, uint64_t buf_gva)

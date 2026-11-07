@@ -487,6 +487,25 @@ static int data_child(void)
     if (again == (void *) -1 || again[0] != 'A' || again[MIB] != 0 ||
         (again != seg + MIB && seg[MIB] != 'X'))
         return 17;
+
+    /* 18: so is a shared anonymous one over the first page, which Linux keeps
+     * apart from the attach.
+     */
+    id = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    seg = id < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    if (seg == (void *) -1 || munmap(seg, 4096) < 0 ||
+        map_anon(seg, 4096, rw, MAP_SHARED | MAP_FIXED) != seg) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    seg[0] = 'S';
+    seg[4096] = 'B';
+    again = shmdt(seg) < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (again == (void *) -1 || again[0] != 0 || again[4096] != 'B' ||
+        (again != seg && seg[0] != 'S'))
+        return 18;
     return 0;
 }
 

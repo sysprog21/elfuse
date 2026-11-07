@@ -964,27 +964,28 @@ int mac_to_linux_status_flags(int mac_flags);
 /* Translate Linux status flags (F_SETFL arg) to macOS equivalents. */
 int linux_to_mac_status_flags(int linux_flags);
 
-/* Guest memory for a SysV shm attach: shared anonymous, as a Linux attach is
- * VM_SHARED. Caller must hold mmap_lock.
+/* Guest memory for a SysV shm attach of the segment with @key: shared
+ * anonymous, as a Linux attach is VM_SHARED. Its region carries a new serial,
+ * which is stored in *@attach. Caller must hold mmap_lock.
  */
-int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot);
+int64_t sys_mmap_shm(guest_t *g,
+                     uint64_t length,
+                     int prot,
+                     int32_t key,
+                     uint64_t *attach);
 
-/* vma_id of the region at guest address @gva, or 0 when nothing is mapped
- * there. Caller must hold mmap_lock.
- */
-uint64_t mem_vma_id_at(guest_t *g, uint64_t gva);
-
-/* The first part of [@gva, @end) whose region has @vma_id, as [*@lo, *@hi) in
- * guest addresses.
+/* The first part of [@gva, @end) whose region carries the shm attach serial
+ * @attach, as [*@lo, *@hi) in guest addresses.
  *
- * Returns false when no part of the range has it. Caller must hold mmap_lock.
+ * Returns false when no part of the range carries it. Caller must hold
+ * mmap_lock.
  */
-bool mem_vma_next(guest_t *g,
-                  uint64_t gva,
-                  uint64_t end,
-                  uint64_t vma_id,
-                  uint64_t *lo,
-                  uint64_t *hi);
+bool mem_attach_next(guest_t *g,
+                     uint64_t gva,
+                     uint64_t end,
+                     uint64_t attach,
+                     uint64_t *lo,
+                     uint64_t *hi);
 
 /* Borrowed-or-pinned host fd reference.
  *

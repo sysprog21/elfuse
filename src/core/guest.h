@@ -292,6 +292,10 @@ typedef struct {
                              */
     uint64_t overlay_end;   /* Host-page-aligned overlay end (exclusive). */
     char name[64];          /* Label: "[heap]", "[stack]", ELF path, etc. */
+    uint64_t shm_attach;    /* Nonzero for a SysV shm attach: a serial unique
+                             * to that attach, so the region never merges with
+                             * or lends its vma_id to any other mapping.
+                             */
 } guest_region_t;
 
 /* TLB invalidation request kinds. After every page-table modification, the shim
@@ -1318,6 +1322,19 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   int owned_backing_fd,
                                   bool inherited_at_fork,
                                   uint64_t vma_id);
+/* guest_region_add_ex_owned_gpa, for a region that carries @shm_attach. */
+int guest_region_add_attach_gpa(guest_t *g,
+                                uint64_t start,
+                                uint64_t end,
+                                uint64_t gpa_base,
+                                int prot,
+                                int flags,
+                                uint64_t offset,
+                                const char *name,
+                                int owned_backing_fd,
+                                bool inherited_at_fork,
+                                uint64_t vma_id,
+                                uint64_t shm_attach);
 
 /* Re-seed the logical-VMA allocator from a restored region snapshot. Fork IPC
  * restores regions by value, so next_vma_id must be advanced past every

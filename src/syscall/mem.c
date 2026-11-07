@@ -115,6 +115,7 @@ typedef struct {
     bool backing_ro;
     bool inherited_at_fork;
     char name[sizeof(((guest_region_t *) 0)->name)];
+    uint64_t shm_attach;
 } region_snapshot_t;
 
 /* Undo record for one boundary split. A split rewrites exactly one entry and
@@ -1901,6 +1902,7 @@ static int capture_region_snapshots(guest_t *g,
         snap->backing_ro = r->backing_ro;
         snap->inherited_at_fork = r->inherited_at_fork;
         str_copy_trunc(snap->name, r->name, sizeof(snap->name));
+        snap->shm_attach = r->shm_attach;
     }
 
     if (splits_out)
@@ -2016,10 +2018,11 @@ static int restore_region_snapshots(guest_t *g, region_snapshot_t *snaps, int n)
 {
     for (int i = 0; i < n; i++) {
         region_snapshot_t *snap = &snaps[i];
-        if (guest_region_add_ex_owned_gpa(
+        if (guest_region_add_attach_gpa(
                 g, snap->start, snap->end, snap->gpa_base, snap->prot,
                 snap->flags, snap->offset, snap->name[0] ? snap->name : NULL,
-                snap->backing_fd, snap->inherited_at_fork, snap->vma_id) < 0) {
+                snap->backing_fd, snap->inherited_at_fork, snap->vma_id,
+                snap->shm_attach) < 0) {
             snap->backing_fd = -1;
             close_region_snapshots(snaps, n);
             return -LINUX_ENOMEM;
@@ -3687,15 +3690,19 @@ static int mmap_extend_fresh(guest_t *g,
  *
  * Flag combinations, not steps: MAP_FIXED, MAP_SHARED, the file-backed overlay
  * and the anonymous path each qualify the others. Splitting by flag duplicates
- * the interactions between them.
+ * the interactions between them. sys_mmap, with the region it records named
+ * @name and tagged @shm_attach. Only a non-fixed request with no high-VA hint
+ * passes them, and it records its region at one place below.
  */
-int64_t sys_mmap(guest_t *g,
-                 uint64_t addr,
-                 uint64_t length,
-                 int prot,
-                 int flags,
-                 int fd,
-                 int64_t offset)
+static int64_t mmap_tagged(guest_t *g,
+                           uint64_t addr,
+                           uint64_t length,
+                           int prot,
+                           int flags,
+                           int fd,
+                           int64_t offset,
+                           const char *name,
+                           uint64_t shm_attach)
 {
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
@@ -3976,9 +3983,10 @@ int64_t sys_mmap(guest_t *g,
      */
     int owned_backing_fd = fresh.track_backing_fd;
     fresh.track_backing_fd = -1;
-    if (guest_region_add_ex_owned(g, result_off, result_off + length, prot,
-                                  track_flags, is_anon ? 0 : (uint64_t) offset,
-                                  NULL, owned_backing_fd, false, 0) < 0) {
+    if (guest_region_add_attach_gpa(
+            g, result_off, result_off + length, result_off, prot, track_flags,
+            is_anon ? 0 : (uint64_t) offset, name, owned_backing_fd, false, 0,
+            shm_attach) < 0) {
         /* Region table was full: undo any host overlay we just installed so the
          * file is not left mmap'd at host_base+ipa with no tracking. Without
          * this, a later operation in that range would memset zeros directly
@@ -4940,39 +4948,53 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
     }
 }
 
+int64_t sys_mmap(guest_t *g,
+                 uint64_t addr,
+                 uint64_t length,
+                 int prot,
+                 int flags,
+                 int fd,
+                 int64_t offset)
+{
+    return mmap_tagged(g, addr, length, prot, flags, fd, offset, NULL, 0);
+}
+
 /* Guest memory for a SysV shm attach, which sys_shmat fills by copying from the
  * host segment. A Linux attach is VM_SHARED: it counts toward RLIMIT_AS only,
  * /proc/self/maps shows it as shared, and a fork child shares it with the
- * parent. Mapping it MAP_SHARED | MAP_ANONYMOUS gives all three, and keeps the
- * region from coalescing with a private neighbor.
+ * parent. Mapping it MAP_SHARED | MAP_ANONYMOUS gives all three. The region is
+ * named as Linux names it in maps, and tagged with a serial no other region
+ * has, so it never merges with another mapping or another attach.
  */
-int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot)
+int64_t sys_mmap_shm(guest_t *g,
+                     uint64_t length,
+                     int prot,
+                     int32_t key,
+                     uint64_t *attach)
 {
-    return sys_mmap(g, 0, length, prot, LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
-                    -1, 0);
+    static uint64_t last_attach;
+    char name[sizeof(((guest_region_t *) 0)->name)];
+    snprintf(name, sizeof(name), "/SYSV%08x (deleted)", (uint32_t) key);
+    *attach = ++last_attach;
+    return mmap_tagged(g, 0, length, prot,
+                       LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS, -1, 0, name,
+                       *attach);
 }
 
-uint64_t mem_vma_id_at(guest_t *g, uint64_t gva)
-{
-    uint64_t off = gva >= g->guest_size ? gva : gva - g->ipa_base;
-    const guest_region_t *r = guest_region_find(g, off);
-    return r ? r->vma_id : 0;
-}
-
-bool mem_vma_next(guest_t *g,
-                  uint64_t gva,
-                  uint64_t end,
-                  uint64_t vma_id,
-                  uint64_t *lo,
-                  uint64_t *hi)
+bool mem_attach_next(guest_t *g,
+                     uint64_t gva,
+                     uint64_t end,
+                     uint64_t attach,
+                     uint64_t *lo,
+                     uint64_t *hi)
 {
     uint64_t off = gva >= g->guest_size ? gva : gva - g->ipa_base;
     uint64_t off_end = off + (end - gva);
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, off); i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
         if (r->start >= off_end)
             break;
-        if (r->end > off && r->vma_id == vma_id) {
+        if (r->shm_attach == attach) {
             *lo = gva + ((r->start > off ? r->start : off) - off);
             *hi = gva + ((r->end < off_end ? r->end : off_end) - off);
             return true;

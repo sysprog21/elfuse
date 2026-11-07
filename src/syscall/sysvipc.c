@@ -301,42 +301,56 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
 
 int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
 {
+    /* The guest may have unmapped an attach, or mapped over it, since it was
+     * made, and attached another segment at the same address since. The record
+     * taken is the one at the address whose attach still has a part mapped, the
+     * regions that carry its serial. When no record there has one, Linux finds
+     * no attach at the address and fails with EINVAL, and what is mapped there
+     * now is neither copied nor unmapped. The caller holds mmap_lock.
+     */
+    uint64_t lo, hi;
     pthread_mutex_lock(&shm_lock);
-    shm_attach_t *match = NULL;
+    shm_attach_t *match = NULL, *stale = NULL;
     SHM_FOR_EACH (e) {
-        if (e->active && e->guest_gva == shmaddr_gva) {
+        if (!e->active || e->guest_gva != shmaddr_gva)
+            continue;
+        uint64_t end = e->guest_gva + PAGE_ALIGN_UP(e->size);
+        if (mem_attach_next(g, e->guest_gva, end, e->attach, &lo, &hi, NULL)) {
             match = e;
             break;
         }
+        if (!stale)
+            stale = e;
     }
-    if (!match) {
+    shm_attach_t *taken = match ? match : stale;
+    if (!taken) {
         pthread_mutex_unlock(&shm_lock);
         return -LINUX_EINVAL;
     }
 
-    shm_attach_t entry = *match;
-    match->active = false;
+    shm_attach_t entry = *taken;
+    taken->active = false;
     pthread_mutex_unlock(&shm_lock);
 
-    /* The guest may have unmapped the attach, or mapped over it, since it was
-     * made. When none of it is left, Linux finds no attach at the address and
-     * fails with EINVAL, and what is mapped there now is neither copied nor
-     * unmapped. When only part of it is gone, the write-back and the unmap take
-     * the parts that remain, the regions that still carry the attach's serial.
-     */
-    uint64_t gva = entry.guest_gva, lo, hi;
-    uint64_t end = gva + PAGE_ALIGN_UP(entry.size);
-    if (!mem_attach_next(g, gva, end, entry.attach, &lo, &hi)) {
+    if (!match) {
         shmdt(entry.host_addr);
         return -LINUX_EINVAL;
     }
 
-    /* Write back guest modifications to host shm (unless read-only) */
+    /* Write back guest modifications to host shm (unless read-only), from the
+     * parts of the attach that remain. The copy reads the memory behind them
+     * directly, so a part the guest made PROT_NONE is written back too.
+     */
+    uint64_t gva = entry.guest_gva;
+    uint64_t end = gva + PAGE_ALIGN_UP(entry.size);
+    void *src;
     for (uint64_t cur = gva;
-         !entry.rdonly && mem_attach_next(g, cur, end, entry.attach, &lo, &hi);
+         !entry.rdonly &&
+         mem_attach_next(g, cur, end, entry.attach, &lo, &hi, &src);
          cur = hi) {
         uint64_t copy_end = hi < gva + entry.size ? hi : gva + entry.size;
-        guest_read(g, lo, (char *) entry.host_addr + (lo - gva), copy_end - lo);
+        if (src)
+            memcpy((char *) entry.host_addr + (lo - gva), src, copy_end - lo);
     }
 
     /* Detach host shm */
@@ -348,7 +362,7 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
      */
     int64_t err = 0;
     for (uint64_t cur = gva;
-         mem_attach_next(g, cur, end, entry.attach, &lo, &hi); cur = hi) {
+         mem_attach_next(g, cur, end, entry.attach, &lo, &hi, NULL); cur = hi) {
         int64_t rc = sys_munmap(g, lo, hi - lo);
         if (rc < 0 && err == 0)
             err = rc;

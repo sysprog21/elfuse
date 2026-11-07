@@ -464,6 +464,7 @@ typedef struct {
     int backing_fd;
     int tail_backing_fd;
     char name[sizeof(((guest_region_t *) 0)->name)];
+    uint64_t shm_attach;
 } mremap_track_t;
 
 /* Release whatever descriptors the tracker still owns. Idempotent, so a failure
@@ -512,6 +513,7 @@ static bool mremap_track_init(mremap_track_t *track,
     if (src_reg->backing_fd >= 0 && track->backing_fd < 0)
         return false;
     str_copy_trunc(track->name, src_reg->name, sizeof(track->name));
+    track->shm_attach = src_reg->shm_attach;
 
     if (mremap_track_splits(track, new_size) && track->backing_fd >= 0) {
         track->tail_backing_fd = dup(track->backing_fd);
@@ -553,17 +555,17 @@ static int add_mremap_region(guest_t *g,
             close(backing_fd);
             return -1;
         }
-        if (guest_region_add_ex_owned(g, start, start + inherited_size, prot,
-                                      flags, offset, name, backing_fd, true,
-                                      vma_id) < 0) {
+        if (guest_region_add_attach_gpa(g, start, start + inherited_size, start,
+                                        prot, flags, offset, name, backing_fd,
+                                        true, vma_id, track->shm_attach) < 0) {
             if (tail_backing_fd >= 0)
                 close(tail_backing_fd);
             return -1;
         }
-        if (guest_region_add_ex_owned(g, start + inherited_size,
-                                      start + new_size, prot, flags,
-                                      offset + inherited_size, name,
-                                      tail_backing_fd, false, vma_id) < 0) {
+        if (guest_region_add_attach_gpa(
+                g, start + inherited_size, start + new_size,
+                start + inherited_size, prot, flags, offset + inherited_size,
+                name, tail_backing_fd, false, vma_id, track->shm_attach) < 0) {
             guest_region_remove(g, start, start + inherited_size);
             return -1;
         }
@@ -572,9 +574,10 @@ static int add_mremap_region(guest_t *g,
 
     if (tail_backing_fd >= 0)
         close(tail_backing_fd);
-    return guest_region_add_ex_owned(
-        g, start, start + new_size, prot, flags, offset, name, backing_fd,
-        inherited_size == new_size && inherited_size > 0, vma_id);
+    return guest_region_add_attach_gpa(
+        g, start, start + new_size, start, prot, flags, offset, name,
+        backing_fd, inherited_size == new_size && inherited_size > 0, vma_id,
+        track->shm_attach);
 }
 
 static void region_clip_overlay(guest_region_t *r)
@@ -3677,9 +3680,12 @@ static int mmap_extend_fresh(guest_t *g,
  *
  * Flag combinations, not steps: MAP_FIXED, MAP_SHARED, the file-backed overlay
  * and the anonymous path each qualify the others. Splitting by flag duplicates
- * the interactions between them. sys_mmap, with the region it records named
- * @name and tagged @shm_attach. Only a non-fixed request with no high-VA hint
- * passes them, and it records its region at one place below.
+ * the interactions between them.
+ */
+
+/* sys_mmap, but the region it records gets the name @name and the shm attach
+ * serial @shm_attach. Only a non-fixed request with no high-VA hint passes
+ * them, and that request records its region at one place below.
  */
 static int64_t mmap_tagged(guest_t *g,
                            uint64_t addr,
@@ -4969,7 +4975,8 @@ bool mem_attach_next(guest_t *g,
                      uint64_t end,
                      uint64_t attach,
                      uint64_t *lo,
-                     uint64_t *hi)
+                     uint64_t *hi,
+                     void **host)
 {
     uint64_t off = gva >= g->guest_size ? gva : gva - g->ipa_base;
     uint64_t off_end = off + (end - gva);
@@ -4978,8 +4985,11 @@ bool mem_attach_next(guest_t *g,
         if (r->start >= off_end)
             break;
         if (r->shm_attach == attach) {
-            *lo = gva + ((r->start > off ? r->start : off) - off);
+            uint64_t piece = r->start > off ? r->start : off;
+            *lo = gva + (piece - off);
             *hi = gva + ((r->end < off_end ? r->end : off_end) - off);
+            if (host)
+                *host = host_ptr_for_gpa(g, r->gpa_base + (piece - r->start));
             return true;
         }
     }

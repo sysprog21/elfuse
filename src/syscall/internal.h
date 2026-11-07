@@ -975,7 +975,9 @@ int64_t sys_mmap_shm(guest_t *g,
                      uint64_t *attach);
 
 /* The first part of [@gva, @end) whose region carries the shm attach serial
- * @attach, as [*@lo, *@hi) in guest addresses.
+ * @attach, as [*@lo, *@hi) in guest addresses. When @host is not NULL, *@host
+ * is set to the host memory behind *@lo, which is readable whatever the guest
+ * page protection.
  *
  * Returns false when no part of the range carries it. Caller must hold
  * mmap_lock.
@@ -985,7 +987,8 @@ bool mem_attach_next(guest_t *g,
                      uint64_t end,
                      uint64_t attach,
                      uint64_t *lo,
-                     uint64_t *hi);
+                     uint64_t *hi,
+                     void **host);
 
 /* Borrowed-or-pinned host fd reference.
  *

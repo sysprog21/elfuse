@@ -509,6 +509,59 @@ static int data_child(void)
     if (again == (void *) -1 || again[0] != 0 || again[4096] != 'B' ||
         (again != seg && seg[0] != 'S'))
         return 18;
+
+    /* 19: an attach that was unmapped does not hide one made at its address
+     * since, which the detach then takes.
+     */
+    int ida = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    int idb = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    char *sa = ida < 0 ? (void *) -1 : shmat(ida, NULL, 0);
+    char *sb = sa == (void *) -1 || munmap(sa, 64 * 1024) < 0 || idb < 0
+                   ? (void *) -1
+                   : shmat(idb, sa, 0);
+    if (ida >= 0)
+        shmctl(ida, IPC_RMID, NULL);
+    if (idb >= 0)
+        shmctl(idb, IPC_RMID, NULL);
+    if (sb == (void *) -1)
+        return 100;
+    if (sb == sa && (shmdt(sa) < 0 || msync(sa, 4096, MS_ASYNC) == 0))
+        return 19;
+
+    /* 20: a detach writes back a part the guest made PROT_NONE. */
+    id = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    seg = id < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    if (seg == (void *) -1) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    seg[100] = 'W';
+    if (mprotect(seg, 64 * 1024, PROT_NONE) < 0 || shmdt(seg) < 0) {
+        shmctl(id, IPC_RMID, NULL);
+        return 20;
+    }
+    again = shmat(id, NULL, 0);
+    if (again == (void *) -1 || again[100] != 'W') {
+        shmctl(id, IPC_RMID, NULL);
+        return 20;
+    }
+
+    /* 21: so is an attach that mremap shrank and grew back in place. */
+    if (mremap(again, 64 * 1024, 32 * 1024, 0) != again ||
+        mremap(again, 32 * 1024, 64 * 1024, 0) != again) {
+        shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    again[0] = 'Q';
+    if (shmdt(again) < 0 || msync(again, 4096, MS_ASYNC) == 0) {
+        shmctl(id, IPC_RMID, NULL);
+        return 21;
+    }
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (seg == (void *) -1 || seg[0] != 'Q')
+        return 21;
     return 0;
 }
 

@@ -431,6 +431,22 @@ static int data_child(void)
     if (seg[0] != 'C')
         return 14;
     shmdt(seg);
+
+    /* 15: a detach releases the attach, so attaching and detaching more than
+     * RLIMIT_AS leaves room for in all does not run out.
+     */
+    id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
+    size_t vm = vm_size();
+    if (id < 0 || vm == 0 || set_soft(RLIMIT_AS, vm + 8 * MIB) < 0)
+        return 100;
+    for (int i = 0; i < 16; i++) {
+        seg = shmat(id, NULL, 0);
+        if (seg == (void *) -1 || shmdt(seg) < 0) {
+            shmctl(id, IPC_RMID, NULL);
+            return 15;
+        }
+    }
+    shmctl(id, IPC_RMID, NULL);
     return 0;
 }
 

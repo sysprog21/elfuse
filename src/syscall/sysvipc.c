@@ -257,6 +257,7 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
 
     /* Copy host shm content into guest memory */
     if (guest_write(g, (uint64_t) gva, host_addr, seg_size) < 0) {
+        sys_munmap(g, (uint64_t) gva, PAGE_ALIGN_UP(seg_size));
         shmdt(host_addr);
         return -LINUX_EFAULT;
     }
@@ -279,6 +280,7 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
     }
     if (!entry) {
         pthread_mutex_unlock(&shm_lock);
+        sys_munmap(g, (uint64_t) gva, PAGE_ALIGN_UP(seg_size));
         shmdt(host_addr);
         return -LINUX_ENOMEM;
     }
@@ -321,10 +323,10 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
     /* Detach host shm */
     shmdt(entry.host_addr);
 
-    /* Guest memory remains allocated (no munmap). Linux shmdt does not
-     * guarantee immediate unmap either; the pages become undefined. A real
-     * implementation would munmap the guest region here.
+    /* Release the guest mapping as Linux does at detach, so it stops counting
+     * toward RLIMIT_AS. The caller holds mmap_lock.
      */
+    sys_munmap(g, entry.guest_gva, PAGE_ALIGN_UP(entry.size));
 
     return 0;
 }

@@ -205,6 +205,8 @@ What they do:
   assembled from the rebuilt binaries. It also runs as a lane of `make check`.
 - `make test-matrix`: cross-check `elfuse` (aarch64), QEMU (aarch64),
   and `elfuse` (x86_64-via-Rosetta) on overlapping corpora
+- `make bench`: performance benchmark suite (see Performance Benchmarks
+  below); `make bench-ci` is the strict CI variant
 - `make verify`: every Frama-C WP proof target, one `frama-c` process each
   and parallel by default (`VERIFY_JOBS=1` for serial). Each target names a
   function set and discharges its obligations under `-wp-rte`; `mk/verify.mk`
@@ -249,6 +251,137 @@ or run all matrix modes back-to-back with `make test-matrix`.
 `make check` already runs the BusyBox applet suite as a second stage, so a
 green `make check` covers BusyBox validation. Use `make test-busybox` to
 iterate on a single applet failure without rerunning the unit suite.
+
+## Performance Benchmarks
+
+`make bench` runs `tests/bench-suite.sh`, a three-tier suite, and
+writes `build/bench-results.json`:
+
+- Tier 1 -- lmbench: `lat_syscall`
+  (null/read/write/stat/open) for syscall entry/forwarding cost,
+  `lat_proc` (fork, fork+execve) for process creation and the ELF-load
+  path, and `lat_fs -s 1024` (1 KiB create/delete only).
+
+- Tier 2 -- application workloads over the fixed corpus in
+  `tests/bench-corpus/` using Alpine fixture tools: `python3 -c pass`,
+  `git status`, `rg`, `zstd`, and `make`. `rg` searches 512 deterministic
+  copies of the source tree (~87 MiB, tens of thousands of files) and
+  `zstd` compresses a matching ~87 MiB input -- fixed sizes chosen so
+  command startup and scheduler jitter don't dominate what would
+  otherwise be millisecond-scale workloads
+
+- Tier 3 -- real workloads, `elfuse-aarch64` only: one OCI image per
+  workload category of the real-workload syscall-frequency ranking, run
+  through `scripts/elfuse-oci.py` (python, node, go, c-compile, jvm; the
+  scripts are in `tests/bench-oci/`). Images are pinned by `linux/arm64`
+  manifest digest in `tests/bench-suite.sh`. The tier needs `crane` and
+  `umoci` on `PATH` and skips with a note without them, except under
+  `BENCH_STRICT=1`. `tests/bench-suite.sh -p` only pulls the images, which
+  CI does before it takes the exclusive host lock.
+
+Each metric runs warmup + timed iterations and reports the median plus
+raw samples. `scripts/bench-compare.py` diffs the results against
+`tests/bench-baseline.json` and exits non-zero on a metric regressing
+past the threshold (default +20%, `BENCH_REGRESSION_THRESHOLD`) or
+missing from the current run. `BENCH_REPORT_ONLY=1` downgrades both to a
+log-only signal; `--fail-on-missing` keeps a missing metric fatal even then.
+The CI `Benchmark` leg runs with both, so a regression only prints and a
+benchmark that errored or timed out fails the leg.
+
+CI measures only the `elfuse-aarch64` column. `qemu-aarch64` (a real
+Linux kernel on the same silicon) and the optional `orbstack` column
+are static references, captured manually per the refresh procedure
+below.
+
+`BENCH_ENV=qemu-aarch64 make bench` produces the `qemu-aarch64`
+reference column; `BENCH_ENV=orbstack` runs the workloads inside the
+default OrbStack machine (Tier-2 tools must be installed there);
+`BENCH_ENV=native` also works on an aarch64 Linux host.
+
+Do not edit `tests/bench-corpus/` -- the corpus is part of the benchmark
+definition, and any change to it invalidates the baseline.
+
+### Manual / Ad-hoc Runs
+
+Prefer the Makefile targets (`bench` / `bench-ci`, `BENCH_ENV` picks the
+column) for a full run -- they build the prerequisites and wire up
+`ELFUSE`/`BENCH_BIN_DIR`. The commands below drive the same pieces
+directly, useful for iterating on one case or comparing an existing
+results file without rerunning everything.
+
+**Full suite with custom env/output:**
+
+```sh
+BENCH_ENV=elfuse-aarch64 BENCH_ITERATIONS=20 BENCH_WARMUP=3 \
+    bash tests/bench-suite.sh -o build/bench-results.json
+```
+
+`BENCH_ENV` selects the column (`elfuse-aarch64` default,
+`qemu-aarch64`, `orbstack`, `native`); the CI variant just adds
+`BENCH_STRICT=1` (fetch fixtures on demand, fail hard instead of
+skipping Tier 2 when they're missing).
+
+**One Tier-1 benchmark without the suite harness:**
+
+```sh
+tests/fetch-fixtures.sh                # builds the lmbench fixtures once
+env ENOUGH=100000 ./build/elfuse \
+    externals/test-fixtures/aarch64-musl/staticbin/bin/busybox \
+    sh -c '"$0" "$@"; exit $?' \
+    externals/test-fixtures/aarch64-musl/lmbench/lat_syscall -N 5 null
+```
+
+**One Tier-2 workload's wall-clock cost:**
+
+```sh
+./build/elfuse --sysroot externals/test-fixtures/rootfs \
+    ./build/bench-timeit /bin/busybox true
+```
+
+**Compare an existing results file against baseline without rerunning:**
+
+```sh
+python3 scripts/bench-compare.py --results build/bench-results.json \
+    --baseline tests/bench-baseline.json --threshold 0.20 \
+    --report-json build/bench-pr-report.json
+```
+
+Add `--report-only` (or `BENCH_REPORT_ONLY=1`) to print regressions
+without a non-zero exit. Any file matching the schema in
+`tests/bench-suite.sh`'s header works, including one captured with
+`BENCH_ENV=qemu-aarch64`/`orbstack`/`native`.
+
+**Promote a captured results file into the baseline:**
+
+```sh
+python3 scripts/bench-promote.py --results build/bench-results.json \
+    --baseline tests/bench-baseline.json
+```
+
+**Environment variables** (all optional; defaults shown):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BENCH_ENV` | `elfuse-aarch64` | column: `elfuse-aarch64` \| `qemu-aarch64` \| `orbstack` \| `native` |
+| `BENCH_ITERATIONS` | `10` | timed Tier-2 samples per metric |
+| `BENCH_WARMUP` | `2` | discarded leading Tier-2 samples per metric |
+| `BENCH_LMBENCH_REPS` | `1` | lmbench `-N` repetitions per Tier-1 outer sample; outer samples provide the median |
+| `BENCH_LMBENCH_RETRIES` | `1` | extra attempts for a failed/hung Tier-1 benchmark before its `ERR` row |
+| `BENCH_LMBENCH_TIMEOUT` | `60` | per-lmbench-invocation timeout in seconds |
+| `BENCH_LMBENCH_ENOUGH` | `100000` | lmbench `ENOUGH` (us per timing interval); empty restores lmbench auto-calibration |
+| `LMBENCH_DIR` | fixtures `aarch64-musl/lmbench` | directory holding the lmbench fixture binaries |
+| `BENCH_STRICT` | `0` | `1` = missing fixtures are fatal and fetched on demand (what `bench-ci` sets) |
+| `ELFUSE` | `build/elfuse` | elfuse binary driving the elfuse-aarch64 column |
+| `BENCH_BIN_DIR` | `build/` | directory holding `bench-timeit` |
+| `TEST_TIMEOUT` | `120` | per-invocation timeout in seconds |
+| `BENCH_PREP_TIMEOUT` | `900` | timeout in seconds for the untimed Tier-2 corpus preparation inside a guest or machine |
+| `BENCH_OCI` | `1` | `0` skips Tier 3 |
+| `BENCH_OCI_PULL_TIMEOUT` | `900` | timeout in seconds for one untimed Tier-3 image pull |
+| `ELFUSE_OCI_STORE` | `~/.local/share/elfuse/oci` | image store Tier 3 pulls into |
+| `BENCH_QEMU_NULL_CEILING` | `180` | ns/op; the qemu boot-calibration probe reboots the VM above this (efficiency-core placement) |
+| `BENCH_QEMU_BOOT_RETRIES` | `2` | qemu boot-calibration retry attempts before proceeding with a warning |
+| `BENCH_REGRESSION_THRESHOLD` | `0.20` | fractional regression that fails `bench-compare.py` |
+| `BENCH_REPORT_ONLY` | unset | `1` = `bench-compare.py` reports regressions but exits 0 |
 
 ## Test Matrix
 

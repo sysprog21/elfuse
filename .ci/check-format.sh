@@ -38,7 +38,7 @@ list_files()
         printf '%s\0' "$@"
     else
         git ls-files -z -- 'src/*.c' 'src/*.h' 'src/**/*.c' 'src/**/*.h' \
-            'tests/*.c' 'tests/*.h'
+            'tests/*.c' 'tests/*.h' ':(exclude)tests/bench-corpus/**'
     fi
 }
 

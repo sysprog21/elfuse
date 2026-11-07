@@ -115,19 +115,22 @@ static int as_child(void)
         errno != EBADF)
         return 7;
 
-    /* 8: MREMAP_FIXED onto a mapping is not charged for it. With the limit
-     * reached, moving 4 MiB of the mapping from step 6 onto an 8 MiB one as 8
-     * MiB leaves 20 MiB mapped, since mremap unmaps the destination first.
+    /* 8: MREMAP_FIXED onto a mapping is charged with that mapping still
+     * counted, as Linux checks the growth before it unmaps the destination
+     * (since v6.17). With the limit reached, moving 4 MiB of the mapping from
+     * step 6 onto an 8 MiB one as 8 MiB fails, and the destination stays.
      */
     void *d = map_anon(NULL, 8 * MIB, rw, MAP_PRIVATE);
     if (d == MAP_FAILED)
         return 100;
-    if (mremap(c, 4 * MIB, 8 * MIB, MREMAP_MAYMOVE | MREMAP_FIXED, d) != d)
+    errno = 0;
+    if (mremap(c, 4 * MIB, 8 * MIB, MREMAP_MAYMOVE | MREMAP_FIXED, d) !=
+            MAP_FAILED ||
+        errno != ENOMEM || msync(d, 4096, MS_ASYNC) < 0)
         return 8;
 
     /* 9: an unaligned MREMAP_FIXED destination is EINVAL even when the growth
-     * would cross the limit. Nothing is mapped at 64 TiB, so no part of the
-     * growth is taken back for a replaced range.
+     * would cross the limit.
      */
     void *far = (void *) ((1UL << 46) + 1);
     errno = 0;
@@ -393,8 +396,9 @@ static int data_child(void)
     if (map_anon(page, 4096, rw, MAP_PRIVATE | MAP_FIXED) != page)
         return 11;
 
-    /* 12: a MREMAP_FIXED move the limit refuses still unmaps its destination,
-     * as mremap_to does before it checks the growth.
+    /* 12: a MREMAP_FIXED move the limit refuses leaves its destination mapped,
+     * as Linux checks the growth before it unmaps the destination (since
+     * v6.17).
      */
     void *dst = map_anon(NULL, 8 * MIB, PROT_READ, MAP_PRIVATE);
     if (dst == MAP_FAILED)
@@ -404,8 +408,7 @@ static int data_child(void)
             MAP_FAILED ||
         errno != ENOMEM)
         return 12;
-    errno = 0;
-    if (msync(dst, 4096, MS_ASYNC) != -1 || errno != ENOMEM)
+    if (msync(dst, 4096, MS_ASYNC) < 0)
         return 12;
 
     /* 13: a SysV shm attach is shared, so RLIMIT_DATA does not count it. */

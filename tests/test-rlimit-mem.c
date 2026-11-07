@@ -137,9 +137,10 @@ static int as_child(void)
 }
 
 /* Bytes /proc/self/maps lists, less the elfuse runtime records ([shim],
- * [shim-data]) that a Linux process has no mapping for.
+ * [shim-data]) that a Linux process has no mapping for. With @data_only, only
+ * the private writable lines other than [stack], which RLIMIT_DATA counts.
  */
-static size_t maps_size(void)
+static size_t maps_size(int data_only)
 {
     static char buf[64 * 1024];
     size_t len = 0;
@@ -163,7 +164,10 @@ static size_t maps_size(void)
         if (!nl)
             break;
         *nl = '\0';
-        if (!strstr(line, "[shim"))
+        char *perms = strchr(line, ' ');
+        int data = perms && perms[2] == 'w' && perms[4] == 'p' &&
+                   !strstr(line, "[stack]");
+        if (!strstr(line, "[shim") && (!data_only || data))
             total += hi - lo;
     }
     return total;
@@ -187,7 +191,7 @@ static int as_exact_child(void)
     if (raw_brk(start + 100) != start + 100)
         return 100;
 
-    size_t base = maps_size();
+    size_t base = maps_size(0);
     int rw = PROT_READ | PROT_WRITE;
     if (base == 0 || set_soft(RLIMIT_AS, base + MIB) < 0)
         return 100;
@@ -316,6 +320,32 @@ static int data_child(void)
     if (raw_brk(start + 32 * MIB - 4096) != start + 32 * MIB ||
         raw_brk(start + 8 * MIB) != start + 8 * MIB)
         return 10;
+
+    /* 11: with the data total at the limit, a private writable MAP_FIXED over a
+     * private read-only page grows data by a page and is charged that page, not
+     * counted twice and not set against a total that left it out.
+     */
+    void *page = map_anon(NULL, 4096, PROT_READ, MAP_PRIVATE);
+    size_t data = maps_size(1);
+    if (page == MAP_FAILED || data == 0 || set_soft(RLIMIT_DATA, data) < 0)
+        return 100;
+    if (map_anon(page, 4096, rw, MAP_PRIVATE | MAP_FIXED) != page)
+        return 11;
+
+    /* 12: a MREMAP_FIXED move the limit refuses still unmaps its destination,
+     * as mremap_to does before it checks the growth.
+     */
+    void *dst = map_anon(NULL, 8 * MIB, PROT_READ, MAP_PRIVATE);
+    if (dst == MAP_FAILED)
+        return 100;
+    errno = 0;
+    if (mremap(page, 4096, 8 * MIB, MREMAP_MAYMOVE | MREMAP_FIXED, dst) !=
+            MAP_FAILED ||
+        errno != ENOMEM)
+        return 12;
+    errno = 0;
+    if (msync(dst, 4096, MS_ASYNC) != -1 || errno != ENOMEM)
+        return 12;
     return 0;
 }
 

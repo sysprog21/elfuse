@@ -2710,6 +2710,27 @@ static void mem_vm_totals(const guest_t *g,
     *data = d;
 }
 
+/* The bytes already mapped in [@start, @end), in region coordinates, each
+ * region to its page-aligned end as mem_vm_totals counts it. Caller holds
+ * mmap_lock.
+ */
+static uint64_t mem_mapped_in(const guest_t *g, uint64_t start, uint64_t end)
+{
+    uint64_t mapped = 0;
+    for (int i = guest_region_first_end_above(g, start);
+         i < g->nregions && g->regions[i].start < end; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (!guest_region_in_process_vm(g, r))
+            continue;
+        uint64_t r_end = PAGE_ALIGN_UP(r->end);
+        uint64_t lo = r->start > start ? r->start : start;
+        uint64_t hi = r_end < end ? r_end : end;
+        if (lo < hi)
+            mapped += hi - lo;
+    }
+    return mapped;
+}
+
 /* Whether a request with @prot and @flags maps data: private and writable. */
 static bool request_is_data(int prot, int flags)
 {
@@ -2726,9 +2747,12 @@ static bool request_is_data(int prot, int flags)
  * instead would fail every later request of a guest that has a finite limit.
  *
  * @grow is the size the request adds, and @grow_is_data says whether it is a
- * data mapping (see request_is_data). [@replace_start, @replace_end) is the
- * range a MAP_FIXED request maps over, in region coordinates, and what is
- * already mapped there is not charged twice; pass an empty range otherwise.
+ * data mapping. [@replace_start, @replace_end) is a range, in region
+ * coordinates, left out of both totals because it is unmapped before the limits
+ * are checked, as mremap_to unmaps a MREMAP_FIXED destination; pass an empty
+ * range otherwise. A MAP_FIXED request instead passes its net growth with an
+ * empty range, since mmap_region checks may_expand_vm with the pages it
+ * replaces still counted.
  *
  * Returns true when the request fits both limits. Caller holds mmap_lock.
  */
@@ -2794,8 +2818,10 @@ static bool mprotect_exceeds_data(const guest_t *g,
             summed = true;
         }
 
+        /* To the page-aligned end, as mem_vm_totals counts the heap record. */
+        uint64_t r_end = PAGE_ALIGN_UP(r->end);
         uint64_t lo = r->start > start ? r->start : start;
-        uint64_t hi = r->end < end ? r->end : end;
+        uint64_t hi = r_end < end ? r_end : end;
         uint64_t pages = hi - lo;
         bool fits_as = total <= as_limit && pages <= as_limit - total;
         bool fits_data = data <= data_limit && pages <= data_limit - data;
@@ -3674,9 +3700,10 @@ int64_t sys_mmap(guest_t *g,
              * EEXIST, because do_mmap checks for an intersection before
              * mmap_region reaches may_expand_vm. Both are checked first.
              */
-            bool replaces = !is_noreplace && addr <= UINT64_MAX - length;
-            if (!mem_rlimit_allows(g, length, is_data, replaces ? addr : 0,
-                                   replaces ? addr + length : 0)) {
+            uint64_t replaced = !is_noreplace && addr <= UINT64_MAX - length
+                                    ? mem_mapped_in(g, addr, addr + length)
+                                    : 0;
+            if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0)) {
                 if (!is_anon) {
                     int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
                     mmap_fresh_dispose(&fresh);
@@ -3714,11 +3741,13 @@ int64_t sys_mmap(guest_t *g,
         /* The limits come after the address and the descriptor have been
          * checked, as may_expand_vm comes after get_unmapped_area and fget in
          * the kernel, so a bad descriptor is EBADF under a limit the request
-         * exceeds. mmap_fixed_prepare has not changed the region table yet. A
-         * MAP_FIXED_NOREPLACE range overlaps nothing by now, so it is not
-         * charged for anything it replaces either.
+         * exceeds. mmap_fixed_prepare has not changed the region table yet.
+         * mmap_region charges the net growth, the length less the pages it
+         * replaces, against totals that still count those pages. A
+         * MAP_FIXED_NOREPLACE range overlaps nothing by now.
          */
-        if (!mem_rlimit_allows(g, length, is_data, result_off, fix_end)) {
+        uint64_t replaced = mem_mapped_in(g, result_off, fix_end);
+        if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0)) {
             mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
         }
@@ -4417,8 +4446,7 @@ int64_t sys_mremap(guest_t *g,
 
     /* A MREMAP_FIXED move checks the limits once its destination is valid. */
     if (!(flags & LINUX_MREMAP_FIXED) && new_size > old_size &&
-        !mem_rlimit_allows(g, new_size - old_size,
-                           request_is_data(src_reg->prot, src_reg->flags), 0,
+        !mem_rlimit_allows(g, new_size - old_size, region_is_data(src_reg), 0,
                            0))
         return finish_mremap(&source, -LINUX_ENOMEM);
 
@@ -4461,13 +4489,16 @@ int64_t sys_mremap(guest_t *g,
 
         /* mremap_to (Linux mm/mremap.c) checks the destination and unmaps it
          * before vma_to_resize calls may_expand_vm, so a bad destination is
-         * EINVAL under any limit, and what is mapped there is not charged.
+         * EINVAL under any limit, what is mapped there is not charged, and a
+         * move the limits refuse still leaves the destination unmapped.
          */
         if (new_size > old_size &&
-            !mem_rlimit_allows(g, new_size - old_size,
-                               request_is_data(src_reg->prot, src_reg->flags),
-                               new_off, new_end))
-            return finish_mremap(&source, -LINUX_ENOMEM);
+            !mem_rlimit_allows(g, new_size - old_size, region_is_data(src_reg),
+                               new_off, new_end)) {
+            dispose_mremap_source(&source);
+            int64_t unmap_err = sys_munmap(g, new_addr, new_size);
+            return unmap_err < 0 ? unmap_err : -LINUX_ENOMEM;
+        }
 
         mremap_move_t move;
         mremap_move_init(&move);

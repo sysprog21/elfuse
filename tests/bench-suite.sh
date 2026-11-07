@@ -919,8 +919,13 @@ run_tier2_suite()
                 bench_note "SKIP applications ($APPS_SKIPPED)"
                 return 0
             fi
-            [ -x "${BENCH_BIN_DIR}/bench-timeit" ] \
-                || bench_die "missing ${BENCH_BIN_DIR}/bench-timeit (build it before benchmarking)"
+            if [ ! -x "${BENCH_BIN_DIR}/bench-timeit" ]; then
+                [ "$BENCH_STRICT" = "1" ] \
+                    && bench_die "missing ${BENCH_BIN_DIR}/bench-timeit (build it before benchmarking)"
+                APPS_SKIPPED="missing ${BENCH_BIN_DIR}/bench-timeit"
+                bench_note "SKIP applications ($APPS_SKIPPED)"
+                return 0
+            fi
 
             bench_note "staging case-sensitive bench sysroot"
             IMG="$(mktemp -u "${TMPDIR:-/tmp}/elfuse-bench.XXXXXX").sparseimage"
@@ -1096,13 +1101,17 @@ run_tier3_suite()
     for entry in "${OCI_WORKLOADS[@]}"; do
         IFS='|' read -r metric image cmd <<< "$entry"
         ref="${OCI_REGISTRY}/${image}"
-        timeout "$BENCH_OCI_PULL_TIMEOUT" "$oci" pull "$ref" > /dev/null \
-            || bench_die "image pull failed: $ref"
+        if ! timeout "$BENCH_OCI_PULL_TIMEOUT" "$oci" pull "$ref" > /dev/null; then
+            oci_skip "image pull failed: $ref"
+            return 0
+        fi
     done
     [ "$PULL_ONLY" = 1 ] && return 0
 
-    [ -x "${BENCH_BIN_DIR}/bench-timeit" ] \
-        || bench_die "missing ${BENCH_BIN_DIR}/bench-timeit (build it before benchmarking)"
+    if [ ! -x "${BENCH_BIN_DIR}/bench-timeit" ]; then
+        oci_skip "missing ${BENCH_BIN_DIR}/bench-timeit"
+        return 0
+    fi
     local timeit dir
     timeit="$(sh_quote "$(cd "$BENCH_BIN_DIR" && pwd)/bench-timeit")"
     dir="$(sh_quote "${REPO_ROOT}/tests/bench-oci")"

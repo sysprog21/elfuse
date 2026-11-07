@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Verify clang-format conformance for all tracked C/H files in src/ and tests/.
-# The repository's .clang-format is calibrated against clang-format-22; older
+# Verify clang-format conformance for all tracked C/H files in src/ and tests/,
+# except tests/bench-corpus, whose content is fixed benchmark input. The
+# repository's .clang-format is calibrated against clang-format-22; older
 # versions produce different output and are rejected to keep CI deterministic.
 #
 # Exit codes, matching .ci/check-commentflow.sh: 0 clean, 1 files differ from

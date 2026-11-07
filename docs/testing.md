@@ -257,20 +257,20 @@ iterate on a single applet failure without rerunning the unit suite.
 `make bench` runs `tests/bench-suite.sh`, a three-tier suite, and
 writes `build/bench-results.json`:
 
-- Tier 1 -- lmbench: `lat_syscall`
+- Tier 1, lmbench: `lat_syscall`
   (null/read/write/stat/open) for syscall entry/forwarding cost,
   `lat_proc` (fork, fork+execve) for process creation and the ELF-load
   path, and `lat_fs -s 1024` (1 KiB create/delete only).
 
-- Tier 2 -- application workloads over the fixed corpus in
+- Tier 2, application workloads over the fixed corpus in
   `tests/bench-corpus/` using Alpine fixture tools: `python3 -c pass`,
   `git status`, `rg`, `zstd`, and `make`. `rg` searches 512 deterministic
   copies of the source tree (~87 MiB, tens of thousands of files) and
-  `zstd` compresses a matching ~87 MiB input -- fixed sizes chosen so
+  `zstd` compresses a matching ~87 MiB input. The fixed sizes are chosen so
   command startup and scheduler jitter don't dominate what would
   otherwise be millisecond-scale workloads
 
-- Tier 3 -- real workloads, `elfuse-aarch64` only: one OCI image per
+- Tier 3, real workloads, `elfuse-aarch64` only: one OCI image per
   workload category of the real-workload syscall-frequency ranking, run
   through `scripts/elfuse-oci.py` (python, node, c-compile, jvm; the
   scripts are in `tests/bench-oci/`). The ranking's go row is left out,
@@ -298,15 +298,15 @@ below.
 `BENCH_ENV=qemu-aarch64 make bench` produces the `qemu-aarch64`
 reference column; `BENCH_ENV=orbstack` runs the workloads inside the
 default OrbStack machine (Tier-2 tools must be installed there);
-`BENCH_ENV=native` also works on an aarch64 Linux host.
+On an aarch64 Linux host, where the make targets cannot build the macOS `elfuse` binary, run `BENCH_ENV=native BENCH_BIN_DIR=<dir holding bench-timeit> bash tests/bench-suite.sh` directly.
 
-Do not edit `tests/bench-corpus/` -- the corpus is part of the benchmark
+Do not edit `tests/bench-corpus/`: the corpus is part of the benchmark
 definition, and any change to it invalidates the baseline.
 
 ### Manual / Ad-hoc Runs
 
 Prefer the Makefile targets (`bench` / `bench-ci`, `BENCH_ENV` picks the
-column) for a full run -- they build the prerequisites and wire up
+column) for a full run, since they build the prerequisites and wire up
 `ELFUSE`/`BENCH_BIN_DIR`. The commands below drive the same pieces
 directly, useful for iterating on one case or comparing an existing
 results file without rerunning everything.

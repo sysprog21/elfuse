@@ -1656,12 +1656,12 @@ bench_out = $(if $(filter-out elfuse-aarch64,$(BENCH_ENV)),$(BUILD_DIR)/bench-re
 ## build/bench-results-$BENCH_ENV.json for a non-default BENCH_ENV)
 bench: $(BENCH_SUITE_DEPS)
 	@ELFUSE="$(ELFUSE_BIN)" BENCH_BIN_DIR="$(TEST_DIR)" \
-	    bash tests/bench-suite.sh -o $(bench_out)
+	    bash tests/bench-suite.sh -o '$(bench_out)'
 
 ## Run the benchmark suite for CI (strict prerequisites)
 bench-ci: $(BENCH_SUITE_DEPS)
 	@ELFUSE="$(ELFUSE_BIN)" BENCH_BIN_DIR="$(TEST_DIR)" BENCH_STRICT=1 \
-	    bash tests/bench-suite.sh -o $(bench_out)
+	    bash tests/bench-suite.sh -o '$(bench_out)'
 
 # Test matrix (elfuse aarch64 + qemu aarch64 + elfuse x86_64/Rosetta)
 ## Run full test matrix (all modes: elfuse-aarch64, qemu-aarch64, elfuse-x86_64)

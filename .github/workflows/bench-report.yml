@@ -18,6 +18,13 @@ jobs:
     if: ${{ github.event.workflow_run.event == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # One report job at a time per branch, so an older run cannot pass the
+    # head check and then overwrite a newer run's comment.
+    concurrency:
+      group: bench-report-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    env:
+      BENCH_THRESHOLD: '0.20'
     steps:
       - name: Find benchmark report artifact
         id: artifact
@@ -69,7 +76,7 @@ jobs:
           set -euo pipefail
           python3 scripts/bench-report.py \
             --report "$REPORT_PATH" --output "$COMMENT_PATH" \
-            --environment elfuse-aarch64 --threshold 0.20
+            --environment elfuse-aarch64 --threshold "$BENCH_THRESHOLD"
 
       # Runs on an empty report too: an earlier comment listing regressions
       # has to be rewritten once a later commit brings every metric back
@@ -136,8 +143,9 @@ jobs:
 
             const report = fs.readFileSync(process.env.COMMENT_PATH, 'utf8').trim();
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${run.id}`;
+            const percent = Math.round(parseFloat(process.env.BENCH_THRESHOLD) * 100);
             const text = report ||
-              'No benchmark metric is outside ±20% of the checked-in baseline at this commit.';
+              `No benchmark metric is outside ±${percent}% of the checked-in baseline at this commit.`;
             const body = `${marker}\n${text}\n\n[Workflow run](${runUrl}) · commit \`${runHead.slice(0, 12)}\`\n`;
             const comments = await github.paginate(
               github.rest.issues.listComments,

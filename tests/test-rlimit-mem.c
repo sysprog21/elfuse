@@ -639,6 +639,30 @@ static int data_child(void)
     shmctl(id, IPC_RMID, NULL);
     if (hrc != 0)
         return hrc;
+
+    /* 25: a detach at the address of a part moved away detaches only that part,
+     * and the part left behind still detaches at the old address, with the
+     * writes made there.
+     */
+    id = shmget(IPC_PRIVATE, 2 * 4096, IPC_CREAT | 0600);
+    to = map_anon(NULL, 4096, rw, MAP_PRIVATE);
+    if (id < 0 || to == MAP_FAILED)
+        return 100;
+    seg = shmat(id, NULL, 0);
+    if (seg == (void *) -1 ||
+        mremap(seg, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, to) != to) {
+        shmctl(id, IPC_RMID, NULL);
+        return 25;
+    }
+    seg[4096] = 'S';
+    new_rc = shmdt(to);
+    old_rc = shmdt(seg);
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (new_rc != 0 || old_rc != 0 || seg == (void *) -1 || seg[4096] != 'S')
+        return 25;
+    shmdt(seg);
+
     return 0;
 }
 

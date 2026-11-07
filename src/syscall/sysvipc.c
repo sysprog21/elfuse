@@ -332,7 +332,10 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
      * the address, the lowest part winning. Records whose attach is mapped
      * nowhere are retired first. When no record has such a part, Linux finds no
      * attach and fails with EINVAL, and what is mapped there now is neither
-     * copied nor unmapped. The caller holds mmap_lock.
+     * copied nor unmapped. Only the parts found are detached: Linux keeps the
+     * segment attached while another part is mapped elsewhere, so the record
+     * stays live until no region carries its serial. The caller holds
+     * mmap_lock, which keeps the record from being taken meanwhile.
      */
     shm_retire_unmapped(g);
 
@@ -350,10 +353,8 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
         }
     }
     shm_attach_t entry;
-    if (match) {
+    if (match)
         entry = *match;
-        match->active = false;
-    }
     pthread_mutex_unlock(&shm_lock);
 
     if (!match)
@@ -375,9 +376,6 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
             memcpy((char *) entry.host_addr + (lo - gva), src, copy_end - lo);
     }
 
-    /* Detach host shm */
-    shmdt(entry.host_addr);
-
     /* Release the guest mapping as Linux does at detach, so it stops counting
      * toward RLIMIT_AS. A piece that fails to unmap does not stop the others,
      * and the first error is returned. The caller holds mmap_lock.
@@ -390,6 +388,14 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
         if (rc < 0 && err == 0)
             err = rc;
     }
+
+    pthread_mutex_lock(&shm_lock);
+    bool last = !mem_attach_mapped(g, entry.attach);
+    if (last)
+        match->active = false;
+    pthread_mutex_unlock(&shm_lock);
+    if (last)
+        shmdt(entry.host_addr);
 
     return err;
 }

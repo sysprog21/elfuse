@@ -12,11 +12,11 @@ caller must not create or update a comment.
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import math
 import pathlib
 import sys
+import unicodedata
 
 MAX_METRICS = 256
 MAX_METRIC_NAME = 160
@@ -43,7 +43,10 @@ def reject_json_constant(value: str) -> None:
 def finite_number(value: object, *, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ReportError(f"{field} must be a number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ReportError(f"{field} must be finite") from exc
     if not math.isfinite(number):
         raise ReportError(f"{field} must be finite")
     return number
@@ -52,14 +55,17 @@ def finite_number(value: object, *, field: str) -> float:
 def metric_name(value: object) -> str:
     if not isinstance(value, str) or not value or len(value) > MAX_METRIC_NAME:
         raise ReportError("metric name must be a non-empty short string")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+    # Cf covers the bidi overrides and zero-width characters that could make
+    # the rendered comment show a name other than the real one.
+    if any(unicodedata.category(char) in ("Cc", "Cf") for char in value):
         raise ReportError(f"metric name contains control characters: {value!r}")
     return value
 
 
 def markdown_cell(value: str) -> str:
-    return (html.escape(value, quote=False).replace("|", "\\|")
-            .replace("`", "&#96;"))
+    """Escape a name for a code span in a table cell, which shows entities
+    literally."""
+    return value.replace("|", "\\|").replace("`", "'")
 
 
 def display_number(value: float) -> str:
@@ -81,7 +87,8 @@ def load_report(
         )
     except FileNotFoundError as exc:
         raise ReportError(f"missing report: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, RecursionError,
+            json.JSONDecodeError) as exc:
         raise ReportError(f"cannot read report {path}: {exc}") from exc
 
     if not isinstance(document, dict):

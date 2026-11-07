@@ -109,13 +109,23 @@ def flatten(tree: dict, *, source: str) -> dict[str, float]:
     return flat
 
 
+def unique_object(pairs: list) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
 def load_json(path: pathlib.Path) -> dict:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(path.read_text(encoding="utf-8"),
+                              object_pairs_hook=unique_object)
     except FileNotFoundError:
         print(f"bench-compare: missing {path}", file=sys.stderr)
         raise SystemExit(2)
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:
         print(f"bench-compare: invalid JSON in {path}: {exc}",
               file=sys.stderr)
         raise SystemExit(2)

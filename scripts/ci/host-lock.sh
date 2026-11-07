@@ -51,6 +51,8 @@ import traceback
 import uuid
 
 lock_path, mode, pid_path, control_prefix, wait_min, hold_min = sys.argv[1:7]
+# The holder changes directory before it opens the lock file.
+lock_path = os.path.abspath(lock_path)
 control_path = os.path.abspath(f"{control_prefix}.{uuid.uuid4().hex}")
 wait_seconds = float(wait_min) * 60
 hold_seconds = float(hold_min) * 60
@@ -170,22 +172,26 @@ if child == 0:
                 conn, _ = listener.accept()
             except socket.timeout:
                 break
+            # A client that times out or disconnects must not end the holder,
+            # which would drop the lock behind the job's back.
             with conn:
                 conn.settimeout(2)
                 try:
                     request = conn.recv(16)
-                except socket.timeout:
-                    continue
-                if request == b"probe":
-                    conn.sendall(b"live")
+                    if request == b"probe":
+                        conn.sendall(b"live")
+                except OSError:
                     continue
                 if request != b"release":
                     continue
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
                 lock_fd = -1
-                conn.sendall(b"released")
                 released = True
+                try:
+                    conn.sendall(b"released")
+                except OSError:
+                    pass
     except BaseException:
         # stderr is /dev/null here, so hand the failure to the waiting parent
         # instead of letting it read as a lock that was never granted.

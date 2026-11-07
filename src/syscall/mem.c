@@ -2452,6 +2452,17 @@ static bool overlay_fd_writable(int fd)
     return (fl & O_ACCMODE) != O_RDONLY;
 }
 
+/* Whether @fd is open for reading, true when fcntl fails, as for
+ * overlay_fd_writable.
+ */
+static bool overlay_fd_readable(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0)
+        return true;
+    return (fl & O_ACCMODE) != O_WRONLY;
+}
+
 /* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
  * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB segment is
  * split out first if it is not already isolated. Caller holds mmap_lock and has
@@ -3138,7 +3149,8 @@ static void mmap_fresh_dispose(mmap_fresh_t *fresh)
 /* The errno for a request the limits refuse. do_mmap reports these before
  * mmap_region reaches may_expand_vm, in this order: EBADF for a bad descriptor
  * (fget comes first), EEXIST when @overlaps (a MAP_FIXED_NOREPLACE over a
- * mapping), and EACCES for a MAP_SHARED PROT_WRITE request on a descriptor not
+ * mapping), and EACCES for a file mapping, shared or private, on a descriptor
+ * not opened for reading, or for a MAP_SHARED PROT_WRITE request on one not
  * opened for writing. ENOMEM when none applies. Opens the descriptor when
  * @fresh does not hold it yet, and disposes @fresh.
  */
@@ -3160,9 +3172,10 @@ static int64_t mmap_refused_errno(mmap_fresh_t *fresh,
     int64_t err = -LINUX_ENOMEM;
     if (overlaps)
         err = -LINUX_EEXIST;
-    else if (!is_anon && (flags & LINUX_MAP_SHARED) &&
-             (prot & LINUX_PROT_WRITE) &&
-             !overlay_fd_writable(fresh->backing_ref.fd))
+    else if (!is_anon &&
+             (!overlay_fd_readable(fresh->backing_ref.fd) ||
+              ((flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
+               !overlay_fd_writable(fresh->backing_ref.fd))))
         err = -LINUX_EACCES;
     mmap_fresh_dispose(fresh);
     return err;

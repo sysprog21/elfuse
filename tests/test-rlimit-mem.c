@@ -140,18 +140,26 @@ static int as_child(void)
         return 9;
 
     /* 10: a shared writable mapping of a read-only descriptor is EACCES even
-     * when it would also cross the limit.
+     * when it would also cross the limit, and so is a private read-only one of
+     * a write-only descriptor.
      */
     char path[] = "/tmp/test-rlimit-mem-XXXXXX";
     int wfd = mkstemp(path);
     int rfd = wfd < 0 ? -1 : open(path, O_RDONLY);
+    int ofd = wfd < 0 ? -1 : open(path, O_WRONLY);
     if (wfd >= 0)
         unlink(path);
-    if (rfd < 0 || ftruncate(wfd, 32 * MIB) < 0)
+    if (rfd < 0 || ofd < 0 || ftruncate(wfd, 32 * MIB) < 0)
         return 100;
     errno = 0;
     if (mmap(NULL, 32 * MIB, rw, MAP_SHARED, rfd, 0) != MAP_FAILED ||
         errno != EACCES)
+        return 10;
+    errno = 0;
+    void *wronly = mmap(NULL, 32 * MIB, PROT_READ, MAP_PRIVATE, ofd, 0);
+    int wronly_errno = errno;
+    close(ofd);
+    if (wronly != MAP_FAILED || wronly_errno != EACCES)
         return 10;
 
     /* 11: so is a MAP_FIXED one. The hole it goes into is reserved with the

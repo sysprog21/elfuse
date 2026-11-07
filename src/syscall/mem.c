@@ -3676,16 +3676,13 @@ static int mmap_extend_fresh(guest_t *g,
     return 0;
 }
 
-/* Why this stays one function.
- *
- * Flag combinations, not steps: MAP_FIXED, MAP_SHARED, the file-backed overlay
- * and the anonymous path each qualify the others. Splitting by flag duplicates
- * the interactions between them.
- */
-
 /* sys_mmap, but the region it records gets the name @name and the shm attach
  * serial @shm_attach. Only a non-fixed request with no high-VA hint passes
  * them, and that request records its region at one place below.
+ *
+ * Why this stays one function: flag combinations, not steps. MAP_FIXED,
+ * MAP_SHARED, the file-backed overlay and the anonymous path each qualify the
+ * others. Splitting by flag duplicates the interactions between them.
  */
 static int64_t mmap_tagged(guest_t *g,
                            uint64_t addr,

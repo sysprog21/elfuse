@@ -964,12 +964,10 @@ int mac_to_linux_status_flags(int mac_flags);
 /* Translate Linux status flags (F_SETFL arg) to macOS equivalents. */
 int linux_to_mac_status_flags(int linux_flags);
 
-/* Anonymous mmap for other modules. */
-
-/* Allocate anonymous guest memory. Wraps the static sys_mmap with
- * MAP_PRIVATE|MAP_ANONYMOUS. Caller must hold mmap_lock.
+/* Guest memory for a SysV shm attach: private anonymous, counted as shared
+ * toward RLIMIT_AS and not toward RLIMIT_DATA. Caller must hold mmap_lock.
  */
-int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
+int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot);
 
 /* Borrowed-or-pinned host fd reference.
  *

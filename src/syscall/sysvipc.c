@@ -249,8 +249,7 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
     /* Always allocate RW initially so the code can copy shm content in. For
      * SHM_RDONLY, downgrade to read-only via mprotect after the copy.
      */
-    int64_t gva =
-        sys_mmap_anon(g, 0, seg_size, LINUX_PROT_READ | LINUX_PROT_WRITE);
+    int64_t gva = sys_mmap_shm(g, seg_size, LINUX_PROT_READ | LINUX_PROT_WRITE);
     if (gva < 0) {
         shmdt(host_addr);
         return gva; /* propagate mmap error */

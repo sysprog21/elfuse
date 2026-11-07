@@ -16,7 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ipc.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -133,6 +135,38 @@ static int as_child(void)
             MAP_FAILED ||
         errno != EINVAL)
         return 9;
+
+    /* 10: a shared writable mapping of a read-only descriptor is EACCES even
+     * when it would also cross the limit.
+     */
+    char path[] = "/tmp/test-rlimit-mem-XXXXXX";
+    int wfd = mkstemp(path);
+    int rfd = wfd < 0 ? -1 : open(path, O_RDONLY);
+    if (wfd >= 0)
+        unlink(path);
+    if (rfd < 0 || ftruncate(wfd, 32 * MIB) < 0)
+        return 100;
+    errno = 0;
+    if (mmap(NULL, 32 * MIB, rw, MAP_SHARED, rfd, 0) != MAP_FAILED ||
+        errno != EACCES)
+        return 10;
+
+    /* 11: so is a MAP_FIXED one. The hole it goes into is reserved with the
+     * limit lifted and unmapped again, so the request maps over nothing.
+     */
+    if (set_soft(RLIMIT_AS, RLIM_INFINITY) < 0)
+        return 100;
+    void *hole = map_anon(NULL, 32 * MIB, PROT_NONE, MAP_PRIVATE);
+    if (hole == MAP_FAILED || munmap(hole, 32 * MIB) < 0 ||
+        set_soft(RLIMIT_AS, base + 24 * MIB) < 0)
+        return 100;
+    errno = 0;
+    if (mmap(hole, 32 * MIB, rw, MAP_SHARED | MAP_FIXED, rfd, 0) !=
+            MAP_FAILED ||
+        errno != EACCES)
+        return 11;
+    close(wfd);
+    close(rfd);
     return 0;
 }
 
@@ -212,7 +246,26 @@ static int as_exact_child(void)
         return 100;
     if (raw_brk(start + 200) != start + 200)
         return 3;
-    return 0;
+
+    /* 4: in a fork child, a break grown inside its page starts a second heap
+     * record in that page. The page is counted once, so a MAP_FIXED over it
+     * fits a limit at the mapped total.
+     */
+    pid_t pid = fork();
+    if (pid == 0) {
+        size_t now = maps_size(0);
+        if (now == 0 || set_soft(RLIMIT_AS, now) < 0)
+            _exit(100);
+        void *page = (void *) start;
+        if (raw_brk(start + 300) != start + 300 ||
+            map_anon(page, 4096, rw, MAP_PRIVATE | MAP_FIXED) != page)
+            _exit(4);
+        _exit(0);
+    }
+    int status;
+    if (pid < 0 || waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
+        return 100;
+    return WEXITSTATUS(status);
 }
 
 /* Runs in a child with RLIMIT_DATA at 24 MiB, far above the data this static
@@ -346,6 +399,17 @@ static int data_child(void)
     errno = 0;
     if (msync(dst, 4096, MS_ASYNC) != -1 || errno != ENOMEM)
         return 12;
+
+    /* 13: a SysV shm attach is shared, so RLIMIT_DATA does not count it. */
+    int id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
+    data = maps_size(1);
+    if (id < 0 || data == 0 || set_soft(RLIMIT_DATA, data + MIB / 2) < 0)
+        return 100;
+    void *seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (seg == (void *) -1)
+        return 13;
+    shmdt(seg);
     return 0;
 }
 

@@ -2683,6 +2683,9 @@ static uint64_t data_rlimit(void)
  * RLIMIT_AS and RLIMIT_DATA, summed from the sorted region array, leaving out
  * the infra reserve. Each record counts to its page-aligned end: the heap
  * record ends at the break itself, and Linux maps the heap to PAGE_ALIGN(brk).
+ * A page two records share is counted once: a fork child that grows the break
+ * from inside a page starts a second [heap] record in that page, and the array
+ * is sorted, so each record starts at the highest end counted so far.
  * [@replace_start, @replace_end) is left out, in region coordinates; pass an
  * empty range to count everything. Caller holds mmap_lock.
  */
@@ -2692,15 +2695,19 @@ static void mem_vm_totals(const guest_t *g,
                           uint64_t *total,
                           uint64_t *data)
 {
-    uint64_t t = 0, d = 0;
+    uint64_t t = 0, d = 0, covered = 0;
     for (int i = 0; i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
         if (!guest_region_in_process_vm(g, r))
             continue;
+        uint64_t start = r->start > covered ? r->start : covered;
         uint64_t end = PAGE_ALIGN_UP(r->end);
-        uint64_t lo = r->start > replace_start ? r->start : replace_start;
+        if (start >= end)
+            continue;
+        covered = end;
+        uint64_t lo = start > replace_start ? start : replace_start;
         uint64_t hi = end < replace_end ? end : replace_end;
-        uint64_t kept = (end - r->start) - (lo < hi ? hi - lo : 0);
+        uint64_t kept = (end - start) - (lo < hi ? hi - lo : 0);
 
         t += kept;
         if (region_is_data(r))
@@ -2710,23 +2717,25 @@ static void mem_vm_totals(const guest_t *g,
     *data = d;
 }
 
-/* The bytes already mapped in [@start, @end), in region coordinates, each
- * region to its page-aligned end as mem_vm_totals counts it. Caller holds
- * mmap_lock.
+/* The bytes already mapped in [@start, @end), in region coordinates, counted as
+ * mem_vm_totals counts them: each region to its page-aligned end, and a shared
+ * page once. Caller holds mmap_lock.
  */
 static uint64_t mem_mapped_in(const guest_t *g, uint64_t start, uint64_t end)
 {
-    uint64_t mapped = 0;
+    uint64_t mapped = 0, covered = start;
     for (int i = guest_region_first_end_above(g, start);
          i < g->nregions && g->regions[i].start < end; i++) {
         const guest_region_t *r = &g->regions[i];
         if (!guest_region_in_process_vm(g, r))
             continue;
+        uint64_t lo = r->start > covered ? r->start : covered;
         uint64_t r_end = PAGE_ALIGN_UP(r->end);
-        uint64_t lo = r->start > start ? r->start : start;
         uint64_t hi = r_end < end ? r_end : end;
-        if (lo < hi)
+        if (lo < hi) {
             mapped += hi - lo;
+            covered = hi;
+        }
     }
     return mapped;
 }
@@ -2800,14 +2809,25 @@ static bool mprotect_exceeds_data(const guest_t *g,
         return false;
 
     uint64_t as_limit = sys_rlimit_cur(LINUX_RLIMIT_AS);
-    uint64_t total = 0, data = 0;
+    uint64_t total = 0, data = 0, covered = start;
     bool summed = false;
 
     for (int i = guest_region_first_end_above(g, start);
          i < g->nregions && g->regions[i].start < end; i++) {
         const guest_region_t *r = &g->regions[i];
-        if (!guest_region_in_process_vm(g, r) || (r->prot & LINUX_PROT_WRITE) ||
-            !region_may_be_data(r))
+        if (!guest_region_in_process_vm(g, r))
+            continue;
+
+        /* As mem_vm_totals counts: to the page-aligned end, a page two records
+         * share once, whichever of the two turns into data.
+         */
+        uint64_t r_end = PAGE_ALIGN_UP(r->end);
+        uint64_t lo = r->start > covered ? r->start : covered;
+        uint64_t hi = r_end < end ? r_end : end;
+        if (lo >= hi)
+            continue;
+        covered = hi;
+        if ((r->prot & LINUX_PROT_WRITE) || !region_may_be_data(r))
             continue;
 
         /* Summed only once a mapping turns into data, so a range that is
@@ -2818,10 +2838,6 @@ static bool mprotect_exceeds_data(const guest_t *g,
             summed = true;
         }
 
-        /* To the page-aligned end, as mem_vm_totals counts the heap record. */
-        uint64_t r_end = PAGE_ALIGN_UP(r->end);
-        uint64_t lo = r->start > start ? r->start : start;
-        uint64_t hi = r_end < end ? r_end : end;
         uint64_t pages = hi - lo;
         bool fits_as = total <= as_limit && pages <= as_limit - total;
         bool fits_data = data <= data_limit && pages <= data_limit - data;
@@ -3108,6 +3124,16 @@ static void mmap_fresh_dispose(mmap_fresh_t *fresh)
     dispose_region_snapshots(&fresh->replaced_snaps, &fresh->replaced_nsnaps);
     host_fd_ref_close(&fresh->backing_ref);
     errno = saved_errno;
+}
+
+/* Whether a MAP_SHARED request for PROT_WRITE names a descriptor that was not
+ * opened for writing, which do_mmap refuses with EACCES before mmap_region
+ * reaches may_expand_vm.
+ */
+static bool mmap_shared_write_denied(int prot, int flags, int host_fd)
+{
+    return (flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
+           !overlay_fd_writable(host_fd);
 }
 
 /* Pick the guest offset for a non-fixed mapping, or UINT64_MAX when the address
@@ -3696,16 +3722,21 @@ int64_t sys_mmap(guest_t *g,
 
         if (addr >= g->guest_size) {
             /* Under a limit the request exceeds, a bad descriptor is EBADF, as
-             * on the paths below, and a MAP_FIXED_NOREPLACE over a mapping is
-             * EEXIST, because do_mmap checks for an intersection before
-             * mmap_region reaches may_expand_vm. Both are checked first.
+             * on the paths below, then a MAP_FIXED_NOREPLACE over a mapping is
+             * EEXIST and a shared writable mapping of a read-only descriptor is
+             * EACCES, because do_mmap checks all three before mmap_region
+             * reaches may_expand_vm.
              */
             uint64_t replaced = !is_noreplace && addr <= UINT64_MAX - length
                                     ? mem_mapped_in(g, addr, addr + length)
                                     : 0;
             if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0)) {
+                bool denied = false;
                 if (!is_anon) {
                     int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
+                    denied =
+                        ref_err >= 0 && mmap_shared_write_denied(
+                                            prot, flags, fresh.backing_ref.fd);
                     mmap_fresh_dispose(&fresh);
                     if (ref_err < 0)
                         return ref_err;
@@ -3713,7 +3744,7 @@ int64_t sys_mmap(guest_t *g,
                 if (is_noreplace && addr <= UINT64_MAX - length &&
                     region_range_overlaps(g, addr, addr + length))
                     return -LINUX_EEXIST;
-                return -LINUX_ENOMEM;
+                return denied ? -LINUX_EACCES : -LINUX_ENOMEM;
             }
             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset,
                                     true, is_noreplace);
@@ -3740,7 +3771,8 @@ int64_t sys_mmap(guest_t *g,
 
         /* The limits come after the address and the descriptor have been
          * checked, as may_expand_vm comes after get_unmapped_area and fget in
-         * the kernel, so a bad descriptor is EBADF under a limit the request
+         * the kernel, so a bad descriptor is EBADF and a shared writable
+         * mapping of a read-only one is EACCES under a limit the request
          * exceeds. mmap_fixed_prepare has not changed the region table yet.
          * mmap_region charges the net growth, the length less the pages it
          * replaces, against totals that still count those pages. A
@@ -3748,8 +3780,10 @@ int64_t sys_mmap(guest_t *g,
          */
         uint64_t replaced = mem_mapped_in(g, result_off, fix_end);
         if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0)) {
+            bool denied = !is_anon && mmap_shared_write_denied(prot, flags,
+                                                               host_backing_fd);
             mmap_fresh_dispose(&fresh);
-            return -LINUX_ENOMEM;
+            return denied ? -LINUX_EACCES : -LINUX_ENOMEM;
         }
 
         int64_t commit_err =
@@ -3763,17 +3797,21 @@ int64_t sys_mmap(guest_t *g,
      * backing once the final guest range is known.
      */
     if (!is_fixed) {
-        /* A bad descriptor is EBADF under a limit the request exceeds, so the
-         * descriptor is looked up before ENOMEM.
+        /* Under a limit the request exceeds, a bad descriptor is EBADF and a
+         * shared writable mapping of a read-only one is EACCES, as do_mmap
+         * checks both before may_expand_vm.
          */
         if (!mem_rlimit_allows(g, length, is_data, 0, 0)) {
+            bool denied = false;
             if (!is_anon) {
                 int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
+                denied = ref_err >= 0 && mmap_shared_write_denied(
+                                             prot, flags, fresh.backing_ref.fd);
                 mmap_fresh_dispose(&fresh);
                 if (ref_err < 0)
                     return ref_err;
             }
-            return -LINUX_ENOMEM;
+            return denied ? -LINUX_EACCES : -LINUX_ENOMEM;
         }
 
         if (g->is_rosetta && addr >= g->guest_size &&
@@ -4899,11 +4937,35 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
     }
 }
 
-/* Anonymous mmap wrapper for other modules. */
-int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot)
+/* Guest memory for a SysV shm attach, which sys_shmat fills by copying from the
+ * host segment. The memory is private anonymous, since elfuse copies the
+ * segment rather than sharing it, but the region is marked shared, because a
+ * Linux attach is VM_SHARED and counts toward RLIMIT_AS only. It is mapped
+ * read-only first, so the mapping is not charged as data, and then given @prot.
+ * Each mmap gets its own vma_id, so the new region merges with no neighbor that
+ * the shared mark could reach.
+ */
+int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot)
 {
-    return sys_mmap(g, addr, length, prot,
-                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
+    int64_t gva = sys_mmap(g, 0, length, LINUX_PROT_READ,
+                           LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
+    if (gva < 0)
+        return gva;
+
+    uint64_t off = (uint64_t) gva - g->ipa_base;
+    uint64_t end = off + PAGE_ALIGN_UP(length);
+    for (int i = guest_region_first_end_above(g, off);
+         i < g->nregions && g->regions[i].start < end; i++)
+        g->regions[i].shared = true;
+
+    if (prot != LINUX_PROT_READ) {
+        int64_t err = sys_mprotect(g, (uint64_t) gva, length, prot);
+        if (err < 0) {
+            (void) sys_munmap(g, (uint64_t) gva, length);
+            return err;
+        }
+    }
+    return gva;
 }
 
 static int compare_range_pair(const void *a, const void *b)

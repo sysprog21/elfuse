@@ -2807,8 +2807,8 @@ static bool mem_rlimit_allows(const guest_t *g,
  * ENOMEM when may_expand_vm refuses it as data and would have allowed it as
  * what it was. The second half is why a range that RLIMIT_AS already refuses
  * goes through. The caller changes the part below that mapping with one
- * whole-range sys_mprotect, which does not stop mapping by mapping at a hole or
- * a refused mapping the way mprotect_fixup does.
+ * whole-range mprotect_apply, which does not stop mapping by mapping at a hole
+ * or a refused mapping the way mprotect_fixup does.
  *
  * [@start, @end) is in region coordinates.
  *
@@ -5136,33 +5136,14 @@ static bool mprotect_same_prot_fast_path_safe(int prot)
            (prot & LINUX_PROT_EXEC);
 }
 
-int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
+/* The page-table and region-table change for a page-aligned range that passed
+ * the checks in sys_mprotect.
+ */
+static int64_t mprotect_apply(guest_t *g,
+                              uint64_t addr,
+                              uint64_t length,
+                              int prot)
 {
-    if (addr & 4095)
-        return -LINUX_EINVAL;
-    if (length == 0)
-        return 0;
-    length = PAGE_ALIGN_UP(length);
-    if (length == 0)
-        return -LINUX_EINVAL;
-    if (addr > UINT64_MAX - length)
-        return -LINUX_EINVAL;
-
-    if (prot & LINUX_PROT_WRITE) {
-        /* Region coordinates, as the two branches below take them. */
-        uint64_t off = addr >= g->guest_size ? addr : addr - g->ipa_base;
-        uint64_t stop;
-        if (off <= UINT64_MAX - length &&
-            mprotect_exceeds_data(g, off, off + length, &stop)) {
-            if (stop > off) {
-                int64_t err = sys_mprotect(g, addr, stop - off, prot);
-                if (err < 0)
-                    return err;
-            }
-            return -LINUX_ENOMEM;
-        }
-    }
-
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
         if (addr >= g->guest_size) {
             uint64_t mprot_end = addr + length;
@@ -5248,6 +5229,36 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
         }
     }
     return 0;
+}
+
+int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
+{
+    if (addr & 4095)
+        return -LINUX_EINVAL;
+    if (length == 0)
+        return 0;
+    length = PAGE_ALIGN_UP(length);
+    if (length == 0)
+        return -LINUX_EINVAL;
+    if (addr > UINT64_MAX - length)
+        return -LINUX_EINVAL;
+
+    if (prot & LINUX_PROT_WRITE) {
+        /* Region coordinates, as both branches of mprotect_apply take them. */
+        uint64_t off = addr >= g->guest_size ? addr : addr - g->ipa_base;
+        uint64_t stop;
+        if (off <= UINT64_MAX - length &&
+            mprotect_exceeds_data(g, off, off + length, &stop)) {
+            if (stop > off) {
+                int64_t err = mprotect_apply(g, addr, stop - off, prot);
+                if (err < 0)
+                    return err;
+            }
+            return -LINUX_ENOMEM;
+        }
+    }
+
+    return mprotect_apply(g, addr, length, prot);
 }
 
 /* msync helpers. */

@@ -43,6 +43,8 @@ server.listen(0, '127.0.0.1', async () => {
                 let body = '';
                 res.on('data', chunk => (body += chunk));
                 res.on('end', () => resolve(body.length));
+                res.on('error', reject);
+                res.on('aborted', () => reject(new Error('response aborted')));
             }).on('error', reject);
         });
     }

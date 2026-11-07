@@ -7,6 +7,7 @@ import java.security.MessageDigest;
 final class Worker extends Thread {
     private final int seed;
     private int digestByte;
+    private Exception failure;
 
     Worker(int seed) {
         this.seed = seed;
@@ -25,11 +26,15 @@ final class Worker extends Thread {
             }
             digestByte = sha.digest()[0] & 0xff;
         } catch (Exception e) {
-            throw new IllegalStateException(e);
+            failure = e;
         }
     }
 
+    // Called after join(): an exception in run() would only end this thread.
     int digestByte() {
+        if (failure != null) {
+            throw new IllegalStateException(failure);
+        }
         return digestByte;
     }
 }

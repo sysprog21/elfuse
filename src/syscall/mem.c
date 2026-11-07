@@ -2679,13 +2679,40 @@ static uint64_t data_rlimit(void)
     return cur ? cur : sys_rlimit_max(LINUX_RLIMIT_DATA);
 }
 
+/* The part of @r that the limits count, below @win_end: from r->start, or from
+ * *@covered when an earlier record already counted past it, to the page-aligned
+ * end, as Linux maps the heap to PAGE_ALIGN(brk). A page two records share is
+ * counted once: a fork child that grows the break from inside a page starts a
+ * second [heap] record in that page, and the array is sorted, so *@covered is
+ * the highest end counted so far. Infra records count for nothing.
+ *
+ * Returns false when nothing of @r is left; otherwise sets [@lo, @hi) and
+ * advances *@covered to @hi.
+ */
+static bool region_counted_span(const guest_t *g,
+                                const guest_region_t *r,
+                                uint64_t win_end,
+                                uint64_t *covered,
+                                uint64_t *lo,
+                                uint64_t *hi)
+{
+    if (!guest_region_in_process_vm(g, r))
+        return false;
+    uint64_t start = r->start > *covered ? r->start : *covered;
+    uint64_t end = PAGE_ALIGN_UP(r->end);
+    if (end > win_end)
+        end = win_end;
+    if (start >= end)
+        return false;
+    *covered = end;
+    *lo = start;
+    *hi = end;
+    return true;
+}
+
 /* The mapped total and the data total that may_expand_vm compares with
  * RLIMIT_AS and RLIMIT_DATA, summed from the sorted region array, leaving out
- * the infra reserve. Each record counts to its page-aligned end: the heap
- * record ends at the break itself, and Linux maps the heap to PAGE_ALIGN(brk).
- * A page two records share is counted once: a fork child that grows the break
- * from inside a page starts a second [heap] record in that page, and the array
- * is sorted, so each record starts at the highest end counted so far.
+ * the infra reserve, each record as region_counted_span counts it.
  * [@replace_start, @replace_end) is left out, in region coordinates; pass an
  * empty range to count everything. Caller holds mmap_lock.
  */
@@ -2698,13 +2725,9 @@ static void mem_vm_totals(const guest_t *g,
     uint64_t t = 0, d = 0, covered = 0;
     for (int i = 0; i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
-        if (!guest_region_in_process_vm(g, r))
+        uint64_t start, end;
+        if (!region_counted_span(g, r, UINT64_MAX, &covered, &start, &end))
             continue;
-        uint64_t start = r->start > covered ? r->start : covered;
-        uint64_t end = PAGE_ALIGN_UP(r->end);
-        if (start >= end)
-            continue;
-        covered = end;
         uint64_t lo = start > replace_start ? start : replace_start;
         uint64_t hi = end < replace_end ? end : replace_end;
         uint64_t kept = (end - start) - (lo < hi ? hi - lo : 0);
@@ -2717,25 +2740,16 @@ static void mem_vm_totals(const guest_t *g,
     *data = d;
 }
 
-/* The bytes already mapped in [@start, @end), in region coordinates, counted as
- * mem_vm_totals counts them: each region to its page-aligned end, and a shared
- * page once. Caller holds mmap_lock.
+/* The bytes already mapped in [@start, @end), in region coordinates, each
+ * record as region_counted_span counts it. Caller holds mmap_lock.
  */
 static uint64_t mem_mapped_in(const guest_t *g, uint64_t start, uint64_t end)
 {
-    uint64_t mapped = 0, covered = start;
+    uint64_t mapped = 0, covered = start, lo, hi;
     for (int i = guest_region_first_end_above(g, start);
          i < g->nregions && g->regions[i].start < end; i++) {
-        const guest_region_t *r = &g->regions[i];
-        if (!guest_region_in_process_vm(g, r))
-            continue;
-        uint64_t lo = r->start > covered ? r->start : covered;
-        uint64_t r_end = PAGE_ALIGN_UP(r->end);
-        uint64_t hi = r_end < end ? r_end : end;
-        if (lo < hi) {
+        if (region_counted_span(g, &g->regions[i], end, &covered, &lo, &hi))
             mapped += hi - lo;
-            covered = hi;
-        }
     }
     return mapped;
 }
@@ -2791,8 +2805,10 @@ static bool mem_rlimit_allows(const guest_t *g,
  * mm/mprotect.c). The kernel takes the mappings of the range in address order.
  * One that turns into data, a private mapping that was not writable, fails with
  * ENOMEM when may_expand_vm refuses it as data and would have allowed it as
- * what it was, and the mappings below it have been changed by then. The second
- * half is why a range that RLIMIT_AS already refuses goes through.
+ * what it was. The second half is why a range that RLIMIT_AS already refuses
+ * goes through. The caller changes the part below that mapping with one
+ * whole-range sys_mprotect, which does not stop mapping by mapping at a hole or
+ * a refused mapping the way mprotect_fixup does.
  *
  * [@start, @end) is in region coordinates.
  *
@@ -2809,25 +2825,18 @@ static bool mprotect_exceeds_data(const guest_t *g,
         return false;
 
     uint64_t as_limit = sys_rlimit_cur(LINUX_RLIMIT_AS);
-    uint64_t total = 0, data = 0, covered = start;
+    uint64_t total = 0, data = 0, covered = start, lo, hi;
     bool summed = false;
 
     for (int i = guest_region_first_end_above(g, start);
          i < g->nregions && g->regions[i].start < end; i++) {
         const guest_region_t *r = &g->regions[i];
-        if (!guest_region_in_process_vm(g, r))
-            continue;
 
-        /* As mem_vm_totals counts: to the page-aligned end, a page two records
-         * share once, whichever of the two turns into data.
+        /* As mem_vm_totals counts, so a page two records share is counted once,
+         * whichever of the two turns into data.
          */
-        uint64_t r_end = PAGE_ALIGN_UP(r->end);
-        uint64_t lo = r->start > covered ? r->start : covered;
-        uint64_t hi = r_end < end ? r_end : end;
-        if (lo >= hi)
-            continue;
-        covered = hi;
-        if ((r->prot & LINUX_PROT_WRITE) || !region_may_be_data(r))
+        if (!region_counted_span(g, r, end, &covered, &lo, &hi) ||
+            (r->prot & LINUX_PROT_WRITE) || !region_may_be_data(r))
             continue;
 
         /* Summed only once a mapping turns into data, so a range that is

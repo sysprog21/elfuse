@@ -2,7 +2,9 @@
 #
 #   build-macos   : compile + entitlement check on macOS Apple Silicon
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
-#                   including release, ASAN, UBSAN, and TSAN variants
+#                   including release, ASAN, UBSAN, and TSAN variants,
+#                   plus a Benchmark leg (tests/bench-suite.sh) that
+#                   compares against tests/bench-baseline.json
 #   oci-smoke     : OCI front end lane on self-hosted Apple Silicon
 #
 # Runtime and sanitizer tests require Hypervisor.framework, which
@@ -140,6 +142,13 @@ jobs:
     # job budget and the per-test TEST_TIMEOUT are set per leg. Without
     # that, a TSAN-slowed guest overruns both, surfacing as TIMEOUT reds
     # indistinguishable from a real hang.
+    #
+    # job_timeout also covers queueing for the shared host lock (see "Acquire
+    # shared host lock" below): the Benchmark leg holds it exclusively for its
+    # measurement window (~10 minutes), so every other leg budgets a 15-minute
+    # queue on top of its own runtime. The Benchmark leg's budget stacks its
+    # own 15-minute shared queue, the longest sibling's 45-minute budget (its
+    # exclusive wait), the ~10-minute run, and setup margin.
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
@@ -153,7 +162,8 @@ jobs:
             ubsan_options: ''
             tsan_options: ''
             test_timeout: ''
-            job_timeout: 20
+            job_timeout: 35
+            shared_lock_wait: 15
             run_matrix: true
             check_target: check
             brew_pkgs: binutils qemu
@@ -164,7 +174,8 @@ jobs:
             ubsan_options: ''
             tsan_options: ''
             test_timeout: '60'
-            job_timeout: 30
+            job_timeout: 45
+            shared_lock_wait: 15
             run_matrix: false
             check_target: check-sanitizer
             brew_pkgs: binutils
@@ -175,7 +186,8 @@ jobs:
             ubsan_options: halt_on_error=1:print_stacktrace=1
             tsan_options: ''
             test_timeout: '30'
-            job_timeout: 30
+            job_timeout: 45
+            shared_lock_wait: 15
             run_matrix: false
             check_target: check-sanitizer
             brew_pkgs: binutils
@@ -186,10 +198,27 @@ jobs:
             ubsan_options: ''
             tsan_options: halt_on_error=1
             test_timeout: '60'
-            job_timeout: 45
+            job_timeout: 60
+            shared_lock_wait: 15
             run_matrix: false
             check_target: check-sanitizer
             brew_pkgs: binutils
+          # Three-tier performance suite (make bench-ci) on a Release build,
+          # compared against tests/bench-baseline.json.
+          - name: Benchmark
+            sanitizer: bench
+            extra_cflags: ''
+            asan_options: ''
+            ubsan_options: ''
+            tsan_options: ''
+            test_timeout: ''
+            job_timeout: 85
+            shared_lock_wait: 15
+            exclusive_lock_wait: 50
+            run_matrix: false
+            run_bench: true
+            check_target: ''
+            brew_pkgs: binutils qemu
 
     # contents: read for the checkout; pull-requests: read so the guard can
     # query the PR's current HEAD. (actions: write would let the guard
@@ -265,10 +294,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Acquire shared host lock
+        # Several runners share this physical machine, so a compile on a
+        # sibling runner would distort the Benchmark leg's microsecond-scale
+        # measurements. Every leg holds a machine-wide shared lock, and
+        # readers coexist. The Benchmark leg trades its shared lock for the
+        # exclusive one only around make bench-ci.
+        run: |
+          CI_HOST_LOCK_WAIT_MIN=${{ matrix.shared_lock_wait }} \
+            scripts/ci/host-lock.sh acquire shared
+
       - name: Restore cached test fixtures
-        # Only the release leg needs fixtures: the sanitizer legs run the
-        # fixture-free check-sanitizer subset.
-        if: ${{ matrix.run_matrix }}
+        # Only the release and benchmark legs need fixtures: the sanitizer
+        # legs run the fixture-free check-sanitizer subset. The release leg
+        # is the only one that saves the cache.
+        if: ${{ matrix.run_matrix || matrix.run_bench }}
         # actions/checkout's default clean:true runs `git clean -ffdx`, which
         # wipes externals/test-fixtures (gitignored) on this self-hosted
         # runner even though its disk otherwise persists across runs.
@@ -374,7 +414,9 @@ jobs:
       - name: make check
         # Release runs the full check suite; sanitizer legs run check-sanitizer,
         # a representative internal-implementation subset (the release lane plus
-        # test-matrix already cover Linux syscall compatibility).
+        # test-matrix already cover Linux syscall compatibility). The Benchmark
+        # leg has no check target.
+        if: ${{ matrix.check_target != '' }}
         run: |
           make EXTRA_CFLAGS="$EXTRA_CFLAGS" ${{ matrix.check_target }}
 
@@ -382,6 +424,82 @@ jobs:
         if: ${{ matrix.run_matrix }}
         run: |
           bash tests/test-matrix.sh all
+
+      - name: Set up Go
+        # Builds crane and umoci for the real-workload OCI tier.
+        if: ${{ matrix.run_bench }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: false
+
+      - name: Build crane and umoci
+        # Same pins as the OCI smoke job below. go install refuses umoci: its
+        # go.mod has a replace directive.
+        if: ${{ matrix.run_bench }}
+        env:
+          CRANE_VERSION: v0.22.1
+          UMOCI_VERSION: v0.6.0
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/oci-tools"
+          GOBIN="$bin" go install \
+            "github.com/google/go-containerregistry/cmd/crane@$CRANE_VERSION"
+          umoci="github.com/opencontainers/umoci@$UMOCI_VERSION"
+          go mod download "$umoci"
+          go build -C "$(go env GOMODCACHE)/$umoci" -o "$bin/umoci" ./cmd/umoci
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Prepare benchmark prerequisites
+        # Fixture downloads, the lmbench cross-compile, the bench-timeit build
+        # and the OCI image pulls run here under the shared lock, so the
+        # exclusive window below holds only the measurement. Runners on one
+        # host share $HOME, so each keeps its own image store.
+        if: ${{ matrix.run_bench }}
+        run: |
+          bash tests/fetch-fixtures.sh
+          make build/bench-timeit
+          ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-bench-$RUNNER_NAME" \
+            bash tests/bench-suite.sh -p
+
+      - name: Benchmark suite (make bench-ci)
+        if: ${{ matrix.run_bench }}
+        run: |
+          export ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-bench-$RUNNER_NAME"
+          scripts/ci/host-lock.sh release
+          CI_HOST_LOCK_WAIT_MIN=${{ matrix.exclusive_lock_wait }} \
+            scripts/ci/host-lock.sh acquire exclusive
+          trap 'scripts/ci/host-lock.sh release' EXIT
+          make bench-ci
+
+      - name: Compare against baseline
+        # Report-only for now: the self-hosted runner's run-to-run variance is
+        # not characterized yet, so a regression prints in the log but does
+        # not fail the leg. Once ~20 runs stay inside the +20% threshold, drop
+        # BENCH_REPORT_ONLY=1 so regressions fail. A missing metric still
+        # fails: it means a benchmark errored or timed out.
+        if: ${{ matrix.run_bench }}
+        run: |
+          BENCH_REPORT_ONLY=1 python3 scripts/bench-compare.py \
+            --fail-on-missing --report-json build/bench-pr-report.json
+
+      - name: Upload benchmark PR report
+        if: ${{ matrix.run_bench && !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-pr-report
+          path: build/bench-pr-report.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload benchmark results
+        if: ${{ matrix.run_bench && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-${{ runner.os }}-${{ runner.arch }}
+          path: build/bench-results.json
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Upload runtime binary
         if: ${{ !cancelled() }}
@@ -398,17 +516,30 @@ jobs:
         # unchanged Alpine packages. Runs even if an earlier step failed, as
         # long as the job wasn't cancelled, so a fixture-unrelated test
         # failure doesn't cost the next run its cache.
+        #
+        # The copy goes to a temporary directory first and is renamed into
+        # place, so the Benchmark leg's restore on another runner never reads
+        # a half-deleted or half-written tree.
         if: ${{ !cancelled() && matrix.sanitizer == 'release' }}
         run: |
           if [ -d externals/test-fixtures ]; then
             cache="$HOME/.cache/elfuse-ci/test-fixtures"
             mkdir -p "$(dirname "$cache")"
-            rm -rf "$cache"
-            cp -Rc externals/test-fixtures "$cache"
+            rm -rf "$cache.new" "$cache.old"
+            cp -Rc externals/test-fixtures "$cache.new"
+            if [ -d "$cache" ]; then
+              mv "$cache" "$cache.old"
+            fi
+            mv "$cache.new" "$cache"
+            rm -rf "$cache.old"
             echo "Saved test fixtures ($(du -sh "$cache" | cut -f1))"
           else
             echo "No externals/test-fixtures to save"
           fi
+
+      - name: Release host lock
+        if: ${{ always() }}
+        run: scripts/ci/host-lock.sh release
 
   oci-smoke:
     name: OCI smoke
@@ -419,10 +550,17 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'merge_group')
     runs-on: [self-hosted, macOS, arm64]
-    timeout-minutes: 30
+    # 15 minutes of the budget cover queueing for the shared host lock while
+    # the Benchmark leg holds it exclusively.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Acquire shared host lock
+        # This job loads the same host as runtime-macos; see the lock step
+        # there for why the Benchmark leg needs it quiet.
+        run: CI_HOST_LOCK_WAIT_MIN=15 scripts/ci/host-lock.sh acquire shared
 
       - name: Download prebuilt elfuse binary
         uses: actions/download-artifact@v7
@@ -460,3 +598,7 @@ jobs:
           set -euo pipefail
           chmod +x build/elfuse
           ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-smoke-$RUNNER_NAME" scripts/ci/oci-smoke.sh
+
+      - name: Release host lock
+        if: ${{ always() }}
+        run: scripts/ci/host-lock.sh release

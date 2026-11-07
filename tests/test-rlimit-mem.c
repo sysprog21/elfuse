@@ -422,8 +422,11 @@ static int data_child(void)
     /* 13: a SysV shm attach is shared, so RLIMIT_DATA does not count it. */
     int id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
     data = maps_size(1);
-    if (id < 0 || data == 0 || set_soft(RLIMIT_DATA, data + MIB / 2) < 0)
+    if (id < 0 || data == 0 || set_soft(RLIMIT_DATA, data + MIB / 2) < 0) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
         return 100;
+    }
     char *seg = shmat(id, NULL, 0);
     shmctl(id, IPC_RMID, NULL);
     if (seg == (void *) -1)
@@ -590,9 +593,11 @@ static int data_child(void)
     /* 23: an attach moved with mremap is detached at its new address, with the
      * writes made there, and not at its old one.
      */
-    id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
     char *to = map_anon(NULL, 4096, rw, MAP_PRIVATE);
-    if (id < 0 || to == MAP_FAILED)
+    if (to == MAP_FAILED)
+        return 100;
+    id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    if (id < 0)
         return 100;
     seg = shmat(id, NULL, 0);
     if (seg == (void *) -1 ||
@@ -652,9 +657,11 @@ static int data_child(void)
      * and the part left behind still detaches at the old address, with the
      * writes made there.
      */
-    id = shmget(IPC_PRIVATE, 2 * 4096, IPC_CREAT | 0600);
     to = map_anon(NULL, 4096, rw, MAP_PRIVATE);
-    if (id < 0 || to == MAP_FAILED)
+    if (to == MAP_FAILED)
+        return 100;
+    id = shmget(IPC_PRIVATE, 2 * 4096, IPC_CREAT | 0600);
+    if (id < 0)
         return 100;
     seg = shmat(id, NULL, 0);
     if (seg == (void *) -1 ||

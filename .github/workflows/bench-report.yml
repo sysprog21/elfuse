@@ -23,8 +23,6 @@ jobs:
     concurrency:
       group: bench-report-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
       cancel-in-progress: false
-    env:
-      BENCH_THRESHOLD: '0.20'
     steps:
       - name: Find benchmark report artifact
         id: artifact
@@ -74,11 +72,12 @@ jobs:
           REPORT_PATH: ${{ runner.temp }}/bench-pr-report/bench-pr-report.json
         run: |
           set -euo pipefail
-          python3 scripts/bench-report.py \
+          status=$(python3 scripts/bench-report.py \
             --report "$REPORT_PATH" --output "$COMMENT_PATH" \
-            --environment elfuse-aarch64 --threshold "$BENCH_THRESHOLD"
+            --environment elfuse-aarch64)
+          echo "status=$status" >> "$GITHUB_OUTPUT"
 
-      # Runs on an empty report too: an earlier comment listing regressions
+      # Runs on a clean report too: an earlier comment listing regressions
       # has to be rewritten once a later commit brings every metric back
       # inside the threshold, or it keeps reporting a regression the PR head
       # no longer has.
@@ -87,6 +86,7 @@ jobs:
         uses: actions/github-script@v9
         env:
           COMMENT_PATH: ${{ runner.temp }}/bench-comment.md
+          REPORT_STATUS: ${{ steps.render.outputs.status }}
         with:
           script: |
             const fs = require('fs');
@@ -141,11 +141,9 @@ jobs:
               return;
             }
 
-            const report = fs.readFileSync(process.env.COMMENT_PATH, 'utf8').trim();
+            const text = fs.readFileSync(process.env.COMMENT_PATH, 'utf8').trim();
+            const clean = process.env.REPORT_STATUS === 'clean';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${run.id}`;
-            const percent = Math.round(parseFloat(process.env.BENCH_THRESHOLD) * 100);
-            const text = report ||
-              `No benchmark metric is outside ±${percent}% of the checked-in baseline at this commit.`;
             const body = `${marker}\n${text}\n\n[Workflow run](${runUrl}) · commit \`${runHead.slice(0, 12)}\`\n`;
             const comments = await github.paginate(
               github.rest.issues.listComments,
@@ -161,7 +159,7 @@ jobs:
               typeof comment.body === 'string' && comment.body.includes(marker)
             );
 
-            if (!report && !previous) {
+            if (clean && !previous) {
               return;
             }
             if (previous) {

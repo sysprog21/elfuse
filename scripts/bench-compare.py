@@ -231,6 +231,12 @@ def main() -> int:
             rows.append((metric, f"{base[metric]:g}", "-", "-",
                          "MISSING (measurement failed)"))
             missing.append(metric)
+            if base[metric] > 0:
+                comparison_metrics.append({
+                    "metric": metric,
+                    "status": "missing",
+                    "baseline": base[metric],
+                })
             continue
         if base[metric] <= 0:
             rows.append((metric, f"{base[metric]:g}",
@@ -241,6 +247,7 @@ def main() -> int:
         ratio = current[metric] / base[metric]
         comparison_metrics.append({
             "metric": metric,
+            "status": "compared",
             "baseline": base[metric],
             "current": current[metric],
         })

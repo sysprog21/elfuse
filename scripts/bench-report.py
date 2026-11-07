@@ -5,8 +5,11 @@ The input artifact comes from an unprivileged pull-request workflow. Treat it
 strictly as untrusted data: validate its schema and values, recompute every
 ratio, escape metric names, and never execute anything from the artifact.
 
-An empty output means every comparable metric was inside the threshold and the
-caller must not create or update a comment.
+The threshold comes from the report, so the comment uses the value
+bench-compare.py applied. A metric the run failed to measure is listed as a
+failure. The comment text always goes to --output; stdout gets "changes" when
+the comment lists anything, or "clean" when every metric was measured and is
+inside the threshold, in which case the caller only updates an earlier comment.
 """
 
 from __future__ import annotations
@@ -21,6 +24,9 @@ import unicodedata
 MAX_METRICS = 256
 MAX_METRIC_NAME = 160
 MAX_REPORT_BYTES = 64 * 1024
+# The comment shows the threshold as plus or minus a percentage, which reads
+# wrongly past 100%.
+MAX_THRESHOLD = 1.0
 
 
 class ReportError(ValueError):
@@ -72,9 +78,11 @@ def display_number(value: float) -> str:
     return f"{value:.6g}"
 
 
-def load_report(
-    path: pathlib.Path, *, expected_environment: str
-) -> list[tuple[str, float, float]]:
+Report = tuple[float, list[tuple[str, float, float]], list[tuple[str, float]]]
+
+
+def load_report(path: pathlib.Path, *, expected_environment: str) -> Report:
+    """Return the threshold, the compared metrics and the missing metrics."""
     try:
         if path.stat().st_size > MAX_REPORT_BYTES:
             raise ReportError(
@@ -103,6 +111,10 @@ def load_report(
         )
     if document.get("direction") != "lower-is-better":
         raise ReportError("unsupported metric direction")
+    threshold = finite_number(document.get("threshold"), field="threshold")
+    if not 0 <= threshold <= MAX_THRESHOLD:
+        raise ReportError(
+            f"threshold must be between 0 and {MAX_THRESHOLD:g}")
 
     metrics = document.get("metrics")
     if not isinstance(metrics, list):
@@ -110,7 +122,8 @@ def load_report(
     if len(metrics) > MAX_METRICS:
         raise ReportError(f"metrics exceeds the {MAX_METRICS}-item limit")
 
-    parsed: list[tuple[str, float, float]] = []
+    compared: list[tuple[str, float, float]] = []
+    missing: list[tuple[str, float]] = []
     seen: set[str] = set()
     for index, item in enumerate(metrics):
         if not isinstance(item, dict):
@@ -121,14 +134,22 @@ def load_report(
         seen.add(name)
         baseline = finite_number(item.get("baseline"),
                                  field=f"{name}.baseline")
-        current = finite_number(item.get("current"),
-                                field=f"{name}.current")
         if baseline <= 0:
             raise ReportError(f"{name}.baseline must be greater than zero")
+        status = item.get("status")
+        if status == "missing":
+            if "current" in item:
+                raise ReportError(f"{name} is missing but has a current value")
+            missing.append((name, baseline))
+            continue
+        if status != "compared":
+            raise ReportError(f"{name}.status must be compared or missing")
+        current = finite_number(item.get("current"),
+                                field=f"{name}.current")
         if current < 0:
             raise ReportError(f"{name}.current must be non-negative")
-        parsed.append((name, baseline, current))
-    return sorted(parsed)
+        compared.append((name, baseline, current))
+    return threshold, sorted(compared), sorted(missing)
 
 
 def section(
@@ -149,9 +170,10 @@ def section(
 
 
 def render(
-    metrics: list[tuple[str, float, float]], *, threshold: float,
-    environment: str
-) -> str:
+    metrics: list[tuple[str, float, float]], missing: list[tuple[str, float]],
+    *, threshold: float, environment: str
+) -> tuple[str, bool]:
+    """Return the comment text and whether it lists anything."""
     regressions: list[tuple[str, float, float, float]] = []
     improvements: list[tuple[str, float, float, float]] = []
     for name, baseline, current in metrics:
@@ -162,10 +184,11 @@ def render(
         elif change < -threshold:
             improvements.append(row)
 
-    if not regressions and not improvements:
-        return ""
-
     threshold_text = f"{threshold:.0%}"
+    if not regressions and not improvements and not missing:
+        return (f"No benchmark metric is outside ±{threshold_text} of the "
+                "checked-in baseline at this commit.\n", False)
+
     lines = [
         f"## Benchmark changes outside ±{threshold_text}",
         "",
@@ -174,23 +197,22 @@ def render(
     ]
     if regressions:
         lines.extend(["", *section("Regressions", regressions)])
+    if missing:
+        lines.extend([
+            "",
+            "### Missing measurements",
+            "",
+            "The run produced no value for these metrics.",
+            "",
+            "| Metric | Baseline |",
+            "| --- | ---: |",
+        ])
+        for name, baseline in missing:
+            lines.append(
+                f"| `{markdown_cell(name)}` | {display_number(baseline)} |")
     if improvements:
         lines.extend(["", *section("Improvements", improvements)])
-    return "\n".join(lines) + "\n"
-
-
-def non_negative_finite_fraction(value: str) -> float:
-    try:
-        fraction = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "must be a finite, non-negative fraction"
-        ) from exc
-    if not math.isfinite(fraction) or fraction < 0:
-        raise argparse.ArgumentTypeError(
-            "must be a finite, non-negative fraction"
-        )
-    return fraction
+    return "\n".join(lines) + "\n", True
 
 
 def main() -> int:
@@ -198,20 +220,19 @@ def main() -> int:
     parser.add_argument("--report", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--environment", default="elfuse-aarch64")
-    parser.add_argument("--threshold", type=non_negative_finite_fraction,
-                        default=0.20)
     args = parser.parse_args()
 
     try:
-        metrics = load_report(args.report,
-                              expected_environment=args.environment)
-        comment = render(metrics, threshold=args.threshold,
-                         environment=args.environment)
+        threshold, metrics, missing = load_report(
+            args.report, expected_environment=args.environment)
+        comment, listed = render(metrics, missing, threshold=threshold,
+                                 environment=args.environment)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(comment, encoding="utf-8")
     except (OSError, ReportError) as exc:
         print(f"bench-report: {exc}", file=sys.stderr)
         return 2
+    print("changes" if listed else "clean")
     return 0
 
 

@@ -3126,14 +3126,37 @@ static void mmap_fresh_dispose(mmap_fresh_t *fresh)
     errno = saved_errno;
 }
 
-/* Whether a MAP_SHARED request for PROT_WRITE names a descriptor that was not
- * opened for writing, which do_mmap refuses with EACCES before mmap_region
- * reaches may_expand_vm.
+/* The errno for a request the limits refuse. do_mmap reports these before
+ * mmap_region reaches may_expand_vm, in this order: EBADF for a bad descriptor
+ * (fget comes first), EEXIST when @overlaps (a MAP_FIXED_NOREPLACE over a
+ * mapping), and EACCES for a MAP_SHARED PROT_WRITE request on a descriptor not
+ * opened for writing. ENOMEM when none applies. Opens the descriptor when
+ * @fresh does not hold it yet, and disposes @fresh.
  */
-static bool mmap_shared_write_denied(int prot, int flags, int host_fd)
+static int64_t mmap_refused_errno(mmap_fresh_t *fresh,
+                                  bool is_anon,
+                                  guest_fd_t fd,
+                                  int prot,
+                                  int flags,
+                                  bool overlaps)
 {
-    return (flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
-           !overlay_fd_writable(host_fd);
+    if (!is_anon && fresh->backing_ref.fd < 0) {
+        int64_t ref_err = host_fd_ref_open(fd, &fresh->backing_ref);
+        if (ref_err < 0) {
+            mmap_fresh_dispose(fresh);
+            return ref_err;
+        }
+    }
+
+    int64_t err = -LINUX_ENOMEM;
+    if (overlaps)
+        err = -LINUX_EEXIST;
+    else if (!is_anon && (flags & LINUX_MAP_SHARED) &&
+             (prot & LINUX_PROT_WRITE) &&
+             !overlay_fd_writable(fresh->backing_ref.fd))
+        err = -LINUX_EACCES;
+    mmap_fresh_dispose(fresh);
+    return err;
 }
 
 /* Pick the guest offset for a non-fixed mapping, or UINT64_MAX when the address
@@ -3721,31 +3744,17 @@ int64_t sys_mmap(guest_t *g,
             return -LINUX_ENOMEM;
 
         if (addr >= g->guest_size) {
-            /* Under a limit the request exceeds, a bad descriptor is EBADF, as
-             * on the paths below, then a MAP_FIXED_NOREPLACE over a mapping is
-             * EEXIST and a shared writable mapping of a read-only descriptor is
-             * EACCES, because do_mmap checks all three before mmap_region
-             * reaches may_expand_vm.
+            /* Under a limit the request exceeds, mmap_refused_errno still
+             * reports what do_mmap checks first, as on the paths below.
              */
             uint64_t replaced = !is_noreplace && addr <= UINT64_MAX - length
                                     ? mem_mapped_in(g, addr, addr + length)
                                     : 0;
-            if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0)) {
-                bool denied = false;
-                if (!is_anon) {
-                    int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
-                    denied =
-                        ref_err >= 0 && mmap_shared_write_denied(
-                                            prot, flags, fresh.backing_ref.fd);
-                    mmap_fresh_dispose(&fresh);
-                    if (ref_err < 0)
-                        return ref_err;
-                }
-                if (is_noreplace && addr <= UINT64_MAX - length &&
-                    region_range_overlaps(g, addr, addr + length))
-                    return -LINUX_EEXIST;
-                return denied ? -LINUX_EACCES : -LINUX_ENOMEM;
-            }
+            if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0))
+                return mmap_refused_errno(
+                    &fresh, is_anon, fd, prot, flags,
+                    is_noreplace && addr <= UINT64_MAX - length &&
+                        region_range_overlaps(g, addr, addr + length));
             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset,
                                     true, is_noreplace);
         }
@@ -3771,20 +3780,15 @@ int64_t sys_mmap(guest_t *g,
 
         /* The limits come after the address and the descriptor have been
          * checked, as may_expand_vm comes after get_unmapped_area and fget in
-         * the kernel, so a bad descriptor is EBADF and a shared writable
-         * mapping of a read-only one is EACCES under a limit the request
-         * exceeds. mmap_fixed_prepare has not changed the region table yet.
-         * mmap_region charges the net growth, the length less the pages it
-         * replaces, against totals that still count those pages. A
-         * MAP_FIXED_NOREPLACE range overlaps nothing by now.
+         * the kernel; mmap_refused_errno reports what do_mmap checks first.
+         * mmap_fixed_prepare has not changed the region table yet. mmap_region
+         * charges the net growth, the length less the pages it replaces,
+         * against totals that still count those pages. A MAP_FIXED_NOREPLACE
+         * range overlaps nothing by now.
          */
         uint64_t replaced = mem_mapped_in(g, result_off, fix_end);
-        if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0)) {
-            bool denied = !is_anon && mmap_shared_write_denied(prot, flags,
-                                                               host_backing_fd);
-            mmap_fresh_dispose(&fresh);
-            return denied ? -LINUX_EACCES : -LINUX_ENOMEM;
-        }
+        if (!mem_rlimit_allows(g, length - replaced, is_data, 0, 0))
+            return mmap_refused_errno(&fresh, is_anon, fd, prot, flags, false);
 
         int64_t commit_err =
             mmap_fixed_commit(g, &fresh, &overlay, prot, flags, fd, offset,
@@ -3797,22 +3801,11 @@ int64_t sys_mmap(guest_t *g,
      * backing once the final guest range is known.
      */
     if (!is_fixed) {
-        /* Under a limit the request exceeds, a bad descriptor is EBADF and a
-         * shared writable mapping of a read-only one is EACCES, as do_mmap
-         * checks both before may_expand_vm.
+        /* Under a limit the request exceeds, mmap_refused_errno still reports
+         * what do_mmap checks first.
          */
-        if (!mem_rlimit_allows(g, length, is_data, 0, 0)) {
-            bool denied = false;
-            if (!is_anon) {
-                int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
-                denied = ref_err >= 0 && mmap_shared_write_denied(
-                                             prot, flags, fresh.backing_ref.fd);
-                mmap_fresh_dispose(&fresh);
-                if (ref_err < 0)
-                    return ref_err;
-            }
-            return denied ? -LINUX_EACCES : -LINUX_ENOMEM;
-        }
+        if (!mem_rlimit_allows(g, length, is_data, 0, 0))
+            return mmap_refused_errno(&fresh, is_anon, fd, prot, flags, false);
 
         if (g->is_rosetta && addr >= g->guest_size &&
             addr <= 0x0000FFFFFFFFFFFFULL) {
@@ -4938,34 +4931,15 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
 }
 
 /* Guest memory for a SysV shm attach, which sys_shmat fills by copying from the
- * host segment. The memory is private anonymous, since elfuse copies the
- * segment rather than sharing it, but the region is marked shared, because a
- * Linux attach is VM_SHARED and counts toward RLIMIT_AS only. It is mapped
- * read-only first, so the mapping is not charged as data, and then given @prot.
- * Each mmap gets its own vma_id, so the new region merges with no neighbor that
- * the shared mark could reach.
+ * host segment. A Linux attach is VM_SHARED: it counts toward RLIMIT_AS only,
+ * /proc/self/maps shows it as shared, and a fork child shares it with the
+ * parent. Mapping it MAP_SHARED | MAP_ANONYMOUS gives all three, and keeps the
+ * region from coalescing with a private neighbor.
  */
 int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot)
 {
-    int64_t gva = sys_mmap(g, 0, length, LINUX_PROT_READ,
-                           LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
-    if (gva < 0)
-        return gva;
-
-    uint64_t off = (uint64_t) gva - g->ipa_base;
-    uint64_t end = off + PAGE_ALIGN_UP(length);
-    for (int i = guest_region_first_end_above(g, off);
-         i < g->nregions && g->regions[i].start < end; i++)
-        g->regions[i].shared = true;
-
-    if (prot != LINUX_PROT_READ) {
-        int64_t err = sys_mprotect(g, (uint64_t) gva, length, prot);
-        if (err < 0) {
-            (void) sys_munmap(g, (uint64_t) gva, length);
-            return err;
-        }
-    }
-    return gva;
+    return sys_mmap(g, 0, length, prot, LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    -1, 0);
 }
 
 static int compare_range_pair(const void *a, const void *b)

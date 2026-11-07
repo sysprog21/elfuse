@@ -405,10 +405,23 @@ static int data_child(void)
     data = maps_size(1);
     if (id < 0 || data == 0 || set_soft(RLIMIT_DATA, data + MIB / 2) < 0)
         return 100;
-    void *seg = shmat(id, NULL, 0);
+    char *seg = shmat(id, NULL, 0);
     shmctl(id, IPC_RMID, NULL);
     if (seg == (void *) -1)
         return 13;
+
+    /* 14: and a fork child shares it, so its write reaches the parent. */
+    seg[0] = 'P';
+    pid_t pid = fork();
+    if (pid == 0) {
+        seg[0] = 'C';
+        _exit(0);
+    }
+    int status;
+    if (pid < 0 || waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
+        return 100;
+    if (seg[0] != 'C')
+        return 14;
     shmdt(seg);
     return 0;
 }

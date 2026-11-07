@@ -964,8 +964,8 @@ int mac_to_linux_status_flags(int mac_flags);
 /* Translate Linux status flags (F_SETFL arg) to macOS equivalents. */
 int linux_to_mac_status_flags(int linux_flags);
 
-/* Guest memory for a SysV shm attach: private anonymous, counted as shared
- * toward RLIMIT_AS and not toward RLIMIT_DATA. Caller must hold mmap_lock.
+/* Guest memory for a SysV shm attach: shared anonymous, as a Linux attach is
+ * VM_SHARED. Caller must hold mmap_lock.
  */
 int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot);
 

@@ -604,6 +604,41 @@ static int data_child(void)
         return 23;
     shmdt(seg);
 
+    /* 24: a fork child's attaches do not take the serials of the attaches it
+     * inherited. In a child holding 8 attaches, a grandchild attaches and
+     * unmaps 20 times; an attach that shared an inherited one's serial would
+     * look still mapped and never be detached.
+     */
+    id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    if (id < 0)
+        return 100;
+    pid_t holder = fork();
+    if (holder == 0) {
+        for (int i = 0; i < 8; i++) {
+            if (shmat(id, NULL, 0) == (void *) -1)
+                _exit(100);
+        }
+        pid_t gc = fork();
+        if (gc == 0) {
+            for (int i = 0; i < 20; i++) {
+                char *a = shmat(id, NULL, 0);
+                if (a == (void *) -1 || munmap(a, 4096) < 0)
+                    _exit(24);
+            }
+            _exit(0);
+        }
+        int gst;
+        _exit(gc < 0 || waitpid(gc, &gst, 0) < 0 || !WIFEXITED(gst)
+                  ? 24
+                  : WEXITSTATUS(gst));
+    }
+    int hst;
+    int hrc = holder < 0 || waitpid(holder, &hst, 0) < 0 || !WIFEXITED(hst)
+                  ? 24
+                  : WEXITSTATUS(hst);
+    shmctl(id, IPC_RMID, NULL);
+    if (hrc != 0)
+        return hrc;
     return 0;
 }
 

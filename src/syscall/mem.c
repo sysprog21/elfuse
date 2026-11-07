@@ -4961,10 +4961,9 @@ int64_t sys_mmap_shm(guest_t *g,
                      int32_t key,
                      uint64_t *attach)
 {
-    static uint64_t last_attach;
     char name[sizeof(((guest_region_t *) 0)->name)];
     snprintf(name, sizeof(name), "/SYSV%08x (deleted)", (uint32_t) key);
-    *attach = ++last_attach;
+    *attach = ++g->next_shm_attach;
     return mmap_tagged(g, 0, length, prot,
                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS, -1, 0, name,
                        *attach);

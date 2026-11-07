@@ -544,8 +544,9 @@ typedef struct {
 
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
-    int nregions;         /* Number of active regions */
-    uint64_t next_vma_id; /* Last logical-VMA lineage ID allocated. */
+    int nregions;             /* Number of active regions */
+    uint64_t next_vma_id;     /* Last logical-VMA lineage ID allocated. */
+    uint64_t next_shm_attach; /* Last SysV shm attach serial handed out. */
     /* Set when a full region table stopped a mutation from being recorded:
      * guest_region_set_prot unable to split (leaving a region's old prot, or
      * applying the new one to a tail no PTE work covered), a munmap split
@@ -1336,9 +1337,10 @@ int guest_region_add_attach_gpa(guest_t *g,
                                 uint64_t vma_id,
                                 uint64_t shm_attach);
 
-/* Re-seed the logical-VMA allocator from a restored region snapshot. Fork IPC
- * restores regions by value, so next_vma_id must be advanced past every
- * serialized lineage before child-private mappings are added.
+/* Re-seed the logical-VMA allocator and the shm attach serial from a restored
+ * region snapshot. Fork IPC restores regions by value, so next_vma_id and
+ * next_shm_attach must be advanced past every serialized lineage and attach
+ * before child-private mappings are added.
  */
 void guest_reseed_next_vma_id(guest_t *g);
 

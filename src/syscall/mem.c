@@ -34,6 +34,7 @@
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/mem.h"
+#include "syscall/sys.h"
 
 /* Protects mmap/brk bump allocators and page table extension. Multiple threads
  * may call mmap/brk concurrently; without this lock they could get overlapping
@@ -2654,6 +2655,159 @@ static bool heap_piece_is_plain(const guest_region_t *r)
 }
 
 
+/* Whether a region counts toward RLIMIT_DATA once it is writable: private and
+ * not the stack (is_data_mapping, mm/internal.h).
+ */
+static bool region_may_be_data(const guest_region_t *r)
+{
+    return !r->shared && strcmp(r->name, "[stack]");
+}
+
+/* Whether a region is what Linux counts toward RLIMIT_DATA now. */
+static bool region_is_data(const guest_region_t *r)
+{
+    return (r->prot & LINUX_PROT_WRITE) && region_may_be_data(r);
+}
+
+/* The bound may_expand_vm (Linux mm/mmap.c) holds data mappings to: the soft
+ * RLIMIT_DATA, or the hard one when the soft limit is 0, which is the kernel's
+ * allowance for Valgrind.
+ */
+static uint64_t data_rlimit(void)
+{
+    uint64_t cur = sys_rlimit_cur(LINUX_RLIMIT_DATA);
+    return cur ? cur : sys_rlimit_max(LINUX_RLIMIT_DATA);
+}
+
+/* The mapped total and the data total that may_expand_vm compares with
+ * RLIMIT_AS and RLIMIT_DATA, summed from the sorted region array, leaving out
+ * the infra reserve. Each record counts to its page-aligned end: the heap
+ * record ends at the break itself, and Linux maps the heap to PAGE_ALIGN(brk).
+ * [@replace_start, @replace_end) is left out, in region coordinates; pass an
+ * empty range to count everything. Caller holds mmap_lock.
+ */
+static void mem_vm_totals(const guest_t *g,
+                          uint64_t replace_start,
+                          uint64_t replace_end,
+                          uint64_t *total,
+                          uint64_t *data)
+{
+    uint64_t t = 0, d = 0;
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (!guest_region_in_process_vm(g, r))
+            continue;
+        uint64_t end = PAGE_ALIGN_UP(r->end);
+        uint64_t lo = r->start > replace_start ? r->start : replace_start;
+        uint64_t hi = end < replace_end ? end : replace_end;
+        uint64_t kept = (end - r->start) - (lo < hi ? hi - lo : 0);
+
+        t += kept;
+        if (region_is_data(r))
+            d += kept;
+    }
+    *total = t;
+    *data = d;
+}
+
+/* Whether a request with @prot and @flags maps data: private and writable. */
+static bool request_is_data(int prot, int flags)
+{
+    return (prot & LINUX_PROT_WRITE) && !(flags & LINUX_MAP_SHARED);
+}
+
+/* RLIMIT_AS and RLIMIT_DATA at the point a request would extend the region
+ * table, after may_expand_vm. Both totals are summed from the sorted region
+ * array on each call, so they cannot drift from the region table. Only a
+ * request for a data mapping is held to RLIMIT_DATA.
+ *
+ * Once regions_tracker_stale is set the table has lost records and the totals
+ * are short by them. The limits are still judged on what is left: refusing
+ * instead would fail every later request of a guest that has a finite limit.
+ *
+ * @grow is the size the request adds, and @grow_is_data says whether it is a
+ * data mapping (see request_is_data). [@replace_start, @replace_end) is the
+ * range a MAP_FIXED request maps over, in region coordinates, and what is
+ * already mapped there is not charged twice; pass an empty range otherwise.
+ *
+ * Returns true when the request fits both limits. Caller holds mmap_lock.
+ */
+static bool mem_rlimit_allows(const guest_t *g,
+                              uint64_t grow,
+                              bool grow_is_data,
+                              uint64_t replace_start,
+                              uint64_t replace_end)
+{
+    uint64_t as_limit = sys_rlimit_cur(LINUX_RLIMIT_AS);
+    uint64_t data_limit = data_rlimit();
+    if (as_limit == LINUX_RLIM_INFINITY && data_limit == LINUX_RLIM_INFINITY)
+        return true;
+
+    uint64_t total, data;
+    mem_vm_totals(g, replace_start, replace_end, &total, &data);
+
+    /* Each limit is compared with what it has left, so a request near
+     * UINT64_MAX cannot wrap a sum.
+     */
+    if (total > as_limit || grow > as_limit - total)
+        return false;
+    return !grow_is_data || (data <= data_limit && grow <= data_limit - data);
+}
+
+/* RLIMIT_DATA on an mprotect that adds PROT_WRITE, after mprotect_fixup (Linux
+ * mm/mprotect.c). The kernel takes the mappings of the range in address order.
+ * One that turns into data, a private mapping that was not writable, fails with
+ * ENOMEM when may_expand_vm refuses it as data and would have allowed it as
+ * what it was, and the mappings below it have been changed by then. The second
+ * half is why a range that RLIMIT_AS already refuses goes through.
+ *
+ * [@start, @end) is in region coordinates.
+ *
+ * Returns true when a mapping fails, with @stop set to where the range reaches
+ * it. Caller holds mmap_lock.
+ */
+static bool mprotect_exceeds_data(const guest_t *g,
+                                  uint64_t start,
+                                  uint64_t end,
+                                  uint64_t *stop)
+{
+    uint64_t data_limit = data_rlimit();
+    if (data_limit == LINUX_RLIM_INFINITY)
+        return false;
+
+    uint64_t as_limit = sys_rlimit_cur(LINUX_RLIMIT_AS);
+    uint64_t total = 0, data = 0;
+    bool summed = false;
+
+    for (int i = guest_region_first_end_above(g, start);
+         i < g->nregions && g->regions[i].start < end; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (!guest_region_in_process_vm(g, r) || (r->prot & LINUX_PROT_WRITE) ||
+            !region_may_be_data(r))
+            continue;
+
+        /* Summed only once a mapping turns into data, so a range that is
+         * already writable or shared skips the walk.
+         */
+        if (!summed) {
+            mem_vm_totals(g, 0, 0, &total, &data);
+            summed = true;
+        }
+
+        uint64_t lo = r->start > start ? r->start : start;
+        uint64_t hi = r->end < end ? r->end : end;
+        uint64_t pages = hi - lo;
+        bool fits_as = total <= as_limit && pages <= as_limit - total;
+        bool fits_data = data <= data_limit && pages <= data_limit - data;
+        if (fits_as && !fits_data) {
+            *stop = lo;
+            return true;
+        }
+        data += pages;
+    }
+    return false;
+}
+
 /* How far the break may grow from its current position.
  *
  * The first tracked mapping above the break is where Linux stops a grow. An
@@ -2741,6 +2895,17 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
         return (int64_t) ipa_brk;
     }
 
+    /* check_data_rlimit (Linux include/linux/mm.h) holds the break extent to
+     * the soft RLIMIT_DATA whatever the heap's protection, before brk tells a
+     * grow from a shrink, so a shrink that stays over the limit fails too. The
+     * kernel adds the data segment (end_data - start_data), which is not
+     * tracked here. The soft limit is used as is: the allowance for a soft
+     * limit of 0 is not for brk.
+     */
+    uint64_t data_cur = sys_rlimit_cur(LINUX_RLIMIT_DATA);
+    if (data_cur != LINUX_RLIM_INFINITY && new_off - g->brk_base > data_cur)
+        return (int64_t) ipa_brk;
+
     /* Linux refuses a break that would run into the next mapping (do_brk_flags,
      * via find_vma_intersection), leaving a page between the two. Nothing here
      * faults on the way to tell the grow to stop: the heap is premapped RW to
@@ -2766,6 +2931,13 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
         new_off >= brk_grow_limit(g, old_brk, &adjoining)) {
         return (int64_t) ipa_brk;
     }
+
+    /* do_brk_flags charges may_expand_vm with the page-aligned growth, so a
+     * break that stays inside its last page charges nothing.
+     */
+    uint64_t new_pg = PAGE_ALIGN_UP(new_off), old_pg = PAGE_ALIGN_UP(old_brk);
+    if (new_pg > old_pg && !mem_rlimit_allows(g, new_pg - old_pg, true, 0, 0))
+        return (int64_t) ipa_brk;
 
     /* Shrinking can split a file-backed semantic region when a fork child has
      * grown and reshaped its heap metadata. Reserve the right-hand region's
@@ -3486,6 +3658,8 @@ int64_t sys_mmap(guest_t *g,
      */
     bool is_noreplace = (flags & LINUX_MAP_FIXED_NOREPLACE) != 0;
 
+    bool is_data = request_is_data(prot, flags);
+
     uint64_t result_off; /* Result as offset (0-based) */
     if (is_fixed) {
         /* Addresses above TASK_SIZE (bit 63 set or beyond user VA range) are
@@ -3494,9 +3668,29 @@ int64_t sys_mmap(guest_t *g,
         if (addr > 0x0000FFFFFFFFFFFFULL)
             return -LINUX_ENOMEM;
 
-        if (addr >= g->guest_size)
+        if (addr >= g->guest_size) {
+            /* Under a limit the request exceeds, a bad descriptor is EBADF, as
+             * on the paths below, and a MAP_FIXED_NOREPLACE over a mapping is
+             * EEXIST, because do_mmap checks for an intersection before
+             * mmap_region reaches may_expand_vm. Both are checked first.
+             */
+            bool replaces = !is_noreplace && addr <= UINT64_MAX - length;
+            if (!mem_rlimit_allows(g, length, is_data, replaces ? addr : 0,
+                                   replaces ? addr + length : 0)) {
+                if (!is_anon) {
+                    int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
+                    mmap_fresh_dispose(&fresh);
+                    if (ref_err < 0)
+                        return ref_err;
+                }
+                if (is_noreplace && addr <= UINT64_MAX - length &&
+                    region_range_overlaps(g, addr, addr + length))
+                    return -LINUX_EEXIST;
+                return -LINUX_ENOMEM;
+            }
             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset,
                                     true, is_noreplace);
+        }
 
         uint64_t off;
         int64_t range_err = mmap_fixed_range(g, addr, length, &off);
@@ -3517,6 +3711,18 @@ int64_t sys_mmap(guest_t *g,
         if (!is_anon)
             host_backing_fd = fresh.backing_ref.fd;
 
+        /* The limits come after the address and the descriptor have been
+         * checked, as may_expand_vm comes after get_unmapped_area and fget in
+         * the kernel, so a bad descriptor is EBADF under a limit the request
+         * exceeds. mmap_fixed_prepare has not changed the region table yet. A
+         * MAP_FIXED_NOREPLACE range overlaps nothing by now, so it is not
+         * charged for anything it replaces either.
+         */
+        if (!mem_rlimit_allows(g, length, is_data, result_off, fix_end)) {
+            mmap_fresh_dispose(&fresh);
+            return -LINUX_ENOMEM;
+        }
+
         int64_t commit_err =
             mmap_fixed_commit(g, &fresh, &overlay, prot, flags, fd, offset,
                               result_off, length, host_backing_fd);
@@ -3528,6 +3734,19 @@ int64_t sys_mmap(guest_t *g,
      * backing once the final guest range is known.
      */
     if (!is_fixed) {
+        /* A bad descriptor is EBADF under a limit the request exceeds, so the
+         * descriptor is looked up before ENOMEM.
+         */
+        if (!mem_rlimit_allows(g, length, is_data, 0, 0)) {
+            if (!is_anon) {
+                int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
+                mmap_fresh_dispose(&fresh);
+                if (ref_err < 0)
+                    return ref_err;
+            }
+            return -LINUX_ENOMEM;
+        }
+
         if (g->is_rosetta && addr >= g->guest_size &&
             addr <= 0x0000FFFFFFFFFFFFULL) {
             int64_t high_hint = sys_mmap_high_va(g, addr, length, prot, flags,
@@ -4196,6 +4415,13 @@ int64_t sys_mremap(guest_t *g,
     uint64_t src_gpa_base = src_reg->gpa_base;
     uint64_t src_start = src_reg->start;
 
+    /* A MREMAP_FIXED move checks the limits once its destination is valid. */
+    if (!(flags & LINUX_MREMAP_FIXED) && new_size > old_size &&
+        !mem_rlimit_allows(g, new_size - old_size,
+                           request_is_data(src_reg->prot, src_reg->flags), 0,
+                           0))
+        return finish_mremap(&source, -LINUX_ENOMEM);
+
     /* Same size: nothing to do */
     if (old_size == new_size && !(flags & LINUX_MREMAP_FIXED))
         return finish_mremap(&source, (int64_t) old_addr);
@@ -4232,6 +4458,16 @@ int64_t sys_mremap(guest_t *g,
         uint64_t old_end = old_off + old_size, new_end = new_off + new_size;
         if (old_off < new_end && new_off < old_end)
             return finish_mremap(&source, -LINUX_EINVAL);
+
+        /* mremap_to (Linux mm/mremap.c) checks the destination and unmaps it
+         * before vma_to_resize calls may_expand_vm, so a bad destination is
+         * EINVAL under any limit, and what is mapped there is not charged.
+         */
+        if (new_size > old_size &&
+            !mem_rlimit_allows(g, new_size - old_size,
+                               request_is_data(src_reg->prot, src_reg->flags),
+                               new_off, new_end))
+            return finish_mremap(&source, -LINUX_ENOMEM);
 
         mremap_move_t move;
         mremap_move_init(&move);
@@ -4835,6 +5071,21 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
         return -LINUX_EINVAL;
     if (addr > UINT64_MAX - length)
         return -LINUX_EINVAL;
+
+    if (prot & LINUX_PROT_WRITE) {
+        /* Region coordinates, as the two branches below take them. */
+        uint64_t off = addr >= g->guest_size ? addr : addr - g->ipa_base;
+        uint64_t stop;
+        if (off <= UINT64_MAX - length &&
+            mprotect_exceeds_data(g, off, off + length, &stop)) {
+            if (stop > off) {
+                int64_t err = sys_mprotect(g, addr, stop - off, prot);
+                if (err < 0)
+                    return err;
+            }
+            return -LINUX_ENOMEM;
+        }
+    }
 
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
         if (addr >= g->guest_size) {

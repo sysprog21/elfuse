@@ -54,6 +54,8 @@ sh_files=()
 staged=()
 while IFS= read -r -d '' file; do
     case "$file" in
+        # Fixed benchmark input: formatting it would invalidate the baseline.
+        tests/bench-corpus/*) continue ;;
         src/*.c | src/*.h)
             c_files+=("$file")
             src_files+=("$file")

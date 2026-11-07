@@ -1636,6 +1636,33 @@ test-perf: $(ELFUSE_BIN) $(PERF_DEPS)
 ## Alias for test-perf
 perf: test-perf
 
+# Performance benchmark suite (tests/bench-suite.sh): lmbench
+# microbenchmarks, application workloads over the Alpine fixture tools,
+# and real workloads in OCI images. It writes build/bench-results.json
+# for scripts/bench-compare.py. bench skips a tier whose prerequisites
+# are missing; bench-ci fails on them instead. BENCH_ENV picks the
+# column (elfuse-aarch64, qemu-aarch64, orbstack or native), and a
+# non-default column writes build/bench-results-$BENCH_ENV.json so one
+# job can capture several columns.
+.PHONY: bench bench-ci
+BENCH_SUITE_DEPS := $(ELFUSE_BIN)
+ifndef GUEST_TEST_BINARIES
+  BENCH_SUITE_DEPS += $(BUILD_DIR)/bench-timeit
+endif
+
+bench_out = $(if $(filter-out elfuse-aarch64,$(BENCH_ENV)),$(BUILD_DIR)/bench-results-$(BENCH_ENV).json,$(BUILD_DIR)/bench-results.json)
+
+## Run the benchmark suite; writes build/bench-results.json (or
+## build/bench-results-$BENCH_ENV.json for a non-default BENCH_ENV)
+bench: $(BENCH_SUITE_DEPS)
+	@ELFUSE="$(ELFUSE_BIN)" BENCH_BIN_DIR="$(TEST_DIR)" \
+	    bash tests/bench-suite.sh -o '$(bench_out)'
+
+## Run the benchmark suite for CI (strict prerequisites)
+bench-ci: $(BENCH_SUITE_DEPS)
+	@ELFUSE="$(ELFUSE_BIN)" BENCH_BIN_DIR="$(TEST_DIR)" BENCH_STRICT=1 \
+	    bash tests/bench-suite.sh -o '$(bench_out)'
+
 # Test matrix (elfuse aarch64 + qemu aarch64 + elfuse x86_64/Rosetta)
 ## Run full test matrix (all modes: elfuse-aarch64, qemu-aarch64, elfuse-x86_64)
 test-matrix: $(ELFUSE_BIN) $(TEST_DEPS)

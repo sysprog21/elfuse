@@ -43,7 +43,7 @@ done < <(git ls-files -z --cached --others --exclude-standard \
     -- 'src/**/*.[ch]' 'src/*.[ch]' \
     'tests/*.c' 'tests/*.h' \
     'frama-c-stubs/**/*.h' 'frama-c-stubs/*.h' \
-    '*.sh' '*.bash' '*.S' '*.s')
+    '*.sh' '*.bash' '*.S' '*.s' ':(exclude)tests/bench-corpus/**')
 
 if [ "${#files[@]}" -eq 0 ]; then
     echo "Error: no files selected; the pathspec no longer matches the tree" >&2

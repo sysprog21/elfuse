@@ -197,7 +197,9 @@ def main() -> int:
             prefix = f"{section}."
             missing_leaves(dest, new_leaves, prefix, missing)
             merge_tree(dest, new_leaves, prefix, added, updated)
-            if args.prune:
+            # An empty section is a tier the capture skipped, not one whose
+            # metrics were all removed.
+            if args.prune and new_leaves:
                 prune_tree(dest, new_leaves, prefix, pruned)
 
         captured_entry = {

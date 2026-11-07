@@ -145,10 +145,10 @@ jobs:
     #
     # job_timeout also covers queueing for the shared host lock (see "Acquire
     # shared host lock" below): the Benchmark leg holds it exclusively for its
-    # measurement window (~10 minutes), so every other leg budgets a 15-minute
+    # measurement window (~13 minutes), so every other leg budgets a 15-minute
     # queue on top of its own runtime. The Benchmark leg's budget stacks its
-    # own 15-minute shared queue, the longest sibling's 45-minute budget (its
-    # exclusive wait), the ~10-minute run, and setup margin.
+    # own 15-minute shared queue, the longest sibling's budget (TSAN, 60
+    # minutes, its exclusive wait), the ~13-minute run, and setup margin.
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
@@ -212,9 +212,9 @@ jobs:
             ubsan_options: ''
             tsan_options: ''
             test_timeout: ''
-            job_timeout: 85
+            job_timeout: 100
             shared_lock_wait: 15
-            exclusive_lock_wait: 50
+            exclusive_lock_wait: 60
             run_matrix: false
             run_bench: true
             check_target: ''
@@ -321,10 +321,12 @@ jobs:
         # guest, so this must be a real copy, not a symlink.
         run: |
           cache="$HOME/.cache/elfuse-ci/test-fixtures"
+          mkdir -p "$(dirname "$cache")"
           if [ -d "$cache" ]; then
             mkdir -p externals
             rm -rf externals/test-fixtures
-            cp -Rc "$cache" externals/test-fixtures
+            # Same lock as the save step, so the copy never sees a swap.
+            lockf -k "$cache.lock" cp -Rc "$cache" externals/test-fixtures
             echo "Restored test fixtures ($(du -sh externals/test-fixtures | cut -f1), lock: $(head -1 externals/test-fixtures/versions.lock 2>/dev/null || echo none))"
           else
             echo "No fixtures cache at $cache; tests fetch on demand"
@@ -517,21 +519,24 @@ jobs:
         # long as the job wasn't cancelled, so a fixture-unrelated test
         # failure doesn't cost the next run its cache.
         #
-        # The copy goes to a temporary directory first and is renamed into
-        # place, so the Benchmark leg's restore on another runner never reads
-        # a half-deleted or half-written tree.
+        # Release legs of two runs can save at the same time, and another
+        # runner can be restoring. Each save copies to a directory of its own
+        # and swaps it in under the lock that restores also take.
         if: ${{ !cancelled() && matrix.sanitizer == 'release' }}
         run: |
           if [ -d externals/test-fixtures ]; then
             cache="$HOME/.cache/elfuse-ci/test-fixtures"
             mkdir -p "$(dirname "$cache")"
-            rm -rf "$cache.new" "$cache.old"
-            cp -Rc externals/test-fixtures "$cache.new"
-            if [ -d "$cache" ]; then
-              mv "$cache" "$cache.old"
-            fi
-            mv "$cache.new" "$cache"
-            rm -rf "$cache.old"
+            new="$cache.new.$RUNNER_NAME.$$"
+            rm -rf "$new"
+            cp -Rc externals/test-fixtures "$new"
+            lockf -k "$cache.lock" sh -c '
+              set -e
+              rm -rf "$1.old"
+              if [ -d "$1" ]; then mv "$1" "$1.old"; fi
+              mv "$2" "$1"
+              rm -rf "$1.old"
+            ' sh "$cache" "$new"
             echo "Saved test fixtures ($(du -sh "$cache" | cut -f1))"
           else
             echo "No externals/test-fixtures to save"

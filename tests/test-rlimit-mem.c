@@ -563,24 +563,47 @@ static int data_child(void)
     if (seg == (void *) -1 || seg[0] != 'Q')
         return 21;
 
-    /* 22: a detach releases the record of an attach that was unmapped at its
-     * address, so unmapping and attaching again there does not run out of
-     * records. elfuse keeps 64.
+    /* 22: an attach the guest unmapped is detached, so unmapping attaches
+     * without shmdt does not run out of them. elfuse keeps 64 records, and the
+     * macOS host allows 8 attaches per process by default.
      */
     id = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
     if (id < 0)
         return 100;
     for (int i = 0; i < 80; i++) {
-        char *first = shmat(id, NULL, 0);
-        char *second = first == (void *) -1 || munmap(first, 64 * 1024) < 0
-                           ? (void *) -1
-                           : shmat(id, first, 0);
-        if (second == (void *) -1 || shmdt(second) < 0) {
+        char *a = shmat(id, NULL, 0);
+        if (a == (void *) -1 || munmap(a, 64 * 1024) < 0) {
             shmctl(id, IPC_RMID, NULL);
             return 22;
         }
     }
     shmctl(id, IPC_RMID, NULL);
+
+    /* 23: an attach moved with mremap is detached at its new address, with the
+     * writes made there, and not at its old one.
+     */
+    id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    char *to = map_anon(NULL, 4096, rw, MAP_PRIVATE);
+    if (id < 0 || to == MAP_FAILED)
+        return 100;
+    seg = shmat(id, NULL, 0);
+    if (seg == (void *) -1 ||
+        mremap(seg, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, to) != to) {
+        shmctl(id, IPC_RMID, NULL);
+        return 23;
+    }
+    to[0] = 'M';
+    errno = 0;
+    int old_rc = shmdt(seg);
+    int old_errno = errno;
+    int new_rc = shmdt(to);
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (old_rc != -1 || old_errno != EINVAL || new_rc != 0 ||
+        seg == (void *) -1 || seg[0] != 'M')
+        return 23;
+    shmdt(seg);
+
     return 0;
 }
 

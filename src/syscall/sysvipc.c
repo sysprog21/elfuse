@@ -135,11 +135,10 @@ typedef struct {
 typedef struct {
     bool active;
     int shmid;
-    void *host_addr;    /* shmat() return on host */
-    uint64_t guest_gva; /* guest virtual address */
-    uint64_t size;      /* segment size */
-    uint64_t attach;    /* serial the guest mapping's regions carry */
-    bool rdonly;        /* attached read-only */
+    void *host_addr; /* shmat() return on host */
+    uint64_t size;   /* segment size */
+    uint64_t attach; /* serial the guest mapping's regions carry */
+    bool rdonly;     /* attached read-only */
 } shm_attach_t;
 
 static shm_attach_t shm_table[MAX_SHM_ATTACH];
@@ -147,6 +146,29 @@ static pthread_mutex_t shm_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define SHM_FOR_EACH(e) \
     for (shm_attach_t *e = shm_table; e < shm_table + MAX_SHM_ATTACH; e++)
+
+/* Retire every record whose attach no region carries any more, wherever the
+ * guest moved it, and release its host attach. Linux detaches an attach when
+ * its last VMA is unmapped, by munmap or by a mapping placed over it, so such a
+ * record names nothing, and keeping it would hold one of the host's few
+ * attaches (kern.sysv.shmseg, 8 by default on macOS) and a table slot. The
+ * caller holds mmap_lock and not shm_lock.
+ */
+static void shm_retire_unmapped(guest_t *g)
+{
+    void *host[MAX_SHM_ATTACH];
+    int n = 0;
+    pthread_mutex_lock(&shm_lock);
+    SHM_FOR_EACH (e) {
+        if (e->active && !mem_attach_mapped(g, e->attach)) {
+            e->active = false;
+            host[n++] = e->host_addr;
+        }
+    }
+    pthread_mutex_unlock(&shm_lock);
+    for (int i = 0; i < n; i++)
+        shmdt(host[i]);
+}
 
 /* Helper: macOS ipc_perm -> Linux ipc64_perm. */
 
@@ -236,6 +258,8 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
 
     bool rdonly = (shmflg & LINUX_SHM_RDONLY) != 0;
 
+    shm_retire_unmapped(g);
+
     /* Attach on host side */
     void *host_addr = shmat(shmid, NULL, rdonly ? SHM_RDONLY : 0);
     if (host_addr == (void *) -1)
@@ -290,7 +314,6 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
     entry->active = true;
     entry->shmid = shmid;
     entry->host_addr = host_addr;
-    entry->guest_gva = (uint64_t) gva;
     entry->size = seg_size;
     entry->attach = attach;
     entry->rdonly = rdonly;
@@ -301,32 +324,30 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
 
 int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
 {
-    /* The guest may have unmapped an attach, or mapped over it, since it was
-     * made, and attached another segment at the same address since. The record
-     * taken is the one at the address whose attach still has a part mapped, the
-     * regions that carry its serial. A record there whose attach has none left
-     * is stale: Linux detached that attach when it was unmapped, so the record
-     * is retired here and its host attach released. When no record there has a
-     * part mapped, Linux finds no attach at the address and fails with EINVAL,
-     * and what is mapped there now is neither copied nor unmapped. The caller
-     * holds mmap_lock.
+    /* Linux finds the attach to detach from the mappings, not from where it was
+     * made: the first VMA of a segment at or above the address whose page
+     * offset matches its distance from the address, so an attach the guest
+     * moved with mremap is detached at its new address and not at its old one.
+     * The record taken is likewise the one with such a part in its range from
+     * the address, the lowest part winning. Records whose attach is mapped
+     * nowhere are retired first. When no record has such a part, Linux finds no
+     * attach and fails with EINVAL, and what is mapped there now is neither
+     * copied nor unmapped. The caller holds mmap_lock.
      */
-    uint64_t lo, hi;
-    void *stale_host[MAX_SHM_ATTACH];
-    int nstale = 0;
+    shm_retire_unmapped(g);
+
+    uint64_t lo, hi, best = UINT64_MAX;
     pthread_mutex_lock(&shm_lock);
     shm_attach_t *match = NULL;
     SHM_FOR_EACH (e) {
-        if (!e->active || e->guest_gva != shmaddr_gva)
-            continue;
-        uint64_t end = e->guest_gva + PAGE_ALIGN_UP(e->size);
-        if (mem_attach_next(g, e->guest_gva, end, e->attach, &lo, &hi, NULL)) {
-            if (!match)
-                match = e;
-            continue;
+        uint64_t end = shmaddr_gva + PAGE_ALIGN_UP(e->size);
+        if (e->active && end > shmaddr_gva &&
+            mem_attach_next(g, shmaddr_gva, shmaddr_gva, end, e->attach, &lo,
+                            &hi, NULL) &&
+            lo < best) {
+            match = e;
+            best = lo;
         }
-        e->active = false;
-        stale_host[nstale++] = e->host_addr;
     }
     shm_attach_t entry;
     if (match) {
@@ -335,8 +356,6 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
     }
     pthread_mutex_unlock(&shm_lock);
 
-    for (int i = 0; i < nstale; i++)
-        shmdt(stale_host[i]);
     if (!match)
         return -LINUX_EINVAL;
 
@@ -344,12 +363,12 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
      * parts of the attach that remain. The copy reads the memory behind them
      * directly, so a part the guest made PROT_NONE is written back too.
      */
-    uint64_t gva = entry.guest_gva;
+    uint64_t gva = shmaddr_gva;
     uint64_t end = gva + PAGE_ALIGN_UP(entry.size);
     void *src;
     for (uint64_t cur = gva;
          !entry.rdonly &&
-         mem_attach_next(g, cur, end, entry.attach, &lo, &hi, &src);
+         mem_attach_next(g, gva, cur, end, entry.attach, &lo, &hi, &src);
          cur = hi) {
         uint64_t copy_end = hi < gva + entry.size ? hi : gva + entry.size;
         if (src)
@@ -365,7 +384,8 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
      */
     int64_t err = 0;
     for (uint64_t cur = gva;
-         mem_attach_next(g, cur, end, entry.attach, &lo, &hi, NULL); cur = hi) {
+         mem_attach_next(g, gva, cur, end, entry.attach, &lo, &hi, NULL);
+         cur = hi) {
         int64_t rc = sys_munmap(g, lo, hi - lo);
         if (rc < 0 && err == 0)
             err = rc;

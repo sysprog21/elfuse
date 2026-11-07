@@ -4971,6 +4971,7 @@ int64_t sys_mmap_shm(guest_t *g,
 }
 
 bool mem_attach_next(guest_t *g,
+                     uint64_t base,
                      uint64_t gva,
                      uint64_t end,
                      uint64_t attach,
@@ -4984,14 +4985,24 @@ bool mem_attach_next(guest_t *g,
         const guest_region_t *r = &g->regions[i];
         if (r->start >= off_end)
             break;
-        if (r->shm_attach == attach) {
-            uint64_t piece = r->start > off ? r->start : off;
+        uint64_t piece = r->start > off ? r->start : off;
+        if (r->shm_attach == attach &&
+            r->offset + (piece - r->start) == gva + (piece - off) - base) {
             *lo = gva + (piece - off);
             *hi = gva + ((r->end < off_end ? r->end : off_end) - off);
             if (host)
                 *host = host_ptr_for_gpa(g, r->gpa_base + (piece - r->start));
             return true;
         }
+    }
+    return false;
+}
+
+bool mem_attach_mapped(const guest_t *g, uint64_t attach)
+{
+    for (int i = 0; i < g->nregions; i++) {
+        if (g->regions[i].shm_attach == attach)
+            return true;
     }
     return false;
 }

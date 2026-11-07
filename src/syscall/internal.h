@@ -975,20 +975,28 @@ int64_t sys_mmap_shm(guest_t *g,
                      uint64_t *attach);
 
 /* The first part of [@gva, @end) whose region carries the shm attach serial
- * @attach, as [*@lo, *@hi) in guest addresses. When @host is not NULL, *@host
- * is set to the host memory behind *@lo, which is readable whatever the guest
- * page protection.
+ * @attach at the offset into the attach that an attach at @base would put
+ * there, as [*@lo, *@hi) in guest addresses. This is the part Linux shmdt at
+ * @base finds: a VMA of the segment whose page offset matches its distance from
+ * @base. When @host is not NULL, *@host is set to the host memory behind *@lo,
+ * which is readable whatever the guest page protection.
  *
  * Returns false when no part of the range carries it. Caller must hold
  * mmap_lock.
  */
 bool mem_attach_next(guest_t *g,
+                     uint64_t base,
                      uint64_t gva,
                      uint64_t end,
                      uint64_t attach,
                      uint64_t *lo,
                      uint64_t *hi,
                      void **host);
+
+/* Whether any region carries the shm attach serial @attach, wherever the guest
+ * has moved it. Caller must hold mmap_lock.
+ */
+bool mem_attach_mapped(const guest_t *g, uint64_t attach);
 
 /* Borrowed-or-pinned host fd reference.
  *

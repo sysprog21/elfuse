@@ -153,12 +153,18 @@ static int as_child(void)
 
     /* 11: so is a MAP_FIXED one. The hole it goes into is reserved with the
      * soft limit raised to the hard one and unmapped again, so the request maps
-     * over nothing.
+     * over nothing. A finite hard limit may leave no room for the hole, and the
+     * step is then skipped.
      */
     struct rlimit as;
     if (getrlimit(RLIMIT_AS, &as) < 0 || set_soft(RLIMIT_AS, as.rlim_max) < 0)
         return 100;
     void *hole = map_anon(NULL, 32 * MIB, PROT_NONE, MAP_PRIVATE);
+    if (hole == MAP_FAILED && as.rlim_max != RLIM_INFINITY) {
+        close(wfd);
+        close(rfd);
+        return 0;
+    }
     if (hole == MAP_FAILED || munmap(hole, 32 * MIB) < 0 ||
         set_soft(RLIMIT_AS, base + 24 * MIB) < 0)
         return 100;

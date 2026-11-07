@@ -83,19 +83,20 @@
 #                              share, and are timed in-machine by
 #                              bench-timeit. Recorded in meta.note.
 #
-# Tier 3 (real-workload benchmarks, elfuse-aarch64 only): the five workload
-#   categories of the real-workload syscall-frequency ranking, each in its
-#   own OCI image run through scripts/elfuse-oci.py:
+# Tier 3 (real-workload benchmarks, elfuse-aarch64 only): workload categories
+#   of the real-workload syscall-frequency ranking, each in its own OCI image
+#   run through scripts/elfuse-oci.py:
 #     python     python:3.12-slim     tests/bench-oci/python.py
 #     node       node:22-alpine       tests/bench-oci/node.js
-#     go         golang:1.23-alpine   tests/bench-oci/go.sh
 #     c-compile  gcc:14               tests/bench-oci/c-compile.sh
 #     jvm        eclipse-temurin:21   tests/bench-oci/jvm.sh
 #   Images are pinned by linux/arm64 manifest digest, so a moving tag
 #   cannot change the workload. Each sample is timed inside the guest by
 #   bench-timeit, reached at its host path through elfuse's host fallback.
 #   Needs crane and umoci on PATH; image pulls are untimed and cached in
-#   $ELFUSE_OCI_STORE.
+#   $ELFUSE_OCI_STORE. The ranking's go row is left out: gofmt over the
+#   standard library can need more than the 64 threads elfuse gives a process
+#   (MAX_THREADS in src/runtime/thread.h), and then fails a sample.
 #
 # Tier-2 metrics are workload-only in every environment: each column times every
 # sample inside its guest/machine via bench-timeit. The per-command entry toll
@@ -1061,7 +1062,6 @@ OCI_REGISTRY="mirror.gcr.io/library"
 OCI_WORKLOADS=(
     "python_ms|python:3.12-slim@sha256:c61cffc3bacb94ed026ff8b45d5114b7693dd0420baca0a1ace0e3d0ce9035fd|python3 @W@/python.py"
     "node_ms|node:22-alpine@sha256:7c8f7d55c4fec6f20d97508cc80982f1301c42e0f7bc9618bf59a8850233c2ec|node @W@/node.js"
-    "go_ms|golang:1.23-alpine@sha256:56e44a486dc12270a471259239c0005ae492be2f078c4f54567c0e3159e23e4b|sh @W@/go.sh"
     "c_compile_ms|gcc:14@sha256:2bafb163aaa91eef7856f17ff0abf69144ebe3218a4eea75c043bb3043b9ecfa|sh @W@/c-compile.sh"
     "jvm_ms|eclipse-temurin:21@sha256:01239420dead341065a8f2749c630efa5d97c63c344973cd38dac305542752b5|sh @W@/jvm.sh @W@/jvm"
 )
@@ -1116,13 +1116,14 @@ run_tier3_suite()
         for ((i = 0; i < total; i++)); do
             rc=0
             out=$(timeout "$TEST_TIMEOUT" "$oci" run --entrypoint /bin/sh \
-                "$ref" -c "$cmd" 2> /dev/null) || rc=$?
+                "$ref" -c "$cmd" 2> "${SAMPLES}.err") || rc=$?
             case "$out" in
                 '' | *[!0-9]*) [ "$rc" -ne 0 ] || rc=1 ;;
             esac
             if [ "$rc" -ne 0 ]; then
                 echo "bench-suite: real-workload sample '$metric' failed (rc=$rc, out='$out'):" >&2
                 echo "  $ref: $cmd" >&2
+                tail -n 20 "${SAMPLES}.err" | sed 's/^/  | /' >&2
                 exit 1
             fi
             printf 'oci %s %s %s\n' "$metric" "$metric" "$out" >> "$SAMPLES"

@@ -272,8 +272,10 @@ writes `build/bench-results.json`:
 
 - Tier 3 -- real workloads, `elfuse-aarch64` only: one OCI image per
   workload category of the real-workload syscall-frequency ranking, run
-  through `scripts/elfuse-oci.py` (python, node, go, c-compile, jvm; the
-  scripts are in `tests/bench-oci/`). Images are pinned by `linux/arm64`
+  through `scripts/elfuse-oci.py` (python, node, c-compile, jvm; the
+  scripts are in `tests/bench-oci/`). The ranking's go row is left out,
+  because gofmt there can need more than the 64 threads elfuse gives a
+  process. Images are pinned by `linux/arm64`
   manifest digest in `tests/bench-suite.sh`. The tier needs `crane` and
   `umoci` on `PATH` and skips with a note without them, except under
   `BENCH_STRICT=1`. `tests/bench-suite.sh -p` only pulls the images, which

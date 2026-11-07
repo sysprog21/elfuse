@@ -964,12 +964,39 @@ int mac_to_linux_status_flags(int mac_flags);
 /* Translate Linux status flags (F_SETFL arg) to macOS equivalents. */
 int linux_to_mac_status_flags(int linux_flags);
 
-/* Anonymous mmap for other modules. */
-
-/* Allocate anonymous guest memory. Wraps the static sys_mmap with
- * MAP_PRIVATE|MAP_ANONYMOUS. Caller must hold mmap_lock.
+/* Guest memory for a SysV shm attach of the segment with @key: shared
+ * anonymous, as a Linux attach is VM_SHARED. Its region carries a new serial,
+ * which is stored in *@attach. Caller must hold mmap_lock.
  */
-int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
+int64_t sys_mmap_shm(guest_t *g,
+                     uint64_t length,
+                     int prot,
+                     int32_t key,
+                     uint64_t *attach);
+
+/* The first part of [@gva, @end) whose region carries the shm attach serial
+ * @attach at the offset into the attach that an attach at @base would put
+ * there, as [*@lo, *@hi) in guest addresses. This is the part Linux shmdt at
+ * @base finds: a VMA of the segment whose page offset matches its distance from
+ * @base. When @host is not NULL, *@host is set to the host memory behind *@lo,
+ * which is readable whatever the guest page protection.
+ *
+ * Returns false when no part of the range carries it. Caller must hold
+ * mmap_lock.
+ */
+bool mem_attach_next(guest_t *g,
+                     uint64_t base,
+                     uint64_t gva,
+                     uint64_t end,
+                     uint64_t attach,
+                     uint64_t *lo,
+                     uint64_t *hi,
+                     void **host);
+
+/* Whether any region carries the shm attach serial @attach, wherever the guest
+ * has moved it. Caller must hold mmap_lock.
+ */
+bool mem_attach_mapped(const guest_t *g, uint64_t attach);
 
 /* Borrowed-or-pinned host fd reference.
  *

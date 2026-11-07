@@ -281,11 +281,16 @@ static int data_child(void)
     int rfd = wfd < 0 ? -1 : open(path, O_RDONLY);
     if (wfd >= 0)
         unlink(path);
-    char *priv = map_anon(NULL, 32 * MIB, PROT_READ, MAP_PRIVATE);
-    if (rfd < 0 || ftruncate(wfd, 4 * MIB) < 0 || priv == MAP_FAILED)
+    char *pair = map_anon(NULL, 36 * MIB, PROT_READ, MAP_PRIVATE);
+    if (rfd < 0 || ftruncate(wfd, 4 * MIB) < 0 || pair == MAP_FAILED)
         return 100;
-    char *pair = priv - 4 * MIB;
-    if (mmap(pair, 4 * MIB, PROT_READ, MAP_SHARED, rfd, 0) != pair)
+
+    /* The shared mapping goes into a hole cut from the reserved range, so the
+     * hint is free to honor. Not MAP_FIXED: elfuse refuses a MAP_FIXED shared
+     * mapping of a read-only descriptor with EACCES.
+     */
+    if (munmap(pair, 4 * MIB) < 0 ||
+        mmap(pair, 4 * MIB, PROT_READ, MAP_SHARED, rfd, 0) != pair)
         return 100;
     errno = 0;
     if (mprotect(pair, 36 * MIB, rw) != -1 || errno != EACCES)

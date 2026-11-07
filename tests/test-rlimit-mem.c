@@ -20,6 +20,7 @@
 #include <sys/resource.h>
 #include <sys/shm.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -42,6 +43,19 @@ static size_t vm_size(void)
     buf[n] = '\0';
     char *p = strstr(buf, "VmSize:");
     return p ? (size_t) strtoul(p + 7, NULL, 10) * 1024 : 0;
+}
+
+/* Whether the running kernel checks MREMAP_FIXED growth before it unmaps the
+ * destination, which Linux does since 6.17 (commit a85dc37186a5) and elfuse
+ * does as the 6.18 it reports. An older kernel unmaps the destination first.
+ */
+static int mremap_checks_first(void)
+{
+    struct utsname u;
+    unsigned major = 0, minor = 0;
+    if (uname(&u) < 0 || sscanf(u.release, "%u.%u", &major, &minor) != 2)
+        return 1;
+    return major > 6 || (major == 6 && minor >= 17);
 }
 
 static int set_soft(int resource, rlim_t cur)
@@ -115,18 +129,19 @@ static int as_child(void)
         errno != EBADF)
         return 7;
 
-    /* 8: MREMAP_FIXED onto a mapping is charged with that mapping still
-     * counted, as Linux checks the growth before it unmaps the destination
-     * (since v6.17). With the limit reached, moving 4 MiB of the mapping from
-     * step 6 onto an 8 MiB one as 8 MiB fails, and the destination stays.
+    /* 8: with the limit reached, move 4 MiB of the mapping from step 6 onto an
+     * 8 MiB one as 8 MiB. Since 6.17 the growth is charged with the destination
+     * still counted, so the move fails and the destination stays. Before, the
+     * destination was unmapped first and the move left 20 MiB mapped.
      */
     void *d = map_anon(NULL, 8 * MIB, rw, MAP_PRIVATE);
     if (d == MAP_FAILED)
         return 100;
     errno = 0;
-    if (mremap(c, 4 * MIB, 8 * MIB, MREMAP_MAYMOVE | MREMAP_FIXED, d) !=
-            MAP_FAILED ||
-        errno != ENOMEM || msync(d, 4096, MS_ASYNC) < 0)
+    void *moved = mremap(c, 4 * MIB, 8 * MIB, MREMAP_MAYMOVE | MREMAP_FIXED, d);
+    if (mremap_checks_first() ? moved != MAP_FAILED || errno != ENOMEM ||
+                                    msync(d, 4096, MS_ASYNC) < 0
+                              : moved != d)
         return 8;
 
     /* 9: an unaligned MREMAP_FIXED destination is EINVAL even when the growth
@@ -396,9 +411,9 @@ static int data_child(void)
     if (map_anon(page, 4096, rw, MAP_PRIVATE | MAP_FIXED) != page)
         return 11;
 
-    /* 12: a MREMAP_FIXED move the limit refuses leaves its destination mapped,
-     * as Linux checks the growth before it unmaps the destination (since
-     * v6.17).
+    /* 12: a MREMAP_FIXED move the limit refuses leaves its destination mapped
+     * since 6.17, and unmapped before, when the destination was unmapped before
+     * the growth was checked.
      */
     void *dst = map_anon(NULL, 8 * MIB, PROT_READ, MAP_PRIVATE);
     if (dst == MAP_FAILED)
@@ -408,7 +423,9 @@ static int data_child(void)
             MAP_FAILED ||
         errno != ENOMEM)
         return 12;
-    if (msync(dst, 4096, MS_ASYNC) < 0)
+    errno = 0;
+    int dst_mapped = msync(dst, 4096, MS_ASYNC) == 0;
+    if (dst_mapped != mremap_checks_first() || (!dst_mapped && errno != ENOMEM))
         return 12;
 
     /* 13: a SysV shm attach is shared, so RLIMIT_DATA does not count it. */

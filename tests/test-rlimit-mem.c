@@ -579,6 +579,25 @@ static int data_child(void)
     shmctl(id, IPC_RMID, NULL);
     if (seg == (void *) -1 || seg[0] != 'Q')
         return 21;
+
+    /* 22: a detach releases the record of an attach that was unmapped at its
+     * address, so unmapping and attaching again there does not run out of
+     * records. elfuse keeps 64.
+     */
+    id = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    if (id < 0)
+        return 100;
+    for (int i = 0; i < 80; i++) {
+        char *first = shmat(id, NULL, 0);
+        char *second = first == (void *) -1 || munmap(first, 64 * 1024) < 0
+                           ? (void *) -1
+                           : shmat(id, first, 0);
+        if (second == (void *) -1 || shmdt(second) < 0) {
+            shmctl(id, IPC_RMID, NULL);
+            return 22;
+        }
+    }
+    shmctl(id, IPC_RMID, NULL);
     return 0;
 }
 

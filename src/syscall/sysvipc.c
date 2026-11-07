@@ -304,38 +304,41 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
     /* The guest may have unmapped an attach, or mapped over it, since it was
      * made, and attached another segment at the same address since. The record
      * taken is the one at the address whose attach still has a part mapped, the
-     * regions that carry its serial. When no record there has one, Linux finds
-     * no attach at the address and fails with EINVAL, and what is mapped there
-     * now is neither copied nor unmapped. The caller holds mmap_lock.
+     * regions that carry its serial. A record there whose attach has none left
+     * is stale: Linux detached that attach when it was unmapped, so the record
+     * is retired here and its host attach released. When no record there has a
+     * part mapped, Linux finds no attach at the address and fails with EINVAL,
+     * and what is mapped there now is neither copied nor unmapped. The caller
+     * holds mmap_lock.
      */
     uint64_t lo, hi;
+    void *stale_host[MAX_SHM_ATTACH];
+    int nstale = 0;
     pthread_mutex_lock(&shm_lock);
-    shm_attach_t *match = NULL, *stale = NULL;
+    shm_attach_t *match = NULL;
     SHM_FOR_EACH (e) {
         if (!e->active || e->guest_gva != shmaddr_gva)
             continue;
         uint64_t end = e->guest_gva + PAGE_ALIGN_UP(e->size);
         if (mem_attach_next(g, e->guest_gva, end, e->attach, &lo, &hi, NULL)) {
-            match = e;
-            break;
+            if (!match)
+                match = e;
+            continue;
         }
-        if (!stale)
-            stale = e;
+        e->active = false;
+        stale_host[nstale++] = e->host_addr;
     }
-    shm_attach_t *taken = match ? match : stale;
-    if (!taken) {
-        pthread_mutex_unlock(&shm_lock);
-        return -LINUX_EINVAL;
+    shm_attach_t entry;
+    if (match) {
+        entry = *match;
+        match->active = false;
     }
-
-    shm_attach_t entry = *taken;
-    taken->active = false;
     pthread_mutex_unlock(&shm_lock);
 
-    if (!match) {
-        shmdt(entry.host_addr);
+    for (int i = 0; i < nstale; i++)
+        shmdt(stale_host[i]);
+    if (!match)
         return -LINUX_EINVAL;
-    }
 
     /* Write back guest modifications to host shm (unless read-only), from the
      * parts of the attach that remain. The copy reads the memory behind them

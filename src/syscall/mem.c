@@ -2787,7 +2787,8 @@ static bool mem_rlimit_allows(const guest_t *g,
 {
     uint64_t as_limit = sys_rlimit_cur(LINUX_RLIMIT_AS);
     uint64_t data_limit = data_rlimit();
-    if (as_limit == LINUX_RLIM_INFINITY && data_limit == LINUX_RLIM_INFINITY)
+    if (as_limit == LINUX_RLIM_INFINITY &&
+        (!grow_is_data || data_limit == LINUX_RLIM_INFINITY))
         return true;
 
     uint64_t total, data;

@@ -4951,6 +4951,35 @@ int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot)
                     -1, 0);
 }
 
+uint64_t mem_vma_id_at(guest_t *g, uint64_t gva)
+{
+    uint64_t off = gva >= g->guest_size ? gva : gva - g->ipa_base;
+    const guest_region_t *r = guest_region_find(g, off);
+    return r ? r->vma_id : 0;
+}
+
+bool mem_vma_next(guest_t *g,
+                  uint64_t gva,
+                  uint64_t end,
+                  uint64_t vma_id,
+                  uint64_t *lo,
+                  uint64_t *hi)
+{
+    uint64_t off = gva >= g->guest_size ? gva : gva - g->ipa_base;
+    uint64_t off_end = off + (end - gva);
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= off_end)
+            break;
+        if (r->end > off && r->vma_id == vma_id) {
+            *lo = gva + ((r->start > off ? r->start : off) - off);
+            *hi = gva + ((r->end < off_end ? r->end : off_end) - off);
+            return true;
+        }
+    }
+    return false;
+}
+
 static int compare_range_pair(const void *a, const void *b)
 {
     const uint64_t *ra = a;

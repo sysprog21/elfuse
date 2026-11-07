@@ -138,6 +138,7 @@ typedef struct {
     void *host_addr;    /* shmat() return on host */
     uint64_t guest_gva; /* guest virtual address */
     uint64_t size;      /* segment size */
+    uint64_t vma_id;    /* region vma_id of the guest mapping */
     bool rdonly;        /* attached read-only */
 } shm_attach_t;
 
@@ -289,6 +290,7 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
     entry->host_addr = host_addr;
     entry->guest_gva = (uint64_t) gva;
     entry->size = seg_size;
+    entry->vma_id = mem_vma_id_at(g, (uint64_t) gva);
     entry->rdonly = rdonly;
     pthread_mutex_unlock(&shm_lock);
 
@@ -314,10 +316,25 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
     match->active = false;
     pthread_mutex_unlock(&shm_lock);
 
+    /* The guest may have unmapped the attach, or mapped over it, since it was
+     * made. Linux then finds no attach at the address and fails with EINVAL,
+     * and the mapping that is there now is neither copied nor unmapped. When
+     * only part of the attach is gone, the write-back and the unmap below take
+     * the parts that remain, the regions that still have the attach's vma_id.
+     */
+    uint64_t gva = entry.guest_gva, lo, hi;
+    uint64_t end = gva + PAGE_ALIGN_UP(entry.size);
+    if (mem_vma_id_at(g, gva) != entry.vma_id) {
+        shmdt(entry.host_addr);
+        return -LINUX_EINVAL;
+    }
+
     /* Write back guest modifications to host shm (unless read-only) */
-    if (!entry.rdonly) {
-        /* Read guest memory back to host shm buffer */
-        guest_read(g, entry.guest_gva, entry.host_addr, entry.size);
+    for (uint64_t cur = gva;
+         !entry.rdonly && mem_vma_next(g, cur, end, entry.vma_id, &lo, &hi);
+         cur = hi) {
+        uint64_t copy_end = hi < gva + entry.size ? hi : gva + entry.size;
+        guest_read(g, lo, (char *) entry.host_addr + (lo - gva), copy_end - lo);
     }
 
     /* Detach host shm */
@@ -326,7 +343,9 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
     /* Release the guest mapping as Linux does at detach, so it stops counting
      * toward RLIMIT_AS. The caller holds mmap_lock.
      */
-    sys_munmap(g, entry.guest_gva, PAGE_ALIGN_UP(entry.size));
+    for (uint64_t cur = gva; mem_vma_next(g, cur, end, entry.vma_id, &lo, &hi);
+         cur = hi)
+        sys_munmap(g, lo, hi - lo);
 
     return 0;
 }

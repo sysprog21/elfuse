@@ -969,6 +969,23 @@ int linux_to_mac_status_flags(int linux_flags);
  */
 int64_t sys_mmap_shm(guest_t *g, uint64_t length, int prot);
 
+/* vma_id of the region at guest address @gva, or 0 when nothing is mapped
+ * there. Caller must hold mmap_lock.
+ */
+uint64_t mem_vma_id_at(guest_t *g, uint64_t gva);
+
+/* The first part of [@gva, @end) whose region has @vma_id, as [*@lo, *@hi) in
+ * guest addresses.
+ *
+ * Returns false when no part of the range has it. Caller must hold mmap_lock.
+ */
+bool mem_vma_next(guest_t *g,
+                  uint64_t gva,
+                  uint64_t end,
+                  uint64_t vma_id,
+                  uint64_t *lo,
+                  uint64_t *hi);
+
 /* Borrowed-or-pinned host fd reference.
  *
  * Single-threaded guests borrow the raw host fd directly (no dup, no close).

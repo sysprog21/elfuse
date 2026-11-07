@@ -437,8 +437,11 @@ static int data_child(void)
      */
     id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
     size_t vm = vm_size();
-    if (id < 0 || vm == 0 || set_soft(RLIMIT_AS, vm + 8 * MIB) < 0)
+    if (id < 0 || vm == 0 || set_soft(RLIMIT_AS, vm + 8 * MIB) < 0) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
         return 100;
+    }
     for (int i = 0; i < 16; i++) {
         seg = shmat(id, NULL, 0);
         if (seg == (void *) -1 || shmdt(seg) < 0) {
@@ -446,7 +449,44 @@ static int data_child(void)
             return 15;
         }
     }
+
+    /* 16: a detach after the attach was mapped over fails with EINVAL and
+     * leaves the new mapping in place.
+     */
+    seg = shmat(id, NULL, 0);
     shmctl(id, IPC_RMID, NULL);
+    if (seg == (void *) -1 ||
+        map_anon(seg, 2 * MIB, rw, MAP_PRIVATE | MAP_FIXED) != seg)
+        return 100;
+    seg[0] = 'N';
+    errno = 0;
+    if (shmdt(seg) != -1 || errno != EINVAL || msync(seg, 4096, MS_ASYNC) < 0 ||
+        seg[0] != 'N')
+        return 16;
+
+    /* 17: when only part of the attach was mapped over, the detach writes back
+     * and unmaps the part that remains and leaves the new mapping alone. The
+     * new mapping is data, so the soft RLIMIT_DATA from step 13 is raised.
+     */
+    struct rlimit dl;
+    if (getrlimit(RLIMIT_DATA, &dl) < 0 ||
+        set_soft(RLIMIT_DATA, dl.rlim_max) < 0)
+        return 100;
+    id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
+    seg = id < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    if (seg == (void *) -1 ||
+        map_anon(seg + MIB, MIB, rw, MAP_PRIVATE | MAP_FIXED) != seg + MIB) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    seg[0] = 'A';
+    seg[MIB] = 'X';
+    char *again = shmdt(seg) < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (again == (void *) -1 || again[0] != 'A' || again[MIB] != 0 ||
+        (again != seg + MIB && seg[MIB] != 'X'))
+        return 17;
     return 0;
 }
 

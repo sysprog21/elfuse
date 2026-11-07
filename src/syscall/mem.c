@@ -2720,6 +2720,12 @@ static bool region_counted_span(const guest_t *g,
  * RLIMIT_AS and RLIMIT_DATA, summed from the sorted region array, leaving out
  * the infra reserve, each record as region_counted_span counts it. Caller holds
  * mmap_lock.
+ *
+ * [stack] counts at the full extent elfuse maps for it up front (8188 KiB),
+ * where Linux counts the stack VMA only as far as it has grown (132 KiB right
+ * after exec of a static binary, measured on 6.18). The total is therefore
+ * about 8 MiB above Linux's, and a guest whose RLIMIT_AS was sized from a Linux
+ * run gets that much less room.
  */
 static void mem_vm_totals(const guest_t *g, uint64_t *total, uint64_t *data)
 {

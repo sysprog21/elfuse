@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-bench-report check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -110,6 +110,11 @@ check-atomics:
 	@echo "  ATOMICS src/ .claude/skills/"
 	@python3 scripts/check-atomics.py --self-test
 	@python3 scripts/check-atomics.py
+
+## Check the benchmark PR reporter and baseline promoter on fixed inputs
+check-bench-report:
+	@python3 scripts/bench-report.py --self-test
+	@python3 scripts/bench-promote.py --self-test
 
 ## Fail when a source file carries non-ASCII outside the diagram set
 check-ascii:
@@ -314,7 +319,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-bench-report check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)

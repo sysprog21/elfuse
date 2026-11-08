@@ -507,7 +507,16 @@ jobs:
         if: ${{ matrix.run_bench }}
         run: |
           BENCH_REPORT_ONLY=1 python3 scripts/bench-compare.py \
-            --fail-on-missing
+            --fail-on-missing --report-json build/bench-pr-report.json
+
+      - name: Upload benchmark PR report
+        if: ${{ matrix.run_bench && !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-pr-report
+          path: build/bench-pr-report.json
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Upload benchmark results
         if: ${{ matrix.run_bench && !cancelled() }}

@@ -288,7 +288,11 @@ past the threshold (default +20%, `BENCH_REGRESSION_THRESHOLD`) or
 missing from the current run. `BENCH_REPORT_ONLY=1` downgrades both to a
 log-only signal; `--fail-on-missing` keeps a missing metric fatal even then.
 The CI `Benchmark` leg runs with both, so a regression only prints and a
-benchmark that errored or timed out fails the leg.
+benchmark that errored or timed out fails the leg. The pull-request comment
+comes from `.github/workflows/bench-report.yml`, which takes only the measured
+values from the run and compares them with the default branch's baseline and
+default threshold, so a pull request that edits the baseline is still compared
+with the merged one.
 
 CI measures only the `elfuse-aarch64` column. `qemu-aarch64` (a real
 Linux kernel on the same silicon) and the optional `orbstack` column
@@ -344,7 +348,8 @@ env ENOUGH=100000 ./build/elfuse \
 
 ```sh
 python3 scripts/bench-compare.py --results build/bench-results.json \
-    --baseline tests/bench-baseline.json --threshold 0.20
+    --baseline tests/bench-baseline.json --threshold 0.20 \
+    --report-json build/bench-pr-report.json
 ```
 
 Add `--report-only` (or `BENCH_REPORT_ONLY=1`) to print regressions

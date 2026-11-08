@@ -10,7 +10,7 @@ qemu-aarch64 column is the same-silicon Linux reference for context.
 Usage:
     scripts/bench-compare.py [--results PATH] [--baseline PATH]
                              [--threshold FRACTION] [--report-only]
-                             [--fail-on-missing]
+                             [--fail-on-missing] [--report-json PATH]
 
 Environment:
     BENCH_REGRESSION_THRESHOLD  overrides --threshold (e.g. 0.20)
@@ -31,6 +31,7 @@ DEFAULT_RESULTS = ROOT / "build" / "bench-results.json"
 DEFAULT_BASELINE = ROOT / "tests" / "bench-baseline.json"
 
 SECTIONS = ("lmbench", "applications", "oci")
+# scripts/bench-report.py reads this too, from the default branch.
 DEFAULT_THRESHOLD = 0.20
 
 
@@ -148,6 +149,32 @@ def print_table(rows: list[tuple[str, str, str, str, str]]) -> None:
             *row, w0=widths[0], w1=widths[1], w2=widths[2], w3=widths[3]))
 
 
+def write_report(path: pathlib.Path, *, environment: str,
+                 current: dict[str, float], failed: list[str]) -> None:
+    """Write the data-only artifact consumed by the trusted PR reporter.
+
+    It carries only what this run measured, and the metrics whose
+    measurement failed. The reporter compares it with the default branch's
+    baseline and threshold, never with this branch's.
+    """
+    report = {
+        "schema_version": 2,
+        "environment": environment,
+        "direction": "lower-is-better",
+        "current": current,
+        "failed": failed,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(report, indent=2, sort_keys=True, allow_nan=False)
+            + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, ValueError) as exc:
+        raise BenchDataError(f"cannot write report {path}: {exc}") from exc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=pathlib.Path,
@@ -165,6 +192,9 @@ def main() -> int:
     parser.add_argument("--fail-on-missing", action="store_true",
                         help="make missing baseline metrics fail even in "
                              "report-only mode")
+    parser.add_argument(
+        "--report-json", type=pathlib.Path,
+        help="write a data-only comparison report for CI automation")
     args = parser.parse_args()
 
     results = load_json(args.results)
@@ -189,6 +219,14 @@ def main() -> int:
         print(f"bench-compare: invalid benchmark data: {exc}",
               file=sys.stderr)
         return 2
+    if args.report_json is not None:
+        try:
+            write_report(args.report_json, environment=env,
+                         current=current, failed=sorted(failed))
+        except BenchDataError as exc:
+            print(f"bench-compare: {exc}", file=sys.stderr)
+            return 2
+
     environments = baseline.get("environments", {})
     if not isinstance(environments, dict):
         print("bench-compare: baseline environments must be an object",

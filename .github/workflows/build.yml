@@ -284,10 +284,12 @@ jobs:
         # guest, so this must be a real copy, not a symlink.
         run: |
           cache="$HOME/.cache/elfuse-ci/test-fixtures"
+          mkdir -p "$(dirname "$cache")"
           if [ -d "$cache" ]; then
             mkdir -p externals
             rm -rf externals/test-fixtures
-            cp -Rc "$cache" externals/test-fixtures
+            # Same lock as the save step, so the copy never sees a swap.
+            lockf -k "$cache.lock" cp -Rc "$cache" externals/test-fixtures
             echo "Restored test fixtures ($(du -sh externals/test-fixtures | cut -f1), lock: $(head -1 externals/test-fixtures/versions.lock 2>/dev/null || echo none))"
           else
             echo "No fixtures cache at $cache"
@@ -409,16 +411,27 @@ jobs:
         # long as the job wasn't cancelled, so a fixture-unrelated test
         # failure doesn't cost the next run its cache. A failed fixture fetch
         # is skipped: its partial tree must not replace the last good cache.
+        #
+        # Release legs of two runs can save at the same time, and another
+        # runner can be restoring. Each save copies to a directory of its own
+        # and swaps it in under the lock that restores also take.
         if: ${{ !cancelled() && matrix.sanitizer == 'release' && steps.fixtures.outcome == 'success' }}
         run: |
           if [ -d externals/test-fixtures ]; then
             cache="$HOME/.cache/elfuse-ci/test-fixtures"
             mkdir -p "$(dirname "$cache")"
             # Copy aside first so a failed copy keeps the last good cache.
-            rm -rf "$cache.new"
-            cp -Rc externals/test-fixtures "$cache.new"
-            rm -rf "$cache"
-            mv "$cache.new" "$cache"
+            new="$cache.new.$RUNNER_NAME.$$"
+            trap 'rm -rf "$new"' EXIT
+            rm -rf "$new"
+            cp -Rc externals/test-fixtures "$new"
+            lockf -k "$cache.lock" sh -c '
+              set -e
+              rm -rf "$1.old"
+              if [ -d "$1" ]; then mv "$1" "$1.old"; fi
+              mv "$2" "$1"
+              rm -rf "$1.old"
+            ' sh "$cache" "$new"
             echo "Saved test fixtures ($(du -sh "$cache" | cut -f1))"
           else
             echo "No externals/test-fixtures to save"

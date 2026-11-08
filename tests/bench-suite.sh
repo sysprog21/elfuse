@@ -53,7 +53,8 @@
 # reported.
 #
 # Usage: tests/bench-suite.sh [-o results.json] [-p]
-#   -p  pull the Tier-3 OCI images into $ELFUSE_OCI_STORE and exit
+#   -p  pull the Tier-3 OCI images into $ELFUSE_OCI_STORE and exit; CI runs
+#       this before it takes the exclusive host lock
 #
 # Environment:
 #   BENCH_ENV         elfuse-aarch64 (default) | qemu-aarch64 | native |

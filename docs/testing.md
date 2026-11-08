@@ -278,7 +278,8 @@ writes `build/bench-results.json`:
   process. Images are pinned by `linux/arm64`
   manifest digest in `tests/bench-suite.sh`. The tier needs `crane` and
   `umoci` on `PATH` and skips with a note without them, except under
-  `BENCH_STRICT=1`. `tests/bench-suite.sh -p` only pulls the images.
+  `BENCH_STRICT=1`. `tests/bench-suite.sh -p` only pulls the images, which
+  CI does before it takes the exclusive host lock.
 
 Each metric runs warmup + timed iterations and reports the median plus
 raw samples. `scripts/bench-compare.py` diffs the results against
@@ -286,6 +287,8 @@ raw samples. `scripts/bench-compare.py` diffs the results against
 past the threshold (default +20%, `BENCH_REGRESSION_THRESHOLD`) or
 missing from the current run. `BENCH_REPORT_ONLY=1` downgrades both to a
 log-only signal; `--fail-on-missing` keeps a missing metric fatal even then.
+The CI `Benchmark` leg runs with both, so a regression only prints and a
+benchmark that errored or timed out fails the leg.
 
 CI measures only the `elfuse-aarch64` column. `qemu-aarch64` (a real
 Linux kernel on the same silicon) and the optional `orbstack` column

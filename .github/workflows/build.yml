@@ -265,17 +265,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Restore cached test fixtures
+      - name: Restore and verify test fixtures
+        id: fixtures
+        # A failed fetch must not skip the build and code checks:
+        # `make check` uses the fixture tree only when it exists. The save
+        # step below keys on this step's `outcome` (still `failure` here),
+        # not `conclusion`, so keep the two in step.
+        continue-on-error: true
         # Only the release leg needs fixtures: the sanitizer legs run the
         # fixture-free check-sanitizer subset.
         if: ${{ matrix.run_matrix }}
         # actions/checkout's default clean:true runs `git clean -ffdx`, which
         # wipes externals/test-fixtures (gitignored) on this self-hosted
         # runner even though its disk otherwise persists across runs.
-        # fetch-fixtures.sh is already idempotent -- it skips re-downloading
-        # Alpine packages when externals/test-fixtures/versions.lock still
-        # matches -- so stash that tree outside the workspace and restore it
-        # here as a real directory. The qemu lane in tests/test-matrix.sh
+        # Restore as a real directory: the qemu lane in tests/test-matrix.sh
         # shares the workspace root with the guest over virtio-9p, and a
         # symlink pointing outside that root does not resolve inside the
         # guest, so this must be a real copy, not a symlink.
@@ -287,7 +290,14 @@ jobs:
             cp -Rc "$cache" externals/test-fixtures
             echo "Restored test fixtures ($(du -sh externals/test-fixtures | cut -f1), lock: $(head -1 externals/test-fixtures/versions.lock 2>/dev/null || echo none))"
           else
-            echo "No fixtures cache at $cache; tests fetch on demand"
+            echo "No fixtures cache at $cache"
+          fi
+          # Check the lock even when all fixture files exist.
+          if ! INCLUDE_X86_64=1 bash tests/fetch-fixtures.sh; then
+            # Drop the stale or partial tree so make check skips it.
+            rm -rf externals/test-fixtures
+            echo "::warning::Fixture fetch failed; fixture-dependent tests are skipped"
+            exit 1
           fi
 
       - name: Host info
@@ -394,17 +404,21 @@ jobs:
 
       - name: Save test fixtures cache
         # Persist externals/test-fixtures outside the workspace so the next
-        # run's "Restore cached test fixtures" step can skip re-downloading
+        # run's "Restore and verify test fixtures" step can skip re-downloading
         # unchanged Alpine packages. Runs even if an earlier step failed, as
         # long as the job wasn't cancelled, so a fixture-unrelated test
-        # failure doesn't cost the next run its cache.
-        if: ${{ !cancelled() && matrix.sanitizer == 'release' }}
+        # failure doesn't cost the next run its cache. A failed fixture fetch
+        # is skipped: its partial tree must not replace the last good cache.
+        if: ${{ !cancelled() && matrix.sanitizer == 'release' && steps.fixtures.outcome == 'success' }}
         run: |
           if [ -d externals/test-fixtures ]; then
             cache="$HOME/.cache/elfuse-ci/test-fixtures"
             mkdir -p "$(dirname "$cache")"
+            # Copy aside first so a failed copy keeps the last good cache.
+            rm -rf "$cache.new"
+            cp -Rc externals/test-fixtures "$cache.new"
             rm -rf "$cache"
-            cp -Rc externals/test-fixtures "$cache"
+            mv "$cache.new" "$cache"
             echo "Saved test fixtures ($(du -sh "$cache" | cut -f1))"
           else
             echo "No externals/test-fixtures to save"

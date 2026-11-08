@@ -551,7 +551,7 @@ EOF
     ok "static-bin: ${STATICBIN}/busybox + ${#STATIC_APPLETS[@]} applets"
 
     if [ "${INCLUDE_X86_64:-0}" = "1" ]; then
-        fetch_x86_64_userspace
+        fetch_x86_64_userspace "$manifest"
     fi
 
     # Record the resolved version set so the next run can detect a mirror bump
@@ -577,11 +577,22 @@ EOF
 # per-mode expected-count table stays consistent.
 fetch_x86_64_userspace()
 {
+    local manifest="$1"
     local x86_cache="${FIXTURES}/cache/x86_64"
     local x86_rootfs="${FIXTURES}/x86_64-musl/rootfs"
     local x86_staticbin="${FIXTURES}/x86_64-musl/staticbin/bin"
     local x86_dynbin="${FIXTURES}/x86_64-musl/dyn-bin"
     mkdir -p "$x86_cache" "$x86_rootfs" "$x86_staticbin" "$x86_dynbin"
+
+    # The shared versions.lock is rewritten by ARM-only runs too, so the x86_64
+    # tree keeps its own lock: a stale tree must rebuild even when the shared
+    # lock already matches the mirror.
+    local x86_lock="${FIXTURES}/x86_64-musl/versions.lock"
+    if [ ! -f "$x86_lock" ] || [ "$manifest" != "$(cat "$x86_lock")" ]; then
+        REBUILD=1
+    fi
+    # Drop it before touching the tree so a failed rebuild leaves no lock.
+    rm -f "$x86_lock"
 
     local x86_main="${CDN_BASE}/main/x86_64"
     local x86_releases="${CDN_BASE}/releases/x86_64"
@@ -657,6 +668,8 @@ fetch_x86_64_userspace()
     fi
     ok "x86_64 dyn-bin: $(find "$x86_dynbin" -maxdepth 1 -type l 2> /dev/null \
         | wc -l | tr -d ' ') entries"
+
+    printf '%s\n' "$manifest" > "$x86_lock"
 }
 
 main "$@"

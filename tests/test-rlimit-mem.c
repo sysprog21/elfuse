@@ -16,7 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ipc.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -381,6 +383,36 @@ static size_t maps_size(int data_only)
     return total;
 }
 
+/* Whether the /proc/self/maps line that starts at @at has the permissions
+ * @perms and ends in @name.
+ */
+static int maps_line_is(const void *at, const char *perms, const char *name)
+{
+    static char buf[64 * 1024];
+    size_t len = 0;
+    ssize_t n = 0;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    while (fd >= 0 && len < sizeof(buf) - 1 &&
+           (n = read(fd, buf + len, sizeof(buf) - 1 - len)) > 0)
+        len += (size_t) n;
+    if (fd >= 0)
+        close(fd);
+    if (fd < 0 || n < 0)
+        return 0;
+    buf[len] = '\0';
+
+    for (char *line = buf, *nl; (nl = strchr(line, '\n')); line = nl + 1) {
+        *nl = '\0';
+        char *end;
+        if (strtoul(line, &end, 16) != (unsigned long) at)
+            continue;
+        size_t ll = strlen(line), nn = strlen(name);
+        return strncmp(strchr(line, ' ') + 1, perms, strlen(perms)) == 0 &&
+               ll >= nn && strcmp(line + ll - nn, name) == 0;
+    }
+    return 0;
+}
+
 /* brk(2) called directly: musl's sbrk fails any non-zero increment without
  * making the syscall.
  */
@@ -447,6 +479,186 @@ static int as_exact_child(void)
      */
     if (raw_brk(start + 4096 + 200) != start + 200)
         return 5;
+    return 0;
+}
+
+/* Attach a new segment of @size bytes in a hole of @hole bytes just unmapped,
+ * and return it with its id in *@id. shmat ignores the address under elfuse, so
+ * the attach lands in the hole only when the allocator hands it back: NULL,
+ * with the segment removed, tells the step to skip. (void *) -1 is a setup
+ * failure.
+ */
+static char *attach_in_hole(size_t size, size_t hole, int *id)
+{
+    char *at = map_anon(NULL, hole, PROT_NONE, MAP_PRIVATE);
+    if (at == MAP_FAILED || munmap(at, hole) < 0)
+        return (void *) -1;
+    *id = shmget(IPC_PRIVATE, size, IPC_CREAT | 0600);
+    if (*id < 0)
+        return (void *) -1;
+    char *seg = shmat(*id, at, 0);
+    if (seg != at) {
+        if (seg != (void *) -1 && shmdt(seg) < 0) {
+            shmctl(*id, IPC_RMID, NULL);
+            return (void *) -1;
+        }
+        shmctl(*id, IPC_RMID, NULL);
+        return seg == (void *) -1 ? seg : NULL;
+    }
+    return seg;
+}
+
+/* 26: an attach mremap grew in place past its segment is detached whole, with
+ * the writes made in the segment.
+ */
+static int grown_attach_step(void)
+{
+    int id;
+    char *seg = attach_in_hole(4096, 2 * 4096, &id);
+    if (seg == (void *) -1)
+        return 100;
+    if (!seg)
+        return 0;
+    if (mremap(seg, 4096, 2 * 4096, 0) != seg) {
+        shmctl(id, IPC_RMID, NULL);
+        return 26;
+    }
+    seg[0] = 'G';
+    if (shmdt(seg) < 0 || msync(seg, 4096, MS_ASYNC) == 0 ||
+        msync(seg + 4096, 4096, MS_ASYNC) == 0) {
+        shmctl(id, IPC_RMID, NULL);
+        return 26;
+    }
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (seg == (void *) -1 || seg[0] != 'G')
+        return 26;
+    shmdt(seg);
+    return 0;
+}
+
+/* 27: a page moved past the next page of its attach does not merge with it.
+ * Detaching at the old address leaves the moved page attached, and each page's
+ * write reaches its own segment offset.
+ */
+static int moved_page_step(void)
+{
+    int id;
+    char *seg = attach_in_hole(2 * 4096, 3 * 4096, &id);
+    if (seg == (void *) -1)
+        return 100;
+    if (!seg)
+        return 0;
+    char *to = seg + 2 * 4096;
+    if (mremap(seg, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, to) != to) {
+        shmctl(id, IPC_RMID, NULL);
+        return 27;
+    }
+    to[0] = 'L';
+    seg[4096] = 'H';
+    int old_rc = shmdt(seg);
+    int moved_mapped = msync(to, 4096, MS_ASYNC) == 0;
+    int new_rc = shmdt(to);
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (old_rc != 0 || !moved_mapped || new_rc != 0 || seg == (void *) -1 ||
+        seg[0] != 'L' || seg[4096] != 'H')
+        return 27;
+    shmdt(seg);
+    return 0;
+}
+
+/* 28: shmdt finds an attach whose first page is gone. A one-page attach is
+ * grown in place to two pages and its first page unmapped; a detach at the old
+ * address still finds the second page and detaches it.
+ */
+static int gone_first_page_step(void)
+{
+    int id;
+    char *seg = attach_in_hole(4096, 2 * 4096, &id);
+    if (seg == (void *) -1)
+        return 100;
+    if (!seg)
+        return 0;
+    if (mremap(seg, 4096, 2 * 4096, 0) != seg || munmap(seg, 4096) < 0) {
+        shmctl(id, IPC_RMID, NULL);
+        return 28;
+    }
+    int rc = shmdt(seg);
+    int tail_mapped = msync(seg + 4096, 4096, MS_ASYNC) == 0;
+    shmctl(id, IPC_RMID, NULL);
+    return rc != 0 || tail_mapped ? 28 : 0;
+}
+
+/* 30: two attaches side by side are two mappings, so maps lists each on a line
+ * of its own. Each is 16 KiB, a host page on Apple Silicon, as elfuse starts an
+ * attach on a host page.
+ */
+static int adjacent_attaches_step(void)
+{
+    const size_t piece = 4 * 4096;
+    int id1;
+    char *seg1 = attach_in_hole(piece, 2 * piece, &id1);
+    if (seg1 == (void *) -1)
+        return 100;
+    if (!seg1)
+        return 0;
+    int id2 = shmget(IPC_PRIVATE, piece, IPC_CREAT | 0600);
+    char *seg2 = id2 < 0 ? (void *) -1 : shmat(id2, seg1 + piece, 0);
+    shmctl(id1, IPC_RMID, NULL);
+    if (id2 >= 0)
+        shmctl(id2, IPC_RMID, NULL);
+    if (seg2 == (void *) -1) {
+        shmdt(seg1);
+        return 100;
+    }
+    int rc = 0;
+    if (seg2 == seg1 + piece &&
+        (!maps_line_is(seg1, "rw-s", "/SYSV00000000 (deleted)") ||
+         !maps_line_is(seg2, "rw-s", "/SYSV00000000 (deleted)")))
+        rc = 30;
+    shmdt(seg2);
+    shmdt(seg1);
+    return rc;
+}
+
+/* 29: an attach split before a fork is still detached whole after it, with the
+ * writes made in each piece. The split points are 16 KiB apart, a host page on
+ * Apple Silicon, so the fork shares each piece with the child.
+ */
+static int split_fork_step(void)
+{
+    int id = shmget(IPC_PRIVATE, 3 * 16384, IPC_CREAT | 0600);
+    if (id < 0)
+        return 100;
+    char *seg = shmat(id, NULL, 0);
+    if (seg == (void *) -1) {
+        shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    if (mprotect(seg + 16384, 16384, PROT_READ) < 0) {
+        shmctl(id, IPC_RMID, NULL);
+        return 29;
+    }
+    seg[0] = 'A';
+    seg[2 * 16384] = 'C';
+    pid_t pid = fork();
+    if (pid == 0)
+        _exit(0);
+    int status;
+    if (pid < 0 || waitpid(pid, &status, 0) < 0 || !WIFEXITED(status)) {
+        shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    int rc = shmdt(seg);
+    int mid_mapped = msync(seg + 16384, 16384, MS_ASYNC) == 0;
+    int tail_mapped = msync(seg + 2 * 16384, 16384, MS_ASYNC) == 0;
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (rc != 0 || mid_mapped || tail_mapped || seg == (void *) -1 ||
+        seg[0] != 'A' || seg[2 * 16384] != 'C')
+        return 29;
+    shmdt(seg);
     return 0;
 }
 
@@ -591,6 +803,274 @@ static int data_child(void)
              MAP_FAILED ||
          errno != ENOMEM || msync(dst, 4096, MS_ASYNC) < 0))
         return 12;
+
+    /* 13: a SysV shm attach is shared, so RLIMIT_DATA does not count it, and
+     * maps lists it as shared under the name Linux gives it.
+     */
+    int id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
+    data = maps_size(1);
+    if (id < 0 || data == 0 || set_soft(RLIMIT_DATA, data + MIB / 2) < 0) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    char *seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (seg == (void *) -1 ||
+        !maps_line_is(seg, "rw-s", "/SYSV00000000 (deleted)"))
+        return 13;
+
+    /* 14: and a fork child shares it, so its write reaches the parent. */
+    seg[0] = 'P';
+    pid_t pid = fork();
+    if (pid == 0) {
+        seg[0] = 'C';
+        _exit(0);
+    }
+    int status;
+    if (pid < 0 || waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
+        return 100;
+    if (seg[0] != 'C')
+        return 14;
+    shmdt(seg);
+
+    /* 15: a detach releases the attach, so attaching and detaching more than
+     * RLIMIT_AS leaves room for in all does not run out.
+     */
+    id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
+    size_t vm = vm_size();
+    if (id < 0 || vm == 0 || set_soft(RLIMIT_AS, vm + 8 * MIB) < 0) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    for (int i = 0; i < 16; i++) {
+        seg = shmat(id, NULL, 0);
+        if (seg == (void *) -1 || shmdt(seg) < 0) {
+            shmctl(id, IPC_RMID, NULL);
+            return 15;
+        }
+    }
+
+    /* 16: a detach after the attach was mapped over fails with EINVAL and
+     * leaves the new mapping in place.
+     */
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (seg == (void *) -1 ||
+        map_anon(seg, 2 * MIB, rw, MAP_PRIVATE | MAP_FIXED) != seg)
+        return 100;
+    seg[0] = 'N';
+    errno = 0;
+    if (shmdt(seg) != -1 || errno != EINVAL || msync(seg, 4096, MS_ASYNC) < 0 ||
+        seg[0] != 'N')
+        return 16;
+
+    /* 17: when only part of the attach was mapped over, the detach writes back
+     * and unmaps the part that remains and leaves the new mapping alone. The
+     * new mapping is data, so the soft RLIMIT_DATA from step 13 is raised.
+     */
+    struct rlimit dl;
+    if (getrlimit(RLIMIT_DATA, &dl) < 0 ||
+        set_soft(RLIMIT_DATA, dl.rlim_max) < 0)
+        return 100;
+    id = shmget(IPC_PRIVATE, 2 * MIB, IPC_CREAT | 0600);
+    seg = id < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    if (seg == (void *) -1 ||
+        map_anon(seg + MIB, MIB, rw, MAP_PRIVATE | MAP_FIXED) != seg + MIB) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    seg[0] = 'A';
+    seg[MIB] = 'X';
+    char *again = shmdt(seg) < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (again == (void *) -1 || again[0] != 'A' || again[MIB] != 0 ||
+        (again != seg + MIB && seg[MIB] != 'X'))
+        return 17;
+
+    /* 18: so is a shared anonymous one over the first page, which Linux keeps
+     * apart from the attach.
+     */
+    id = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    seg = id < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    if (seg == (void *) -1 || munmap(seg, 4096) < 0 ||
+        map_anon(seg, 4096, rw, MAP_SHARED | MAP_FIXED) != seg) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    seg[0] = 'S';
+    seg[4096] = 'B';
+    again = shmdt(seg) < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (again == (void *) -1 || again[0] != 0 || again[4096] != 'B' ||
+        (again != seg && seg[0] != 'S'))
+        return 18;
+
+    /* 19: an attach that was unmapped does not hide one made at its address
+     * since, which the detach then takes.
+     */
+    int ida = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    int idb = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    char *sa = ida < 0 ? (void *) -1 : shmat(ida, NULL, 0);
+    char *sb = sa == (void *) -1 || munmap(sa, 64 * 1024) < 0 || idb < 0
+                   ? (void *) -1
+                   : shmat(idb, sa, 0);
+    if (ida >= 0)
+        shmctl(ida, IPC_RMID, NULL);
+    if (idb >= 0)
+        shmctl(idb, IPC_RMID, NULL);
+    if (sb == (void *) -1)
+        return 100;
+    if (sb == sa && (shmdt(sa) < 0 || msync(sa, 4096, MS_ASYNC) == 0))
+        return 19;
+
+    /* 20: a detach writes back a part the guest made PROT_NONE. */
+    id = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    seg = id < 0 ? (void *) -1 : shmat(id, NULL, 0);
+    if (seg == (void *) -1) {
+        if (id >= 0)
+            shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    seg[100] = 'W';
+    if (mprotect(seg, 64 * 1024, PROT_NONE) < 0 || shmdt(seg) < 0) {
+        shmctl(id, IPC_RMID, NULL);
+        return 20;
+    }
+    again = shmat(id, NULL, 0);
+    if (again == (void *) -1 || again[100] != 'W') {
+        shmctl(id, IPC_RMID, NULL);
+        return 20;
+    }
+
+    /* 21: so is an attach that mremap shrank and grew back in place. */
+    if (mremap(again, 64 * 1024, 32 * 1024, 0) != again ||
+        mremap(again, 32 * 1024, 64 * 1024, 0) != again) {
+        shmctl(id, IPC_RMID, NULL);
+        return 100;
+    }
+    again[0] = 'Q';
+    if (shmdt(again) < 0 || msync(again, 4096, MS_ASYNC) == 0) {
+        shmctl(id, IPC_RMID, NULL);
+        return 21;
+    }
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (seg == (void *) -1 || seg[0] != 'Q')
+        return 21;
+
+    /* 22: an attach the guest unmapped is detached, so unmapping attaches
+     * without shmdt does not run out of them. elfuse keeps 64 records, and the
+     * macOS host allows 8 attaches per process by default.
+     */
+    id = shmget(IPC_PRIVATE, 64 * 1024, IPC_CREAT | 0600);
+    if (id < 0)
+        return 100;
+    for (int i = 0; i < 80; i++) {
+        char *a = shmat(id, NULL, 0);
+        if (a == (void *) -1 || munmap(a, 64 * 1024) < 0) {
+            shmctl(id, IPC_RMID, NULL);
+            return 22;
+        }
+    }
+    shmctl(id, IPC_RMID, NULL);
+
+    /* 23: an attach moved with mremap is detached at its new address, with the
+     * writes made there, and not at its old one.
+     */
+    char *to = map_anon(NULL, 4096, rw, MAP_PRIVATE);
+    if (to == MAP_FAILED)
+        return 100;
+    id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    if (id < 0)
+        return 100;
+    seg = shmat(id, NULL, 0);
+    if (seg == (void *) -1 ||
+        mremap(seg, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, to) != to) {
+        shmctl(id, IPC_RMID, NULL);
+        return 23;
+    }
+    to[0] = 'M';
+    errno = 0;
+    int old_rc = shmdt(seg);
+    int old_errno = errno;
+    int new_rc = shmdt(to);
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (old_rc != -1 || old_errno != EINVAL || new_rc != 0 ||
+        seg == (void *) -1 || seg[0] != 'M')
+        return 23;
+    shmdt(seg);
+
+    /* 24: a fork child's attaches do not take the serials of the attaches it
+     * inherited. In a child holding 8 attaches, a grandchild attaches and
+     * unmaps 20 times; an attach that shared an inherited one's serial would
+     * look still mapped and never be detached.
+     */
+    id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    if (id < 0)
+        return 100;
+    pid_t holder = fork();
+    if (holder == 0) {
+        for (int i = 0; i < 8; i++) {
+            if (shmat(id, NULL, 0) == (void *) -1)
+                _exit(100);
+        }
+        pid_t gc = fork();
+        if (gc == 0) {
+            for (int i = 0; i < 20; i++) {
+                char *a = shmat(id, NULL, 0);
+                if (a == (void *) -1 || munmap(a, 4096) < 0)
+                    _exit(24);
+            }
+            _exit(0);
+        }
+        int gst;
+        _exit(gc < 0 || waitpid(gc, &gst, 0) < 0 || !WIFEXITED(gst)
+                  ? 24
+                  : WEXITSTATUS(gst));
+    }
+    int hst;
+    int hrc = holder < 0 || waitpid(holder, &hst, 0) < 0 || !WIFEXITED(hst)
+                  ? 24
+                  : WEXITSTATUS(hst);
+    shmctl(id, IPC_RMID, NULL);
+    if (hrc != 0)
+        return hrc;
+
+    /* 25: a detach at the address of a part moved away detaches only that part,
+     * and the part left behind still detaches at the old address, with the
+     * writes made there.
+     */
+    to = map_anon(NULL, 4096, rw, MAP_PRIVATE);
+    if (to == MAP_FAILED)
+        return 100;
+    id = shmget(IPC_PRIVATE, 2 * 4096, IPC_CREAT | 0600);
+    if (id < 0)
+        return 100;
+    seg = shmat(id, NULL, 0);
+    if (seg == (void *) -1 ||
+        mremap(seg, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, to) != to) {
+        shmctl(id, IPC_RMID, NULL);
+        return 25;
+    }
+    seg[4096] = 'S';
+    new_rc = shmdt(to);
+    old_rc = shmdt(seg);
+    seg = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    if (new_rc != 0 || old_rc != 0 || seg == (void *) -1 || seg[4096] != 'S')
+        return 25;
+    shmdt(seg);
+
+    int rc;
+    if ((rc = grown_attach_step()) != 0 || (rc = moved_page_step()) != 0 ||
+        (rc = gone_first_page_step()) != 0 || (rc = split_fork_step()) != 0 ||
+        (rc = adjacent_attaches_step()) != 0)
+        return rc;
 
     return 0;
 }

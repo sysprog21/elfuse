@@ -292,6 +292,10 @@ typedef struct {
                              */
     uint64_t overlay_end;   /* Host-page-aligned overlay end (exclusive). */
     char name[64];          /* Label: "[heap]", "[stack]", ELF path, etc. */
+    uint64_t shm_attach;    /* Nonzero for a SysV shm attach: a serial unique
+                             * to that attach, so the region never merges with
+                             * or lends its vma_id to any other mapping.
+                             */
 } guest_region_t;
 
 /* TLB invalidation request kinds. After every page-table modification, the shim
@@ -540,8 +544,9 @@ typedef struct {
 
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
-    int nregions;         /* Number of active regions */
-    uint64_t next_vma_id; /* Last logical-VMA lineage ID allocated. */
+    int nregions;             /* Number of active regions */
+    uint64_t next_vma_id;     /* Last logical-VMA lineage ID allocated. */
+    uint64_t next_shm_attach; /* Last SysV shm attach serial handed out. */
     /* Set when a full region table stopped a mutation from being recorded:
      * guest_region_set_prot unable to split (leaving a region's old prot, or
      * applying the new one to a tail no PTE work covered), a munmap split
@@ -1318,10 +1323,24 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   int owned_backing_fd,
                                   bool inherited_at_fork,
                                   uint64_t vma_id);
+/* guest_region_add_ex_owned_gpa, for a region that carries @shm_attach. */
+int guest_region_add_attach_gpa(guest_t *g,
+                                uint64_t start,
+                                uint64_t end,
+                                uint64_t gpa_base,
+                                int prot,
+                                int flags,
+                                uint64_t offset,
+                                const char *name,
+                                int owned_backing_fd,
+                                bool inherited_at_fork,
+                                uint64_t vma_id,
+                                uint64_t shm_attach);
 
-/* Re-seed the logical-VMA allocator from a restored region snapshot. Fork IPC
- * restores regions by value, so next_vma_id must be advanced past every
- * serialized lineage before child-private mappings are added.
+/* Re-seed the logical-VMA allocator and the shm attach serial from a restored
+ * region snapshot. Fork IPC restores regions by value, so next_vma_id and
+ * next_shm_attach must be advanced past every serialized lineage and attach
+ * before child-private mappings are added.
  */
 void guest_reseed_next_vma_id(guest_t *g);
 

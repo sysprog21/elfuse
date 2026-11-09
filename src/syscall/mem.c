@@ -115,6 +115,7 @@ typedef struct {
     bool backing_ro;
     bool inherited_at_fork;
     char name[sizeof(((guest_region_t *) 0)->name)];
+    uint64_t shm_attach;
 } region_snapshot_t;
 
 /* Undo record for one boundary split. A split rewrites exactly one entry and
@@ -463,6 +464,7 @@ typedef struct {
     int backing_fd;
     int tail_backing_fd;
     char name[sizeof(((guest_region_t *) 0)->name)];
+    uint64_t shm_attach;
 } mremap_track_t;
 
 /* Release whatever descriptors the tracker still owns. Idempotent, so a failure
@@ -511,6 +513,7 @@ static bool mremap_track_init(mremap_track_t *track,
     if (src_reg->backing_fd >= 0 && track->backing_fd < 0)
         return false;
     str_copy_trunc(track->name, src_reg->name, sizeof(track->name));
+    track->shm_attach = src_reg->shm_attach;
 
     if (mremap_track_splits(track, new_size) && track->backing_fd >= 0) {
         track->tail_backing_fd = dup(track->backing_fd);
@@ -552,17 +555,17 @@ static int add_mremap_region(guest_t *g,
             close(backing_fd);
             return -1;
         }
-        if (guest_region_add_ex_owned(g, start, start + inherited_size, prot,
-                                      flags, offset, name, backing_fd, true,
-                                      vma_id) < 0) {
+        if (guest_region_add_attach_gpa(g, start, start + inherited_size, start,
+                                        prot, flags, offset, name, backing_fd,
+                                        true, vma_id, track->shm_attach) < 0) {
             if (tail_backing_fd >= 0)
                 close(tail_backing_fd);
             return -1;
         }
-        if (guest_region_add_ex_owned(g, start + inherited_size,
-                                      start + new_size, prot, flags,
-                                      offset + inherited_size, name,
-                                      tail_backing_fd, false, vma_id) < 0) {
+        if (guest_region_add_attach_gpa(
+                g, start + inherited_size, start + new_size,
+                start + inherited_size, prot, flags, offset + inherited_size,
+                name, tail_backing_fd, false, vma_id, track->shm_attach) < 0) {
             guest_region_remove(g, start, start + inherited_size);
             return -1;
         }
@@ -571,9 +574,10 @@ static int add_mremap_region(guest_t *g,
 
     if (tail_backing_fd >= 0)
         close(tail_backing_fd);
-    return guest_region_add_ex_owned(
-        g, start, start + new_size, prot, flags, offset, name, backing_fd,
-        inherited_size == new_size && inherited_size > 0, vma_id);
+    return guest_region_add_attach_gpa(
+        g, start, start + new_size, start, prot, flags, offset, name,
+        backing_fd, inherited_size == new_size && inherited_size > 0, vma_id,
+        track->shm_attach);
 }
 
 static void region_clip_overlay(guest_region_t *r)
@@ -1901,6 +1905,7 @@ static int capture_region_snapshots(guest_t *g,
         snap->backing_ro = r->backing_ro;
         snap->inherited_at_fork = r->inherited_at_fork;
         str_copy_trunc(snap->name, r->name, sizeof(snap->name));
+        snap->shm_attach = r->shm_attach;
     }
 
     if (splits_out)
@@ -2016,10 +2021,11 @@ static int restore_region_snapshots(guest_t *g, region_snapshot_t *snaps, int n)
 {
     for (int i = 0; i < n; i++) {
         region_snapshot_t *snap = &snaps[i];
-        if (guest_region_add_ex_owned_gpa(
+        if (guest_region_add_attach_gpa(
                 g, snap->start, snap->end, snap->gpa_base, snap->prot,
                 snap->flags, snap->offset, snap->name[0] ? snap->name : NULL,
-                snap->backing_fd, snap->inherited_at_fork, snap->vma_id) < 0) {
+                snap->backing_fd, snap->inherited_at_fork, snap->vma_id,
+                snap->shm_attach) < 0) {
             snap->backing_fd = -1;
             close_region_snapshots(snaps, n);
             return -LINUX_ENOMEM;
@@ -3704,19 +3710,23 @@ static int mmap_extend_fresh(guest_t *g,
     return 0;
 }
 
-/* Why this stays one function.
+/* sys_mmap, but the region it records gets the name @name and the shm attach
+ * serial @shm_attach. Only a non-fixed request with no high-VA hint passes
+ * them, and that request records its region at one place below.
  *
- * Flag combinations, not steps: MAP_FIXED, MAP_SHARED, the file-backed overlay
- * and the anonymous path each qualify the others. Splitting by flag duplicates
- * the interactions between them.
+ * Why this stays one function: flag combinations, not steps. MAP_FIXED,
+ * MAP_SHARED, the file-backed overlay and the anonymous path each qualify the
+ * others. Splitting by flag duplicates the interactions between them.
  */
-int64_t sys_mmap(guest_t *g,
-                 uint64_t addr,
-                 uint64_t length,
-                 int prot,
-                 int flags,
-                 int fd,
-                 int64_t offset)
+static int64_t mmap_tagged(guest_t *g,
+                           uint64_t addr,
+                           uint64_t length,
+                           int prot,
+                           int flags,
+                           int fd,
+                           int64_t offset,
+                           const char *name,
+                           uint64_t shm_attach)
 {
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
@@ -4070,9 +4080,10 @@ int64_t sys_mmap(guest_t *g,
      */
     int owned_backing_fd = fresh.track_backing_fd;
     fresh.track_backing_fd = -1;
-    if (guest_region_add_ex_owned(g, result_off, result_off + length, prot,
-                                  track_flags, is_anon ? 0 : (uint64_t) offset,
-                                  NULL, owned_backing_fd, false, 0) < 0) {
+    if (guest_region_add_attach_gpa(
+            g, result_off, result_off + length, result_off, prot, track_flags,
+            is_anon ? 0 : (uint64_t) offset, name, owned_backing_fd, false, 0,
+            shm_attach) < 0) {
         /* Region table was full: undo any host overlay we just installed so the
          * file is not left mmap'd at host_base+ipa with no tracking. Without
          * this, a later operation in that range would memset zeros directly
@@ -5030,11 +5041,82 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
     }
 }
 
-/* Anonymous mmap wrapper for other modules. */
-int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot)
+int64_t sys_mmap(guest_t *g,
+                 uint64_t addr,
+                 uint64_t length,
+                 int prot,
+                 int flags,
+                 int fd,
+                 int64_t offset)
 {
-    return sys_mmap(g, addr, length, prot,
-                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
+    return mmap_tagged(g, addr, length, prot, flags, fd, offset, NULL, 0);
+}
+
+/* Guest memory for a SysV shm attach, which sys_shmat fills by copying from the
+ * host segment. A Linux attach is VM_SHARED: it counts toward RLIMIT_AS only,
+ * /proc/self/maps shows it as shared, and a fork child shares it with the
+ * parent. Mapping it MAP_SHARED | MAP_ANONYMOUS gives all three. The region is
+ * named as Linux names it in maps, and tagged with a serial no other region
+ * has, so it never merges with another mapping or another attach.
+ */
+int64_t sys_mmap_shm(guest_t *g,
+                     uint64_t length,
+                     int prot,
+                     int32_t key,
+                     uint64_t *attach)
+{
+    char name[sizeof(((guest_region_t *) 0)->name)];
+    snprintf(name, sizeof(name), "/SYSV%08x (deleted)", (uint32_t) key);
+    *attach = ++g->next_shm_attach;
+    return mmap_tagged(g, 0, length, prot,
+                       LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS, -1, 0, name,
+                       *attach);
+}
+
+bool mem_attach_next(guest_t *g,
+                     uint64_t base,
+                     uint64_t gva,
+                     uint64_t end,
+                     uint64_t attach,
+                     uint64_t *lo,
+                     uint64_t *hi,
+                     void **host)
+{
+    if (gva >= end)
+        return false;
+    uint64_t off = gva >= g->guest_size ? gva : gva - g->ipa_base;
+    uint64_t off_end = off + (end - gva);
+    for (int i = guest_region_first_end_above(g, off); i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= off_end)
+            break;
+        uint64_t piece = r->start > off ? r->start : off;
+        if (r->shm_attach == attach &&
+            r->offset + (piece - r->start) == gva + (piece - off) - base) {
+            *lo = gva + (piece - off);
+            *hi = gva + (r->end - off);
+            if (host)
+                *host = host_ptr_for_gpa(g, r->gpa_base + (piece - r->start));
+            return true;
+        }
+    }
+    return false;
+}
+
+void mem_attach_mapped(const guest_t *g,
+                       const uint64_t *attach,
+                       bool *mapped,
+                       int n)
+{
+    for (int k = 0; k < n; k++)
+        mapped[k] = false;
+    for (int i = 0; i < g->nregions; i++) {
+        uint64_t serial = g->regions[i].shm_attach;
+        for (int k = 0; serial && k < n; k++) {
+            if (attach[k] == serial)
+                mapped[k] = true;
+        }
+    }
 }
 
 static int compare_range_pair(const void *a, const void *b)
@@ -5726,6 +5808,7 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
     struct {
         uint64_t start;
         uint64_t end;
+        uint64_t file_off;
     } cands[GUEST_MAX_REGIONS];
     int n_cands = 0;
     for (int i = 0; i < g->nregions && n_cands < GUEST_MAX_REGIONS; i++) {
@@ -5738,6 +5821,14 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
             continue;
         if ((r->start % hps) != 0)
             continue; /* misaligned start: snapshot fallback */
+        /* A piece of a shm attach keeps its offset into the attach, which shmdt
+         * matches, so its bytes sit at that offset in the temp file. The host
+         * maps a file only at a host-page offset.
+         */
+        uint64_t file_off = r->shm_attach ? r->offset : 0;
+        if ((file_off % hps) != 0)
+            continue;
+
         /* If the region is shorter than a host page, the host
          * MAP_FIXED|MAP_SHARED mmap rounds up to ALIGN_UP(len, hps) and may
          * alias the next region's host page. Codex flagged this tail-aliasing
@@ -5762,12 +5853,14 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
         }
         cands[n_cands].start = r->start;
         cands[n_cands].end = r->end;
+        cands[n_cands].file_off = file_off;
         n_cands++;
     }
 
     for (int i = 0; i < n_cands; i++) {
         uint64_t start = cands[i].start;
         uint64_t end = cands[i].end;
+        uint64_t file_off = cands[i].file_off;
         if (end <= start)
             continue;
         uint64_t len = end - start;
@@ -5779,9 +5872,10 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
                      strerror(errno));
             continue;
         }
-        if (ftruncate(fd, (off_t) aligned_len) < 0) {
+        if (ftruncate(fd, (off_t) (file_off + aligned_len)) < 0) {
             log_warn("fork-prep: ftruncate(%llu) failed: %s",
-                     (unsigned long long) aligned_len, strerror(errno));
+                     (unsigned long long) (file_off + aligned_len),
+                     strerror(errno));
             close(fd);
             continue;
         }
@@ -5791,7 +5885,7 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
          */
         const uint8_t *src = (const uint8_t *) g->host_base + start;
         uint64_t remain = len;
-        off_t off = 0;
+        off_t off = (off_t) file_off;
         bool seed_ok = true;
         while (remain > 0) {
             size_t chunk = remain > (uint64_t) SSIZE_MAX ? (size_t) SSIZE_MAX
@@ -5877,7 +5971,8 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
             return nsnaps;
         }
 
-        int err = hvf_apply_file_overlay_quiesced(g, start, aligned_len, fd, 0);
+        int err = hvf_apply_file_overlay_quiesced(g, start, aligned_len, fd,
+                                                  (off_t) file_off);
         if (err < 0) {
             log_warn("fork-prep: overlay install [0x%llx, 0x%llx) failed: %d",
                      (unsigned long long) start,
@@ -5907,7 +6002,7 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
         for (int k = 0; k < n_regions; k++) {
             guest_region_t *r = &g->regions[region_idxs[k]];
             r->backing_fd = dup_fds[k];
-            r->offset = r->start - start;
+            r->offset = file_off + (r->start - start);
         }
         close(fd);
     }

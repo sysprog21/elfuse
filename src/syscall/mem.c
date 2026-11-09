@@ -34,6 +34,7 @@
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/mem.h"
+#include "syscall/sys.h"
 
 /* Protects mmap/brk bump allocators and page table extension. Multiple threads
  * may call mmap/brk concurrently; without this lock they could get overlapping
@@ -951,12 +952,11 @@ typedef struct {
 } high_va_replace_t;
 
 /* The host fd a file-backed high-VA mapping reads from, and the dup the new
- * region keeps. host_fd is borrowed through ref unless close_host_fd says it
- * was opened here (a FUSE file materialized to a temp), in which case it is
- * closed with the rest. track_fd is handed to the region on success.
+ * region keeps. host_fd is the caller's pinned reference unless close_host_fd
+ * says it was opened here (a FUSE file materialized to a temp), in which case
+ * it is closed with the rest. track_fd is handed to the region on success.
  */
 typedef struct {
-    host_fd_ref_t ref;
     int host_fd;
     int track_fd;
     bool close_host_fd;
@@ -1029,21 +1029,23 @@ static int64_t high_va_replace_prepare(guest_t *g,
     return 0;
 }
 
-/* Open the host fd a file-backed high-VA mapping reads from: the guest fd's own
- * host fd, or, for a FUSE file, a temp materialized from it and opened
- * read-only. Dups it for the region to keep, and for a mapping with permissions
- * reads one byte so a bad offset fails here instead of mid-fill. Whatever was
- * taken stays in *bk even on failure, because the caller's fail path releases
- * it.
+/* Take the host fd a file-backed high-VA mapping reads from: @pinned_fd, the
+ * host fd of the reference mmap_tagged looked up and checked, or, when it is -1
+ * because mmap_tagged found a FUSE file, a temp materialized from guest @fd and
+ * opened read-only. Dups it for the region to keep, and for a mapping with
+ * permissions reads one byte so a bad offset fails here instead of mid-fill.
+ * Whatever was taken stays in *bk even on failure, because the caller's fail
+ * path releases it.
  *
  * Returns 0 or a negative errno.
  */
 static int64_t high_va_open_backing(guest_fd_t fd,
+                                    int pinned_fd,
                                     int prot,
                                     uint64_t offset,
                                     high_va_backing_t *bk)
 {
-    if (fuse_fd_refuse_mmap(fd)) {
+    if (pinned_fd < 0) {
         char materialized_path[PATH_MAX];
         int rc = fuse_materialize_fd(fd, materialized_path,
                                      sizeof(materialized_path));
@@ -1059,11 +1061,7 @@ static int64_t high_va_open_backing(guest_fd_t fd,
         }
         bk->close_host_fd = true;
     } else {
-        int64_t ref_err = host_fd_ref_open(fd, &bk->ref);
-        if (ref_err < 0) {
-            return ref_err;
-        }
-        bk->host_fd = bk->ref.fd;
+        bk->host_fd = pinned_fd;
     }
     bk->track_fd = dup(bk->host_fd);
     if (bk->track_fd < 0)
@@ -1204,6 +1202,10 @@ static int64_t high_va_populate(high_va_replace_t *rep,
  * this call installed: the mapping loop reports its progress through
  * va_installed_end and inflight_fresh_block_va for that purpose.
  *
+ * A file mapping reads from @pinned_fd, the host fd of the reference the caller
+ * looked up and checked and holds for the call, so a sibling thread that
+ * replaces guest @fd meanwhile cannot get another file mapped.
+ *
  * Returns the address, or a negative errno; ret keeps its -ENOMEM default for
  * any failure that does not set a more specific one.
  */
@@ -1213,6 +1215,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
                                 int prot,
                                 int flags,
                                 guest_fd_t fd,
+                                int pinned_fd,
                                 uint64_t offset,
                                 bool replace_existing,
                                 bool is_noreplace)
@@ -1224,7 +1227,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
         return -LINUX_ENOMEM;
 
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
-    high_va_backing_t bk = {HOST_FD_REF_INIT, -1, -1, false};
+    high_va_backing_t bk = {-1, -1, false};
 
     /* High-water mark of VA installed by the mapping loop; reachable from the
      * fail label so the rollback knows what to invalidate. Must be initialized
@@ -1293,7 +1296,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
     }
 
     if (!is_anon) {
-        step_err = high_va_open_backing(fd, prot, offset, &bk);
+        step_err = high_va_open_backing(fd, pinned_fd, prot, offset, &bk);
         if (step_err < 0) {
             ret = step_err;
             goto fail;
@@ -1376,7 +1379,6 @@ populate_existing:
      */
     if (bk.close_host_fd && bk.host_fd >= 0)
         close(bk.host_fd);
-    host_fd_ref_close(&bk.ref);
     if (rep.snaps) {
         close_region_snapshots(rep.snaps, rep.nsnaps);
         free(rep.snaps);
@@ -1474,7 +1476,6 @@ fail:
         free(rep.bytes_snap);
     if (bk.close_host_fd && bk.host_fd >= 0)
         close(bk.host_fd);
-    host_fd_ref_close(&bk.ref);
 
     /* Close the rep.quiesced bracket as the very last step, so the byte restore
      * + region/PTE restore + fd cleanup all complete before any sibling vCPU
@@ -2102,6 +2103,16 @@ static mmap_alloc_state_t mmap_alloc_save(const guest_t *g)
     };
 }
 
+static void mmap_alloc_restore(guest_t *g, const mmap_alloc_state_t *saved)
+{
+    g->mmap_next = saved->next;
+    g->mmap_end = saved->end;
+    g->mmap_rx_next = saved->rx_next;
+    g->mmap_rx_end = saved->rx_end;
+    g->mmap_rw_gap_hint = saved->rw_gap_hint;
+    g->mmap_rx_gap_hint = saved->rx_gap_hint;
+}
+
 static int rollback_fresh_mmap_allocation(guest_t *g,
                                           uint64_t start,
                                           uint64_t length,
@@ -2112,12 +2123,7 @@ static int rollback_fresh_mmap_allocation(guest_t *g,
         hvf_remove_file_overlay(g, overlay->ipa, overlay->len);
     if (guest_invalidate_ptes(g, start, start + length) < 0)
         return -LINUX_ENOMEM;
-    g->mmap_next = saved->next;
-    g->mmap_end = saved->end;
-    g->mmap_rx_next = saved->rx_next;
-    g->mmap_rx_end = saved->rx_end;
-    g->mmap_rw_gap_hint = saved->rw_gap_hint;
-    g->mmap_rx_gap_hint = saved->rx_gap_hint;
+    mmap_alloc_restore(g, saved);
     return 0;
 }
 
@@ -2445,6 +2451,17 @@ static bool overlay_fd_writable(int fd)
     return (fl & O_ACCMODE) != O_RDONLY;
 }
 
+/* Whether @fd is open for reading, true when fcntl fails, as for
+ * overlay_fd_writable.
+ */
+static bool overlay_fd_readable(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0)
+        return true;
+    return (fl & O_ACCMODE) != O_WRONLY;
+}
+
 /* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
  * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB segment is
  * split out first if it is not already isolated. Caller holds mmap_lock and has
@@ -2654,6 +2671,209 @@ static bool heap_piece_is_plain(const guest_region_t *r)
 }
 
 
+/* Whether a region counts toward RLIMIT_DATA once it is writable: private and
+ * not a stack (is_data_mapping, mm/internal.h). VM_STACK is VM_GROWSDOWN on
+ * arm64, so a MAP_GROWSDOWN mapping is a stack as well as [stack].
+ */
+static bool region_may_be_data(const guest_region_t *r)
+{
+    return !r->shared && !(r->flags & LINUX_MAP_GROWSDOWN) &&
+           strcmp(r->name, "[stack]");
+}
+
+/* Whether a region is what Linux counts toward RLIMIT_DATA now. */
+static bool region_is_data(const guest_region_t *r)
+{
+    return (r->prot & LINUX_PROT_WRITE) && region_may_be_data(r);
+}
+
+/* The bound may_expand_vm (Linux mm/mmap.c) holds data mappings to: the soft
+ * RLIMIT_DATA, or the hard one when the soft limit is 0, which is the kernel's
+ * allowance for Valgrind.
+ */
+static uint64_t data_rlimit(void)
+{
+    uint64_t cur = sys_rlimit_cur(LINUX_RLIMIT_DATA);
+    return cur ? cur : sys_rlimit_max(LINUX_RLIMIT_DATA);
+}
+
+/* The part of @r that the limits count, below @win_end: from r->start, or from
+ * *@covered when an earlier record already counted past it, to the page-aligned
+ * end, as Linux maps the heap to PAGE_ALIGN(brk). A page two records share is
+ * counted once: a fork child that grows the break from inside a page starts a
+ * second [heap] record in that page, and the array is sorted, so *@covered is
+ * the highest end counted so far. Infra records count for nothing.
+ *
+ * Returns false when nothing of @r is left; otherwise sets [@lo, @hi) and
+ * advances *@covered to @hi.
+ */
+static bool region_counted_span(const guest_t *g,
+                                const guest_region_t *r,
+                                uint64_t win_end,
+                                uint64_t *covered,
+                                uint64_t *lo,
+                                uint64_t *hi)
+{
+    if (!guest_region_in_process_vm(g, r))
+        return false;
+    uint64_t start = r->start > *covered ? r->start : *covered;
+    uint64_t end = PAGE_ALIGN_UP(r->end);
+    if (end > win_end)
+        end = win_end;
+    if (start >= end)
+        return false;
+    *covered = end;
+    *lo = start;
+    *hi = end;
+    return true;
+}
+
+/* The mapped total and the data total that may_expand_vm compares with
+ * RLIMIT_AS and RLIMIT_DATA, summed from the sorted region array, leaving out
+ * the infra reserve, each record as region_counted_span counts it. Caller holds
+ * mmap_lock.
+ *
+ * [stack] counts at the full extent elfuse maps for it up front (8188 KiB),
+ * where Linux counts the stack VMA only as far as it has grown (132 KiB right
+ * after exec of a static binary, measured on 6.18). The total is therefore
+ * about 8 MiB above Linux's, and a guest whose RLIMIT_AS was sized from a Linux
+ * run gets that much less room.
+ */
+static void mem_vm_totals(const guest_t *g, uint64_t *total, uint64_t *data)
+{
+    uint64_t t = 0, d = 0, covered = 0;
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        uint64_t start, end;
+        if (!region_counted_span(g, r, UINT64_MAX, &covered, &start, &end))
+            continue;
+        t += end - start;
+        if (region_is_data(r))
+            d += end - start;
+    }
+    *total = t;
+    *data = d;
+}
+
+/* The bytes already mapped in [@start, @end), in region coordinates, each
+ * record as region_counted_span counts it. Caller holds mmap_lock.
+ */
+static uint64_t mem_mapped_in(const guest_t *g, uint64_t start, uint64_t end)
+{
+    uint64_t mapped = 0, covered = start, lo, hi;
+    for (int i = guest_region_first_end_above(g, start);
+         i < g->nregions && g->regions[i].start < end; i++) {
+        if (region_counted_span(g, &g->regions[i], end, &covered, &lo, &hi))
+            mapped += hi - lo;
+    }
+    return mapped;
+}
+
+/* Whether a request with @prot and @flags maps data: private, writable and not
+ * a stack, as region_may_be_data has it.
+ */
+static bool request_is_data(int prot, int flags)
+{
+    return (prot & LINUX_PROT_WRITE) &&
+           !(flags & (LINUX_MAP_SHARED | LINUX_MAP_GROWSDOWN));
+}
+
+/* RLIMIT_AS and RLIMIT_DATA at the point a request would extend the region
+ * table, after may_expand_vm. Both totals are summed from the sorted region
+ * array on each call, so they cannot drift from the region table. Only a
+ * request for a data mapping is held to RLIMIT_DATA.
+ *
+ * Once regions_tracker_stale is set the table has lost records and the totals
+ * are short by them. The limits are still judged on what is left: refusing
+ * instead would fail every later request of a guest that has a finite limit.
+ *
+ * @grow is the size the request adds, and @grow_is_data says whether it is a
+ * data mapping. What the request replaces is still counted in both totals: a
+ * MAP_FIXED request passes its net growth, since mmap_region checks
+ * may_expand_vm with the pages it replaces still counted, and a MREMAP_FIXED
+ * move is checked before its destination is unmapped.
+ *
+ * Returns true when the request fits both limits. Caller holds mmap_lock.
+ */
+static bool mem_rlimit_allows(const guest_t *g,
+                              uint64_t grow,
+                              bool grow_is_data)
+{
+    uint64_t as_limit = sys_rlimit_cur(LINUX_RLIMIT_AS);
+    uint64_t data_limit = data_rlimit();
+    if (as_limit == LINUX_RLIM_INFINITY &&
+        (!grow_is_data || data_limit == LINUX_RLIM_INFINITY))
+        return true;
+
+    uint64_t total, data;
+    mem_vm_totals(g, &total, &data);
+
+    /* Each limit is compared with what it has left, so a request near
+     * UINT64_MAX cannot wrap a sum.
+     */
+    if (total > as_limit || grow > as_limit - total)
+        return false;
+    return !grow_is_data || (data <= data_limit && grow <= data_limit - data);
+}
+
+/* RLIMIT_DATA on an mprotect that adds PROT_WRITE, after mprotect_fixup (Linux
+ * mm/mprotect.c). The kernel takes the mappings of the range in address order.
+ * One that turns into data, a private mapping that was not writable, fails with
+ * ENOMEM when may_expand_vm refuses it as data and would have allowed it as
+ * what it was. The second half is why a range that RLIMIT_AS already refuses
+ * goes through. The caller changes the part below that mapping with one
+ * whole-range mprotect_apply, which does not stop mapping by mapping at a hole
+ * or a refused mapping the way mprotect_fixup does.
+ *
+ * [@start, @end) is in region coordinates.
+ *
+ * Returns true when a mapping fails, with @stop set to where the range reaches
+ * it. Caller holds mmap_lock.
+ */
+static bool mprotect_exceeds_data(const guest_t *g,
+                                  uint64_t start,
+                                  uint64_t end,
+                                  uint64_t *stop)
+{
+    uint64_t data_limit = data_rlimit();
+    if (data_limit == LINUX_RLIM_INFINITY)
+        return false;
+
+    uint64_t as_limit = sys_rlimit_cur(LINUX_RLIMIT_AS);
+    uint64_t total = 0, data = 0, covered = start, lo, hi;
+    bool summed = false;
+
+    for (int i = guest_region_first_end_above(g, start);
+         i < g->nregions && g->regions[i].start < end; i++) {
+        const guest_region_t *r = &g->regions[i];
+
+        /* As mem_vm_totals counts, so a page two records share is counted once,
+         * whichever of the two turns into data.
+         */
+        if (!region_counted_span(g, r, end, &covered, &lo, &hi) ||
+            (r->prot & LINUX_PROT_WRITE) || !region_may_be_data(r))
+            continue;
+
+        /* Summed only once a mapping turns into data, so a range that is
+         * already writable or shared skips the walk.
+         */
+        if (!summed) {
+            mem_vm_totals(g, &total, &data);
+            summed = true;
+        }
+
+        uint64_t pages = hi - lo;
+        bool fits_as = total <= as_limit && pages <= as_limit - total;
+        bool fits_data = data <= data_limit && pages <= data_limit - data;
+        if (fits_as && !fits_data) {
+            *stop = lo;
+            return true;
+        }
+        data += pages;
+    }
+    return false;
+}
+
 /* How far the break may grow from its current position.
  *
  * The first tracked mapping above the break is where Linux stops a grow. An
@@ -2741,6 +2961,17 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
         return (int64_t) ipa_brk;
     }
 
+    /* check_data_rlimit (Linux include/linux/mm.h) holds the break extent to
+     * the soft RLIMIT_DATA whatever the heap's protection, before brk tells a
+     * grow from a shrink, so a shrink that stays over the limit fails too. The
+     * kernel adds the data segment (end_data - start_data), which is not
+     * tracked here. The soft limit is used as is: the allowance for a soft
+     * limit of 0 is not for brk.
+     */
+    uint64_t data_cur = sys_rlimit_cur(LINUX_RLIMIT_DATA);
+    if (data_cur != LINUX_RLIM_INFINITY && new_off - g->brk_base > data_cur)
+        return (int64_t) ipa_brk;
+
     /* Linux refuses a break that would run into the next mapping (do_brk_flags,
      * via find_vma_intersection), leaving a page between the two. Nothing here
      * faults on the way to tell the grow to stop: the heap is premapped RW to
@@ -2766,6 +2997,13 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
         new_off >= brk_grow_limit(g, old_brk, &adjoining)) {
         return (int64_t) ipa_brk;
     }
+
+    /* do_brk_flags charges may_expand_vm with the page-aligned growth, so a
+     * break that stays inside its last page charges nothing.
+     */
+    uint64_t new_pg = PAGE_ALIGN_UP(new_off), old_pg = PAGE_ALIGN_UP(old_brk);
+    if (new_pg > old_pg && !mem_rlimit_allows(g, new_pg - old_pg, true))
+        return (int64_t) ipa_brk;
 
     /* Shrinking can split a file-backed semantic region when a fork child has
      * grown and reshaped its heap metadata. Reserve the right-hand region's
@@ -2910,6 +3148,59 @@ static void mmap_fresh_dispose(mmap_fresh_t *fresh)
     dispose_region_snapshots(&fresh->replaced_snaps, &fresh->replaced_nsnaps);
     host_fd_ref_close(&fresh->backing_ref);
     errno = saved_errno;
+}
+
+/* The errno do_mmap reports for a mapping of @host_fd before it places the
+ * mapping, whatever the limits: EACCES on a descriptor not opened for reading,
+ * or for a MAP_SHARED PROT_WRITE request on one not opened for writing, and
+ * ENODEV for a file whose operations have no mmap (a pipe or a directory). A
+ * socket has an mmap operation, so it gets past here. 0 when none applies.
+ * @host_fd is the backing reference that mmap_tagged opens first, with the
+ * EBADF that fget in ksys_mmap_pgoff reports for a bad or O_PATH descriptor. A
+ * MAP_FIXED request runs this after its range and its MAP_FIXED_NOREPLACE
+ * overlap have been checked, a non-fixed one once a gap is found, as do_mmap
+ * checks those first.
+ */
+static int64_t mmap_host_fd_errno(int host_fd, int prot, int flags)
+{
+    struct stat st;
+    if (!overlay_fd_readable(host_fd) ||
+        ((flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
+         !overlay_fd_writable(host_fd)))
+        return -LINUX_EACCES;
+    if (fstat(host_fd, &st) == 0 &&
+        (S_ISFIFO(st.st_mode) || S_ISDIR(st.st_mode)))
+        return -LINUX_ENODEV;
+    return 0;
+}
+
+/* The errno for a request the limits refuse, once mmap_host_fd_errno has
+ * passed: EEXIST when @overlaps (a MAP_FIXED_NOREPLACE over a mapping, which
+ * do_mmap reports before the limit), else ENOMEM. Disposes @fresh.
+ */
+static int64_t mmap_refused_errno(mmap_fresh_t *fresh, bool overlaps)
+{
+    mmap_fresh_dispose(fresh);
+    return overlaps ? -LINUX_EEXIST : -LINUX_ENOMEM;
+}
+
+/* The errno for a non-fixed request once its place is known: the
+ * mmap_host_fd_errno checks on @host_fd for a file mapping (-1 for an anonymous
+ * one), then ENOMEM when the limits refuse @length. 0 when both pass.
+ */
+static int64_t mmap_placed_errno(const guest_t *g,
+                                 int host_fd,
+                                 int prot,
+                                 int flags,
+                                 uint64_t length,
+                                 bool is_data)
+{
+    if (host_fd >= 0) {
+        int64_t file_err = mmap_host_fd_errno(host_fd, prot, flags);
+        if (file_err < 0)
+            return file_err;
+    }
+    return mem_rlimit_allows(g, length, is_data) ? 0 : -LINUX_ENOMEM;
 }
 
 /* Pick the guest offset for a non-fixed mapping, or UINT64_MAX when the address
@@ -3070,10 +3361,11 @@ static int64_t mmap_fixed_range(const guest_t *g,
 }
 
 /* Prepare the replacement of [result_off, result_off + length) by a MAP_FIXED
- * mapping: take the backing fd, make sure the region table can absorb the
- * change, snapshot what is being replaced for rollback, and check that the
- * first byte of a file mapping is readable. Every failure releases @fresh
- * itself, so the caller returns the errno as is.
+ * mapping whose backing reference, for a file mapping, @fresh already holds:
+ * make sure the region table can absorb the change, snapshot what is being
+ * replaced for rollback, and check that the first byte of a file mapping is
+ * readable. Every failure releases @fresh itself, so the caller returns the
+ * errno as is.
  */
 static int64_t mmap_fixed_prepare(guest_t *g,
                                   mmap_fresh_t *fresh,
@@ -3081,18 +3373,9 @@ static int64_t mmap_fixed_prepare(guest_t *g,
                                   uint64_t length,
                                   bool is_anon,
                                   bool is_prot_none,
-                                  int fd,
                                   int64_t offset)
 {
-    int host_backing_fd = -1;
-    if (!is_anon) {
-        int64_t ref_err = host_fd_ref_open(fd, &fresh->backing_ref);
-        if (ref_err < 0) {
-            mmap_fresh_dispose(fresh);
-            return ref_err;
-        }
-        host_backing_fd = fresh->backing_ref.fd;
-    }
+    int host_backing_fd = fresh->backing_ref.fd;
 
     remove_range_t replaced = {result_off, result_off + length};
     if (!region_has_capacity_after_removes(g, &replaced, 1, 1)) {
@@ -3174,25 +3457,20 @@ static int64_t mmap_fixed_undo(guest_t *g,
 }
 
 /* Validate a mmap request and page-align its length in place. The checks run in
- * a fixed order because the first to fail picks the errno the guest sees.
+ * a fixed order because the first to fail picks the errno the guest sees;
+ * mmap_tagged checks the page offset and looks the descriptor up before them.
  */
 static int64_t mmap_check_args(const guest_t *g,
                                uint64_t addr,
                                uint64_t *length_io,
                                int flags,
-                               int fd,
-                               int64_t offset,
-                               bool is_anon)
+                               bool is_fuse)
 {
     /* Linux rejects zero-length mmap */
     if (*length_io == 0)
         return -LINUX_EINVAL;
 
-    /* Linux requires page-aligned offset for file-backed mmap */
-    if (!is_anon && (offset & 4095))
-        return -LINUX_EINVAL;
-
-    if (!is_anon && fuse_fd_refuse_mmap(fd)) {
+    if (is_fuse) {
         bool allow_materialized_fuse_mmap =
             g->is_rosetta &&
             ((flags & LINUX_MAP_FIXED) ||
@@ -3467,6 +3745,10 @@ int64_t sys_mmap(guest_t *g,
     if (is_noreserve)
         track_flags |= LINUX_MAP_NORESERVE;
 
+    /* MAP_GROWSDOWN marks a stack, which RLIMIT_DATA does not count. */
+    if (flags & LINUX_MAP_GROWSDOWN)
+        track_flags |= LINUX_MAP_GROWSDOWN;
+
     /* The memory syscall layer handles all mmap variants. Aligned file-backed
      * MAP_SHARED installs a live host overlay so guest writes reach the backing
      * file and peer mappings; cases the overlay cannot serve fall back to a
@@ -3474,10 +3756,38 @@ int64_t sys_mmap(guest_t *g,
      * (CLONE_VM semantics).
      */
 
-    int64_t arg_err =
-        mmap_check_args(g, addr, &length, flags, fd, offset, is_anon);
-    if (arg_err < 0)
+    /* Only the page offset is checked before the descriptor, as arm64 sys_mmap
+     * does before ksys_mmap_pgoff looks at the flags, so an anonymous request
+     * with a misaligned offset is refused too.
+     */
+    if (offset & 4095)
+        return -LINUX_EINVAL;
+
+    /* The descriptor lookup comes next, as fget does before do_mmap checks the
+     * length and the address, and its reference is the mapping's backing, so
+     * the file checked is the file mapped even when a sibling thread replaces
+     * the descriptor (mmap_lock does not cover the fd table). The rest of the
+     * file checks comes once the address has been checked, before the limits,
+     * so the errno is the same whether or not a limit refuses the request.
+     *
+     * Whether the file is FUSE is decided once, here, for the same reason. A
+     * FUSE file has no host fd: the one FUSE mapping mmap_check_args lets
+     * through is the Rosetta high-VA one, which materializes the file from the
+     * guest fd instead.
+     */
+    bool is_fuse = !is_anon && fuse_fd_refuse_mmap(fd);
+    if (!is_anon && !is_fuse) {
+        int64_t ref_err = host_fd_ref_open_io(fd, &fresh.backing_ref);
+        if (ref_err < 0)
+            return ref_err;
+        host_backing_fd = fresh.backing_ref.fd;
+    }
+
+    int64_t arg_err = mmap_check_args(g, addr, &length, flags, is_fuse);
+    if (arg_err < 0) {
+        mmap_fresh_dispose(&fresh);
         return arg_err;
+    }
     bool is_fixed =
         (flags & LINUX_MAP_FIXED) || (flags & LINUX_MAP_FIXED_NOREPLACE);
 
@@ -3486,36 +3796,91 @@ int64_t sys_mmap(guest_t *g,
      */
     bool is_noreplace = (flags & LINUX_MAP_FIXED_NOREPLACE) != 0;
 
+    bool is_data = request_is_data(prot, flags);
+
     uint64_t result_off; /* Result as offset (0-based) */
     if (is_fixed) {
         /* Addresses above TASK_SIZE (bit 63 set or beyond user VA range) are
          * rejected, matching real Linux kernel behavior.
          */
-        if (addr > 0x0000FFFFFFFFFFFFULL)
+        if (addr > 0x0000FFFFFFFFFFFFULL) {
+            mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
+        }
 
-        if (addr >= g->guest_size)
-            return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset,
-                                    true, is_noreplace);
+        /* So is a range that ends past it: get_unmapped_area refuses it for
+         * TASK_SIZE before do_mmap reads the file's mode or mmap operation.
+         */
+        if (length > 0x0001000000000000ULL - addr) {
+            mmap_fresh_dispose(&fresh);
+            return -LINUX_ENOMEM;
+        }
+
+        if (addr >= g->guest_size) {
+            /* Under a limit the request exceeds, mmap_refused_errno still
+             * reports what do_mmap checks first, as on the paths below.
+             */
+            uint64_t replaced =
+                is_noreplace ? 0 : mem_mapped_in(g, addr, addr + length);
+            bool overlaps =
+                is_noreplace && region_range_overlaps(g, addr, addr + length);
+            if (!overlaps && host_backing_fd >= 0) {
+                int64_t file_err =
+                    mmap_host_fd_errno(host_backing_fd, prot, flags);
+                if (file_err < 0) {
+                    mmap_fresh_dispose(&fresh);
+                    return file_err;
+                }
+            }
+            if (!mem_rlimit_allows(g, length - replaced, is_data))
+                return mmap_refused_errno(&fresh, overlaps);
+            int64_t high =
+                sys_mmap_high_va(g, addr, length, prot, flags, fd,
+                                 host_backing_fd, offset, true, is_noreplace);
+            mmap_fresh_dispose(&fresh);
+            return high;
+        }
 
         uint64_t off;
         int64_t range_err = mmap_fixed_range(g, addr, length, &off);
-        if (range_err < 0)
+        if (range_err < 0) {
+            mmap_fresh_dispose(&fresh);
             return range_err;
+        }
         uint64_t fix_end = off + length;
 
         result_off = off;
 
         /* MAP_FIXED_NOREPLACE: reject if any region overlaps the range. */
-        if (is_noreplace && region_range_overlaps(g, result_off, fix_end))
+        if (is_noreplace && region_range_overlaps(g, result_off, fix_end)) {
+            mmap_fresh_dispose(&fresh);
             return -LINUX_EEXIST;
+        }
+        if (!is_anon) {
+            int64_t file_err = mmap_host_fd_errno(host_backing_fd, prot, flags);
+            if (file_err < 0) {
+                mmap_fresh_dispose(&fresh);
+                return file_err;
+            }
+        }
 
-        int64_t prep_err = mmap_fixed_prepare(
-            g, &fresh, result_off, length, is_anon, is_prot_none, fd, offset);
+        /* The limits come after the address and the descriptor have been
+         * checked, as may_expand_vm comes after get_unmapped_area and fget in
+         * the kernel, and before mmap_fixed_prepare, as it comes before
+         * call_mmap: a refused request skips the snapshot and the read probe,
+         * and a socket gets ENOMEM rather than the probe's errno. mmap_region
+         * charges the net growth, the length less the pages it replaces,
+         * against totals that still count those pages. A MAP_FIXED_NOREPLACE
+         * range overlaps nothing by now.
+         */
+        uint64_t replaced = mem_mapped_in(g, result_off, fix_end);
+        if (!mem_rlimit_allows(g, length - replaced, is_data))
+            return mmap_refused_errno(&fresh, false);
+
+        int64_t prep_err = mmap_fixed_prepare(g, &fresh, result_off, length,
+                                              is_anon, is_prot_none, offset);
         if (prep_err < 0)
             return prep_err;
-        if (!is_anon)
-            host_backing_fd = fresh.backing_ref.fd;
 
         int64_t commit_err =
             mmap_fixed_commit(g, &fresh, &overlay, prot, flags, fd, offset,
@@ -3528,25 +3893,30 @@ int64_t sys_mmap(guest_t *g,
      * backing once the final guest range is known.
      */
     if (!is_fixed) {
-        if (g->is_rosetta && addr >= g->guest_size &&
-            addr <= 0x0000FFFFFFFFFFFFULL) {
-            int64_t high_hint = sys_mmap_high_va(g, addr, length, prot, flags,
-                                                 fd, offset, false, false);
-            if (high_hint >= 0)
-                return high_hint;
+        /* A length past TASK_SIZE fits nowhere: get_unmapped_area refuses it
+         * before do_mmap reads the file.
+         */
+        if (length > 0x0001000000000000ULL) {
+            mmap_fresh_dispose(&fresh);
+            return -LINUX_ENOMEM;
         }
 
-        /* Open the backing fd before the gap-finder so the alignment heuristic
-         * can read the host fd's access mode through overlay_fd_writable.
-         * Closes on every failure path within the non-fixed branch.
-         */
-        if (!is_anon) {
-            int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
-            if (ref_err < 0) {
+        if (g->is_rosetta && addr >= g->guest_size &&
+            addr <= 0x0000FFFFFFFFFFFFULL) {
+            /* The hint is the place, so the file and the limits come now. */
+            int64_t placed_err = mmap_placed_errno(g, host_backing_fd, prot,
+                                                   flags, length, is_data);
+            if (placed_err < 0) {
                 mmap_fresh_dispose(&fresh);
-                return ref_err;
+                return placed_err;
             }
-            host_backing_fd = fresh.backing_ref.fd;
+            int64_t high_hint =
+                sys_mmap_high_va(g, addr, length, prot, flags, fd,
+                                 host_backing_fd, offset, false, false);
+            if (high_hint >= 0) {
+                mmap_fresh_dispose(&fresh);
+                return high_hint;
+            }
         }
 
         /* Prefer stage-2 2 MiB block boundaries for non-fixed MAP_SHARED
@@ -3575,6 +3945,19 @@ int64_t sys_mmap(guest_t *g,
         if (result_off == UINT64_MAX) {
             mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
+        }
+
+        /* The file and the limits come once a gap is found, as do_mmap runs
+         * get_unmapped_area first: with no gap left the request fails with
+         * ENOMEM whatever the descriptor. A refused request leaves the
+         * allocator as it was.
+         */
+        int64_t placed_err =
+            mmap_placed_errno(g, host_backing_fd, prot, flags, length, is_data);
+        if (placed_err < 0) {
+            mmap_alloc_restore(g, &saved);
+            mmap_fresh_dispose(&fresh);
+            return placed_err;
         }
         if (!region_has_capacity_after_removes(g, NULL, 0, 1)) {
             mmap_fresh_dispose(&fresh);
@@ -4196,6 +4579,11 @@ int64_t sys_mremap(guest_t *g,
     uint64_t src_gpa_base = src_reg->gpa_base;
     uint64_t src_start = src_reg->start;
 
+    /* A MREMAP_FIXED move checks the limits once its destination is valid. */
+    if (!(flags & LINUX_MREMAP_FIXED) && new_size > old_size &&
+        !mem_rlimit_allows(g, new_size - old_size, region_is_data(src_reg)))
+        return finish_mremap(&source, -LINUX_ENOMEM);
+
     /* Same size: nothing to do */
     if (old_size == new_size && !(flags & LINUX_MREMAP_FIXED))
         return finish_mremap(&source, (int64_t) old_addr);
@@ -4232,6 +4620,16 @@ int64_t sys_mremap(guest_t *g,
         uint64_t old_end = old_off + old_size, new_end = new_off + new_size;
         if (old_off < new_end && new_off < old_end)
             return finish_mremap(&source, -LINUX_EINVAL);
+
+        /* Linux (mm/mremap.c, since v6.17) checks the destination in
+         * check_mremap_params, then calls may_expand_vm from check_prep_vma
+         * before mremap_to unmaps the destination. So a bad destination is
+         * EINVAL under any limit, what is mapped there is still counted, and a
+         * move the limits refuse leaves the destination mapped.
+         */
+        if (new_size > old_size &&
+            !mem_rlimit_allows(g, new_size - old_size, region_is_data(src_reg)))
+            return finish_mremap(&source, -LINUX_ENOMEM);
 
         mremap_move_t move;
         mremap_move_init(&move);
@@ -4824,18 +5222,14 @@ static bool mprotect_same_prot_fast_path_safe(int prot)
            (prot & LINUX_PROT_EXEC);
 }
 
-int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
+/* The page-table and region-table change for a page-aligned range that passed
+ * the checks in sys_mprotect.
+ */
+static int64_t mprotect_apply(guest_t *g,
+                              uint64_t addr,
+                              uint64_t length,
+                              int prot)
 {
-    if (addr & 4095)
-        return -LINUX_EINVAL;
-    if (length == 0)
-        return 0;
-    length = PAGE_ALIGN_UP(length);
-    if (length == 0)
-        return -LINUX_EINVAL;
-    if (addr > UINT64_MAX - length)
-        return -LINUX_EINVAL;
-
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
         if (addr >= g->guest_size) {
             uint64_t mprot_end = addr + length;
@@ -4921,6 +5315,36 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
         }
     }
     return 0;
+}
+
+int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
+{
+    if (addr & 4095)
+        return -LINUX_EINVAL;
+    if (length == 0)
+        return 0;
+    length = PAGE_ALIGN_UP(length);
+    if (length == 0)
+        return -LINUX_EINVAL;
+    if (addr > UINT64_MAX - length)
+        return -LINUX_EINVAL;
+
+    if (prot & LINUX_PROT_WRITE) {
+        /* Region coordinates, as both branches of mprotect_apply take them. */
+        uint64_t off = addr >= g->guest_size ? addr : addr - g->ipa_base;
+        uint64_t stop;
+        if (off <= UINT64_MAX - length &&
+            mprotect_exceeds_data(g, off, off + length, &stop)) {
+            if (stop > off) {
+                int64_t err = mprotect_apply(g, addr, stop - off, prot);
+                if (err < 0)
+                    return err;
+            }
+            return -LINUX_ENOMEM;
+        }
+    }
+
+    return mprotect_apply(g, addr, length, prot);
 }
 
 /* msync helpers. */

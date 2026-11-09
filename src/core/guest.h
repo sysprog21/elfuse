@@ -844,7 +844,7 @@ static inline bool guest_range_hits_infra(const guest_t *g,
 
 /* Whether a tracked region is address space a Linux process would have. The
  * shim and its data sit in the infra reserve, which Linux has no mapping for,
- * so they do not count toward VmSize.
+ * so they count toward neither VmSize nor RLIMIT_AS and RLIMIT_DATA.
  */
 static inline bool guest_region_in_process_vm(const guest_t *g,
                                               const guest_region_t *r)

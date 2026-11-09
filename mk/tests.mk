@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-bench-report check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -110,6 +110,11 @@ check-atomics:
 	@echo "  ATOMICS src/ .claude/skills/"
 	@python3 scripts/check-atomics.py --self-test
 	@python3 scripts/check-atomics.py
+
+## Check the benchmark PR reporter and baseline promoter on fixed inputs
+check-bench-report:
+	@python3 scripts/bench-report.py --self-test
+	@python3 scripts/bench-promote.py --self-test
 
 ## Fail when a source file carries non-ASCII outside the diagram set
 check-ascii:
@@ -314,7 +319,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-bench-report check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
@@ -1635,6 +1640,38 @@ test-perf: $(ELFUSE_BIN) $(PERF_DEPS)
 
 ## Alias for test-perf
 perf: test-perf
+
+# Performance benchmark suite (tests/bench-suite.sh): lmbench
+# microbenchmarks, application workloads over the Alpine fixture tools,
+# and real workloads in OCI images. It writes build/bench-results.json
+# for scripts/bench-compare.py. bench skips a tier whose prerequisites
+# are missing; bench-ci fails on them instead. BENCH_ENV picks the
+# column (elfuse-aarch64, qemu-aarch64, orbstack or native), and a
+# non-default column writes build/bench-results-$BENCH_ENV.json so one
+# job can capture several columns.
+.PHONY: bench bench-ci
+BENCH_SUITE_DEPS := $(ELFUSE_BIN)
+ifndef GUEST_TEST_BINARIES
+  BENCH_SUITE_DEPS += $(BUILD_DIR)/bench-timeit
+else
+  # No rule builds bench-timeit into a prebuilt tree, so the tree has to ship
+  # it; bench then skips Tiers 2 and 3 without it, and bench-ci stops here.
+  BENCH_CI_CHECK = @test -x '$(TEST_DIR)/bench-timeit' || { echo "bench-ci: $(TEST_DIR)/bench-timeit missing; a prebuilt GUEST_TEST_BINARIES tree has to ship bin/bench-timeit" >&2; exit 1; }
+endif
+
+bench_out = $(if $(filter-out elfuse-aarch64,$(BENCH_ENV)),$(BUILD_DIR)/bench-results-$(BENCH_ENV).json,$(BUILD_DIR)/bench-results.json)
+
+## Run the benchmark suite; writes build/bench-results.json (or
+## build/bench-results-$BENCH_ENV.json for a non-default BENCH_ENV)
+bench: $(BENCH_SUITE_DEPS)
+	@ELFUSE="$(ELFUSE_BIN)" BENCH_BIN_DIR="$(TEST_DIR)" \
+	    bash tests/bench-suite.sh -o '$(bench_out)'
+
+## Run the benchmark suite for CI (strict prerequisites)
+bench-ci: $(BENCH_SUITE_DEPS)
+	$(BENCH_CI_CHECK)
+	@ELFUSE="$(ELFUSE_BIN)" BENCH_BIN_DIR="$(TEST_DIR)" BENCH_STRICT=1 \
+	    bash tests/bench-suite.sh -o '$(bench_out)'
 
 # Test matrix (elfuse aarch64 + qemu aarch64 + elfuse x86_64/Rosetta)
 ## Run full test matrix (all modes: elfuse-aarch64, qemu-aarch64, elfuse-x86_64)

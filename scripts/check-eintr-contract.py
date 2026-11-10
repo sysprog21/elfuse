@@ -324,14 +324,14 @@ INVENTORY = {
         "restartable",
         "The queue is empty by the loop condition; no request is dequeued.",
     ),
-    "syscall/proc.c::sys_wait4": (
+    "syscall/proc.c::wait4_once": (
         "restartable",
         "Every reapable outcome returns earlier; no child is removed and no "
         "status or rusage is written.",
     ),
-    "syscall/proc.c::sys_waitid": (
+    "syscall/proc.c::waitid_once": (
         "restartable",
-        "Same shape as sys_wait4: the reap and WNOHANG answers precede this.",
+        "Same shape as wait4_once: the reap and WNOHANG answers precede this.",
     ),
     "runtime/futex.c::futex_lock_pi_inner": (
         "restartable",

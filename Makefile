@@ -330,6 +330,20 @@ $(BUILD_DIR)/test-usbdev-urb-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the record splitter host unit test (native macOS binary)
+# record-split.h is header-only, so the test needs no object but its own.
+$(BUILD_DIR)/test-record-split-host: \
+		$(BUILD_DIR)/test-record-split-host.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the file compaction host unit test (native macOS binary)
+# file-compact.h is header-only, so the test needs no object but its own.
+$(BUILD_DIR)/test-file-compact-host: \
+		$(BUILD_DIR)/test-file-compact-host.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the guest environment merge host test (native macOS binary)
 # guest-env.o's only dependency is the log macro, which the test stubs.
 $(BUILD_DIR)/test-guest-env-host: $(BUILD_DIR)/test-guest-env-host.o \

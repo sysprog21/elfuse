@@ -353,6 +353,12 @@ void signal_reset_for_exec(void);
  */
 void signal_queue(int signum);
 
+/* signal_queue(), except that a signal Linux would discard at generation (an
+ * ignoring disposition, and no thread blocks it) is dropped here rather than at
+ * delivery, so a handler another thread installs in between never sees it.
+ */
+void signal_queue_unless_ignored(int signum);
+
 /* Queue a thread-directed signal (tgkill/tkill semantics): lands in the target
  * thread's private pending set so only that thread consumes it, and standard
  * signals do not coalesce across threads. The target is resolved by guest tid

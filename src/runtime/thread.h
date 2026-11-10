@@ -43,16 +43,16 @@
  * signal API without an include cycle.
  */
 typedef struct thread_entry {
-    /* Read without thread_lock. Four scans walk the table lock-free
+    /* Read without thread_lock. Five scans walk the table lock-free
      * (thread_pending_union, thread_tid_alive, thread_signal_deliverable,
-     * thread_kick_futex_waiters): each loads active, then one or two of
-     * blocked, guest_tid, and tpending.pending, with nothing in between. A
-     * scanner that saw active as 1 just before this slot went inactive can
-     * still be loading one of those when thread_alloc recycles the slot, so
-     * none of them may be plain-written there. They are grouped here, cleared
-     * with atomic stores, and deliberately excluded from the memset that clears
-     * the rest. Keep them ahead of the rest of the struct; thread.c asserts
-     * that each one sits below where its memset starts.
+     * thread_signal_blocked_any, thread_kick_futex_waiters): each loads active,
+     * then one or two of blocked, guest_tid, and tpending.pending, with nothing
+     * in between. A scanner that saw active as 1 just before this slot went
+     * inactive can still be loading one of those when thread_alloc recycles the
+     * slot, so none of them may be plain-written there. They are grouped here,
+     * cleared with atomic stores, and deliberately excluded from the memset
+     * that clears the rest. Keep them ahead of the rest of the struct; thread.c
+     * asserts that each one sits below where its memset starts.
      */
     _Atomic int active; /* Non-zero while thread is running. Stays int (not
                          * bool) because lock-free paths in thread.c use
@@ -489,6 +489,11 @@ void thread_wake_exit_waiters(void);
  * NOT acquire thread_lock.
  */
 bool thread_signal_deliverable(uint64_t sigbit);
+
+/* Check if any active thread blocks sigbit. Same relaxed reads as
+ * thread_signal_deliverable. Does NOT acquire thread_lock.
+ */
+bool thread_signal_blocked_any(uint64_t sigbit);
 
 /* Kick every other thread that has a pending signal it does not block, so one
  * parked in a futex wait re-checks now rather than when its polling quantum

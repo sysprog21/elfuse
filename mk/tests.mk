@@ -39,6 +39,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
         test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
+        test-record-split-host test-file-compact-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
@@ -262,7 +263,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
         test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
-        test-gdbstub-host)
+        test-record-split-host test-file-compact-host test-gdbstub-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -285,6 +286,8 @@ $(call run-host-unit,test-rlimit-unchanged-host,host rlimits across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)
+$(call run-host-unit,test-record-split-host,record splitter across chunks unit test)
+$(call run-host-unit,test-file-compact-host,file tail compaction unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 $(call run-lane,test-path-fold,one answer per object however its path is spelled)
@@ -2137,6 +2140,14 @@ test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
 ## Run the usbdevfs URB bookkeeping unit test (native host binary)
 test-usbdev-urb-host: $(BUILD_DIR)/test-usbdev-urb-host
 	$(BUILD_DIR)/test-usbdev-urb-host
+
+## Run the record splitter host unit test (native host binary)
+test-record-split-host: $(BUILD_DIR)/test-record-split-host
+	$(BUILD_DIR)/test-record-split-host
+
+## Run the file compaction host unit test (native host binary)
+test-file-compact-host: $(BUILD_DIR)/test-file-compact-host
+	$(BUILD_DIR)/test-file-compact-host
 
 ## Run the ELF header validation host unit test
 test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host

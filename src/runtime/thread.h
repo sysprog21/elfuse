@@ -392,6 +392,11 @@ int thread_is_single_active(void);
  */
 uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t);
 
+/* One past the highest SP_EL1 slot ever handed out; slots at or above it have
+ * never been used.
+ */
+int thread_sp_el1_slot_limit(void);
+
 /* The IPA range the slots above are carved from: *lo is the bottom of the
  * lowest slot, *hi one past the top of the highest, so a live SP_EL1 is in
  * [*lo, *hi).

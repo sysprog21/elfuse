@@ -847,6 +847,7 @@ run_unit_tests()
     test_rc "$runner" "test-epoll-aba" 0 "$bindir/test-epoll-aba"
     test_rc "$runner" "test-epoll-epfd-reuse" 0 "$bindir/test-epoll-epfd-reuse"
     test_rc "$runner" "test-large-io-boundary" 0 "$bindir/test-large-io-boundary"
+    test_rc "$runner" "test-getdents64-lazy-span" 0 "$bindir/test-getdents64-lazy-span"
     test_rc "$runner" "test-ioctl-cloexec" 0 "$bindir/test-ioctl-cloexec"
     test_rc "$runner" "test-pty" 0 "$bindir/test-pty"
     test_rc "$runner" "test-ioctl-fioasync" 0 "$bindir/test-ioctl-fioasync"

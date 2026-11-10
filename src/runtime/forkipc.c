@@ -202,6 +202,7 @@ static int fork_child_recv_state(int ipc_fd,
         log_error("fork-child: failed to receive memory regions");
         return -1;
     }
+    guest_rebuild_pte_present(g);
 
     if (fork_ipc_recv_fd_table(ipc_fd, g) < 0) {
         log_error("fork-child: failed to receive fd table");
@@ -1173,8 +1174,8 @@ startup_ok:
      * how pthread_join works in musl: the joining thread does FUTEX_WAIT on
      * this address until it becomes 0.
      *
-     * Drain any deferred munmap before publishing clear_child_tid. A joiner
-     * may observe the zero without ever sleeping in FUTEX_WAIT, then reuse the
+     * Drain any deferred munmap before publishing clear_child_tid. A joiner may
+     * observe the zero without ever sleeping in FUTEX_WAIT, then reuse the
      * freed VA immediately; ordering only the wake after cleanup leaves a
      * window where MAP_FIXED_NOREPLACE still sees the old stack VMA.
      */
@@ -2047,6 +2048,17 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         return flag_err;
     bool want_pidfd = (flags & LINUX_CLONE_PIDFD) != 0;
 
+    /* Once an anonymous arena allocation becomes a live thread stack, munmap
+     * must pass through thread_collect_and_defer_stack_ranges(). Revoke arena
+     * generations before publishing the stack to the thread table so no EL1
+     * fast munmap can bypass that lifetime rule.
+     */
+    if (child_stack != 0) {
+        mmap_lock_acquire(g);
+        mmap_fastpath_revoke_all_locked(g, false);
+        mmap_lock_release();
+    }
+
     /* CLONE_THREAD: create a new thread in the same VM (not a new process) */
     if (flags & LINUX_CLONE_THREAD) {
         return sys_clone_thread(vcpu, g, req, verbose);
@@ -2171,7 +2183,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * SCM_RIGHTS fd. Misaligned shared regions stay incoherent across fork by
      * design.
      */
-    mmap_lock_acquire(g);
+    mmap_lock_acquire_for_fork(g);
     mmap_locked = true;
     if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
         goto fail_snapshot;

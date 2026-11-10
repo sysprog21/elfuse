@@ -130,9 +130,9 @@
  * 22 uint64 slots after the ring lock, bumped by identity_class_fast,
  * urandom_read_fast, futex_wait_fast and futex_wake_fast at every hit and bail
  * so fast-path activity can be attributed rather than guessed. Slots 0-7 are
- * bail reasons, 8-11 identity and urandom hits, 12-13 futex wait hits, 14-15
- * futex wait bails, 16-17 the futex wake path's hit and its one bail, and
- * 18-21 lazy-fault materializations and the TLBI wire mode they emit.
+ * bail reasons, 8-11 identity and urandom hits, 12 the futex wait hit, 13-15
+ * futex wait bails, 16-17 the futex wake path's hit and its one bail, and 18-21
+ * lazy-fault materializations and the TLBI wire mode they emit.
  *
  * Increments are plain load-add-store, so concurrent bails on separate vCPUs
  * lose a few. These are diagnostic ratios, not accounting.
@@ -162,7 +162,7 @@
 #define SHIM_COUNTER_GETRANDOM_HIT 10
 #define SHIM_COUNTER_PGSID_HIT 11
 #define SHIM_COUNTER_FUTEX_EAGAIN_HIT 12
-#define SHIM_COUNTER_FUTEX_EFAULT_HIT 13
+#define SHIM_COUNTER_FUTEX_FAULT_BAIL 13
 #define SHIM_COUNTER_FUTEX_SHAPE_BAIL 14
 #define SHIM_COUNTER_FUTEX_MATCH_BAIL 15
 #define SHIM_COUNTER_FUTEX_WAKE_HIT 16

@@ -742,11 +742,32 @@ static void signal_notify_waiters(int signum)
         wakeup_pipe_signal();
 }
 
-void signal_queue(int signum)
+/* True when @signum's disposition ignores it and no thread blocks it. Linux
+ * discards such a signal at generation (sig_ignored() in prepare_signal()), but
+ * checks only the target thread's mask, which for SIGCHLD is the thread that
+ * forked the child. A transport record names no thread, so any blocking thread
+ * keeps the signal pending: this drops a subset of what Linux drops. A blocked
+ * signal stays pending, because a handler installed before the unblock still
+ * runs for it. Caller holds sig_lock.
+ */
+static bool signal_ignored_at_generation_locked(int signum)
+{
+    const linux_sigaction_t *act = &sig_state.actions[signum - 1];
+    bool ignored = act->sa_handler == LINUX_SIG_IGN ||
+                   (act->sa_handler == LINUX_SIG_DFL &&
+                    signal_default_disposition(signum) == SIG_DISP_IGN);
+    return ignored && !thread_signal_blocked_any(sig_bit(signum));
+}
+
+static void signal_queue_shared(int signum, bool drop_ignored)
 {
     if (signum < 1 || signum > LINUX_NSIG)
         return;
     pthread_mutex_lock(&sig_lock);
+    if (drop_ignored && signal_ignored_at_generation_locked(signum)) {
+        pthread_mutex_unlock(&sig_lock);
+        return;
+    }
     signal_enqueue_locked(&sig_state.shared, signum, NULL);
     /* Publish hint before releasing lock so vCPU hot path sees it. */
     refresh_pending_hint_locked();
@@ -772,6 +793,16 @@ void signal_queue(int signum)
      */
     if (signal_should_interrupt(signum))
         attention_raise();
+}
+
+void signal_queue(int signum)
+{
+    signal_queue_shared(signum, false);
+}
+
+void signal_queue_unless_ignored(int signum)
+{
+    signal_queue_shared(signum, true);
 }
 
 void signal_queue_info(int signum,
@@ -1993,7 +2024,7 @@ int64_t signal_rt_sigaction(guest_t *g,
 
     pthread_mutex_unlock(&sig_lock);
     if (reap_exited_sigchld)
-        proc_autoreap_exited_children();
+        proc_autoreap_exited_children(true);
     return 0;
 }
 

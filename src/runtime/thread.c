@@ -885,6 +885,16 @@ bool thread_signal_deliverable(uint64_t sigbit)
     return false;
 }
 
+bool thread_signal_blocked_any(uint64_t sigbit)
+{
+    /* Lock-free scan, on the same terms as thread_signal_deliverable above. */
+    THREAD_FOR_EACH_ACTIVE_RELAXED (t) {
+        if (sigbit & thread_blocked_load(t))
+            return true;
+    }
+    return false;
+}
+
 void thread_kick_futex_waiters(uint64_t shared_pending)
 {
     /* Lock-free scan, on the same terms as thread_signal_deliverable above. A

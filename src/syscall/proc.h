@@ -524,8 +524,12 @@ pid_t proc_resolve_guest_pid(int64_t guest_pid);
 /* Publish the caller's current guest pid/pgid to the fork-family registry. */
 void proc_registry_publish_self(void);
 
-/* Reap only children whose shared lifecycle entry is already terminal. */
-void proc_autoreap_exited_children(void);
+/* Reap only children whose shared lifecycle entry is already terminal. With
+ * @block false, a child whose host process has not exited yet leaves the guest
+ * table at once, and its host process is reaped later by the deferred-reap
+ * sweep.
+ */
+void proc_autoreap_exited_children(bool block);
 
 /* Pull authoritative PPID state into a newly bootstrapped fork child. */
 void proc_lifecycle_sync_self(guest_t *g);

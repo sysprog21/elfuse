@@ -71,6 +71,8 @@ NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-guest-env-host.c \
                 tests/test-usb-desc-host.c \
                 tests/test-usbdev-urb-host.c \
+                tests/test-record-split-host.c \
+                tests/test-file-compact-host.c \
                 tests/test-elf-headers-host.c \
                 tests/test-gdbstub-host.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c

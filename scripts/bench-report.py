@@ -76,7 +76,10 @@ def metric_name(value: object) -> str:
         raise ReportError("metric name must be a non-empty short string")
     # Cf covers the bidi overrides and zero-width characters that could make
     # the rendered comment show a name other than the real one.
-    if any(unicodedata.category(char) in ("Cc", "Cf") for char in value):
+    # Cs is a lone surrogate, which JSON can carry but UTF-8 cannot encode,
+    # so the comment could not be written.
+    if any(unicodedata.category(char) in ("Cc", "Cf", "Cs")
+           for char in value):
         raise ReportError(f"metric name contains control characters: {value!r}")
     return value
 
@@ -259,6 +262,7 @@ def self_test() -> int:
         "overflow": head + '{"a.b": 1e999}}',
         "negative": head + '{"a.b": -1}}',
         "bidi name": head + '{"a\u202eb": 1}}',
+        "surrogate name": head + '{"a\\ud800": 1}}',
         "wrong environment": head.replace(env, "native") + '{"a.b": 1}}',
         "measured and failed": head.replace('[]', '["a.b"]') + '{"a.b": 1}}',
     }

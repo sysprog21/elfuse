@@ -2,7 +2,7 @@
 
 .PHONY: verify check-contracts verify-mutants check-char-signedness \
         check-stub-constants check-stub-shadow print-verify-targets \
-        print-verify-profiles
+        print-verify-profiles verify-tla
 
 # Frama-C proof of the ELF parsing core. ELF headers come from untrusted
 # binaries, so every offset and extent computed from them is discharged as a
@@ -847,3 +847,43 @@ check-contracts:
 	@echo "  CONTRACT proved/gva.h call-site preconditions (5 of 9 clauses)"
 	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/contracts \
 	    EXTRA_CFLAGS="-DELFUSE_CONTRACT_ASSERT $(EXTRA_CFLAGS)" check
+
+## Model-check the TLA+ specs under tests/tla with TLC
+#
+# TLA2TOOLS is the path to tla2tools.jar from the TLA+ release page
+# (https://github.com/tlaplus/tlaplus/releases). Nothing in the tree fetches
+# it, so the target names what is missing rather than downloading. Each entry
+# of TLA_RUNS is spec:config, one TLC run over tests/tla/<spec>.tla with
+# tests/tla/<config>.cfg.
+#
+# The default holds the configurations that model the code as it is and pass.
+# Teardown.cfg also models the code as it is and fails: the fork quiesce
+# barrier can be bypassed. TeardownFix.cfg models the repair and passes, and
+# replaces it in the default once the repair lands. ArenaProtocolNoFlush.cfg
+# drops the arena TLB flush on refill and rewind and fails, which is what
+# shows ArenaProtocolTLB.cfg can reach that bug.
+TLA2TOOLS ?=
+TLA_RUNS ?= ArenaProtocol:ArenaProtocol ArenaProtocol:ArenaProtocolHelper \
+            ArenaProtocol:ArenaProtocolTLB
+
+verify-tla:
+	$(call require-tool,java,brew install --cask temurin)
+	@if [ -z "$(TLA2TOOLS)" ] || [ ! -f "$(TLA2TOOLS)" ]; then \
+		printf "  $(RED)tla2tools.jar not found$(RESET) (set TLA2TOOLS=/path/to/tla2tools.jar)\n"; \
+		exit 1; \
+	fi
+	@mkdir -p $(BUILD_DIR)/tla
+	@for run in $(TLA_RUNS); do \
+		spec=$${run%%:*}; cfg=$${run##*:}; \
+		echo "  TLC     $$spec ($$cfg)"; \
+		java -XX:+UseParallelGC -cp "$(TLA2TOOLS)" tlc2.TLC -workers auto -noGenerateSpecTE \
+		    -metadir $(BUILD_DIR)/tla/$$cfg -config tests/tla/$$cfg.cfg \
+		    tests/tla/$$spec.tla > $(BUILD_DIR)/tla/$$cfg.log 2>&1 || { \
+			printf "  $(RED)FAILED$(RESET)   %s, see %s\n" "$$cfg" \
+			    "$(BUILD_DIR)/tla/$$cfg.log"; \
+			grep -A40 "Error:" $(BUILD_DIR)/tla/$$cfg.log | head -60; \
+			exit 1; \
+		}; \
+		grep -E "^[0-9]+ states generated|No error" $(BUILD_DIR)/tla/$$cfg.log | \
+		    sed 's/^/          /'; \
+	done

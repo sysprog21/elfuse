@@ -231,6 +231,19 @@ What they do:
   expressible `proved/gva.h` preconditions are checked on every call the suite
   makes. Separate from `make check` because those checks sit on the
   `guest_read` / `guest_write` hot path
+- `make verify-tla TLA2TOOLS=/path/to/tla2tools.jar`: model-check the TLA+
+  specs in `tests/tla` with TLC. `ArenaProtocol.tla` covers the EL1 fast-path
+  arena protocol (the PT gate, publication and retire rings, generations, the
+  materialized envelope, materialization claims, revoke, fork and exec);
+  `ArenaProtocolTLB.cfg` adds per-vCPU TLB entries and the host's TLBI
+  deferred to its vCPU's return to EL0. `Teardown.tla` covers the fork quiesce
+  window against the execve reap and the vCPU run loop. `TLA_RUNS` selects
+  spec:config pairs; the default runs the configurations that model the code
+  as it is and pass, about 25 minutes on an M4. `Teardown.cfg` also models the
+  code as it is and fails, because the fork quiesce barrier can be bypassed;
+  `TeardownFix.cfg` models the repair. `ArenaProtocolNoFlush.cfg` drops the
+  arena TLB flush on refill and rewind and fails, the counterexample the TLB
+  configuration exists to find
 - `make check-lockdep`: rebuild with `LOCKDEP=1` and run `make check` under
   the runtime lock-order validator (`src/debug/lockdep.c`). Every pthread lock
   call is routed through it; it fails the acquisition that would close a cycle

@@ -270,6 +270,7 @@ ORB_WORK=""
 T1_FS_HOST=""
 T1_HELLO=""
 T1_HELLO_OWNER=""
+T1_HELLO_CLAIM=""
 APPS_SKIPPED=""
 OCI_SKIPPED=""
 BENCH_OCI="${BENCH_OCI:-1}"
@@ -572,7 +573,7 @@ lmbench_lat_fs()
 # staging lives in the VM's tmpfs and goes with the VM.
 tier1_unstage()
 {
-    [ -n "$T1_FS_HOST$T1_HELLO$T1_HELLO_OWNER" ] || return 0
+    [ -n "$T1_FS_HOST$T1_HELLO$T1_HELLO_OWNER$T1_HELLO_CLAIM" ] || return 0
 
     # The owner file goes last, so a kill midway still leaves it to mark the
     # rest as stale.
@@ -581,17 +582,20 @@ tier1_unstage()
         if ! timeout "$TEST_TIMEOUT" orb run rm -rf \
             ${T1_FS_HOST:+"$T1_FS_HOST"} ${T1_HELLO:+"$T1_HELLO"} \
             ${T1_HELLO_OWNER:+"$T1_HELLO_OWNER"} \
+            ${T1_HELLO_CLAIM:+"$T1_HELLO_CLAIM"} \
             > /dev/null 2>&1; then
             echo "bench-suite: WARNING: could not remove $T1_FS_HOST $T1_HELLO in the OrbStack machine" >&2
             return 0
         fi
     else
         rm -rf ${T1_FS_HOST:+"$T1_FS_HOST"} ${T1_HELLO:+"$T1_HELLO"} \
-            ${T1_HELLO_OWNER:+"$T1_HELLO_OWNER"}
+            ${T1_HELLO_OWNER:+"$T1_HELLO_OWNER"} \
+            ${T1_HELLO_CLAIM:+"$T1_HELLO_CLAIM"}
     fi
     T1_FS_HOST=""
     T1_HELLO=""
     T1_HELLO_OWNER=""
+    T1_HELLO_CLAIM=""
 }
 
 # Run a sh script where lat_proc's /tmp/hello-s lives: the host, or the OrbStack
@@ -612,17 +616,49 @@ hello_sh()
 claim_hello_s()
 {
     # shellcheck disable=SC2016 # $1 expands in the target shell.
-    local claim='set -C && echo "$1" > /tmp/hello-s.owner' owner
+    local claim='set -C && echo "$1" > /tmp/hello-s.owner' owner err="" tries=0
+    local out
+
+    # The stale check and the reclaim run under a mkdir lock, so two suites
+    # cannot both find the same dead owner and remove each other's files. The
+    # target shell prints ok or held, telling a lock another suite holds apart
+    # from a mkdir that fails. A failed mkdir with no directory there is retried
+    # in the same shell, since a holder can release in between; no output after
+    # three tries means mkdir itself fails (the machine is down, /tmp refuses
+    # writes).
+    while :; do
+        out=$(hello_sh 'for i in 1 2 3; do
+            mkdir /tmp/hello-s.claim 2> /dev/null && { echo ok; exit; }
+            [ -d /tmp/hello-s.claim ] && { echo held; exit; }
+        done' 2> /dev/null)
+        [ "$out" != ok ] || break
+        [ "$out" = held ] || bench_die "cannot create /tmp/hello-s.claim"
+        tries=$((tries + 1))
+        [ "$tries" -lt 50 ] \
+            || bench_die "/tmp/hello-s.claim is held; if no suite is starting, a killed suite left it, remove it"
+        sleep 0.2
+    done
+    T1_HELLO_CLAIM=/tmp/hello-s.claim
     if ! hello_sh "$claim" sh "$$" 2> /dev/null; then
         owner=$(hello_sh 'cat /tmp/hello-s.owner' 2> /dev/null)
-        if [ -n "$owner" ] && kill -0 "$owner" 2> /dev/null; then
-            bench_die "/tmp/hello-s is in use by bench-suite pid $owner"
+
+        # An owner holding this suite's pid is not live: the claim wrote the
+        # file and then reported failure, or a dead suite had the same pid.
+        if [ -n "$owner" ] && [ "$owner" != "$$" ] \
+            && kill -0 "$owner" 2> /dev/null; then
+            err="/tmp/hello-s is in use by bench-suite pid $owner"
+        elif ! hello_sh "rm -f /tmp/hello-s /tmp/hello-s.owner && $claim" \
+            sh "$$" 2> /dev/null; then
+            err="could not reclaim /tmp/hello-s"
+        else
+            bench_note "removed /tmp/hello-s left by dead bench-suite pid ${owner:-unknown}"
         fi
-        bench_note "removing /tmp/hello-s left by dead bench-suite pid ${owner:-unknown}"
-        hello_sh "rm -f /tmp/hello-s /tmp/hello-s.owner && $claim" sh "$$" \
-            2> /dev/null || bench_die "could not reclaim /tmp/hello-s"
     fi
-    T1_HELLO_OWNER=/tmp/hello-s.owner
+    [ -n "$err" ] || T1_HELLO_OWNER=/tmp/hello-s.owner
+    T1_HELLO_CLAIM=""
+    hello_sh 'rmdir /tmp/hello-s.claim' 2> /dev/null \
+        || bench_die "could not release /tmp/hello-s.claim${err:+ ($err)}"
+    [ -z "$err" ] || bench_die "$err"
     hello_sh 'set -C && : > /tmp/hello-s' 2> /dev/null \
         || bench_die "/tmp/hello-s already exists and bench-suite did not stage it"
     T1_HELLO=/tmp/hello-s

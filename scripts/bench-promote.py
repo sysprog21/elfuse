@@ -39,6 +39,7 @@ import math
 import os
 import pathlib
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -118,17 +119,22 @@ def prune_tree(dest: dict, src: dict, prefix: str, pruned: list) -> None:
         elif (isinstance(dest[name], dict) and isinstance(src[name], dict)
               and "median" not in src[name] and "status" not in src[name]):
             prune_tree(dest[name], src[name], f"{tag}.", pruned)
+            if not dest[name]:
+                del dest[name]
 
 
 def missing_leaves(dest: dict, src: dict, prefix: str,
                    missing: list) -> None:
-    """Record existing baseline metrics absent from this result capture."""
+    """Record baseline metrics (scalar leaves) absent from this result
+    capture, descending into every baseline group."""
     for name, value in dest.items():
         tag = f"{prefix}{name}"
-        if name not in src:
+        if isinstance(value, dict):
+            sub = src.get(name, {})
+            missing_leaves(value, sub if isinstance(sub, dict) else {},
+                           f"{tag}.", missing)
+        elif name not in src:
             missing.append(tag)
-        elif isinstance(value, dict) and isinstance(src[name], dict):
-            missing_leaves(value, src[name], f"{tag}.", missing)
 
 
 def format_host(host: dict) -> str:
@@ -162,7 +168,9 @@ def mapping_entry(parent: dict, name: str, label: str) -> dict:
 
 
 def self_test() -> int:
-    """Check that --prune keeps metrics whose capture failed."""
+    """Check that --prune keeps metrics whose capture failed, that those
+    metrics and a skipped tier keep the earlier provenance, and that an
+    emptied group does not."""
     dest = {"lat_fs": {"create": 5.0, "delete": 6.0}, "lat_proc": 7.0,
             "gone": 1.0}
     src = {"lat_fs": {"create": {"status": "ERR"},
@@ -174,6 +182,49 @@ def self_test() -> int:
         print(f"bench-promote self-test: FAIL: pruned {pruned}, "
               f"kept {sorted(dest)}", file=sys.stderr)
         return 1
+    # Full --prune promotes through main(): an ERR row keeps the earlier
+    # provenance; a group the capture emptied is dropped with its key, so
+    # every value left is new and the provenance moves to this run;
+    # a tier the capture skipped is not pruned, so its metrics keep the earlier
+    # provenance.
+    cases = [
+        ({"lmbench": {"lat_fs": {"create": 5.0}, "lat_proc": 7.0}},
+         {"lmbench": {"lat_fs": {"create": {"status": "ERR"}},
+                      "lat_proc": {"median": 8.0}}},
+         "old", {"lmbench": {"lat_fs": {"create": 5.0}, "lat_proc": 8.0}}),
+        ({"lmbench": {"a": {"x": 1.0, "y": 2.0}, "p": 3.0}},
+         {"lmbench": {"a": {}, "p": {"median": 4.0}}},
+         "new", {"lmbench": {"p": 4.0}}),
+        ({"lmbench": {"p": 3.0}, "applications": {"app": 2.0}},
+         {"lmbench": {"p": {"median": 4.0}}},
+         "old", {"lmbench": {"p": 4.0}, "applications": {"app": 2.0}}),
+    ]
+    for column, results, want_date, want_column in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            base_path = pathlib.Path(tmp, "baseline.json")
+            res_path = pathlib.Path(tmp, "results.json")
+            base_path.write_text(json.dumps({
+                "captured": {"e": {"date": "old"}},
+                "environments": {"e": column},
+            }), encoding="utf-8")
+            res_path.write_text(json.dumps({
+                "meta": {"env": "e", "date": "new", "host": {},
+                         "iterations": 1},
+                **results,
+            }), encoding="utf-8")
+            run = subprocess.run(
+                [sys.executable, __file__, "--prune", "--results",
+                 str(res_path), "--baseline", str(base_path)],
+                capture_output=True, text=True)
+            promoted = json.loads(base_path.read_text(encoding="utf-8"))
+        date = promoted["captured"]["e"]["date"]
+        got = {name: promoted["environments"]["e"].get(name)
+               for name in want_column}
+        if run.returncode != 0 or date != want_date or got != want_column:
+            print(f"bench-promote self-test: FAIL: rc {run.returncode}, "
+                  f"captured date {date!r}, column {got}\n{run.stderr}",
+                  file=sys.stderr)
+            return 1
     print("bench-promote self-test: ok")
     return 0
 
@@ -219,12 +270,15 @@ def main() -> int:
                 column, section,
                 f"baseline environments.{env}.{section}")
             prefix = f"{section}."
-            missing_leaves(dest, new_leaves, prefix, missing)
             merge_tree(dest, new_leaves, prefix, added, updated)
             # An empty section is a tier the capture skipped, not one whose
             # metrics were all removed.
             if args.prune and new_leaves:
                 prune_tree(dest, results[section], prefix, pruned)
+            # What is left and not measured now still comes from an earlier
+            # capture: ERR/SKIP rows --prune kept, a tier the capture skipped,
+            # or everything without --prune.
+            missing_leaves(dest, new_leaves, prefix, missing)
 
         captured_entry = {
             "date": meta.get("date"),
@@ -234,9 +288,13 @@ def main() -> int:
         if meta.get("note"):
             captured_entry["note"] = meta["note"]
         captured = mapping_entry(baseline, "captured", "baseline captured")
-        if missing and not args.prune:
+        if missing:
             print("  capture is partial; preserving existing provenance "
                   f"({len(missing)} baseline metric(s) absent)")
+            for tag in missing:
+                print(f"    ? {tag}")
+            print("  to record this run's provenance, capture those metrics "
+                  f"again or delete them from {args.baseline}")
         else:
             captured[env] = captured_entry
     except BenchPromoteError as exc:

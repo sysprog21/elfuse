@@ -344,10 +344,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/apt-cache
-          sudo apt-get update
+          # A mirror outage can outlast apt's own retries, so retry the whole
+          # step.
+          n=0
           # shellcheck disable=SC2086 -- LINT_PKGS is a space-separated list.
-          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" \
-            $LINT_PKGS
+          until sudo apt-get update &&
+            sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" \
+              $LINT_PKGS; do
+            n=$((n + 1))
+            [ "$n" -lt 3 ] || exit 1
+            sleep 20
+          done
 
       - name: clang-format
         if: ${{ !cancelled() && steps.changed.outputs.c == 'true' }}

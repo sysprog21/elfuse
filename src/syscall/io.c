@@ -4306,11 +4306,13 @@ int64_t sys_copy_file_range(guest_t *g,
 
     /* generic_copy_file_checks (Linux fs/read_write.c) applies RLIMIT_FSIZE to
      * the whole request before anything is read: EFBIG and SIGXFSZ at or past
-     * the limit whatever the length, and a length cut at the limit otherwise.
+     * the limit, and a length cut at the limit otherwise. A zero-length request
+     * is the exception: the Linux 6.18 guest kernel answers it with 0 and no
+     * signal at the limit, so it skips the refusal.
      */
     uint64_t room;
     if (fsize_copy_room(out_ref.fd, off_out, &room)) {
-        if (room == 0) {
+        if (room == 0 && len != 0) {
             sys_rlimit_send_xfsz();
             err = -LINUX_EFBIG;
             goto out_copy_file_range;

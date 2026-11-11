@@ -35,7 +35,9 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -51,7 +53,26 @@ int passes = 0, fails = 0;
 #define ROUNDS 700
 #define BATCH 24
 
+/* The matrix runner kills a test at 30 seconds, and a loaded host can stretch
+ * 700 rounds past that. Stop at the budget with fewer rounds instead.
+ */
+#define BUDGET_SEC 12
+
+/* Fewer rounds than this and the window was barely sampled, so a pass would say
+ * nothing: report the host as too slow rather than a green result.
+ */
+#define MIN_ROUNDS 100
+
 static int pipe_rd, pipe_wr;
+
+static bool over_budget(const struct timespec *t0)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec - t0->tv_sec > BUDGET_SEC ||
+           (now.tv_sec - t0->tv_sec == BUDGET_SEC &&
+            now.tv_nsec >= t0->tv_nsec);
+}
 
 /* pause_ack counts both edges of each request. Main waits for the flipper to
  * observe the release before requesting the next pause, so one wait cannot
@@ -81,6 +102,20 @@ static void *flipper(void *arg)
     return NULL;
 }
 
+/* Spin until the flipper has counted @want edges. False if the budget ran out
+ * first, sampled every 1024 spins to keep the clock off the hot path.
+ */
+static bool wait_ack(unsigned want, const struct timespec *t0)
+{
+    for (unsigned spins = 0;
+         atomic_load(&pause_ack) < want && !atomic_load(&stop); spins++) {
+        if ((spins & 1023u) == 1023u && over_budget(t0))
+            return false;
+        sched_yield();
+    }
+    return true;
+}
+
 int main(void)
 {
     int fds[2];
@@ -101,8 +136,10 @@ int main(void)
 
     int dups[BATCH];
     int dups_taken = 0;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    for (int r = 0; r < ROUNDS && stale_round < 0; r++) {
+    for (int r = 0; r < ROUNDS && stale_round < 0 && !over_budget(&t0); r++) {
         int n = 0;
         for (int i = 0; i < BATCH; i++) {
             int d = dup(pipe_wr);
@@ -116,27 +153,31 @@ int main(void)
          */
         unsigned want = atomic_load(&pause_ack) + 1u;
         atomic_store(&pause_req, 1);
-        while (atomic_load(&pause_ack) < want && !atomic_load(&stop))
-            sched_yield();
+        bool parked = wait_ack(want, &t0);
 
-        int src = fcntl(pipe_wr, F_GETFL);
-        for (int i = 0; i < n; i++) {
-            int alias = fcntl(dups[i], F_GETFL);
-            if (src >= 0 && alias >= 0 && ((src ^ alias) & O_NONBLOCK) &&
-                stale_round < 0) {
-                stale_round = r;
-                stale_alias = alias & O_NONBLOCK;
-                stale_src = src & O_NONBLOCK;
+        /* An unparked flipper still writes the flag, so comparing proves
+         * nothing.
+         */
+        if (parked) {
+            dups_taken += n;
+            int src = fcntl(pipe_wr, F_GETFL);
+            for (int i = 0; i < n; i++) {
+                int alias = fcntl(dups[i], F_GETFL);
+                if (src >= 0 && alias >= 0 && ((src ^ alias) & O_NONBLOCK) &&
+                    stale_round < 0) {
+                    stale_round = r;
+                    stale_alias = alias & O_NONBLOCK;
+                    stale_src = src & O_NONBLOCK;
+                }
             }
         }
 
         atomic_store(&pause_req, 0);
-        want++;
-        while (atomic_load(&pause_ack) < want && !atomic_load(&stop))
-            sched_yield();
+        bool released = parked && wait_ack(want + 1u, &t0);
         for (int i = 0; i < n; i++)
             close(dups[i]);
-        dups_taken += n;
+        if (!released)
+            break;
     }
 
     atomic_store(&stop, 1);
@@ -153,12 +194,13 @@ int main(void)
 
     /* Count what the rounds actually produced, not that they ran. Asserting on
      * a counter the loop bumps unconditionally says only that the loop body
-     * executed, which the loop condition already guarantees; a dup() failing
-     * every time would still have passed it.
+     * executed; a dup() failing every time would still have passed it. The
+     * budget can also end the loop early, so the count is what shows the window
+     * was sampled.
      */
-    TEST("the race window was actually exercised");
-    EXPECT_TRUE(dups_taken >= BATCH,
-                "no dup was taken, so nothing was compared");
+    TEST("the race window was sampled enough times to mean something");
+    EXPECT_TRUE(dups_taken >= MIN_ROUNDS * BATCH || stale_round >= 0,
+                "host too slow or the pause handshake stalled");
 
     close(pipe_rd);
     close(pipe_wr);

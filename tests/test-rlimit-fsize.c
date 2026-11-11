@@ -40,10 +40,17 @@ static void on_xfsz(int sig)
     xfsz_count++;
 }
 
+/* What the last refused_with_xfsz saw, for the child to report on failure. */
+static char last_refusal[64];
+
 /* True if @rc is -1 with EFBIG and exactly one more SIGXFSZ has arrived. */
 static int refused_with_xfsz(long rc, int *seen)
 {
     int ok = rc == -1 && errno == EFBIG && xfsz_count == *seen + 1;
+    int saved_errno = errno;
+    snprintf(last_refusal, sizeof(last_refusal), "rc=%ld errno=%d signals=%d",
+             rc, errno, xfsz_count - *seen);
+    errno = saved_errno;
     *seen = xfsz_count;
     return ok;
 }
@@ -269,12 +276,14 @@ static int fsize_copy_child(void)
     struct rlimit rl;
     struct sigaction sa = {.sa_handler = on_xfsz};
     int seen = 0, step = 0;
+    rlim_t soft;
 
     memset(block, 'y', sizeof(block));
     if (sfd < 0 || dfd < 0 || pipe(pfd) < 0 ||
         write(sfd, block, sizeof(block)) != sizeof(block) ||
         sigaction(SIGXFSZ, &sa, NULL) < 0 || getrlimit(RLIMIT_FSIZE, &rl) < 0)
         return 100;
+    soft = rl.rlim_cur;
     rl.rlim_cur = FSIZE_LIMIT;
     if (setrlimit(RLIMIT_FSIZE, &rl) < 0)
         return 101;
@@ -305,9 +314,13 @@ static int fsize_copy_child(void)
         xfsz_count != seen)
         goto out;
 
-    /* 5: at the limit it is refused whatever the length. */
+    /* 5: at the limit a request is refused, and a zero-length one is not: Linux
+     * returns 0 for it with no signal.
+     */
     step++;
-    if (!refused_with_xfsz(copy_file_range(sfd, NULL, dfd, NULL, 0, 0), &seen))
+    if (copy_file_range(sfd, NULL, dfd, NULL, 0, 0) != 0 ||
+        xfsz_count != seen ||
+        !refused_with_xfsz(copy_file_range(sfd, NULL, dfd, NULL, 1, 0), &seen))
         goto out;
 
     /* 6: splice across the limit leaves the rest in the pipe. */
@@ -381,6 +394,18 @@ static int fsize_copy_child(void)
 
     step = 0;
 out:
+    if (step) {
+        /* Say what the kernel answered; the limit would cut this line short. */
+        rl.rlim_cur = soft;
+        if (setrlimit(RLIMIT_FSIZE, &rl) == 0) {
+            if (last_refusal[0])
+                printf(
+                    "    step %d: latest refusal check, maybe from an earlier "
+                    "step: %s\n",
+                    step, last_refusal);
+            fflush(stdout);
+        }
+    }
     close(sfd);
     close(dfd);
     unlink(src);

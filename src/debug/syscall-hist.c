@@ -155,10 +155,13 @@ void syscall_hist_record(int nr, uint64_t ns)
     /* Enter the recording window before the mode probe. The matching decrement
      * runs on every exit path. syscall_hist_dump waits for the counter to drain
      * to zero after flipping mode to OFF; that wait is what guarantees the
-     * dump's reads see no further updates.
+     * dump's reads see no further updates. The two sides form a store-buffering
+     * handshake (each writes its own word, then reads the other's), so all four
+     * accesses are seq_cst: under acquire/release both could read the stale
+     * value and the dump would run beside a recorder.
      */
-    atomic_fetch_add_explicit(&hist_active_recorders, 1, memory_order_acquire);
-    if (atomic_load_explicit(&hist_mode, memory_order_acquire) != HIST_RECORD)
+    atomic_fetch_add_explicit(&hist_active_recorders, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&hist_mode, memory_order_seq_cst) != HIST_RECORD)
         goto leave;
     if (nr < 0 || nr >= HIST_TABLE_SIZE)
         goto leave;
@@ -264,7 +267,7 @@ void syscall_hist_dump(void)
             memory_order_acquire);
     }
     int prev =
-        atomic_exchange_explicit(&hist_mode, HIST_OFF, memory_order_acq_rel);
+        atomic_exchange_explicit(&hist_mode, HIST_OFF, memory_order_seq_cst);
     if (prev == HIST_OFF)
         return;
 
@@ -275,7 +278,7 @@ void syscall_hist_dump(void)
      * bounded by the slowest recorder (a few hundred ns) and only runs during
      * the one-shot dump.
      */
-    while (atomic_load_explicit(&hist_active_recorders, memory_order_acquire) >
+    while (atomic_load_explicit(&hist_active_recorders, memory_order_seq_cst) >
            0) {
         /* sched_yield is not portable to relaxed memory models the same way
          * pause is on x86; on aarch64 macOS the loop iteration cost is

@@ -962,7 +962,8 @@ int linux_to_mac_status_flags(int linux_flags);
 /* Allocate anonymous guest memory. Wraps the static sys_mmap with
  * MAP_PRIVATE|MAP_ANONYMOUS. Caller must hold mmap_lock.
  */
-int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
+int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot)
+    REQUIRES(mmap_pt_gate);
 
 /* Borrowed-or-pinned host fd reference.
  *

@@ -109,6 +109,7 @@ static void register_elf_segment_regions(guest_t *g,
  * between aarch64 and rosetta guests.
  */
 static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
+    REQUIRES(mmap_pt_gate)
 {
     guest_region_add(g, g->shim_base, g->shim_base + shim_bin_len,
                      LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
@@ -584,6 +585,10 @@ int guest_bootstrap_prepare(guest_t *g,
         startup_trace_step("rosetta_prepare", t0);
     }
 
+    /* No vCPU has been created yet, so nothing else can walk or write the
+     * tables this builds.
+     */
+    mmap_pt_gate_exclusive();
     t0 = startup_trace_now_ns();
     boot->ttbr0 = guest_build_page_tables(g, regions, nregions);
     if (!boot->ttbr0) {

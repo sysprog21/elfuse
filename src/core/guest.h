@@ -26,6 +26,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "core/thread-safety.h"
+
 /* The guest slab and the shim_data block are plain byte-addressed mappings
  * whose layout the guest ABI fixes, so the words the host and the guest both
  * touch (page-table descriptors, the shim_data identity and urandom slots, the
@@ -1111,6 +1113,20 @@ int guest_map_va_range(guest_t *g,
                        uint64_t gpa_start,
                        int perms);
 
+/* Held from mmap_lock_acquire to mmap_lock_release: mmap_lock is held and the
+ * EL1 page-table gate is closed with every fast-path producer out, so no EL1
+ * mmap or munmap can run beside a descriptor rewrite. mmap_lock_acquire_raw
+ * does not grant it. Every page-table writer below requires it.
+ */
+extern elfuse_role_t mmap_pt_gate;
+
+/* Tell the analysis the caller has the page tables to itself without the gate:
+ * it runs before any vCPU exists. Not a lock; each call site says why it holds.
+ */
+static inline void mmap_pt_gate_exclusive(void) ASSERT_CAPABILITY(mmap_pt_gate)
+{
+}
+
 /* Install (or overwrite) 4 KiB L3 page descriptors mapping [va, va+length) to
  * [gpa, gpa+length) with the requested perms. Unlike guest_update_perms, which
  * only edits existing descriptors and falls back to region metadata for invalid
@@ -1131,7 +1147,7 @@ int guest_install_va_pages(guest_t *g,
                            uint64_t va,
                            uint64_t length,
                            uint64_t gpa,
-                           int perms);
+                           int perms) REQUIRES(mmap_pt_gate);
 
 /* Query whether a 2 MiB TTBR0 VA block already has any L2 entry, either a block
  * descriptor or an L3 table descriptor.
@@ -1195,7 +1211,8 @@ void *guest_ptr_avail_nofault(const guest_t *g,
 int guest_lazy_faultin(const guest_t *g, uint64_t gva, uint64_t len);
 
 /* Materialization with mmap_lock already held. Follow with nofault access. */
-int guest_lazy_faultin_locked(const guest_t *g, uint64_t gva, uint64_t len);
+int guest_lazy_faultin_locked(const guest_t *g, uint64_t gva, uint64_t len)
+    REQUIRES(mmap_pt_gate);
 
 /* Smallest 2MiB-block-aligned va' in [va, end) containing at least one valid
  * TTBR0 PTE, or end if none. Low VA uses the host-side hierarchical occupancy
@@ -1322,9 +1339,8 @@ size_t guest_host_copy_partial(void *dst, const void *src, size_t len);
  *
  * Returns the TTBR0 value (GPA of L0 table), or 0 on failure.
  */
-uint64_t guest_build_page_tables(guest_t *g,
-                                 const mem_region_t *regions,
-                                 int n);
+uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
+    REQUIRES(mmap_pt_gate);
 
 /* Extend page tables to cover a new address range [start, end) with 2MiB block
  * descriptors. Reuses the existing L0->L1 table structure and allocates new L2
@@ -1335,7 +1351,7 @@ uint64_t guest_build_page_tables(guest_t *g,
 int guest_extend_page_tables(guest_t *g,
                              uint64_t start,
                              uint64_t end,
-                             int perms);
+                             int perms) REQUIRES(mmap_pt_gate);
 
 /* Split a 2MiB block descriptor into 512 x 4KiB L3 page descriptors. block_gpa
  * must be within a currently-mapped 2MiB block. The block's permissions are
@@ -1353,7 +1369,7 @@ int guest_extend_page_tables(guest_t *g,
  *
  * Returns 0 on success, -1 on failure.
  */
-int guest_split_block(guest_t *g, uint64_t block_gpa);
+int guest_split_block(guest_t *g, uint64_t block_gpa) REQUIRES(mmap_pt_gate);
 
 /* Invalidate page table entries for the range [start, end). Sets L2 block
  * descriptors and L3 page descriptors to 0 (invalid), causing translation
@@ -1363,7 +1379,8 @@ int guest_split_block(guest_t *g, uint64_t block_gpa);
  * Records a TLBI request covering the invalidated range.
  * Returns 0 on success, -1 on failure.
  */
-int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
+int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
+    REQUIRES(mmap_pt_gate);
 
 /* Update page table permissions for the range [start, end). If a 2MiB block
  * needs mixed permissions (only part of it is being updated), the block is
@@ -1373,7 +1390,8 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
  * whose descriptor actually changed.
  * Returns 0 on success, -1 on failure.
  */
-int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms);
+int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
+    REQUIRES(mmap_pt_gate);
 
 /* Reset guest memory for execve. Zeros ELF, brk, stack, mmap regions and resets
  * page table pool, brk, and mmap allocation state. Preserves the host_base
@@ -1561,10 +1579,12 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
  * in a lazy region or the region is PROT_NONE. Locking: callers MUST hold
  * mmap_lock.
  */
-int guest_materialize_lazy(guest_t *g, uint64_t fault_offset);
+int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
+    REQUIRES(mmap_pt_gate);
 
 /* Guest-fault variant with per-vCPU sequential fault-around. */
-int guest_materialize_lazy_fault(guest_t *g, uint64_t fault_offset);
+int guest_materialize_lazy_fault(guest_t *g, uint64_t fault_offset)
+    REQUIRES(mmap_pt_gate);
 
 /* Dirty-map and in-flight-claim helpers. Callers hold mmap_lock. */
 bool guest_block_may_be_dirty(const guest_t *g, uint64_t block_start);
@@ -1572,8 +1592,8 @@ void guest_dirty_mark_range(guest_t *g, uint64_t start, uint64_t end);
 void guest_dirty_clear_zeroed_range(guest_t *g, uint64_t start, uint64_t end);
 void guest_materialize_wait_range_locked(guest_t *g,
                                          uint64_t start,
-                                         uint64_t end);
-void guest_materialize_wait_all_locked(guest_t *g);
+                                         uint64_t end) REQUIRES(mmap_pt_gate);
+void guest_materialize_wait_all_locked(guest_t *g) REQUIRES(mmap_pt_gate);
 
 /* Whether the 4KiB page containing va has a valid stage-1 descriptor. Locking:
  * callers MUST hold mmap_lock.

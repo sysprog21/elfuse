@@ -19,8 +19,9 @@
 /* Shared memory handlers. */
 
 int64_t sys_shmget(guest_t *g, int32_t key, uint64_t size, int shmflg);
-int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg);
-int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva);
+int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
+    REQUIRES(mmap_pt_gate);
+int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva) REQUIRES(mmap_pt_gate);
 int64_t sys_shmctl(guest_t *g, int shmid, int cmd, uint64_t buf_gva);
 
 /* Semaphore handlers. */

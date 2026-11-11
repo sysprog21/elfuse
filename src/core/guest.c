@@ -2917,6 +2917,7 @@ static uint64_t make_block_desc(uint64_t gpa, int perms)
  * Linux semantics for inter-segment gaps in small static binaries.
  */
 static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
+    REQUIRES(mmap_pt_gate)
 {
     /* Walk every 2MiB block touched by any region. Blocks shared by multiple
      * regions are processed multiple times; the underlying split / invalidate /
@@ -4138,7 +4139,7 @@ void guest_materialize_wait_all_locked(guest_t *g)
 
 static int materialize_claim_alloc_locked(guest_t *g,
                                           uint64_t start,
-                                          uint64_t end)
+                                          uint64_t end) REQUIRES(mmap_pt_gate)
 {
     guest_materialize_wait_range_locked(g, start, end);
     for (int i = 0; i < GUEST_MATERIALIZE_CLAIMS; i++) {
@@ -4180,7 +4181,30 @@ bool guest_va_pte_valid(guest_t *g, uint64_t va)
     return (l3[l3_idx] & PT_VALID) != 0;
 }
 
+/* Zero the pages of the 2MiB block at @block_start whose bit is set in
+ * @zero_pages, one memset per run of set bits.
+ */
+static void materialize_zero_pages(guest_t *g,
+                                   uint64_t block_start,
+                                   const uint64_t zero_pages[8])
+{
+    for (unsigned page = 0; page < 512;) {
+        if (!(zero_pages[page >> 6] & (1ULL << (page & 63)))) {
+            page++;
+            continue;
+        }
+        unsigned first = page;
+        do {
+            page++;
+        } while (page < 512 && (zero_pages[page >> 6] & (1ULL << (page & 63))));
+        memset((uint8_t *) g->host_base + block_start +
+                   (uint64_t) first * PAGE_SIZE,
+               0, (uint64_t) (page - first) * PAGE_SIZE);
+    }
+}
+
 static int guest_materialize_lazy_one(guest_t *g, uint64_t fault_offset)
+    REQUIRES(mmap_pt_gate)
 {
 retry:;
     /* Find the lazy region containing this offset */
@@ -4280,24 +4304,13 @@ retry:;
         }
 
         claim_slot = materialize_claim_alloc_locked(g, block_start, block_end);
-        if (claim_slot >= 0)
+        if (claim_slot >= 0) {
             mmap_lock_drop_keep_gate();
-        for (unsigned page = 0; page < 512;) {
-            if (!(zero_pages[page >> 6] & (1ULL << (page & 63)))) {
-                page++;
-                continue;
-            }
-            unsigned first = page;
-            do {
-                page++;
-            } while (page < 512 &&
-                     (zero_pages[page >> 6] & (1ULL << (page & 63))));
-            memset((uint8_t *) g->host_base + block_start +
-                       (uint64_t) first * PAGE_SIZE,
-                   0, (uint64_t) (page - first) * PAGE_SIZE);
-        }
-        if (claim_slot >= 0)
+            materialize_zero_pages(g, block_start, zero_pages);
             mmap_lock_reacquire_with_gate(g);
+        } else {
+            materialize_zero_pages(g, block_start, zero_pages);
+        }
         if (!(perms & MEM_PERM_W) && !any_valid &&
             materialize_start == block_start && materialize_end == block_end)
             guest_dirty_clear_zeroed_range(g, block_start, block_end);

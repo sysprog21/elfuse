@@ -1050,6 +1050,7 @@ typedef struct {
  * Returns the new TTBR0.
  */
 static uint64_t exec_install_address_space(guest_t *g, const exec_image_t *img)
+    REQUIRES(mmap_pt_gate)
 {
     const unsigned int shim_size = img->shim_size;
     const elf_info_t *elf_info = img->elf_info;
@@ -1182,6 +1183,7 @@ too_many_regions:
  * and the NULL page, whose PTEs are invalidated rather than described.
  */
 static void exec_publish_maps(guest_t *g, const exec_image_t *img)
+    REQUIRES(mmap_pt_gate)
 {
     const unsigned int shim_size = img->shim_size;
     const elf_info_t *elf_info = img->elf_info;
@@ -1319,6 +1321,7 @@ static void exec_enter_rosetta_image(hv_vcpu_t vcpu,
                                      char **argv,
                                      char **envp,
                                      unsigned int shim_size)
+    REQUIRES(mmap_pt_gate)
 {
     /* Drain the previous rosettad bridge before rosetta_finalize wires a fresh
      * one. The detached handler thread only clears its global client-fd marker

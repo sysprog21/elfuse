@@ -77,6 +77,7 @@ SRCS := \
     debug/gdbstub.c \
     debug/gdbstub-reg.c \
     debug/gdbstub-rsp.c \
+    debug/lockdep.c \
     debug/log.c \
     debug/syscall-hist.c
 
@@ -154,6 +155,21 @@ $(DISPATCH_HEADER): $(DISPATCH_MANIFEST) $(DISPATCH_GENERATOR) src/syscall/abi.h
 	rm -f "$$tmp"
 
 $(BUILD_DIR)/syscall/syscall.o: $(DISPATCH_HEADER)
+
+# The lock-order document as the table the LOCKDEP=1 validator reads.
+LOCKDEP_ORDER_HEADER := $(BUILD_DIR)/lockdep-order.h
+
+$(LOCKDEP_ORDER_HEADER): src/syscall/internal.h scripts/check-lock-order.py | $(BUILD_DIR)
+	@echo "  GEN     $@"
+	$(Q)python3 scripts/check-lock-order.py --emit-lockdep $@
+
+$(BUILD_DIR)/debug/lockdep.o: $(LOCKDEP_ORDER_HEADER)
+
+## Build the lock-order validator self-test (meaningful under LOCKDEP=1)
+$(BUILD_DIR)/test-lockdep-host: $(BUILD_DIR)/test-lockdep-host.o \
+		$(BUILD_DIR)/debug/lockdep.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 $(DEPARTED_HEADER): $(DEPARTED_MANIFEST) $(DEPARTED_GENERATOR) \
 		src/syscall/usbdev.c | $(BUILD_DIR)

@@ -191,6 +191,14 @@ jobs:
           python3 scripts/check-atomics.py --self-test
           python3 scripts/check-atomics.py
 
+      - name: Store-buffering handshakes
+        # Lexical over src/, nothing built: a store then a load of another
+        # location, mirrored elsewhere, without seq_cst on both sides.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check-sb-handshake.py --self-test
+          python3 scripts/check-sb-handshake.py
+
       # What follows needs LINT_PKGS, and the three checks that use it read
       # only C sources, the style file, and the .ci scripts that implement
       # them. cppcheck alone is 50 of this job's 85 seconds and the install is

@@ -42,12 +42,19 @@ static void *retire_like_el1(void *arg)
     return (void *) (intptr_t) rc;
 }
 
+/* Setup runs before any test thread starts, so the tables are the caller's. */
+static uint64_t build_tables(guest_t *guest)
+{
+    mmap_pt_gate_exclusive();
+    return guest_build_page_tables(guest, NULL, 0);
+}
+
 int main(void)
 {
     g = calloc(1, sizeof(*g));
     if (!g || guest_init(g, 64ULL << 30, 0) != 0)
         return 1;
-    if (!guest_build_page_tables(g, NULL, 0))
+    if (!build_tables(g))
         return 1;
     if (guest_region_add(
             g, addr, addr + block, LINUX_PROT_READ | LINUX_PROT_WRITE,

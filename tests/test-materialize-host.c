@@ -202,12 +202,19 @@ static void test_mremap_lazy_source(guest_t *g)
     EXPECT_TRUE(ok, "growth exposed dirty bytes or materialized the old body");
 }
 
+/* Setup runs before any test thread starts, so the tables are the caller's. */
+static uint64_t build_tables(guest_t *g)
+{
+    mmap_pt_gate_exclusive();
+    return guest_build_page_tables(g, NULL, 0);
+}
+
 int main(void)
 {
     guest_t *g = calloc(1, sizeof(*g));
     if (!g || guest_init(g, 64ULL << 30, 0) != 0)
         return 1;
-    if (!guest_build_page_tables(g, NULL, 0))
+    if (!build_tables(g))
         return 1;
     const uint64_t block = 2ULL << 20;
     const uint64_t addr = 16ULL << 20;

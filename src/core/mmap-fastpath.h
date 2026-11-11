@@ -158,7 +158,7 @@ _Static_assert(sizeof(shim_mmap_control_t) <= SHIM_MMAP_CONTROL_STRIDE,
 void mmap_fastpath_prepare_vcpu(guest_t *g, thread_entry_t *t);
 
 /* Drain every per-vCPU SPSC ring. Caller holds mmap_lock. */
-void mmap_fastpath_drain_locked(guest_t *g);
+void mmap_fastpath_drain_locked(guest_t *g) REQUIRES(mmap_pt_gate);
 
 /* Opportunistically drain publications and retirements at a natural VM exit.
  * Safe before every exit handler; it acquires mmap_lock internally. When a
@@ -179,13 +179,15 @@ bool mmap_fastpath_current_producer_active(const guest_t *g);
  */
 void mmap_fastpath_note_materialized_locked(guest_t *g,
                                             uint64_t start,
-                                            uint64_t end);
+                                            uint64_t end)
+    REQUIRES(mmap_pt_gate);
 
 /* Refill the current vCPU after an eligible mmap slow-path. request_len is
  * page-rounded; requests above MMAP_FAST_ARENA_MAX leave the arena untouched.
  * Caller holds mmap_lock.
  */
-void mmap_fastpath_refill_current_locked(guest_t *g, uint64_t request_len);
+void mmap_fastpath_refill_current_locked(guest_t *g, uint64_t request_len)
+    REQUIRES(mmap_pt_gate);
 
 /* Fulfil an eligible mmap that reached HVC (capacity/ring/generation fallback)
  * directly from the current vCPU's refilled arena. Metadata is committed by the
@@ -194,7 +196,8 @@ void mmap_fastpath_refill_current_locked(guest_t *g, uint64_t request_len);
  */
 bool mmap_fastpath_allocate_current_locked(guest_t *g,
                                            uint64_t request_len,
-                                           uint64_t *addr_out);
+                                           uint64_t *addr_out)
+    REQUIRES(mmap_pt_gate);
 bool mmap_fastpath_allocate_current_publication_only(guest_t *g,
                                                      uint64_t request_len,
                                                      uint64_t *addr_out);
@@ -204,18 +207,19 @@ bool mmap_fastpath_allocate_current_publication_only(guest_t *g,
  */
 void mmap_fastpath_release_current_hint_locked(guest_t *g,
                                                uint64_t addr,
-                                               uint64_t length);
+                                               uint64_t length)
+    REQUIRES(mmap_pt_gate);
 
 /* Revoke all arenas while sibling vCPUs are quiesced. Caller holds mmap_lock.
  */
-void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water);
+void mmap_fastpath_revoke_all_locked(guest_t *g, bool shrink_high_water)
+    REQUIRES(mmap_pt_gate);
 
 /* Revoke the arenas whose [arena_base, arena_limit) intersects [start, end),
  * after retiring what EL1 already published. Caller holds mmap_lock.
  */
-void mmap_fastpath_revoke_range_locked(guest_t *g,
-                                       uint64_t start,
-                                       uint64_t end);
+void mmap_fastpath_revoke_range_locked(guest_t *g, uint64_t start, uint64_t end)
+    REQUIRES(mmap_pt_gate);
 
 /* Disable the feature before first guest entry (debugger/observability). */
 void mmap_fastpath_disable(guest_t *g);

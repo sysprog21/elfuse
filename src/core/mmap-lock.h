@@ -22,14 +22,15 @@
  * lower-ranked locks, then use nofault access while holding them; pre-faulting
  * does not pin the mapping against concurrent changes.
  */
-void mmap_lock_acquire(guest_t *g);
-void mmap_lock_release(void);
-void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond);
+void mmap_lock_acquire(guest_t *g) ACQUIRE(mmap_pt_gate);
+void mmap_lock_release(void) RELEASE(mmap_pt_gate);
+void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond)
+    REQUIRES(mmap_pt_gate);
 
 /* mmap_lock_acquire() for fork, which revokes every arena under the lock: it
  * drains without topping up the caller's arena.
  */
-void mmap_lock_acquire_for_fork(guest_t *g);
+void mmap_lock_acquire_for_fork(guest_t *g) ACQUIRE(mmap_pt_gate);
 
 /* Ownership-tracked mutex access without changing the EL1 gate or rings. */
 void mmap_lock_acquire_raw(void);
@@ -41,5 +42,5 @@ bool mmap_lock_held(void);
 /* Temporarily drop mmap_lock while retaining the host PT-gate reference, then
  * reacquire without taking a second reference. Used only by lazy zeroing.
  */
-void mmap_lock_drop_keep_gate(void);
-void mmap_lock_reacquire_with_gate(guest_t *g);
+void mmap_lock_drop_keep_gate(void) RELEASE(mmap_pt_gate);
+void mmap_lock_reacquire_with_gate(guest_t *g) ACQUIRE(mmap_pt_gate);

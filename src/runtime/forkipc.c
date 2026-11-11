@@ -2032,11 +2032,17 @@ static int clone_check_flags(uint64_t flags,
  * One transaction. The failure paths unwind state established earlier in the
  * same function (quiesced siblings, promoted overlays, the snapshot fd), so the
  * goto ladder has to see all of it.
+ *
+ * Exempt from the thread safety analysis, which cannot follow a lock whose
+ * release the mmap_locked flag decides at the shared failure exit. The PT gate
+ * is held from mmap_lock_acquire_for_fork to the release that clears the flag,
+ * and the page-table work inside that window is in functions that still carry
+ * REQUIRES(mmap_pt_gate).
  */
 int64_t sys_clone(hv_vcpu_t vcpu,
                   guest_t *g,
                   const clone_req_t *req,
-                  bool verbose)
+                  bool verbose) NO_THREAD_SAFETY_ANALYSIS
 {
     const uint64_t flags = req->flags;
     const uint64_t child_stack = req->child_stack;

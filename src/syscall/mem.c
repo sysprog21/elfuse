@@ -67,6 +67,8 @@ void mmap_lock_release_raw(void)
     pthread_mutex_unlock(&mmap_lock);
 }
 
+elfuse_role_t mmap_pt_gate;
+
 static pthread_once_t mmap_fastpath_env_once = PTHREAD_ONCE_INIT;
 static bool mmap_fastpath_env_enabled;
 static _Atomic bool mmap_fastpath_forced_off;
@@ -320,6 +322,7 @@ static void munmap_retire_commit_locked(guest_t *g,
                                         const munmap_retire_entry_t *e,
                                         uint64_t backing_start,
                                         uint64_t backing_end)
+    REQUIRES(mmap_pt_gate)
 {
     uint64_t start = e->addr;
     uint64_t end = start + e->length;
@@ -598,7 +601,7 @@ static void mmap_fastpath_topup_locked(guest_t *g)
     mmap_fastpath_refill_thread_locked(g, current_thread, 0, true);
 }
 
-static void mmap_lock_acquire_common(guest_t *g)
+static void mmap_lock_acquire_common(guest_t *g) NO_THREAD_SAFETY_ANALYSIS
 {
     mmap_lock_acquire_raw();
     mmap_fastpath_host_gate_close(g);
@@ -606,13 +609,13 @@ static void mmap_lock_acquire_common(guest_t *g)
     mmap_fastpath_drain_locked(g);
 }
 
-void mmap_lock_acquire(guest_t *g)
+void mmap_lock_acquire(guest_t *g) NO_THREAD_SAFETY_ANALYSIS
 {
     mmap_lock_acquire_common(g);
     mmap_fastpath_topup_locked(g);
 }
 
-void mmap_lock_acquire_for_fork(guest_t *g)
+void mmap_lock_acquire_for_fork(guest_t *g) NO_THREAD_SAFETY_ANALYSIS
 {
     /* Fork is about to revoke every arena. Keep the drain-before-region-read
      * invariant without allocating a replacement arena that cannot survive this
@@ -621,7 +624,7 @@ void mmap_lock_acquire_for_fork(guest_t *g)
     mmap_lock_acquire_common(g);
 }
 
-void mmap_lock_release(void)
+void mmap_lock_release(void) NO_THREAD_SAFETY_ANALYSIS
 {
     mmap_fastpath_host_gate_open(mmap_lock_guest);
     mmap_lock_guest = NULL;
@@ -645,7 +648,7 @@ void mmap_lock_cond_wait(guest_t *g, pthread_cond_t *cond)
     mmap_fastpath_drain_locked(g);
 }
 
-void mmap_lock_drop_keep_gate(void)
+void mmap_lock_drop_keep_gate(void) NO_THREAD_SAFETY_ANALYSIS
 {
     /* Dirty lazy-materialization drops mmap_lock around a potentially large
      * memset. Retain this thread's gate reference so EL1 cannot retire the
@@ -657,7 +660,7 @@ void mmap_lock_drop_keep_gate(void)
     mmap_lock_release_raw();
 }
 
-void mmap_lock_reacquire_with_gate(guest_t *g)
+void mmap_lock_reacquire_with_gate(guest_t *g) NO_THREAD_SAFETY_ANALYSIS
 {
     mmap_lock_acquire_raw();
     mmap_lock_guest = g;
@@ -781,6 +784,7 @@ static void mmap_fastpath_refill_thread_locked(guest_t *g,
                                                thread_entry_t *t,
                                                uint64_t request_len,
                                                bool speculative)
+    REQUIRES(mmap_pt_gate)
 {
     if (!t || t->sp_el1_slot < 0)
         return;
@@ -2302,7 +2306,7 @@ static bool high_va_map_blocks(guest_t *g,
                                uint64_t backing_gpa_start,
                                int map_perms,
                                uint64_t *installed_end,
-                               uint64_t *inflight_fresh)
+                               uint64_t *inflight_fresh) REQUIRES(mmap_pt_gate)
 {
     *installed_end = va_base;
 
@@ -2420,7 +2424,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
                                 uint64_t offset,
                                 bool replace_existing,
                                 bool is_noreplace,
-                                int materialized_fd)
+                                int materialized_fd) REQUIRES(mmap_pt_gate)
 {
     int64_t ret = mmap_high_va_preflight_locked(g, addr, length,
                                                 replace_existing, is_noreplace);
@@ -2757,7 +2761,7 @@ static void mmap_bump_next(guest_t *g, uint64_t off, uint64_t end)
 static int mremap_extend_range(guest_t *g,
                                uint64_t off,
                                uint64_t size,
-                               int prot)
+                               int prot) REQUIRES(mmap_pt_gate)
 {
     uint64_t *pt_end = mmap_pt_end_for_off(g, off);
 
@@ -3323,7 +3327,7 @@ static int restore_snapshot_page_tables(guest_t *g,
                                         uint64_t start,
                                         uint64_t end,
                                         const region_snapshot_t *snaps,
-                                        int n)
+                                        int n) REQUIRES(mmap_pt_gate)
 {
     if (guest_invalidate_ptes(g, start, end) < 0)
         return -LINUX_ENOMEM;
@@ -3460,6 +3464,7 @@ static int rollback_fresh_mmap_allocation(guest_t *g,
                                           uint64_t length,
                                           const mmap_overlay_t *overlay,
                                           const mmap_alloc_state_t *saved)
+    REQUIRES(mmap_pt_gate)
 {
     if (overlay && overlay->installed)
         hvf_remove_file_overlay(g, overlay->ipa, overlay->len);
@@ -4382,7 +4387,7 @@ static int64_t mmap_abort_alloc(guest_t *g,
                                 uint64_t length,
                                 const mmap_alloc_state_t *saved,
                                 mmap_fresh_t *fresh,
-                                int64_t err)
+                                int64_t err) REQUIRES(mmap_pt_gate)
 {
     int rollback_err =
         rollback_fresh_mmap_allocation(g, start, length, NULL, saved);
@@ -4523,7 +4528,7 @@ static int64_t mmap_fixed_undo(guest_t *g,
                                mmap_fresh_t *fresh,
                                uint64_t start,
                                uint64_t length,
-                               int64_t err)
+                               int64_t err) REQUIRES(mmap_pt_gate)
 {
     int restore_err = restore_region_snapshots(g, fresh->replaced_snaps,
                                                fresh->replaced_nsnaps);
@@ -4625,7 +4630,7 @@ static int64_t mmap_fixed_commit(guest_t *g,
                                  int64_t offset,
                                  uint64_t result_off,
                                  uint64_t length,
-                                 int host_backing_fd)
+                                 int host_backing_fd) REQUIRES(mmap_pt_gate)
 {
     if (prot != LINUX_PROT_NONE) {
         /* Ensure page table entries exist for the fixed range. PROT_NONE
@@ -4734,7 +4739,7 @@ static int64_t mmap_fixed_commit(guest_t *g,
 static int mmap_extend_fresh(guest_t *g,
                              uint64_t result_off,
                              uint64_t length,
-                             int prot)
+                             int prot) REQUIRES(mmap_pt_gate)
 {
     /* Extend page tables for this specific allocation range only.
      * guest_extend_page_tables skips already-mapped blocks, so calling it on
@@ -5236,7 +5241,7 @@ static int64_t mremap_shrink_tail(guest_t *g,
                                   uint64_t tail_off,
                                   uint64_t tail_end,
                                   uint64_t src_gpa_base,
-                                  uint64_t src_start)
+                                  uint64_t src_start) REQUIRES(mmap_pt_gate)
 {
     int tail_remove_fd = -1;
     if (guest_region_remove_prepare(g, tail_off, tail_end, &tail_remove_fd) < 0)
@@ -5287,7 +5292,7 @@ static int64_t mremap_extend_in_place(guest_t *g,
                                       uint64_t new_size,
                                       uint64_t source_inherited_size,
                                       uint64_t source_vma_id,
-                                      bool source_lazy)
+                                      bool source_lazy) REQUIRES(mmap_pt_gate)
 {
     uint64_t grow_off = old_off + old_size, grow_len = new_size - old_size;
     remove_range_t removed = {old_off, old_off + old_size};
@@ -5461,6 +5466,7 @@ static int64_t mremap_grow_move_prepare(guest_t *g,
                                         mremap_track_t *track,
                                         uint64_t *new_off_out,
                                         int *remove_fd_out)
+    REQUIRES(mmap_pt_gate)
 {
     if (!mremap_track_init(track, source->first, old_off,
                            source->inherited_prefix, new_size,
@@ -5557,7 +5563,7 @@ static int64_t mremap_fixed_copy_failed(guest_t *g,
                                         mremap_move_t *move,
                                         uint64_t new_off,
                                         uint64_t new_size,
-                                        int copy_err)
+                                        int copy_err) REQUIRES(mmap_pt_gate)
 {
     int restore_err = restore_snapshot_overlays_in_place(g, move->source_snaps,
                                                          move->source_nsnaps);
@@ -6149,6 +6155,7 @@ static void zero_range_push(zero_range_t *ranges,
 }
 
 static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
+    REQUIRES(mmap_pt_gate)
 {
     /* Reject munmap targeting VM infrastructure regions. */
     if (guest_range_hits_infra(g, unmap_off, end))

@@ -128,24 +128,78 @@ typedef struct {
 #define LINUX_MSG_EXCEPT 020000
 #define LINUX_MSG_COPY 040000
 
-/* shmat tracking table. */
+/* shmat tracking table. mmap_lock protects it: shmat and shmdt run under it,
+ * and shmctl does not touch the table.
+ */
 
 #define MAX_SHM_ATTACH 64
 
 typedef struct {
     bool active;
     int shmid;
-    void *host_addr;    /* shmat() return on host */
-    uint64_t guest_gva; /* guest virtual address */
-    uint64_t size;      /* segment size */
-    bool rdonly;        /* attached read-only */
+    void *host_addr; /* shmat() return on host */
+    uint64_t size;   /* segment size */
+    uint64_t attach; /* serial the guest mapping's regions carry */
+    bool rdonly;     /* attached read-only */
 } shm_attach_t;
 
 static shm_attach_t shm_table[MAX_SHM_ATTACH];
-static pthread_mutex_t shm_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define SHM_FOR_EACH(e) \
     for (shm_attach_t *e = shm_table; e < shm_table + MAX_SHM_ATTACH; e++)
+
+/* Retire every record whose attach no region carries any more, wherever the
+ * guest moved it, and release its host attach. Linux detaches an attach when
+ * its last VMA is unmapped, by munmap or by a mapping placed over it, so such a
+ * record names nothing, and keeping it would hold one of the host's few
+ * attaches (kern.sysv.shmseg, 8 by default on macOS) and a table slot. The
+ * caller holds mmap_lock.
+ */
+static void shm_retire_unmapped(guest_t *g)
+{
+    shm_attach_t *rec[MAX_SHM_ATTACH];
+    uint64_t attach[MAX_SHM_ATTACH];
+    bool mapped[MAX_SHM_ATTACH];
+    void *host[MAX_SHM_ATTACH];
+    int n = 0, nhost = 0;
+    SHM_FOR_EACH (e) {
+        if (e->active) {
+            rec[n] = e;
+            attach[n++] = e->attach;
+        }
+    }
+    mem_attach_mapped(g, attach, mapped, n);
+    for (int k = 0; k < n; k++) {
+        if (!mapped[k]) {
+            rec[k]->active = false;
+            host[nhost++] = rec[k]->host_addr;
+        }
+    }
+    for (int i = 0; i < nhost; i++)
+        shmdt(host[i]);
+}
+
+/* The next part of the attach at @base that shmdt detaches, from @cur on, with
+ * @cur equal to @base for the first call. Linux searches every VMA above @base
+ * for the first one of the segment, even when the pages before it are gone, and
+ * unmaps it whole, even when mremap grew it past the segment. It then unmaps
+ * only the later VMAs that end within the segment size from @base, and stops at
+ * the first one that reaches past it. Caller must hold mmap_lock.
+ */
+static bool shm_next_part(guest_t *g,
+                          uint64_t base,
+                          uint64_t cur,
+                          uint64_t end,
+                          uint64_t attach,
+                          uint64_t *lo,
+                          uint64_t *hi,
+                          void **host)
+{
+    if (cur == base)
+        return mem_attach_next(g, base, cur, UINT64_MAX, attach, lo, hi, host);
+    return mem_attach_next(g, base, cur, end, attach, lo, hi, host) &&
+           *hi <= end;
+}
 
 /* Helper: macOS ipc_perm -> Linux ipc64_perm. */
 
@@ -235,6 +289,21 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
 
     bool rdonly = (shmflg & LINUX_SHM_RDONLY) != 0;
 
+    shm_retire_unmapped(g);
+
+    /* Take a free record before attaching anything. mmap_lock keeps it free
+     * until it is filled in below.
+     */
+    shm_attach_t *entry = NULL;
+    SHM_FOR_EACH (e) {
+        if (!e->active) {
+            entry = e;
+            break;
+        }
+    }
+    if (!entry)
+        return -LINUX_ENOMEM;
+
     /* Attach on host side */
     void *host_addr = shmat(shmid, NULL, rdonly ? SHM_RDONLY : 0);
     if (host_addr == (void *) -1)
@@ -249,8 +318,9 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
     /* Always allocate RW initially so the code can copy shm content in. For
      * SHM_RDONLY, downgrade to read-only via mprotect after the copy.
      */
-    int64_t gva =
-        sys_mmap_anon(g, 0, seg_size, LINUX_PROT_READ | LINUX_PROT_WRITE);
+    uint64_t attach;
+    int64_t gva = sys_mmap_shm(g, seg_size, LINUX_PROT_READ | LINUX_PROT_WRITE,
+                               (int32_t) info.shm_perm._key, &attach);
     if (gva < 0) {
         shmdt(host_addr);
         return gva; /* propagate mmap error */
@@ -258,6 +328,7 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
 
     /* Copy host shm content into guest memory */
     if (guest_write(g, (uint64_t) gva, host_addr, seg_size) < 0) {
+        sys_munmap(g, (uint64_t) gva, PAGE_ALIGN_UP(seg_size));
         shmdt(host_addr);
         return -LINUX_EFAULT;
     }
@@ -270,64 +341,78 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
                      LINUX_PROT_READ);
 
     /* Track the attachment */
-    pthread_mutex_lock(&shm_lock);
-    shm_attach_t *entry = NULL;
-    SHM_FOR_EACH (e) {
-        if (!e->active) {
-            entry = e;
-            break;
-        }
-    }
-    if (!entry) {
-        pthread_mutex_unlock(&shm_lock);
-        shmdt(host_addr);
-        return -LINUX_ENOMEM;
-    }
     entry->active = true;
     entry->shmid = shmid;
     entry->host_addr = host_addr;
-    entry->guest_gva = (uint64_t) gva;
     entry->size = seg_size;
+    entry->attach = attach;
     entry->rdonly = rdonly;
-    pthread_mutex_unlock(&shm_lock);
 
     return gva;
 }
 
 int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
 {
-    pthread_mutex_lock(&shm_lock);
+    /* Linux finds the attach to detach from the mappings, not from where it was
+     * made: the first VMA of a segment at or above the address whose page
+     * offset matches its distance from the address, so an attach the guest
+     * moved with mremap is detached at its new address and not at its old one.
+     * The record taken is likewise the one with such a part anywhere above the
+     * address, the lowest part winning. Records whose attach is mapped nowhere
+     * are retired first. When no record has such a part, Linux finds no attach
+     * and fails with EINVAL, and what is mapped there now is neither copied nor
+     * unmapped. Only the parts found are detached: Linux keeps the segment
+     * attached while another part is mapped elsewhere, so the record stays live
+     * until no region carries its serial. The caller holds mmap_lock, which
+     * keeps the record from being taken meanwhile.
+     */
+    shm_retire_unmapped(g);
+
+    uint64_t lo, hi, best = UINT64_MAX;
     shm_attach_t *match = NULL;
     SHM_FOR_EACH (e) {
-        if (e->active && e->guest_gva == shmaddr_gva) {
+        if (e->active &&
+            mem_attach_next(g, shmaddr_gva, shmaddr_gva, UINT64_MAX, e->attach,
+                            &lo, &hi, NULL) &&
+            lo < best) {
             match = e;
-            break;
+            best = lo;
         }
     }
-    if (!match) {
-        pthread_mutex_unlock(&shm_lock);
+    if (!match)
         return -LINUX_EINVAL;
-    }
 
-    shm_attach_t entry = *match;
-    match->active = false;
-    pthread_mutex_unlock(&shm_lock);
-
-    /* Write back guest modifications to host shm (unless read-only) */
-    if (!entry.rdonly) {
-        /* Read guest memory back to host shm buffer */
-        guest_read(g, entry.guest_gva, entry.host_addr, entry.size);
-    }
-
-    /* Detach host shm */
-    shmdt(entry.host_addr);
-
-    /* Guest memory remains allocated (no munmap). Linux shmdt does not
-     * guarantee immediate unmap either; the pages become undefined. A real
-     * implementation would munmap the guest region here.
+    /* Write back each part found to host shm (unless read-only), then release
+     * it as Linux does at detach, so it stops counting toward RLIMIT_AS. The
+     * copy reads the memory behind the part directly, so a part the guest made
+     * PROT_NONE is written back too. Each step looks the next part up from the
+     * end of this one, so unmapping a part does not change which comes next. A
+     * part that fails to unmap does not stop the others, and the first error is
+     * returned.
      */
+    uint64_t gva = shmaddr_gva;
+    uint64_t end = gva + PAGE_ALIGN_UP(match->size);
+    void *src;
+    int64_t err = 0;
+    for (uint64_t cur = gva;
+         shm_next_part(g, gva, cur, end, match->attach, &lo, &hi, &src);
+         cur = hi) {
+        uint64_t copy_end = hi < gva + match->size ? hi : gva + match->size;
+        if (!match->rdonly && src && lo < copy_end)
+            memcpy((char *) match->host_addr + (lo - gva), src, copy_end - lo);
+        int64_t rc = sys_munmap(g, lo, hi - lo);
+        if (rc < 0 && err == 0)
+            err = rc;
+    }
 
-    return 0;
+    bool mapped;
+    mem_attach_mapped(g, &match->attach, &mapped, 1);
+    if (!mapped) {
+        match->active = false;
+        shmdt(match->host_addr);
+    }
+
+    return err;
 }
 
 int64_t sys_shmctl(guest_t *g, int shmid, int cmd, uint64_t buf_gva)

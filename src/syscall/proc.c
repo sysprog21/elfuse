@@ -46,6 +46,7 @@
 #include "syscall/exec.h"
 #include "syscall/io.h" /* io_retry_backoff */
 #include "syscall/linux-wire.h"
+#include "syscall/mem.h"
 #include "syscall/internal.h"
 #include "syscall/net.h"
 #include "syscall/proc-identity.h"
@@ -4223,6 +4224,106 @@ static bool syscall_return_epilogue(guest_t *g,
     return running;
 }
 
+/* Counts this thread's vCPU exits, so a retry can tell whether the exit before
+ * it was the previous retry.
+ */
+static _Thread_local uint64_t vcpu_exit_seq;
+
+/* A guest access to a MAP_SHARED file page whose file was truncated past it.
+ * The host overlay page is gone, so HVF exits with a stage-2 abort (EC 0x24
+ * data, EC 0x20 instruction) instead of entering the shim's vectors. Linux
+ * answers SIGBUS (BUS_ADRERR) for a user access and EFAULT for a kernel one
+ * made on the user's behalf.
+ *
+ * Returns false for any other abort, which stays a crash report.
+ */
+static bool vcpu_handle_vanished_page_abort(guest_t *g,
+                                            hv_vcpu_t vcpu,
+                                            const hv_vcpu_exit_t *vexit,
+                                            const char *prefix,
+                                            int *exit_code,
+                                            bool *running)
+{
+    uint64_t syndrome = vexit->exception.syndrome;
+    uint64_t va = vexit->exception.virtual_address;
+    uint64_t ipa = vexit->exception.physical_address;
+    overlay_page_state_t state = mmap_overlay_page_state(g, ipa);
+    if (state == OVERLAY_PAGE_NONE)
+        return false;
+
+    uint64_t pc = vcpu_get_reg(vcpu, HV_REG_PC);
+    uint64_t cpsr = vcpu_get_reg(vcpu, HV_REG_CPSR);
+
+    if (state == OVERLAY_PAGE_PRESENT) {
+        /* The file grew back, or a sibling replaced the mapping, between the
+         * abort and the probe. Resume at the same PC so the access is retried
+         * against the current mapping, as on Linux. A page that keeps faulting
+         * while it reads fine is some other stage-2 fault, so after a few
+         * back-to-back retries it goes to the crash report. Any other exit in
+         * between starts the count over.
+         */
+        enum { REGROW_RETRY_MAX = 16 };
+        static _Thread_local uint64_t retry_page, retry_pc, retry_seq;
+        static _Thread_local int retry_count;
+        uint64_t page = ipa & ~(GUEST_PAGE_SIZE - 1);
+        if (retry_seq + 1 != vcpu_exit_seq || page != retry_page ||
+            pc != retry_pc) {
+            retry_page = page;
+            retry_pc = pc;
+            retry_count = 0;
+        }
+        retry_seq = vcpu_exit_seq;
+        if (++retry_count > REGROW_RETRY_MAX) {
+            log_warn(
+                "%s: stage-2 abort at IPA 0x%llx PC=0x%llx persists "
+                "while the host page reads fine",
+                prefix, (unsigned long long) ipa, (unsigned long long) pc);
+            retry_count = 0;
+            return false;
+        }
+        *running = true;
+        return true;
+    }
+
+    if ((cpsr & 0xF) == 0) {
+        /* No shim frame: signal delivery redirects from HV_REG_PC, as for a
+         * preempted EL0.
+         */
+        signal_set_fault_info(LINUX_BUS_ADRERR, va, syndrome);
+        int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGBUS, exit_code);
+        log_at(sig_ret < 0 ? LOG_WARN : LOG_DEBUG,
+               "%s: EL0 access at 0x%llx PC=0x%llx to a truncated MAP_SHARED "
+               "page -> SIGBUS/BUS_ADRERR",
+               prefix, (unsigned long long) va, (unsigned long long) pc);
+        *running = sig_ret >= 0;
+        return true;
+    }
+
+    /* The shim never executes from a file mapping. */
+    if (((syndrome >> 26) & 0x3F) == 0x20)
+        return false;
+
+    /* The shim's own access (futex LDTR, inline urandom store). Inject the EL1
+     * data abort a stage-1 fault would have raised, so
+     * handle_el1_data_abort_recover answers EFAULT for the ranges it knows and
+     * any other shim PC still halts through restore_and_bad.
+     */
+    uint64_t esr = (0x25ULL << 26) | (syndrome & 0x3FFFFFFULL);
+    vcpu_set_sysreg(vcpu, HV_SYS_REG_ESR_EL1, esr);
+    vcpu_set_sysreg(vcpu, HV_SYS_REG_FAR_EL1, va);
+    vcpu_set_sysreg(vcpu, HV_SYS_REG_ELR_EL1, pc);
+    vcpu_set_sysreg(vcpu, HV_SYS_REG_SPSR_EL1, cpsr);
+    hv_vcpu_set_reg(vcpu, HV_REG_PC,
+                    vcpu_get_sysreg(vcpu, HV_SYS_REG_VBAR_EL1) + 0x200);
+    hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3C5); /* EL1h, DAIF masked */
+    log_debug(
+        "%s: EL1 access at 0x%llx PC=0x%llx to a truncated MAP_SHARED "
+        "page -> injected EL1 data abort",
+        prefix, (unsigned long long) va, (unsigned long long) pc);
+    *running = true;
+    return true;
+}
+
 static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
                                                 hv_vcpu_t vcpu,
                                                 const hv_vcpu_exit_t *vexit,
@@ -4267,11 +4368,8 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
              * wasted round trip per delivered signal: the recompute still sees
              * the signal queued, so the flag stays up until the next syscall's
              * epilogue clears it. Moving it after the delivery recovers that
-             * (ATTN_BAIL fell 9.6 percent on a signal-storm workload) and
-             * crashes tests/test-mmap-sigbus-efault, because the fast paths it
-             * re-engages have no answer for a stage-2 fault on a truncated
-             * MAP_SHARED overlay: EC=0x24 reaches EL2 and no arm handles it.
-             * The clear stays here until that gap is closed.
+             * (ATTN_BAIL fell 9.6 percent on a signal-storm workload) but is a
+             * separate change, measured on its own.
              */
             shim_globals_recompute_attention(g);
 
@@ -4491,6 +4589,12 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
         /* WFI/WFE has no host-side work in this userspace VM. */
         if (verbose)
             log_debug("%s: WFI/WFE trapped", prefix);
+    } else if ((ec == 0x24 || ec == 0x20) &&
+               vcpu_handle_vanished_page_abort(g, vcpu, vexit, prefix,
+                                               exit_code, &running)) {
+        /* Handled: SIGBUS for EL0, an injected abort for the shim, or a retry
+         * when the page is back.
+         */
     } else {
         /* Non-HVC exception at EL2 level */
         log_error(
@@ -4796,6 +4900,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         signal_forget_sigreturn_x8();
 
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
+        vcpu_exit_seq++;
 
         if (is_main)
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 2,

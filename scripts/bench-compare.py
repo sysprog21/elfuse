@@ -7,13 +7,26 @@ matching environment column, and exits non-zero when any metric
 regresses beyond the threshold (default +20%). The checked-in
 qemu-aarch64 column is the same-silicon Linux reference for context.
 
+With --paired it instead compares two builds measured in alternating
+rounds: --base and --head each take one results file per round, and the
+Nth base file pairs with the Nth head file. For each metric it prints
+the median of the head/base ratios of the pairs and a distribution-free
+95% interval of that median, and calls the metric slower or faster only
+when the interval excludes 1 and the median is past the threshold. Paired mode
+has no default threshold: without --threshold or BENCH_REGRESSION_THRESHOLD
+it shows ratios and intervals with no verdict. It is advisory and exits 0
+on valid input; it exits 2 when an input is unusable or the --report-json
+report would exceed 64 KiB, in which case it is not written.
+
 Usage:
     scripts/bench-compare.py [--results PATH] [--baseline PATH]
                              [--threshold FRACTION] [--report-only]
                              [--fail-on-missing] [--report-json PATH]
+    scripts/bench-compare.py --paired --base PATH... --head PATH...
+                             [--threshold FRACTION] [--report-json PATH]
 
 Environment:
-    BENCH_REGRESSION_THRESHOLD  overrides --threshold (e.g. 0.20)
+    BENCH_REGRESSION_THRESHOLD  threshold when --threshold is not given
     BENCH_REPORT_ONLY=1         report regressions but exit 0
 """
 
@@ -24,7 +37,9 @@ import json
 import math
 import os
 import pathlib
+import statistics
 import sys
+import unicodedata
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_RESULTS = ROOT / "build" / "bench-results.json"
@@ -33,6 +48,30 @@ DEFAULT_BASELINE = ROOT / "tests" / "bench-baseline.json"
 SECTIONS = ("lmbench", "applications", "oci")
 # scripts/bench-report.py reads this too, from the default branch.
 DEFAULT_THRESHOLD = 0.20
+
+# Paired mode. scripts/bench-report.py recomputes the verdicts with these
+# from the default branch, so they are constants rather than options.
+#
+# make_ms samples jump between two levels inside one run (1.51 s to 2.36 s
+# in one CI run), so its ratio is shown without a verdict.
+NO_VERDICT = frozenset({"applications.make_ms"})
+# No interval of a median reaches 95% coverage from fewer pairs: the widest,
+# from the smallest to the largest of 5 ratios, covers 93.75%.
+MIN_PAIRS = 6
+# The most rounds per side, the largest report, the most metrics and the
+# longest metric name that bench-report.py accepts.
+MAX_ROUNDS = 32
+MAX_REPORT_BYTES = 64 * 1024
+MAX_METRICS = 256
+MAX_METRIC_NAME = 160
+
+VERDICTS = ("slower", "lost on head", "faster", "too few pairs",
+            "no threshold", "no verdict", "no result",
+            "no significant change")
+# The verdicts that make bench-report.py post a new comment.
+LISTED = frozenset({"slower", "lost on head", "faster"})
+# A round value for a tier the round's meta records as skipped.
+SKIPPED = "skipped"
 
 
 class BenchDataError(ValueError):
@@ -74,7 +113,7 @@ def flatten(tree: dict, *, source: str,
                         f"{source}: metric '{prefix}' has a boolean median")
                 try:
                     number = float(value)
-                except (TypeError, ValueError) as exc:
+                except (TypeError, ValueError, OverflowError) as exc:
                     raise BenchDataError(
                         f"{source}: metric '{prefix}' has a non-numeric "
                         "median") from exc
@@ -94,7 +133,11 @@ def flatten(tree: dict, *, source: str,
             for key, value in node.items():
                 walk(f"{prefix}.{key}" if prefix else key, value)
         elif isinstance(node, (int, float)) and not isinstance(node, bool):
-            number = float(node)
+            try:
+                number = float(node)
+            except OverflowError as exc:
+                raise BenchDataError(
+                    f"{source}: metric '{prefix}' is non-finite") from exc
             if not math.isfinite(number):
                 raise BenchDataError(
                     f"{source}: metric '{prefix}' is non-finite")
@@ -131,6 +174,9 @@ def load_json(path: pathlib.Path) -> dict:
     except FileNotFoundError:
         print(f"bench-compare: missing {path}", file=sys.stderr)
         raise SystemExit(2)
+    except OSError as exc:
+        print(f"bench-compare: cannot read {path}: {exc}", file=sys.stderr)
+        raise SystemExit(2)
     except (ValueError, RecursionError) as exc:
         print(f"bench-compare: invalid JSON in {path}: {exc}",
               file=sys.stderr)
@@ -142,11 +188,230 @@ def load_json(path: pathlib.Path) -> dict:
     return document
 
 
-def print_table(rows: list[tuple[str, str, str, str, str]]) -> None:
-    widths = [max(len(row[col]) for row in rows) for col in range(5)]
+def print_table(rows: list[tuple[str, ...]]) -> None:
+    """Print rows with the first column left-aligned, the last unpadded and
+    the others right-aligned."""
+    count = len(rows[0])
+    widths = [max(len(row[col]) for row in rows) for col in range(count)]
     for row in rows:
-        print("  {0:<{w0}}  {1:>{w1}}  {2:>{w2}}  {3:>{w3}}  {4}".format(
-            *row, w0=widths[0], w1=widths[1], w2=widths[2], w3=widths[3]))
+        cells = [row[0].ljust(widths[0])]
+        cells.extend(row[col].rjust(widths[col])
+                     for col in range(1, count - 1))
+        cells.append(row[-1])
+        print("  " + "  ".join(cells))
+
+
+def metric_name_error(name: object) -> str | None:
+    """Return why bench-report.py rejects a metric name, or None."""
+    if not isinstance(name, str) or not name or len(name) > MAX_METRIC_NAME:
+        return "metric name must be a non-empty short string"
+    # Cf covers the bidi overrides and zero-width characters that could make
+    # the rendered comment show a name other than the real one.
+    # Cs is a lone surrogate, which JSON can carry but UTF-8 cannot encode,
+    # so the comment could not be written.
+    if any(unicodedata.category(char) in ("Cc", "Cf", "Cs") for char in name):
+        return f"metric name contains control characters: {name!r}"
+    return None
+
+
+def env_threshold(*, blank_is_unset: bool) -> float | None:
+    """Return BENCH_REGRESSION_THRESHOLD as a fraction, or None when unset.
+
+    A workflow line such as BENCH_REGRESSION_THRESHOLD: ${{ vars.X }}
+    expands to an empty string while vars.X is unset, so paired mode, which
+    ships with no threshold, counts a blank value as unset. The static mode
+    keeps rejecting it, as before. Raises argparse.ArgumentTypeError when
+    the value is set but not a fraction.
+    """
+    value = os.environ.get("BENCH_REGRESSION_THRESHOLD")
+    if value is None or (blank_is_unset and not value.strip()):
+        return None
+    return non_negative_finite_fraction(value)
+
+
+def threshold_text(threshold: float) -> str:
+    """Format a threshold as a percentage without rounding it away: an A/A
+    threshold is likely sub-percent, and 0.004 would print as 0%."""
+    return f"{threshold * 100:g}%"
+
+
+def median_interval(ratios: list[float]) -> tuple[float, float] | None:
+    """Return the k-th smallest and k-th largest ratio, with k the largest
+    order that keeps the binomial coverage of the median at 95% or more,
+    or None when no order does (below MIN_PAIRS)."""
+    n, ordered = len(ratios), sorted(ratios)
+    tail, k = 0.0, 0
+    for i in range(n // 2):
+        tail += math.comb(n, i) / 2 ** n
+        if 2 * tail > 0.05:
+            break
+        k = i + 1
+    return (ordered[k - 1], ordered[n - k]) if k else None
+
+
+def paired_verdict(name: str, base: list[float | str | None],
+                   head: list[float | str | None], *,
+                   threshold: float | None) -> dict:
+    """Judge one metric from its per-round values, None where the round
+    produced none and SKIPPED where it skipped the metric's tier. A round
+    the head skipped and the base did not is a lost head value whatever
+    the base holds, and so is a round the head ran without a value while
+    the base skipped; a pair both rounds skipped drops out.
+
+    A pair counts only when both sides have a value above zero; a zero
+    value counts as a missing one (flatten rejects a negative median, so
+    such a round exits 2). The result holds the pair count, the rounds that
+    lost only the base or only the head value, the medians of the usable
+    base and head values, the median ratio with its 95% interval (None
+    below MIN_PAIRS), and the verdict, one of VERDICTS. A head value lost
+    in any round gives "lost on head", because the head build failed where
+    the base did not, and the statistics of the remaining pairs stay in the
+    result. With no threshold, a metric that would get a verdict gets "no
+    threshold".
+    """
+    base_skipped = [b == SKIPPED for b in base]
+    head_skipped = [h == SKIPPED for h in head]
+    base = [b if isinstance(b, (float, int)) and b > 0 else None for b in base]
+    head = [h if isinstance(h, (float, int)) and h > 0 else None for h in head]
+    pairs = [(b, h) for b, h in zip(base, head)
+             if b is not None and h is not None]
+    result = {"pairs": len(pairs),
+              "base_lost": sum(b is None and h is not None
+                               for b, h in zip(base, head)),
+              "head_lost": sum(
+                  (hs and not bs)
+                  or (not hs and h is None and (bs or b is not None))
+                  for b, h, bs, hs in zip(base, head, base_skipped,
+                                          head_skipped)),
+              "base": None, "head": None,
+              "ratio": None, "low": None, "high": None}
+    if pairs:
+        ratios = [h / b for b, h in pairs]
+        result["base"] = statistics.median(b for b, _ in pairs)
+        result["head"] = statistics.median(h for _, h in pairs)
+        result["ratio"] = statistics.median(ratios)
+        interval = median_interval(ratios)
+        if interval is not None:
+            result["low"], result["high"] = interval
+    if result["head_lost"]:
+        result["verdict"] = "lost on head"
+    elif not pairs:
+        result["verdict"] = "no result"
+    elif len(pairs) < MIN_PAIRS:
+        result["verdict"] = "too few pairs"
+    elif name in NO_VERDICT:
+        result["verdict"] = "no verdict"
+    elif threshold is None:
+        result["verdict"] = "no threshold"
+    elif result["low"] > 1.0 and result["ratio"] > 1.0 + threshold:
+        result["verdict"] = "slower"
+    elif result["high"] < 1.0 and result["ratio"] < 1.0 - threshold:
+        result["verdict"] = "faster"
+    else:
+        result["verdict"] = "no significant change"
+    return result
+
+
+def load_round(path: pathlib.Path
+               ) -> tuple[str, dict[str, float], list[str], set[str]]:
+    """Return the environment, the measured metrics, the failed metrics and
+    the skipped tiers of one round's results file."""
+    document = load_json(path)
+    meta = document.get("meta")
+    env = meta.get("env") if isinstance(meta, dict) else None
+    if not isinstance(env, str) or not env.strip():
+        raise BenchDataError(f"{path} has no non-empty meta.env")
+    failed: list[str] = []
+    values = flatten(document, source=str(path), errors=failed)
+    if not values and not failed:
+        raise BenchDataError(f"{path} holds no metric")
+    # tests/bench-suite.sh records a skipped tier only here; lmbench never
+    # skips, since a failure there stops the run.
+    skipped = {tier for tier in ("oci", "applications")
+               if meta.get(f"{tier}_skipped")}
+    return env.strip(), values, failed, skipped
+
+
+def run_paired(args: argparse.Namespace) -> int:
+    try:
+        bases = [load_round(path) for path in args.base]
+        heads = [load_round(path) for path in args.head]
+    except BenchDataError as exc:
+        print(f"bench-compare: invalid benchmark data: {exc}",
+              file=sys.stderr)
+        return 2
+    envs = {env for env, _, _, _ in bases + heads}
+    if len(envs) != 1:
+        print("bench-compare: rounds come from different environments: "
+              f"{', '.join(sorted(envs))}", file=sys.stderr)
+        return 2
+    env = envs.pop()
+
+    names = set()
+    for _, values, failed, _ in bases + heads:
+        names.update(values, failed)
+    # bench-report.py rejects a schema 3 report that breaks these.
+    if len(names) > MAX_METRICS:
+        print(f"bench-compare: {len(names)} metrics, over the "
+              f"{MAX_METRICS}-metric limit", file=sys.stderr)
+        return 2
+    for name in sorted(names):
+        error = metric_name_error(name)
+        if error is not None:
+            print(f"bench-compare: {error}", file=sys.stderr)
+            return 2
+    # A round's values in a tier it records as skipped are replaced by
+    # SKIPPED, so contradictory data cannot count as a loss on the other
+    # side, and paired_verdict counts a head-only skip as a lost head value:
+    # bench-suite.sh skips a tier when build/bench-timeit is missing or the
+    # OCI pull fails, and the head checkout can cause either.
+    metrics = {}
+    for name in sorted(names):
+        tier = name.split(".", 1)[0]
+        sides = {"base": [], "head": []}
+        for side, rounds in (("base", bases), ("head", heads)):
+            for _, values, _, skipped in rounds:
+                sides[side].append(SKIPPED if tier in skipped
+                                   else values.get(name))
+        metrics[name] = sides
+    if args.report_json is not None:
+        report = {
+            "schema_version": 3,
+            "environment": env,
+            "direction": "lower-is-better",
+            "rounds": len(bases),
+            "metrics": metrics,
+        }
+        try:
+            text = json.dumps(report, sort_keys=True, allow_nan=False) + "\n"
+            if len(text.encode("utf-8")) > MAX_REPORT_BYTES:
+                raise ValueError(f"over the {MAX_REPORT_BYTES}-byte limit")
+            args.report_json.parent.mkdir(parents=True, exist_ok=True)
+            args.report_json.write_text(text, encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            print(f"bench-compare: cannot write report {args.report_json}: "
+                  f"{exc}", file=sys.stderr)
+            return 2
+
+    shown = ("none" if args.threshold is None
+             else f"+-{threshold_text(args.threshold)}")
+    print(f"bench-compare: paired, environment '{env}', {len(bases)} "
+          f"pair(s), threshold {shown}")
+    rows = [("metric", "pairs", "lost base/head", "base median",
+             "head median", "ratio", "95% interval", "")]
+    for name, sides in metrics.items():
+        v = paired_verdict(name, sides["base"], sides["head"],
+                           threshold=args.threshold)
+        rows.append((
+            name, str(v["pairs"]), f"{v['base_lost']}/{v['head_lost']}",
+            "-" if v["base"] is None else f"{v['base']:g}",
+            "-" if v["head"] is None else f"{v['head']:g}",
+            "-" if v["ratio"] is None else f"{v['ratio']:.3f}x",
+            "-" if v["low"] is None
+            else f"{v['low']:.3f}x to {v['high']:.3f}x",
+            v["verdict"]))
+    print_table(rows)
+    return 0
 
 
 def write_report(path: pathlib.Path, *, environment: str,
@@ -178,27 +443,58 @@ def write_report(path: pathlib.Path, *, environment: str,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=pathlib.Path,
-                        default=DEFAULT_RESULTS)
+                        help=f"default {DEFAULT_RESULTS}")
     parser.add_argument("--baseline", type=pathlib.Path,
-                        default=DEFAULT_BASELINE)
+                        help=f"default {DEFAULT_BASELINE}")
     parser.add_argument(
         "--threshold", type=non_negative_finite_fraction,
-        default=os.environ.get("BENCH_REGRESSION_THRESHOLD",
-                               str(DEFAULT_THRESHOLD)),
-        help="regression threshold as a fraction (default 0.20 = +20%%)")
+        help="regression threshold as a fraction (default "
+             "BENCH_REGRESSION_THRESHOLD, else 0.20 = +20%%, or none with "
+             "--paired)")
     parser.add_argument("--report-only", action="store_true",
                         default=os.environ.get("BENCH_REPORT_ONLY") == "1",
                         help="print the report but always exit 0")
-    parser.add_argument("--fail-on-missing", action="store_true",
+    parser.add_argument("--fail-on-missing", action="store_true", default=None,
                         help="make missing baseline metrics fail even in "
                              "report-only mode")
     parser.add_argument(
         "--report-json", type=pathlib.Path,
         help="write a data-only comparison report for CI automation")
+    parser.add_argument("--paired", action="store_true",
+                        help="compare --base rounds with --head rounds")
+    parser.add_argument("--base", type=pathlib.Path, nargs="+",
+                        help="one results file per base round")
+    parser.add_argument("--head", type=pathlib.Path, nargs="+",
+                        help="one results file per head round")
     args = parser.parse_args()
+    if args.threshold is None:
+        try:
+            args.threshold = env_threshold(blank_is_unset=args.paired)
+        except argparse.ArgumentTypeError as exc:
+            parser.error(f"BENCH_REGRESSION_THRESHOLD {exc}")
 
-    results = load_json(args.results)
-    baseline = load_json(args.baseline)
+    if args.paired:
+        for flag, value in (("--results", args.results),
+                            ("--baseline", args.baseline),
+                            ("--fail-on-missing", args.fail_on_missing)):
+            if value is not None:
+                parser.error(f"--paired does not take {flag}")
+        if not args.base or not args.head:
+            parser.error("--paired requires --base and --head")
+        if len(args.base) != len(args.head):
+            parser.error(f"--base has {len(args.base)} file(s), --head "
+                         f"has {len(args.head)}")
+        if len(args.base) > MAX_ROUNDS:
+            parser.error(f"--paired takes at most {MAX_ROUNDS} rounds per "
+                         "side")
+        return run_paired(args)
+    if args.base or args.head:
+        parser.error("--base and --head require --paired")
+    if args.threshold is None:
+        args.threshold = DEFAULT_THRESHOLD
+
+    results = load_json(args.results or DEFAULT_RESULTS)
+    baseline = load_json(args.baseline or DEFAULT_BASELINE)
 
     meta = results.get("meta")
     if not isinstance(meta, dict):

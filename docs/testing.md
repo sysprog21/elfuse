@@ -357,6 +357,16 @@ without a non-zero exit. Any file matching the schema in
 `tests/bench-suite.sh`'s header works, including one captured with
 `BENCH_ENV=qemu-aarch64`/`orbstack`/`native`.
 
+**Compare two builds measured in alternating rounds:**
+
+```sh
+python3 scripts/bench-compare.py --paired --threshold 0.05 \
+    --base build/base-1.json build/base-2.json ... \
+    --head build/head-1.json build/head-2.json ...
+```
+
+Each file is one `tests/bench-suite.sh` run, and the Nth base file pairs with the Nth head file. Per metric it prints the number of rounds that lost only the base or only the head value (a zero value counts as missing; a negative value makes the round file invalid, which exits 2), the median of each side, the median of the head/base ratios and, from 6 usable pairs on, a distribution-free 95% interval of that median: the k-th smallest and k-th largest ratio, with k the largest order whose binomial coverage stays at 95% or more (the smallest and largest from 6 to 8 pairs). No such interval exists below 6 pairs. The 95% coverage assumes the pair ratios are independent draws with a common median; alternating rounds on one machine can share drift or machine state, and then the interval misses more often than 5%. Each interval is also a separate 95% statement, so across the dozens of metrics in a run a steady metric can still show `slower` or `faster` now and then, and only the threshold filters it out. Treat a lone verdict, especially at 6 to 8 pairs, as advisory. A metric that lost a head value in any round is `lost on head`, with the statistics of its remaining pairs. A round whose `meta.oci_skipped` or `meta.applications_skipped` says it skipped the metric's tier counts as having no value in that tier, even when it carries one. A pair whose two rounds both skipped the tier drops out; a head-only skip is `lost on head` whatever the base round holds, because a broken head checkout can cause the skip (a missing `build/bench-timeit` or a failed OCI pull), and so is a head round that ran the tier without a value next to a base round that skipped it. A round file with no metric exits 2. Otherwise a metric with no usable pair is `no result` and one with fewer than 6 is `too few pairs`. The rest are `slower` or `faster` only when the interval excludes 1 and the median is past the threshold, except `applications.make_ms`, which gets `no verdict` because its samples jump between two levels inside one run. The threshold is symmetric in percentage change, not in speed: at 0.20, `slower` needs a median ratio above 1.20 and `faster` one below 0.80, which is a 1.25x speedup; the static mode uses the same rule. Paired mode has no default threshold: with neither `--threshold` nor `BENCH_REGRESSION_THRESHOLD` (a blank value counts as unset), every such metric shows `no threshold` with its ratio and interval. Paired mode exits 0 on valid input. It exits 2 on more than 32 rounds per side, on rounds whose `meta.env` differ, on more than 256 metrics or a metric name the reporter rejects, and when the `--report-json` report would exceed 64 KiB. `--paired` does not take `--results`, `--baseline` or `--fail-on-missing`. `--report-json` writes the per-round values, with `"skipped"` for a round that skipped the tier, which `scripts/bench-report.py` renders as a Markdown table after it recomputes the verdicts from those values; a report over 64 KiB exits 2 without writing the file.
+
 **Promote a captured results file into the baseline:**
 
 ```sh
@@ -386,7 +396,7 @@ python3 scripts/bench-promote.py --results build/bench-results.json \
 | `ELFUSE_OCI_STORE` | `~/.local/share/elfuse/oci` | image store Tier 3 pulls into |
 | `BENCH_QEMU_NULL_CEILING` | `180` | ns/op; the qemu boot-calibration probe reboots the VM above this (efficiency-core placement) |
 | `BENCH_QEMU_BOOT_RETRIES` | `2` | qemu boot-calibration retry attempts before proceeding with a warning |
-| `BENCH_REGRESSION_THRESHOLD` | `0.20` | fractional regression that fails `bench-compare.py` |
+| `BENCH_REGRESSION_THRESHOLD` | `0.20` | fractional regression that fails `bench-compare.py`; with `--paired`, the change a verdict needs, with no default, also for the `bench-report.py` comment on a paired report |
 | `BENCH_REPORT_ONLY` | unset | `1` = `bench-compare.py` reports regressions but exits 0 |
 
 ## Test Matrix

@@ -24,6 +24,7 @@
 #include "debug/log.h"
 #include "utils.h"
 
+#include "core/host-sigbus.h"
 #include "core/vdso.h"
 
 #include "proved/align.h"
@@ -211,6 +212,29 @@ static int dup_region_backing_fd(const guest_region_t *region)
 static bool region_has_live_overlay(const guest_region_t *r)
 {
     return r->overlay_active && r->overlay_end > r->overlay_start;
+}
+
+overlay_page_state_t mmap_overlay_page_state(guest_t *g, uint64_t ipa)
+{
+    if (ipa < g->ipa_base || ipa - g->ipa_base >= g->guest_size)
+        return OVERLAY_PAGE_NONE;
+    uint64_t off = ipa - g->ipa_base;
+
+    overlay_page_state_t state = OVERLAY_PAGE_NONE;
+    mmap_lock_acquire();
+    const guest_region_t *r = guest_region_find(g, off);
+    if (r && r->gpa_base == r->start && region_has_live_overlay(r) &&
+        off >= r->overlay_start && off < r->overlay_end) {
+        /* An overlay alone does not prove the page is gone; only a host SIGBUS
+         * on the same page does.
+         */
+        volatile const uint8_t *host = (const uint8_t *) g->host_base + off;
+        bool faulted = false;
+        HOST_SIGBUS_GUARD(faulted, (void) *host);
+        state = faulted ? OVERLAY_PAGE_GONE : OVERLAY_PAGE_PRESENT;
+    }
+    mmap_lock_release();
+    return state;
 }
 
 static void region_clear_overlay(guest_region_t *r)

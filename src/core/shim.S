@@ -238,7 +238,7 @@
 .equ CB_GETRANDOM_HIT,       80
 .equ CB_PGSID_HIT,           88
 .equ CB_FUTEX_EAGAIN_HIT,    96
-.equ CB_FUTEX_EFAULT_HIT,    104
+.equ CB_FUTEX_FAULT_BAIL,    104
 .equ CB_FUTEX_SHAPE_BAIL,    112
 .equ CB_FUTEX_MATCH_BAIL,    120
 .equ CB_FUTEX_WAKE_HIT,      128
@@ -465,7 +465,21 @@ svc_handler:
     b.eq getsid_fast
     cmp x10, #278                      /* SYS_getrandom? */
     b.eq getrandom_fast
+    cmp x10, #222                      /* SYS_mmap? */
+    b.eq mmap_anon_fast
     b handle_svc_0
+
+/* The mmap fast path is a freestanding C consumer. The saved frame remains
+ * authoritative: false leaves it untouched for HVC #5; true places the
+ * completed result in saved X0. The normal restore tail reloads every other
+ * guest register, so the C ABI's caller-clobbered set is private to EL1.
+ */
+mmap_anon_fast:
+    mov x0, sp
+    bl _el1_mmap_fastpath
+    cbz w0, handle_svc_0
+    ldr x0, [sp, #0]
+    b svc_restore_eret
 
 identity_class_fast:
     mrs x12, tpidr_el1               /* shim-globals base */
@@ -494,7 +508,7 @@ getpgid_fast:
     mrs x12, tpidr_el1
     ldar w13, [x12]
     cbnz w13, attn_bail
-    ldr x0, [x12, #0x1158]            /* SHIM_IDENTITY_OFF_PGID */
+    ldr x0, [x12, #0x1178]            /* SHIM_IDENTITY_OFF_PGID */
     COUNTER_INC CB_PGSID_HIT
     b svc_restore_eret
 
@@ -504,15 +518,14 @@ getsid_fast:
     mrs x12, tpidr_el1
     ldar w13, [x12]
     cbnz w13, attn_bail
-    ldr x0, [x12, #0x1160]            /* SHIM_IDENTITY_OFF_SID */
+    ldr x0, [x12, #0x1180]            /* SHIM_IDENTITY_OFF_SID */
     COUNTER_INC CB_PGSID_HIT
     b svc_restore_eret
 
 /* futex_wait_fast: serve a FUTEX_WAIT or FUTEX_WAIT_BITSET, timed or not, whose
  * word differs from expected. It answers EAGAIN once an EL0 read proves the
- * caller will not block, and EFAULT when that read faults
- * (handle_el1_data_abort_recover below). Anything that could need a waiter, and
- * every other shape, bails to the host.
+ * caller will not block. Faulting reads and calls that could need a waiter fall
+ * back to the host.
  *
  * The authority this must match is futex_should_block in runtime/futex.c, not
  * the Linux source: reordering the checks there is what would silently make
@@ -623,13 +636,11 @@ futex_uaddr_tag:
      * drew, in one instruction rather than four, with no page walk, no ISB, and
      * no window between check and access for a sibling vCPU to unmap into. A
      * translation or permission fault lands in handle_el1_data_abort_recover
-     * and returns EFAULT, matching what the host answers for an address it
-     * cannot resolve.
+     * and falls back to the host, which can fault in a lazy mapping or reject
+     * an inaccessible address.
      *
      * A host-side SIGBUS (the truncated MAP_SHARED overlay HOST_SIGBUS_GUARD
-     * covers) is not a stage-1 fault and does not arrive here. Any FUTEX_WAIT
-     * caller already read this word in EL0 to learn the expected value, so it
-     * hits that case identically.
+     * covers) is not a stage-1 fault and does not arrive here.
      *
      * Relaxed, not the acquire it replaces: nothing orders a later access
      * against this load, and the path returns EAGAIN without ever enqueueing,
@@ -660,8 +671,8 @@ futex_uaddr_tag:
 
     /* Timed shape. The timespec is read through the same LDTR the word is, so
      * an unreadable one takes the EL0 permission fault in hardware and
-     * handle_el1_data_abort_recover answers EFAULT, which is what Linux answers
-     * for it and in the same order.
+     * handle_el1_data_abort_recover forwards it to the host for lazy fault-in
+     * and timeout validation before the word comparison.
      *
      * Validity is deliberately narrower than the host's. futex.c accepts tv_sec
      * up to INT64_MAX/4; this accepts up to 2^31, about 68 years, and hands
@@ -1050,7 +1061,7 @@ futex_wake_shape:
     dmb ish
 
     add x16, x12, #0x1000
-    add x16, x16, #0x168              /* SHIM_FUTEX_WAITERS_OFF, 0x1168 */
+    add x16, x16, #0x188              /* SHIM_FUTEX_WAITERS_OFF, 0x1188 */
     ldr w17, [x16, x15, lsl #2]
     cbnz w17, futex_wake_waiter_bail
 
@@ -1068,7 +1079,7 @@ futex_wake_waiter_bail:
 futex_shape_bail:
     /* Not the shape this path serves: another futex command, a zero bitset, a
      * non-NULL timeout, or an unaligned or tagged uaddr. An unreadable address
-     * is not here: LDTR faults on it and the recovery tail answers EFAULT. One
+     * is not here: LDTR faults on it and the recovery tail forwards it. One
      * counter rather than a taxonomy; splitting it further would only subdivide
      * the answer to "how often is the servable shape seen".
      */
@@ -1263,7 +1274,7 @@ not_svc:
     /* EC=0x25: the urandom store or futex LDTR can fault after a sibling vCPU
      * revokes the page.
      *
-     * Return EFAULT rather than halting the VM.
+     * Recover through the access-specific tail rather than halting the VM.
      */
     cmp x10, #0x25
     b.eq handle_el1_data_abort_recover
@@ -1277,7 +1288,7 @@ not_svc:
     b handle_el0_fault           /* EL0 (M=0): forward for signal delivery */
 
 /* handle_el1_data_abort_recover: tag a data abort whose faulting PC sits inside
- * the futex ldtr or the urandom-copy strb region as a recoverable EFAULT.
+ * the futex ldtr or the urandom-copy strb region as a recoverable fault.
  *
  * Layout invariants exploited here:
  *   - SAVE_GPRS allocated 256 bytes for THIS (inner) entry on top of
@@ -1303,11 +1314,7 @@ handle_el1_data_abort_recover:
     cmp x11, x12
     b.lo 5f
 4:
-    /* The timespec loads on the timed shape. Same recovery as the word load
-     * below and for the same reason: they are LDTRs under the same pushed slot,
-     * they hold no lock and no exclusive monitor, and an unreadable timeout is
-     * EFAULT on Linux before the word is looked at.
-     */
+    /* Timeout load faults use the same host fallback as the futex word. */
     adr x12, futex_ts_load_start
     cmp x11, x12
     b.lo 3f
@@ -1316,19 +1323,16 @@ handle_el1_data_abort_recover:
     b.hs 3f
 5:
 
-    /* The futex load holds no lock or exclusive monitor. Its recovery slot is
-     * otherwise the same shape as urandom's: discard the nested exception
-     * frame, restore the SVC return state, and report Linux EFAULT. This is the
-     * only way the futex path reports EFAULT, since LDTR takes the EL0
-     * permission fault itself rather than being gated by a probe.
+    /* A missing PTE may belong to a valid lazy mapping. Restore the outer SVC
+     * state and let the host fault it in or return EFAULT. No lock or exclusive
+     * monitor is held across this fallback.
      */
     add sp, sp, #256
     ldp x9, x10, [sp], #16
     msr elr_el1, x9
     msr spsr_el1, x10
-    mov x0, #-14
-    COUNTER_INC CB_FUTEX_EFAULT_HIT
-    b svc_restore_eret
+    COUNTER_INC CB_FUTEX_FAULT_BAIL
+    b handle_svc_0
 
 3:
     adr x12, urandom_strb_1byte_start
@@ -1568,6 +1572,7 @@ handle_el0_fault:
 
 .Lel0_fault_tlbi_full:
     /* Broadcast TLB + conditional I-cache flush. X11=0 skips IC IALLU. */
+    dsb ishst
     tlbi vmalle1is
     dsb ish
     cbz x11, .Lel0_fault_full_no_ic
@@ -1589,6 +1594,7 @@ handle_el0_fault:
     mov x13, x11
     ubfx x11, x9, #12, #44
     mov x12, x10
+    dsb ishst
 4:  tlbi vae1is, x11
     add x11, x11, #1
     subs x12, x12, #1
@@ -1603,7 +1609,10 @@ handle_el0_fault:
 
 .Lel0_fault_tlbi_rvae:
     /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE). X9 carries the pre-encoded
-     * operand (baddr | NUM<<39 | TG=01<<46); X11 the I-cache hint. */
+     * operand (baddr | NUM<<39 | SCALE<<44 | TG=01<<46); X11 the I-cache
+     * hint.
+     */
+    dsb ishst
     tlbi rvae1is, x9
     dsb ish
     cbz x11, .Lel0_fault_rvae_no_ic
@@ -1647,6 +1656,7 @@ tlbi_restore_eret:
      * into the TTL [47:44] or ASID [63:48] operand fields.
      */
     ubfx x0, x0, #12, #44
+    dsb ishst
     tlbi vae1is, x0
     dsb ish
     ic iallu
@@ -1735,6 +1745,7 @@ handle_svc_0:
      *            delivery): drop frame + flush, and reload X8 from the
      *            frame's own slot; see exec_drop_frame
      *        3 = selective TLBI VAE1IS over X10 pages starting at X9
+     *        4 = single-shot TLBI RVAE1IS with encoded operand in X9
      *   5. Resume vCPU (execution continues below)
      */
     hvc #5
@@ -1763,6 +1774,7 @@ tlbi_full:
      * the shim must IC IALLU; zero means a data-only PT change and the I-cache
      * invalidation is skipped.
      */
+    dsb ishst
     tlbi vmalle1is
     dsb ish
     cbz x11, .Ltlbi_full_skip_ic
@@ -1797,6 +1809,7 @@ tlbi_selective:
      */
     ubfx x11, x9, #12, #44    /* x11 = VA[55:12] (current page operand) */
     mov x12, x10              /* x12 = remaining page counter */
+    dsb ishst
 3:  tlbi vae1is, x11
     add x11, x11, #1          /* next page (operand is in 4 KiB units) */
     subs x12, x12, #1
@@ -1812,11 +1825,11 @@ tlbi_selective:
 tlbi_range_large:
     /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has encoded
      * the full operand in X9: baddr (VA >> 12), TTL=0, NUM in bits [43:39],
-     * SCALE=0, ASID=0. One instruction covers up to 64 pages, avoiding the
-     * broadcast TLBI VMALLE1IS that the prior selective cap forced for
-     * 17..64-page ranges. X11 carries the I-cache hint as in tlbi_full /
+     * SCALE in bits [45:44], ASID=0. One instruction covers up to
+     * TLBI_RVAE_MAX_PAGES. X11 carries the I-cache hint as in tlbi_full /
      * tlbi_selective.
      */
+    dsb ishst
     tlbi rvae1is, x9
     dsb ish
     cbz x11, .Ltlbi_rvae_skip_ic
@@ -1888,16 +1901,6 @@ exec_drop_frame:
      * handler would enter with the marker. handle_brk has the same problem and
      * does not branch here, since it has its own flush to skip and no X8
      * dispatch to run; it carries its own copy of the reload.
-     *
-     * The ordinary syscall-return tail above is not covered, and this reload
-     * does not reach it. A signal delivered in the epilogue of a page-table
-     * syscall snapshots the live registers there, where X8 is the TLBI kind and
-     * X9 through X11 are its operands and the icache hint, so the frame that
-     * delivery builds records the wire values as the guest's and its own
-     * rt_sigreturn hands them back. The saved PC being past the SVC does not
-     * make that free: the instruction after an SVC can be another SVC, and the
-     * guest then issues the wire value as a syscall number. syscall/proc.h
-     * names the same shadowing on the frame a handler returns through.
      */
     ldr x8, [sp, #64]
     tlbi vmalle1is

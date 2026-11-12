@@ -31,7 +31,6 @@
 #define CLONE_PIDFD 0x00001000
 #define CLONE_VM 0x00000100
 #define CLONE_PARENT_SETTID 0x00100000
-#define __NR_nanosleep 101
 #define SIGCHLD 17
 
 int passes = 0, fails = 0;
@@ -48,6 +47,29 @@ struct linux_pollfd {
     int fd;
     short events, revents;
 };
+
+/* The child changes SP, so it cannot access the caller's C frame. */
+static long clone_vm_wait_for_gate(struct clone_args *ca)
+{
+    register long x0 __asm__("x0") = (long) ca;
+    register long x1 __asm__("x1") = sizeof(*ca);
+    register long x2 __asm__("x2") = (long) &vm_exit_gate;
+    register long x8 __asm__("x8") = __NR_clone3;
+    __asm__ volatile(
+        "svc #0\n"
+        "cbnz x0, 2f\n"
+        "1: ldar w9, [x2]\n"
+        "cbz w9, 1b\n"
+        "mov x0, #42\n"
+        "mov x8, %c[exit_nr]\n"
+        "svc #0\n"
+        "brk #0\n"
+        "2:\n"
+        : "+r"(x0), "+r"(x8)
+        : "r"(x1), "r"(x2), [exit_nr] "i"(__NR_exit)
+        : "x9", "memory", "cc");
+    return x0;
+}
 
 static void test_clone_failure(uint64_t output, long error)
 {
@@ -201,13 +223,7 @@ int main(void)
         raw_syscall4(__NR_wait4, child, 0, 0, 0);
     }
 
-    /* A CLONE_VM child's pidfd becomes readable only after the child exits.
-     *
-     * This case cannot be cross-checked against a real kernel: a CLONE_VM child
-     * resumes on the fresh stack below, where the compiler's copy of the clone3
-     * return value is undefined, so the child branch is only reliable under
-     * elfuse. Keep the child to raw syscalls for the same reason.
-     */
+    /* A CLONE_VM child's pidfd becomes readable only after the child exits. */
     TEST("clone3 CLONE_PIDFD|CLONE_VM pidfd not readable while child runs");
     {
         void *stack = mmap(NULL, 65536, PROT_READ | PROT_WRITE,
@@ -224,15 +240,7 @@ int main(void)
         ca.stack = (uint64_t) stack;
         ca.stack_size = 65536;
 
-        long child = raw_syscall2(__NR_clone3, (long) &ca, sizeof(ca));
-        if (child == 0) {
-            while (!atomic_load_explicit(&vm_exit_gate, memory_order_acquire)) {
-                uint64_t delay[2] = {0, 1000000};
-                raw_syscall2(__NR_nanosleep, (long) delay, 0);
-            }
-            raw_syscall1(__NR_exit, 42);
-            __builtin_unreachable();
-        }
+        long child = clone_vm_wait_for_gate(&ca);
         if (child < 0) {
             FAIL("clone3 CLONE_VM failed");
             munmap(stack, 65536);

@@ -20,7 +20,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4653U /* "ELFS" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4654U /* "ELFT" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -160,7 +160,8 @@ int fork_ipc_recv_pty_keepalives(int ipc_fd);
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
-                                bool regions_tracker_stale_snapshot);
+                                bool regions_tracker_stale_snapshot,
+                                const uint64_t *dirty_blocks_snapshot);
 int fork_ipc_recv_process_state(int ipc_fd,
                                 guest_t *g,
                                 signal_state_snapshot_t *sig);

@@ -47,12 +47,12 @@ static void check_field(const char *label, uint64_t got, uint64_t expect)
 
 /* Decompose the operand per ARM ARM D8.7.6 and compare each field against the
  * expected value. baseADDR is VA>>12 masked to 37 bits; TG must be 01 (4 KiB);
- * SCALE must be 0; TTL must be 0; ASID must be 0. NUM derives from the page
- * count via the ceil(pages/2) - 1 SCALE=0 encoding.
+ * TTL and ASID must be 0. NUM derives from the selected SCALE unit.
  */
 static void verify_operand(uint64_t start_va,
                            uint16_t pages,
-                           uint64_t expect_num)
+                           uint64_t expect_num,
+                           uint64_t expect_scale)
 {
     uint64_t op = tlbi_rvae1is_operand(start_va, pages);
 
@@ -76,7 +76,7 @@ static void verify_operand(uint64_t start_va,
     check_field(label, num, expect_num);
 
     snprintf(label, sizeof(label), "SCALE (pages=%u)", (unsigned) pages);
-    check_field(label, scale, 0);
+    check_field(label, scale, expect_scale);
 
     snprintf(label, sizeof(label), "TG (start=0x%llx)",
              (unsigned long long) start_va);
@@ -100,30 +100,47 @@ int main(void)
      *   pages 63 -> NUM 31 (covers 64)
      *   pages 64 -> NUM 31 (covers 64)
      */
-    verify_operand(0x10000000ULL, 2, 0);
-    verify_operand(0x10000000ULL, 3, 1);
-    verify_operand(0x10000000ULL, 16, 7);
-    verify_operand(0x10000000ULL, 17, 8);
-    verify_operand(0x10000000ULL, 32, 15);
-    verify_operand(0x10000000ULL, 63, 31);
-    verify_operand(0x10000000ULL, 64, 31);
+    verify_operand(0x10000000ULL, 2, 0, 0);
+    verify_operand(0x10000000ULL, 3, 1, 0);
+    verify_operand(0x10000000ULL, 16, 7, 0);
+    verify_operand(0x10000000ULL, 17, 8, 0);
+    verify_operand(0x10000000ULL, 32, 15, 0);
+    verify_operand(0x10000000ULL, 63, 31, 0);
+    verify_operand(0x10000000ULL, 64, 31, 0);
+
+    /* SCALE=1 covers 64 pages per NUM step; SCALE=2 covers 2048. A lazy 2 MiB
+     * block is 512 pages and must therefore encode as SCALE=1, NUM=7.
+     */
+    verify_operand(0x10000000ULL, 512, 7, 1);
+    verify_operand(0x10000000ULL, 2048, 31, 1);
+    verify_operand(0x10000000ULL, 8192, 3, 2);
 
     /* Boundary VAs. 4 KiB-aligned, low-VA, MMAP_BASE (8 GiB), high-VA just
      * below the 48-bit BaseADDR truncation point.
      */
-    verify_operand(0x00000000ULL, 32, 15);         /* zero base */
-    verify_operand(0x200000000ULL, 32, 15);        /* MMAP_BASE */
-    verify_operand(0x800000000000ULL, 32, 15);     /* Rosetta image */
-    verify_operand(0x0000FFFFF0000000ULL, 32, 15); /* KBUF_USER_VA */
+    verify_operand(0x00000000ULL, 32, 15, 0);         /* zero base */
+    verify_operand(0x200000000ULL, 32, 15, 0);        /* MMAP_BASE */
+    verify_operand(0x800000000000ULL, 32, 15, 0);     /* Rosetta image */
+    verify_operand(0x0000FFFFF0000000ULL, 32, 15, 0); /* KBUF_USER_VA */
 
     /* Pathological inputs the clamp must catch:
      *   pages = 0 -> clamped to 2 -> NUM 0
      *   pages = 1 -> clamped to 2 -> NUM 0 (callers never reach here)
      *   pages = UINT16_MAX -> NUM clamped to 31 (saturating)
      */
-    verify_operand(0x10000000ULL, 0, 0);
-    verify_operand(0x10000000ULL, 1, 0);
-    verify_operand(0x10000000ULL, UINT16_MAX, 31);
+    verify_operand(0x10000000ULL, 0, 0, 0);
+    verify_operand(0x10000000ULL, 1, 0, 0);
+    verify_operand(0x10000000ULL, UINT16_MAX, 31, 2);
+
+    /* The accumulator widens a 2 MiB request to the SCALE=1 granule and keeps
+     * it on the single-shot RVAE path instead of degrading to broadcast.
+     */
+    g_tlbi_range_supported = true;
+    tlbi_request_clear();
+    tlbi_request_range(0x200000000ULL, 0x200200000ULL);
+    check_field("2MiB accumulator kind", cpu_tlbi_req.kind, TLBI_RANGE_LARGE);
+    check_field("2MiB accumulator pages", cpu_tlbi_req.pages, 512);
+    check_field("2MiB accumulator start", cpu_tlbi_req.start, 0x200000000ULL);
 
     /* TG bit is the architectural lynchpin -- if the encoder ever drops it the
      * integration tests on Apple Silicon would still pass. Pin a direct bit-46

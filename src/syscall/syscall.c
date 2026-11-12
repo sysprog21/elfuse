@@ -73,6 +73,7 @@
 #include "syscall/time.h"
 
 #include "core/shim-globals.h"
+#include "core/mmap-fastpath.h"
 
 #include "debug/syscall-hist.h"
 
@@ -183,7 +184,7 @@ typedef int64_t (*syscall_handler_t)(guest_t *g,
     {                                                                         \
         (void) g; (void) x0; (void) x1; (void) x2;                            \
         (void) x3; (void) x4; (void) x5; (void) verbose;                      \
-        mmap_lock_acquire();                                                  \
+        mmap_lock_acquire(g);                                                 \
         int64_t r = (body);                                                   \
         mmap_lock_release();                                                  \
         return r;                                                             \
@@ -507,7 +508,7 @@ static void sc_sync_regions_inline(guest_t *g)
      * position) cannot make us skip an entry permanently.
      */
     for (int i = 0;; i++) {
-        mmap_lock_acquire();
+        mmap_lock_acquire(g);
         if (i >= g->nregions) {
             mmap_lock_release();
             break;
@@ -547,7 +548,7 @@ static int64_t sc_sync_impl(guest_t *g)
     }
     pthread_mutex_unlock(&fd_lock);
 
-    mmap_lock_acquire();
+    mmap_lock_acquire(g);
     for (int i = 0; i < g->nregions && n < (int) cap; i++) {
         const guest_region_t *r = &g->regions[i];
         if (!r->shared || r->backing_fd < 0)
@@ -743,7 +744,7 @@ static int64_t sc_mincore(guest_t *g,
      * never early-returns on a hole.
      */
     uint8_t chunk[512];
-    mmap_lock_acquire();
+    mmap_lock_acquire(g);
     int ri = guest_region_first_end_above(g, addr);
     for (uint64_t done = 0; done < npages;) {
         uint64_t batch = npages - done;
@@ -758,7 +759,14 @@ static int64_t sc_mincore(guest_t *g,
             if (!mapped)
                 has_hole = true;
         }
-        if (guest_write(g, vec + done, chunk, batch) < 0) {
+
+        /* sc_mincore holds mmap_lock while regions[] is swept. Materialize a
+         * valid lazy output block through the locked entry point, then use a
+         * no-fault copy so an invalid vec returns EFAULT instead of trying to
+         * acquire mmap_lock recursively.
+         */
+        (void) guest_lazy_faultin_locked(g, vec + done, batch);
+        if (guest_write_nofault(g, vec + done, chunk, batch) < 0) {
             mmap_lock_release();
             return -LINUX_EFAULT;
         }
@@ -981,6 +989,19 @@ static int64_t sc_set_tid_address(guest_t *g,
     return proc_get_pid();
 }
 
+static uint64_t mmap_fastpath_eligible_length(uint64_t addr,
+                                              uint64_t length,
+                                              uint64_t prot,
+                                              uint64_t flags)
+{
+    if (addr != 0 || prot != (LINUX_PROT_READ | LINUX_PROT_WRITE) ||
+        (flags & ~(uint64_t) LINUX_MAP_NORESERVE) !=
+            (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS) ||
+        length == 0 || length > UINT64_MAX - (GUEST_PAGE_SIZE - 1))
+        return 0;
+    return (length + GUEST_PAGE_SIZE - 1) & ~(GUEST_PAGE_SIZE - 1);
+}
+
 static int64_t sc_mmap(guest_t *g,
                        uint64_t x0,
                        uint64_t x1,
@@ -990,8 +1011,11 @@ static int64_t sc_mmap(guest_t *g,
                        uint64_t x5,
                        bool verbose)
 {
-    mmap_lock_acquire();
+    uint64_t refill_len = mmap_fastpath_eligible_length(x0, x1, x2, x3);
+    mmap_lock_acquire(g);
     int64_t r = sys_mmap(g, x0, x1, (int) x2, (int) x3, (int) x4, (int64_t) x5);
+    if (r >= 0 && refill_len)
+        mmap_fastpath_refill_current_locked(g, refill_len);
     mmap_lock_release();
     log_debug("  mmap(0x%llx, 0x%llx) \xe2\x86\x92 0x%llx",
               (unsigned long long) x0, (unsigned long long) x1,
@@ -1009,7 +1033,7 @@ static int64_t sc_mremap(guest_t *g,
                          bool verbose)
 {
     (void) x5;
-    mmap_lock_acquire();
+    mmap_lock_acquire(g);
     int64_t r = sys_mremap(g, x0, x1, x2, (int) x3, x4);
     mmap_lock_release();
     log_debug("  mremap(0x%llx, 0x%llx, 0x%llx, 0x%x) \xe2\x86\x92 0x%llx",
@@ -2196,10 +2220,7 @@ static int64_t sc_execve(guest_t *g,
     (void) x3;
     (void) x4;
     (void) x5;
-    mmap_lock_acquire();
-    int64_t r = sys_execve(current_thread->vcpu, g, x0, x1, x2, verbose, NULL);
-    mmap_lock_release();
-    return r;
+    return sys_execve(current_thread->vcpu, g, x0, x1, x2, verbose, NULL);
 }
 
 static int64_t sc_execveat(guest_t *g,
@@ -2215,8 +2236,9 @@ static int64_t sc_execveat(guest_t *g,
     hv_vcpu_t vcpu = current_thread->vcpu;
     int dirfd = (int) x0, flags = (int) x4;
 
-    /* Resolve the target path before taking mmap_lock (path resolution may call
-     * fd_to_host / openat which do not need mmap_lock).
+    /* Resolve the target path before entering the exec transaction. Path
+     * resolution may call fd_to_host / openat and does not need mmap_lock;
+     * sys_execve takes it at the point of no return.
      */
     uint64_t path_gva = x1;
     char resolved[LINUX_PATH_MAX];
@@ -2279,7 +2301,6 @@ static int64_t sc_execveat(guest_t *g,
         need_resolve = true;
     }
 
-    mmap_lock_acquire();
     int64_t r;
     if (need_resolve) {
         /* Use the host-resolved path directly so execveat does not copy a host
@@ -2289,7 +2310,6 @@ static int64_t sc_execveat(guest_t *g,
     } else {
         r = sys_execve(vcpu, g, path_gva, x2, x3, verbose, NULL);
     }
-    mmap_lock_release();
     return r;
 }
 
@@ -2543,13 +2563,6 @@ void syscall_restart_cancel(hv_vcpu_t vcpu)
     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
     if (elr != cpu_restart_req.elr_rewound)
         return;
-
-    /* No syscall-number witness here, unlike the dispatch test. By the time a
-     * cancel runs, X8 is the TLBI wire value the epilogue wrote rather than the
-     * syscall number, so comparing it would refuse every cancel and strand the
-     * rewind. tests/test-exec-handoff.c covers it: the "signal delivered on top
-     * of a handoff" case fails outright when this reads X8.
-     */
 
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,
                         cpu_restart_req.elr_after_svc);
@@ -2960,19 +2973,6 @@ fast_done:
         /* Write result back to X0 */
         if (!restart_armed)
             hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) result);
-
-        /* Signal the shim to flush TLB if this vCPU modified page tables.
-         * Protocol after HVC #5 lives in tlbi_request_emit_to_vcpu (see
-         * src/core/guest.h); the helper also handles the HVC #11 EL0-fault
-         * lazy-materialize path so both call sites use the same wire codes.
-         * Must call the emit helper because the shim reads X8 unconditionally
-         * on return; the pre-syscall X8 is the syscall number (always non-zero)
-         * and would spuriously TLBI on every return.
-         *
-         * cpu_tlbi_req is a per-vCPU TLS slot, so this read needs no lock and
-         * cannot be drained or torn by another vCPU's epilogue.
-         */
-        tlbi_request_emit_to_vcpu(vcpu);
     }
 
     if (hist_start_ns)

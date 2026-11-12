@@ -256,13 +256,10 @@ INVENTORY = {
         "restartable",
         "io_xfer returns EINTR only before it has transferred a byte.",
     ),
-    "syscall/io.c::sys_write": (
+    "syscall/io.c::file_io": (
         "restartable",
-        "io_xfer returns EINTR only before it has transferred a byte.",
-    ),
-    "syscall/io.c::sys_writev": (
-        "restartable",
-        "io_xfer returns EINTR only before it has transferred a byte.",
+        "Reports io_xfer's EINTR only while no window has transferred a byte; "
+        "a later window's EINTR returns the count already written.",
     ),
     "syscall/io.c::sys_splice": (
         "restartable",

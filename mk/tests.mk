@@ -332,6 +332,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-shebang-host,shebang parser unit test)
 	$(call run-lane,test-shim-futex-stats,futex EL1 fast path is live)
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
+	$(call run-lane,test-materialize-host,lazy materialization boundaries)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
 	$(call run-lane,test-rlimit-seed,guest rlimits seeded from host limits)
@@ -2165,6 +2166,10 @@ test-shebang-host: $(BUILD_DIR)/test-shebang-host
 ## Run the proved/gva.h call-site precondition checks (skips without the flag)
 test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
 	$(BUILD_DIR)/test-gva-contracts
+
+.PHONY: test-materialize-host
+test-materialize-host: $(BUILD_DIR)/test-materialize-host
+	@$(BUILD_DIR)/test-materialize-host
 
 # The two fixtures are prerequisites only where the makefile can build them.
 # A prebuilt tree sets TEST_DEPS empty and points TEST_DIR at binaries it did

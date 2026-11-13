@@ -1612,7 +1612,7 @@ static int proc_build_maps_entries(const guest_t *g,
     int result = -1;
     int saved_errno = 0;
 
-    mmap_lock_acquire();
+    mmap_lock_acquire((guest_t *) (uintptr_t) g);
 
     /* Convert regions[] to maps entries. regions[] is already sorted by start
      * address. The MAP_SHARED/MAP_ANONYMOUS/MAP_NORESERVE bits are preserved in

@@ -57,6 +57,7 @@ endif
 
 # Exclude native macOS test files from cross-compilation
 NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
+                tests/test-materialize-host.c \
                 tests/test-tlbi-encoder-host.c \
                 tests/test-fork-ipc-protocol-host.c \
                 tests/test-casefold-host.c \

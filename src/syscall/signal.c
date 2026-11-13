@@ -2954,14 +2954,8 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
 
     /* Deliver to user handler: build rt_sigframe on guest stack */
 
-    /* Past every disposition that discards the signal, so this is the point a
-     * handler frame is committed to. An armed SVC restart has to come off here,
-     * before the state below is snapshotted: the frame would otherwise capture
-     * the rewound PC together with the live X8, which is the shim's TLBI wire
-     * value rather than the syscall number, and rt_sigreturn would re-execute
-     * the SVC as whatever syscall that value names. Undoing the rewind also
-     * gives the guest back the EINTR it was going to get, which this signal now
-     * explains. See syscall_restart_arm in syscall/proc.h.
+    /* Cancel an armed syscall restart before capturing the signal frame, so the
+     * interrupted wait reports EINTR after the handler returns.
      *
      * Only on the syscall-return path, though. A vCPU kicked at EL0 after the
      * ERET has already taken the restart: PC sits on the rewound SVC with the
@@ -3208,6 +3202,32 @@ int signal_take_termination_wait_status(void)
     return status;
 }
 
+/* Pre-fault the candidate signal-frame windows (current stack and altstack top)
+ * before sig_lock is taken. The frame write in deliver_signal_locked runs under
+ * sig_lock; letting it materialize lazy stack pages there would acquire
+ * mmap_lock in descending lock order. The pre-fault is advisory -- the write
+ * path still faults in as a backstop -- but it makes the under-lock engagement
+ * unreachable in practice. Reading the altstack fields without sig_lock is
+ * benign for the same reason.
+ */
+static void signal_prefault_frame(hv_vcpu_t vcpu, guest_t *g)
+{
+    /* Worst-case alignment slack the frame can cost, matching the static_assert
+     * above: a larger margin would exceed LINUX_MINSIGSTKSZ and silently skip
+     * prefaulting a minimum-sized altstack.
+     */
+    uint64_t need = sizeof(linux_rt_sigframe_t) + SIGFRAME_ALIGN - 1;
+    uint64_t sp = 0;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp);
+    if (sp > need && sp <= g->guest_size)
+        guest_lazy_faultin(g, sp - need, need);
+    thread_entry_t *thr = current_thread;
+    if (thr && thr->altstack_sp != 0 &&
+        !(thr->altstack_flags & LINUX_SS_DISABLE) && thr->altstack_size > need)
+        guest_lazy_faultin(g, thr->altstack_sp + thr->altstack_size - need,
+                           need);
+}
+
 /* signal_deliver_one() consumed a signal the guest never observes, so the
  * caller should look at the next one. Distinct from the documented 0/1/-1
  * contract of deliver_signal_locked() and never escapes signal_deliver().
@@ -3218,6 +3238,8 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
 
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 {
+    signal_prefault_frame(vcpu, g);
+
     /* Callers invoke this once per syscall epilogue, so stopping at the first
      * signal that turns out to be discarded (SIG_IGN, or a SIG_DFL disposition
      * of ignore/stop/continue) would let a lower-numbered ignored signal mask a
@@ -3335,6 +3357,7 @@ int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
      * threads faulting on the same signal collapse into one bit so one fault is
      * lost. Deliver directly here, never touching sig_state.pending.
      */
+    signal_prefault_frame(vcpu, g);
     pthread_mutex_lock(&sig_lock);
 
     /* Linux force_sig_info_to_task(): a forced synchronous fault cannot be

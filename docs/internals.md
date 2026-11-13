@@ -340,9 +340,8 @@ ptrace stop the one its tracer left. `signal_rt_sigreturn` also parks
 that value for a signal delivered later in the same epilogue, which
 would otherwise snapshot the marker as the guest's `X8`; the run loop
 drops the record before every `hv_vcpu_run()`, and an inline ptrace
-stop that moves the PC re-keys it. The TLBI kinds on the ordinary
-syscall-return tail are not covered: a signal delivered there still
-records the wire values as `X8`-`X11`.
+stop that moves the PC re-keys it. The ordinary syscall-return path
+publishes TLBI operands after signal delivery captures the guest registers.
 
 Important: `signal_rt_sigreturn` returns `SYSCALL_EXEC_HAPPENED` to
 bypass the normal syscall dispatch epilogue, as `sys_execve` does.

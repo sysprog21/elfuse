@@ -363,18 +363,8 @@ const char *proc_resolve_sysroot_create_path(const char *path,
  * guest passed and ELR_EL1 steps back over the SVC, so the ERET re-executes the
  * syscall once the handoff has been serviced.
  *
- * A signal delivered before the guest resumes cancels it. Two reasons, and
- * either alone would be enough. The EINTR becomes one Linux can produce, since
- * a signal really did arrive. And the frame the handler returns through carries
- * the live X8, which by then is the TLBI wire value the shim epilogue wrote
- * rather than the syscall number the shim would have restored from its own
- * saved frame. A rewound PC makes rt_sigreturn re-execute that SVC as the call
- * the wire value names. Leaving the PC past the SVC narrows that rather than
- * closing it, because the instruction after an SVC can be another SVC; that
- * residue is described beside exec_drop_frame in core/shim.S, and out of reach
- * of this cancel. The drop-frame marker is the other value that displaces the
- * guest's X8, and signal.c keeps that one out of both the frame and the ERET on
- * its own.
+ * A signal delivered before the guest resumes cancels the restart, so the
+ * interrupted wait reports EINTR after the handler returns.
  *
  * Cancel is a no-op unless ELR_EL1 still holds the value the arm wrote, so a
  * later delivery on an unrelated path cannot disturb a guest that has moved on.

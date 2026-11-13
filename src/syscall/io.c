@@ -1646,230 +1646,6 @@ static int64_t fsize_limit_writev(int host_fd,
     return 0;
 }
 
-int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
-{
-    int type = fd_get_type(fd);
-    if (type == FD_FUSE_DEV)
-        return fuse_dev_write(g, fd, buf_gva, count);
-    if (type == FD_EVENTFD)
-        return eventfd_write(fd, g, buf_gva, count);
-
-    /* Linux accepts write() on a netlink socket as sendto() with no explicit
-     * destination, and iproute2-style senders use it in place of sendto. The
-     * host fd behind a netlink guest fd is the read end of the readiness pipe,
-     * so falling through would write to a read-only pipe end and report EBADF
-     * for a request the emulation can answer.
-     */
-    if (type == FD_NETLINK)
-        return netlink_send(fd, g, buf_gva, count);
-
-    /* usbdevfs has no write op. Falling through would scribble on the readiness
-     * pipe's read end.
-     */
-    if (type == FD_USBDEV)
-        return usbdev_write_refused(fd);
-
-    host_fd_ref_t host_ref;
-    fd_block_state_t write_st;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &write_st);
-    if (err < 0)
-        return err;
-
-    /* Linux: write(fd, NULL, 0) returns 0, not EFAULT */
-    if (count == 0)
-        return io_return_zero(&host_ref);
-
-    /* Resolve buffer and cap count to available contiguous guest bytes.
-     * guest_ptr_avail returns the host pointer and remaining bytes in the
-     * current region. This prevents host write() from reading past the guest
-     * buffer boundary.
-     */
-    uint64_t avail = 0;
-    void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_R, count);
-    if (!buf) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
-    }
-    if (count > avail)
-        count = avail;
-
-    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
-    if (offset >= 0) {
-        ssize_t intercepted = 0;
-        int handled = proc_intercept_write(fd, host_ref.fd, buf, count, offset,
-                                           0, &intercepted);
-        if (handled < 0) {
-            host_fd_ref_close(&host_ref);
-            return linux_errno();
-        }
-        if (handled > 0) {
-            host_fd_ref_close(&host_ref);
-            return intercepted;
-        }
-
-        int64_t fsz = fsize_limit_write(host_ref.fd, offset, true, &count);
-        if (fsz < 0) {
-            host_fd_ref_close(&host_ref);
-            return fsz;
-        }
-    }
-
-    /* Wait for POLLOUT (or a guest signal) and transfer without ever parking
-     * this vCPU thread in a host call. io_xfer completes short pipe writes and
-     * returns a short socket write.
-     */
-    struct iovec iov = {.iov_base = buf, .iov_len = count};
-    ssize_t ret;
-    int64_t wwait = io_xfer(fd, host_ref.fd, POLLOUT, &iov, 1, &ret, &write_st);
-    if (wwait < 0) {
-        host_fd_ref_close(&host_ref);
-        return wwait;
-    }
-
-    host_fd_ref_close(&host_ref);
-    return io_write_result(ret);
-}
-
-int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
-{
-    /* Read the type once under fd_lock so a concurrent close/reopen cannot make
-     * different dispatch checks disagree. Each handler still re-validates
-     * internally and returns EBADF if its slot changed.
-     */
-    int type = fd_get_type(fd);
-    switch (type) {
-    case FD_FUSE_DEV:
-        return fuse_dev_read(fd, g, buf_gva, count);
-    case FD_FUSE_FILE:
-        return fuse_read_fd(g, fd, buf_gva, count);
-    case FD_EVENTFD:
-        return eventfd_read(fd, g, buf_gva, count);
-    case FD_SIGNALFD:
-        return signalfd_read(fd, g, buf_gva, count);
-    case FD_TIMERFD:
-        return timerfd_read(fd, g, buf_gva, count);
-    case FD_INOTIFY:
-        return inotify_read(fd, g, buf_gva, count);
-    case FD_NETLINK:
-        return netlink_read(fd, g, buf_gva, count);
-    case FD_URANDOM:
-        return urandom_read(g, fd, buf_gva, count);
-    case FD_USBDEV:
-        return usbdev_read(fd, g, buf_gva, count);
-    }
-
-    /* Pin the generation in the same fd_lock window as the host fd. The pty
-     * hangup check below re-resolves the guest fd, and this is the witness that
-     * the slot still holds the very file this read resolved.
-     */
-    host_fd_ref_t host_ref;
-    uint64_t read_gen;
-    fd_block_state_t read_st;
-    int64_t err = host_fd_ref_open_io_state(fd, &host_ref, &read_gen, &read_st);
-    if (err < 0)
-        return err;
-
-    /* Linux: read(fd, NULL, 0) returns 0, not EFAULT */
-    if (count == 0)
-        return io_return_zero(&host_ref);
-
-    /* Resolve buffer and cap count to available contiguous guest bytes.
-     * Prevents host read() from writing past the guest buffer boundary.
-     */
-    uint64_t avail = 0;
-    void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_W, count);
-    if (!buf) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
-    }
-    if (count > avail)
-        count = avail;
-
-    /* A pty master whose guest-side slaves have all closed is hung up. Linux
-     * answers EIO there; the host would block forever instead, because elfuse's
-     * keepalive slave keeps the pty alive from its point of view.
-     *
-     * Only once nothing is left to read: a shell that printed on its way out
-     * leaves that output queued, and Linux hands it over before reporting the
-     * hangup. Deciding on the hangup first would swallow it.
-     */
-    if (pty_read_hangs_up(fd, read_gen, host_ref.fd)) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EIO;
-    }
-
-    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
-    if (offset >= 0) {
-        int64_t intercepted =
-            proc_try_read_intercept(fd, host_ref.fd, buf, count, offset, 0);
-        if (intercepted != INT64_MIN) {
-            host_fd_ref_close(&host_ref);
-            return intercepted;
-        }
-    }
-
-    /* Wait interruptibly when the fd can block on a read (pipe, socket, fifo,
-     * char/tty), then take the bytes without parking. Regular files never block
-     * and transfer straight through.
-     */
-    struct iovec iov = {.iov_base = buf, .iov_len = count};
-    ssize_t ret;
-    int64_t rwait = io_xfer(fd, host_ref.fd, POLLIN, &iov, 1, &ret, &read_st);
-    if (rwait < 0) {
-        host_fd_ref_close(&host_ref);
-        return rwait;
-    }
-
-    int64_t result = ret < 0 ? recv_eof_or_errno(host_ref.fd, fd) : ret;
-    host_fd_ref_close(&host_ref);
-    return result;
-}
-
-int64_t sys_pread64(guest_t *g,
-                    int fd,
-                    uint64_t buf_gva,
-                    uint64_t count,
-                    int64_t offset)
-{
-    if (fuse_is_file_fd(fd))
-        return fuse_pread_fd(g, fd, buf_gva, count, offset);
-
-    /* usbdevfs serves its descriptors blob positionally too: every read path on
-     * the fd must agree, and the host fd behind it is a readiness pipe.
-     */
-    if (fd_get_type(fd) == FD_USBDEV)
-        return usbdev_pread(fd, g, buf_gva, count, offset);
-
-    host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_io(fd, &host_ref);
-    if (err < 0)
-        return err;
-
-    /* Linux: pread(fd, NULL, 0, off) returns 0, not EFAULT */
-    if (count == 0)
-        return io_return_zero(&host_ref);
-
-    uint64_t avail = 0;
-    void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_W, count);
-    if (!buf) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
-    }
-    if (count > avail)
-        count = avail;
-
-    int64_t intercepted =
-        proc_try_read_intercept(fd, host_ref.fd, buf, count, offset, 1);
-    if (intercepted != INT64_MIN) {
-        host_fd_ref_close(&host_ref);
-        return intercepted;
-    }
-
-    ssize_t ret = pread(host_ref.fd, buf, count, offset);
-    host_fd_ref_close(&host_ref);
-    return ret < 0 ? linux_errno() : ret;
-}
-
 /* pwrite and pwritev on an O_APPEND descriptor write at end of file on Linux,
  * since generic_write_checks moves the position there, and leave the
  * descriptor's own position alone. macOS writes at the offset given, so such a
@@ -1937,6 +1713,400 @@ static bool io_write_range_wraps(int host_fd, int64_t offset, uint64_t count)
            lseek(host_fd, 0, SEEK_CUR) >= 0;
 }
 
+enum file_io_op {
+    FILE_IO_READ,
+    FILE_IO_WRITE,
+    FILE_IO_PREAD,
+    FILE_IO_PWRITE,
+    FILE_IO_APPEND,
+    FILE_IO_PAPPEND,
+};
+
+static bool io_is_regular(int host_fd)
+{
+    struct stat st;
+    return fstat(host_fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* A lazy-block boundary is not a short transfer. Resolve a bounded window at a
+ * time, retaining the original guest-vector cursor until that window has
+ * transferred in full. Real short transfers, EOF and permission holes stop the
+ * operation.
+ *
+ * @stream is the pinned block state of a descriptor that is not a regular file,
+ * or NULL for one that is. Only writes take this path for a stream: a pipe or
+ * socket read may return less than asked for on Linux too, but a blocking write
+ * does not stop at a boundary the guest cannot see. Each window then goes
+ * through io_xfer, which keeps the readiness wait and signal interruption.
+ */
+static int64_t file_io(guest_t *g,
+                       int fd,
+                       int host_fd,
+                       const linux_iovec_t *giov,
+                       int iovcnt,
+                       enum file_io_op op,
+                       int64_t offset,
+                       const fd_block_state_t *stream)
+{
+    bool writing = op != FILE_IO_READ && op != FILE_IO_PREAD;
+    bool positioned =
+        op == FILE_IO_PREAD || op == FILE_IO_PWRITE || op == FILE_IO_PAPPEND;
+    bool appends = false;
+    if (!positioned)
+        offset = lseek(host_fd, 0, SEEK_CUR);
+    if (op == FILE_IO_APPEND || op == FILE_IO_PAPPEND) {
+        struct stat st;
+        if (fstat(host_fd, &st) < 0)
+            return linux_errno();
+        offset = st.st_size;
+        if (!positioned && lseek(host_fd, offset, SEEK_SET) < 0)
+            return linux_errno();
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (!iov_total_add(total, giov[i].iov_len, &total))
+            return -LINUX_EINVAL;
+    }
+    if (writing && positioned && io_write_range_wraps(host_fd, offset, total))
+        return -LINUX_EINVAL;
+    if (op == FILE_IO_PWRITE)
+        offset = io_append_offset(host_fd, FD_REGULAR, offset, &appends);
+    if (total == 0 && stream) {
+        int64_t err = io_check_access(host_fd, POLLOUT);
+        return err < 0 ? err : 0;
+    }
+    if (total == 0) {
+        struct iovec empty = {0};
+        ssize_t n = positioned ? (writing ? pwritev(host_fd, &empty, 1, offset)
+                                          : preadv(host_fd, &empty, 1, offset))
+                               : (writing ? writev(host_fd, &empty, 1)
+                                          : readv(host_fd, &empty, 1));
+        return n < 0 ? linux_errno() : n;
+    }
+
+    uint64_t done = 0, skip = 0;
+    int index = 0;
+    while (done < total) {
+        struct iovec host_iov[SYSCALL_IOV_STACK_MAX];
+        uint64_t window = total - done;
+        if (window > BLOCK_2MIB)
+            window = BLOCK_2MIB;
+        uint64_t bytes = 0, next_skip = skip;
+        int count = 0, next_index = index;
+        bool fault = false;
+        while (next_index < iovcnt && count < SYSCALL_IOV_STACK_MAX &&
+               bytes < window) {
+            const linux_iovec_t *entry = &giov[next_index];
+            uint64_t chunk;
+            if (!slice_clamp(entry->iov_len, next_skip, window - bytes,
+                             &chunk)) {
+                next_index++;
+                next_skip = 0;
+                continue;
+            }
+            uint64_t avail = 0;
+            void *base =
+                entry->iov_base <= UINT64_MAX - next_skip
+                    ? guest_ptr_bound(g, entry->iov_base + next_skip, &avail,
+                                      writing ? MEM_PERM_R : MEM_PERM_W, chunk)
+                    : NULL;
+            if (!base || avail == 0) {
+                fault = true;
+                break;
+            }
+            if (chunk > avail)
+                chunk = avail;
+            host_iov[count++] = (struct iovec) {base, chunk};
+            bytes += chunk;
+            next_skip += chunk;
+            if (next_skip == entry->iov_len) {
+                next_index++;
+                next_skip = 0;
+            }
+            if (chunk == avail)
+                break;
+        }
+        if (bytes == 0)
+            return done ? (int64_t) done : -LINUX_EFAULT;
+
+        if (done == 0 && offset >= 0) {
+            int64_t intercepted =
+                writing ? proc_try_writev_intercept(fd, host_fd, host_iov,
+                                                    count, offset, positioned)
+                        : proc_try_readv_intercept(fd, host_fd, host_iov, count,
+                                                   offset, positioned);
+            if (intercepted != INT64_MIN)
+                return intercepted;
+            if (writing) {
+                int64_t err =
+                    fsize_limit_write(host_fd, offset, !positioned, &total);
+                if (err < 0)
+                    return err;
+                if (bytes > total) {
+                    uint64_t left = total;
+                    for (int i = 0; i < count; i++) {
+                        if (host_iov[i].iov_len >= left) {
+                            host_iov[i].iov_len = left;
+                            count = i + 1;
+                            break;
+                        }
+                        left -= host_iov[i].iov_len;
+                    }
+                    bytes = total;
+                }
+            }
+        }
+
+        ssize_t n;
+        if (stream) {
+            int64_t wait =
+                io_xfer(fd, host_fd, POLLOUT, host_iov, count, &n, stream);
+            if (wait < 0)
+                return done ? (int64_t) done : wait;
+        } else if (positioned) {
+            n = writing
+                    ? io_pwritev_at(host_fd, host_iov, count, offset, appends)
+                    : preadv(host_fd, host_iov, count, offset);
+        } else {
+            n = writing ? writev(host_fd, host_iov, count)
+                        : readv(host_fd, host_iov, count);
+        }
+        if (n < 0)
+            return done ? (int64_t) done
+                        : (writing ? io_write_result(n) : linux_errno());
+        done += (uint64_t) n;
+        if ((uint64_t) n < bytes || fault || done == total)
+            break;
+        index = next_index;
+        skip = next_skip;
+        if (positioned) {
+            if (offset < 0 || (uint64_t) n > (uint64_t) (INT64_MAX - offset))
+                break;
+            offset += n;
+        }
+    }
+    return (int64_t) done;
+}
+
+static int64_t file_iov_io(guest_t *g,
+                           int fd,
+                           int host_fd,
+                           uint64_t iov_gva,
+                           int iovcnt,
+                           enum file_io_op op,
+                           int64_t offset,
+                           const fd_block_state_t *stream)
+{
+    if (!iov_count_ok(iovcnt))
+        return -LINUX_EINVAL;
+    linux_iovec_t stack[SYSCALL_IOV_STACK_MAX];
+    linux_iovec_t *iov = stack;
+    if (iovcnt > SYSCALL_IOV_STACK_MAX) {
+        iov = malloc((size_t) iovcnt * sizeof(*iov));
+        if (!iov)
+            return -LINUX_ENOMEM;
+    }
+    int64_t result = -LINUX_EFAULT;
+    if (guest_read(g, iov_gva, iov, (size_t) iovcnt * sizeof(*iov)) == 0)
+        result = file_io(g, fd, host_fd, iov, iovcnt, op, offset, stream);
+    if (iov != stack)
+        free(iov);
+    return result;
+}
+
+int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
+{
+    int type = fd_get_type(fd);
+    if (type == FD_FUSE_DEV)
+        return fuse_dev_write(g, fd, buf_gva, count);
+    if (type == FD_EVENTFD)
+        return eventfd_write(fd, g, buf_gva, count);
+
+    /* Linux accepts write() on a netlink socket as sendto() with no explicit
+     * destination, and iproute2-style senders use it in place of sendto. The
+     * host fd behind a netlink guest fd is the read end of the readiness pipe,
+     * so falling through would write to a read-only pipe end and report EBADF
+     * for a request the emulation can answer.
+     */
+    if (type == FD_NETLINK)
+        return netlink_send(fd, g, buf_gva, count);
+
+    /* usbdevfs has no write op. Falling through would scribble on the readiness
+     * pipe's read end.
+     */
+    if (type == FD_USBDEV)
+        return usbdev_write_refused(fd);
+
+    host_fd_ref_t host_ref;
+    fd_block_state_t write_st;
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &write_st);
+    if (err < 0)
+        return err;
+
+    /* Linux: write(fd, NULL, 0) returns 0, not EFAULT */
+    if (count == 0)
+        return io_return_zero(&host_ref);
+
+    linux_iovec_t iov = {buf_gva, count};
+    int64_t result = file_io(g, fd, host_ref.fd, &iov, 1, FILE_IO_WRITE, 0,
+                             io_is_regular(host_ref.fd) ? NULL : &write_st);
+    host_fd_ref_close(&host_ref);
+    return result;
+}
+
+int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
+{
+    /* Read the type once under fd_lock so a concurrent close/reopen cannot make
+     * different dispatch checks disagree. Each handler still re-validates
+     * internally and returns EBADF if its slot changed.
+     */
+    int type = fd_get_type(fd);
+    switch (type) {
+    case FD_FUSE_DEV:
+        return fuse_dev_read(fd, g, buf_gva, count);
+    case FD_FUSE_FILE:
+        return fuse_read_fd(g, fd, buf_gva, count);
+    case FD_EVENTFD:
+        return eventfd_read(fd, g, buf_gva, count);
+    case FD_SIGNALFD:
+        return signalfd_read(fd, g, buf_gva, count);
+    case FD_TIMERFD:
+        return timerfd_read(fd, g, buf_gva, count);
+    case FD_INOTIFY:
+        return inotify_read(fd, g, buf_gva, count);
+    case FD_NETLINK:
+        return netlink_read(fd, g, buf_gva, count);
+    case FD_URANDOM:
+        return urandom_read(g, fd, buf_gva, count);
+    case FD_USBDEV:
+        return usbdev_read(fd, g, buf_gva, count);
+    }
+
+    /* Pin the generation in the same fd_lock window as the host fd. The pty
+     * hangup check below re-resolves the guest fd, and this is the witness that
+     * the slot still holds the very file this read resolved.
+     */
+    host_fd_ref_t host_ref;
+    uint64_t read_gen;
+    fd_block_state_t read_st;
+    int64_t err = host_fd_ref_open_io_state(fd, &host_ref, &read_gen, &read_st);
+    if (err < 0)
+        return err;
+
+    /* Linux: read(fd, NULL, 0) returns 0, not EFAULT */
+    if (count == 0)
+        return io_return_zero(&host_ref);
+
+    uint64_t done = 0;
+    int64_t result;
+    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+    for (;;) {
+        uint64_t avail = 0;
+        void *buf = buf_gva <= UINT64_MAX - done
+                        ? guest_ptr_bound(g, buf_gva + done, &avail, MEM_PERM_W,
+                                          count - done)
+                        : NULL;
+        if (!buf) {
+            result = done ? (int64_t) done : -LINUX_EFAULT;
+            break;
+        }
+        uint64_t chunk = count - done < avail ? count - done : avail;
+
+        /* The keepalive slave hides Linux pty hangup from the host. Buffered
+         * output still takes precedence over EIO.
+         */
+        if (pty_read_hangs_up(fd, read_gen, host_ref.fd)) {
+            result = done ? (int64_t) done : -LINUX_EIO;
+            break;
+        }
+
+        int64_t n = INT64_MIN;
+        if (offset >= 0)
+            n = proc_try_read_intercept(fd, host_ref.fd, buf, chunk, offset, 0);
+        if (n == INT64_MIN) {
+            struct iovec iov = {.iov_base = buf, .iov_len = chunk};
+            ssize_t ret;
+            n = io_xfer(fd, host_ref.fd, POLLIN, &iov, 1, &ret, &read_st);
+            if (n >= 0)
+                n = ret < 0 ? recv_eof_or_errno(host_ref.fd, fd) : ret;
+        }
+        if (n < 0) {
+            result = done ? (int64_t) done : n;
+            break;
+        }
+        done += (uint64_t) n;
+
+        /* A full chunk on a seekable fd can continue into the next lazy block.
+         * Pipes and sockets must not wait for more data after the first read.
+         */
+        if ((uint64_t) n < chunk || done == count || offset < 0) {
+            result = (int64_t) done;
+            break;
+        }
+        offset = lseek(host_ref.fd, 0, SEEK_CUR);
+        if (offset < 0) {
+            result = (int64_t) done;
+            break;
+        }
+    }
+    host_fd_ref_close(&host_ref);
+    return result;
+}
+
+int64_t sys_pread64(guest_t *g,
+                    int fd,
+                    uint64_t buf_gva,
+                    uint64_t count,
+                    int64_t offset)
+{
+    if (fuse_is_file_fd(fd))
+        return fuse_pread_fd(g, fd, buf_gva, count, offset);
+
+    /* usbdevfs serves its descriptors blob positionally too: every read path on
+     * the fd must agree, and the host fd behind it is a readiness pipe.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_pread(fd, g, buf_gva, count, offset);
+
+    host_fd_ref_t host_ref;
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
+    if (err < 0)
+        return err;
+
+    /* Linux: pread(fd, NULL, 0, off) returns 0, not EFAULT */
+    if (count == 0)
+        return io_return_zero(&host_ref);
+
+    if (io_is_regular(host_ref.fd)) {
+        linux_iovec_t iov = {buf_gva, count};
+        int64_t result =
+            file_io(g, fd, host_ref.fd, &iov, 1, FILE_IO_PREAD, offset, NULL);
+        host_fd_ref_close(&host_ref);
+        return result;
+    }
+
+    uint64_t avail = 0;
+    void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_W, count);
+    if (!buf) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EFAULT;
+    }
+    if (count > avail)
+        count = avail;
+
+    int64_t intercepted =
+        proc_try_read_intercept(fd, host_ref.fd, buf, count, offset, 1);
+    if (intercepted != INT64_MIN) {
+        host_fd_ref_close(&host_ref);
+        return intercepted;
+    }
+
+    ssize_t ret = pread(host_ref.fd, buf, count, offset);
+    host_fd_ref_close(&host_ref);
+    return ret < 0 ? linux_errno() : ret;
+}
+
 int64_t sys_pwrite64(guest_t *g,
                      int fd,
                      uint64_t buf_gva,
@@ -1963,6 +2133,14 @@ int64_t sys_pwrite64(guest_t *g,
     if (io_write_range_wraps(host_ref.fd, offset, count)) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EINVAL;
+    }
+
+    if (io_is_regular(host_ref.fd)) {
+        linux_iovec_t iov = {buf_gva, count};
+        int64_t result =
+            file_io(g, fd, host_ref.fd, &iov, 1, FILE_IO_PWRITE, offset, NULL);
+        host_fd_ref_close(&host_ref);
+        return result;
     }
 
     uint64_t avail = 0;
@@ -2361,6 +2539,13 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     if (err < 0)
         return err;
 
+    if (io_is_regular(host_ref.fd)) {
+        int64_t result = file_iov_io(g, fd, host_ref.fd, iov_gva, iovcnt,
+                                     FILE_IO_READ, 0, NULL);
+        host_fd_ref_close(&host_ref);
+        return result;
+    }
+
     host_iov_buf_t host_iov;
     err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_W, &host_iov);
     if (err < 0) {
@@ -2457,49 +2642,9 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     if (err < 0)
         return err;
 
-    host_iov_buf_t host_iov;
-    err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_R, &host_iov);
-    if (err < 0) {
-        host_fd_ref_close(&host_ref);
-        return err;
-    }
-    if (!host_iov_has_payload(&host_iov, iovcnt)) {
-        err = io_check_access(host_ref.fd, POLLOUT);
-        host_iov_free(&host_iov);
-        host_fd_ref_close(&host_ref);
-        return err < 0 ? err : 0;
-    }
-
-    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
-    if (offset >= 0) {
-        int64_t intercepted = proc_try_writev_intercept(
-            fd, host_ref.fd, host_iov.iov, iovcnt, offset, 0);
-        if (intercepted != INT64_MIN) {
-            host_iov_free(&host_iov);
-            host_fd_ref_close(&host_ref);
-            return intercepted;
-        }
-
-        int64_t fsz = fsize_limit_writev(host_ref.fd, offset, true,
-                                         host_iov.iov, &iovcnt);
-        if (fsz < 0) {
-            host_iov_free(&host_iov);
-            host_fd_ref_close(&host_ref);
-            return fsz;
-        }
-    }
-
-    ssize_t ret;
-    int64_t wwait = io_xfer(fd, host_ref.fd, POLLOUT, host_iov.iov, iovcnt,
-                            &ret, &writev_st);
-    if (wwait < 0) {
-        host_iov_free(&host_iov);
-        host_fd_ref_close(&host_ref);
-        return wwait;
-    }
-
-    int64_t result = io_write_result(ret);
-    host_iov_free(&host_iov);
+    int64_t result =
+        file_iov_io(g, fd, host_ref.fd, iov_gva, iovcnt, FILE_IO_WRITE, 0,
+                    io_is_regular(host_ref.fd) ? NULL : &writev_st);
     host_fd_ref_close(&host_ref);
     return result;
 }
@@ -2533,6 +2678,13 @@ int64_t sys_preadv(guest_t *g,
     int64_t err = host_fd_ref_open_io(fd, &host_ref);
     if (err < 0)
         return err;
+
+    if (io_is_regular(host_ref.fd)) {
+        int64_t result = file_iov_io(g, fd, host_ref.fd, iov_gva, iovcnt,
+                                     FILE_IO_PREAD, offset, NULL);
+        host_fd_ref_close(&host_ref);
+        return result;
+    }
 
     host_iov_buf_t host_iov;
     err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_W, &host_iov);
@@ -2588,6 +2740,13 @@ int64_t sys_pwritev(guest_t *g,
     if (err < 0)
         return err;
 
+    if (io_is_regular(host_ref.fd)) {
+        int64_t result = file_iov_io(g, fd, host_ref.fd, iov_gva, iovcnt,
+                                     FILE_IO_PWRITE, offset, NULL);
+        host_fd_ref_close(&host_ref);
+        return result;
+    }
+
     host_iov_buf_t host_iov;
     err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_R, &host_iov);
     if (err < 0) {
@@ -2640,6 +2799,14 @@ static int64_t sys_pwritev_append(guest_t *g,
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
     if (err < 0)
         return err;
+
+    if (io_is_regular(host_ref.fd)) {
+        int64_t result = file_iov_io(
+            g, fd, host_ref.fd, iov_gva, iovcnt,
+            update_file_offset ? FILE_IO_APPEND : FILE_IO_PAPPEND, 0, NULL);
+        host_fd_ref_close(&host_ref);
+        return result;
+    }
 
     host_iov_buf_t host_iov;
     err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_R, &host_iov);

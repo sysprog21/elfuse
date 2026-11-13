@@ -2100,6 +2100,16 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_ENOTCONN;
     }
+
+    /* The file slot is taken here, before the session lock: fuse_lock is held
+     * above session->lock (fuse_path_lookup), so reaching for it later with the
+     * session lock held would close a cycle.
+     */
+    fuse_file_t *file = fuse_alloc_file_locked();
+    if (!file) {
+        pthread_mutex_unlock(&fuse_lock);
+        return -LINUX_ENOMEM;
+    }
     fuse_session_t *session = mount->session;
     int mount_id = mount->mount_id;
     fuse_session_get_locked(session);
@@ -2112,6 +2122,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     if (rc < 0) {
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return rc;
@@ -2123,6 +2134,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_ENOTDIR;
@@ -2137,6 +2149,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_EACCES;
@@ -2148,23 +2161,10 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_EMFILE;
-    }
-
-    fuse_file_t *file = NULL;
-    pthread_mutex_lock(&fuse_lock);
-    file = fuse_alloc_file_locked();
-    pthread_mutex_unlock(&fuse_lock);
-    if (!file) {
-        fd_mark_closed(guest_fd);
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
-        pthread_mutex_unlock(&session->lock);
-        pthread_mutex_lock(&fuse_lock);
-        fuse_session_put_locked(session);
-        pthread_mutex_unlock(&fuse_lock);
-        return -LINUX_ENOMEM;
     }
 
     fuse_open_out_t out;
@@ -2552,6 +2552,10 @@ int64_t fuse_dev_read(int guest_fd,
     fuse_session_get_locked(session);
     pthread_mutex_unlock(&fuse_lock);
 
+    if (count)
+        (void) guest_lazy_faultin(
+            g, buf_gva, count < FUSE_FRAME_CAP ? count : FUSE_FRAME_CAP);
+
     /* The state came from the descriptor; the session came from the fd number.
      * A sibling closing and reopening guest_fd between the two makes them
      * describe different objects, and the read would then take its blocking
@@ -2622,7 +2626,7 @@ int64_t fuse_dev_read(int guest_fd,
         host_fd_ref_close(&notify_ref);
         return -LINUX_EINVAL;
     }
-    if (guest_write(g, buf_gva, req->frame, frame_len) < 0) {
+    if (guest_write_nofault(g, buf_gva, req->frame, frame_len) < 0) {
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);

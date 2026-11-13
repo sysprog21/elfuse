@@ -72,7 +72,8 @@ NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-usb-desc-host.c \
                 tests/test-usbdev-urb-host.c \
                 tests/test-elf-headers-host.c \
-                tests/test-gdbstub-host.c
+                tests/test-gdbstub-host.c \
+                tests/thread-safety-reject.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c
 SPECIAL_TEST_BINS := $(BUILD_DIR)/test-lowbase-mem-200000 $(BUILD_DIR)/test-lowbase-mem-300000
 
@@ -110,8 +111,15 @@ RESET  := \033[0m
 CFLAGS := -O2 -Wall -Wextra -Wpedantic \
           -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
           -Wformat=2 -Wimplicit-fallthrough -Wundef \
-          -Wnull-dereference -Wno-unused-parameter
+          -Wnull-dereference -Wno-unused-parameter \
+          -Wthread-safety
 CFLAGS += $(EXTRA_CFLAGS)
+
+# LOCKDEP=1 routes every pthread lock call through the runtime lock-order
+# validator in src/debug/lockdep.c (see src/debug/lockdep.h).
+ifeq ($(LOCKDEP),1)
+CFLAGS += -DELFUSE_LOCKDEP -include src/debug/lockdep.h
+endif
 
 # Warnings are errors, because this tree has none and the gates around it (the
 # syscall coverage check, the EINTR contract, the proof targets) all fail the

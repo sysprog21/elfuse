@@ -120,6 +120,13 @@ static _Atomic bool exec_de_thread_active;
  */
 static uint64_t sp_el1_allocated = 0;
 
+/* One past the highest slot ever handed out, never lowered. Slot 0 is the main
+ * thread's from the start. Released after the slot is recorded, so a reader
+ * that acquires it and then takes mmap_lock sees every slot whose control could
+ * hold state.
+ */
+static _Atomic int sp_el1_slot_limit = 1;
+
 /* Per-thread pointer to the current thread's entry. Set once when a host
  * pthread starts running a guest vCPU. Syscall handlers read this without
  * locking since it is thread-local and never changes after init.
@@ -557,11 +564,20 @@ uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t)
         sp_el1_allocated |= BIT64(slot);
         t->sp_el1 = sp;
         t->sp_el1_slot = slot;
+        if (slot + 1 >
+            atomic_load_explicit(&sp_el1_slot_limit, memory_order_relaxed))
+            atomic_store_explicit(&sp_el1_slot_limit, slot + 1,
+                                  memory_order_release);
     }
 
     pthread_mutex_unlock(&thread_lock);
 
     return sp;
+}
+
+int thread_sp_el1_slot_limit(void)
+{
+    return atomic_load_explicit(&sp_el1_slot_limit, memory_order_acquire);
 }
 
 void thread_sp_el1_region(const guest_t *g, uint64_t *lo, uint64_t *hi)

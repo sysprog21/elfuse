@@ -85,9 +85,9 @@ check_positive FUTEX_EAGAIN_HIT
 check_positive FUTEX_SHAPE_BAIL
 check_positive FUTEX_MATCH_BAIL
 
-# The EFAULT tail is the riskiest piece of the new assembly: it unwinds a nested
-# exception frame by hand. The guest's three unresolvable addresses drive it.
-check_positive FUTEX_EFAULT_HIT
+# Fault fallback unwinds a nested exception frame before HVC. The guest's
+# unresolvable addresses exercise it and must still return EFAULT.
+check_positive FUTEX_FAULT_BAIL
 
 # The wake path serves the shape a real contended workload actually produces, so
 # a dispatch that stops reaching it costs more than the wait path does. Its bail

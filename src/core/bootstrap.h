@@ -91,4 +91,5 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
                                        bool verbose,
                                        uint64_t *out_entry_point,
                                        uint64_t *out_stack_pointer,
-                                       uint64_t *out_ttbr0);
+                                       uint64_t *out_ttbr0)
+    REQUIRES(mmap_pt_gate);

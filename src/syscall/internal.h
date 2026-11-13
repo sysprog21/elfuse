@@ -81,11 +81,10 @@
  *                                     under mmap_lock only by
  *                                     exec_handoff_reset, and holds sig_lock
  *                                     beneath it through
- *                                     signal_restore_blocked. A requester drops
- *                                     mmap_lock before taking it: waiting for
- *                                     the slot under mmap_lock deadlocks
- *                                     against the leader, which needs that lock
- *                                     to run the request that frees the slot
+ *                                     signal_restore_blocked. sys_execve does
+ *                                     not acquire mmap_lock until the point of
+ *                                     no return, so a requester waiting for the
+ *                                     slot never holds it
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
@@ -186,6 +185,7 @@
 
 #include "syscall/linux-wire.h"
 #include "linux-limits.h"
+#include "core/mmap-lock.h"
 #include "runtime/thread.h"
 
 /* Whether the guest's effective IDs may execute a file with this stat: 0, or a
@@ -200,13 +200,6 @@ typedef int host_fd_t;
 
 /* Cross-module locks. */
 extern pthread_mutex_t fd_lock; /* FD table */
-
-/* mmap_lock (mmap/brk + page tables) is not recursive. */
-void mmap_lock_acquire(void);
-void mmap_lock_release(void);
-
-/* Whether the calling thread holds mmap_lock. */
-bool mmap_lock_held(void);
 
 /* FD table (defined in syscall/fdtable.c). */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];
@@ -969,7 +962,8 @@ int linux_to_mac_status_flags(int linux_flags);
 /* Allocate anonymous guest memory. Wraps the static sys_mmap with
  * MAP_PRIVATE|MAP_ANONYMOUS. Caller must hold mmap_lock.
  */
-int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
+int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot)
+    REQUIRES(mmap_pt_gate);
 
 /* Borrowed-or-pinned host fd reference.
  *

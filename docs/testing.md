@@ -105,6 +105,15 @@ What they do:
     `_explicit` form, or a `__atomic_*` / `__sync_*` builtin, fails the
     build. Plain-operator access to an `_Atomic` object needs the
     declarations resolved and stays a review question
+  - `scripts/check-sb-handshake.py` so a store-buffering handshake (one
+    function stores X then loads Y, another stores Y then loads X) fails
+    the build unless both sides are `memory_order_seq_cst` or carry a
+    seq_cst fence. Release/acquire does not order a store before a later
+    load, so such a handshake can admit both sides at once
+  - `check-thread-safety`, which compiles `tests/thread-safety-reject.c` and
+    fails unless a page-table write and a revoke under the raw lock are both
+    rejected for not holding `mmap_pt_gate`, so a build that stopped running
+    the analysis cannot pass
   - `scripts/check-ascii.py` so a source file carrying non-ASCII outside
     the comment-diagram set fails the build
   - `scripts/check-svc-tails.py` so an HVC #5 return tail cannot reach EL0
@@ -222,7 +231,39 @@ What they do:
   expressible `proved/gva.h` preconditions are checked on every call the suite
   makes. Separate from `make check` because those checks sit on the
   `guest_read` / `guest_write` hot path
+- `make verify-tla TLA2TOOLS=/path/to/tla2tools.jar`: model-check the TLA+
+  specs in `tests/tla` with TLC. `ArenaProtocol.tla` covers the EL1 fast-path
+  arena protocol (the PT gate, publication and retire rings, generations, the
+  materialized envelope, materialization claims, revoke, fork and exec);
+  `ArenaProtocolTLB.cfg` adds per-vCPU TLB entries and the host's TLBI
+  deferred to its vCPU's return to EL0. `Teardown.tla` covers the fork quiesce
+  window against the execve reap and the vCPU run loop. `TLA_RUNS` selects
+  spec:config pairs; the default runs the configurations that model the code
+  as it is and pass, about 25 minutes on an M4. `Teardown.cfg` also models the
+  code as it is and fails, because the fork quiesce barrier can be bypassed;
+  `TeardownFix.cfg` models the repair. `ArenaProtocolNoFlush.cfg` drops the
+  arena TLB flush on refill and rewind and fails, the counterexample the TLB
+  configuration exists to find
+- `make check-lockdep`: rebuild with `LOCKDEP=1` and run `make check` under
+  the runtime lock-order validator (`src/debug/lockdep.c`). Every pthread lock
+  call is routed through it; it fails the acquisition that would close a cycle
+  in the observed lock graph, that runs against the order block in
+  `src/syscall/internal.h`, or that is taken while a documented leaf is held.
+  Each path has to run once, not race, so a single-threaded test covers it. Its
+  own self-test, `tests/test-lockdep-host.c`, runs first
 - `make lint`: static analysis through `clang-tidy`
+
+Every build also passes `-Wthread-safety` (macros in
+`src/core/thread-safety.h`): a function declared `REQUIRES(c)` cannot be called
+on a path that does not hold `c`; the compiler rejects it.
+`mmap_pt_gate` (`src/core/guest.h`) is the one capability so far, with no lock
+object behind it: it is
+held from `mmap_lock_acquire` to `mmap_lock_release`, while mmap_lock is held
+and the EL1 page-table gate is closed with every fast-path producer out.
+`mmap_lock_acquire_raw` does not grant it. Every page-table writer and every
+arena revoke, refill or drain requires it, so a descriptor rewrite or revoke on
+a path that holds only the raw lock does not compile. Code that runs before any
+vCPU exists claims it through `mmap_pt_gate_exclusive`.
 
 ## Quick Iteration
 
@@ -824,6 +865,7 @@ Suggested minimum validation:
 | CLI, logging, docs-only build rules | `make elfuse` |
 | Filename codec, case-exact walk, sysroot resolvers | `make check` (runs the codec unit tests, name lanes, and byte-exact oracle lane), plus `make test-sysroot-name-soak` for resolver concurrency. A red golden vector in `test-casefold-host` means the on-disk format moved: see `docs/filenames.md` before touching `tests/casefold-vectors.h` |
 | General syscall or runtime logic | `make elfuse && make check && make test-matrix-elfuse-aarch64` |
+| Locking, lock nesting, a new lock, or a lock-free handshake | `make check && make check-lockdep && make check-tsan` |
 | `/proc`, `/dev`, path, or BusyBox-sensitive behavior | `make elfuse && make check && make test-matrix-elfuse-aarch64` |
 | Rosetta hosting, x86_64 dispatch, VZ ioctls, AOT cache | `make elfuse && make test-rosetta-all` |
 | Broad behavioral changes | `make elfuse && make check && make test-matrix` |

@@ -85,6 +85,7 @@ test-epoll-del-leak
 test-timerfd
 test-timerfd-overflow
 test-large-io-boundary
+test-getdents64-lazy-span
 test-ioctl-cloexec
 test-pty
 test-ioctl-fioasync
@@ -137,6 +138,11 @@ test-guard-page
 test-mmap-hint
 test-mmap-sigbus-efault
 test-brk-stack
+
+[section] Lazy anonymous mmap tests
+test-mmap-lazy
+test-mmap-fastpath
+test-mmap-fastpath-stress
 
 [section] mremap tests
 test-mremap

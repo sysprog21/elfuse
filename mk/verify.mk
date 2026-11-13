@@ -2,7 +2,7 @@
 
 .PHONY: verify check-contracts verify-mutants check-char-signedness \
         check-stub-constants check-stub-shadow print-verify-targets \
-        print-verify-profiles
+        print-verify-profiles verify-tla
 
 # Frama-C proof of the ELF parsing core. ELF headers come from untrusted
 # binaries, so every offset and extent computed from them is discharged as a
@@ -476,6 +476,35 @@ VERIFY_FUTEXOP_MODEL := typed
 VERIFY_FUTEXOP_SCAN := src/proved/futexop.h
 VERIFY_FUTEXOP_CLAIM := for ANY guest-supplied val3 word
 VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-covered
+# Includes align.h: request_fits calls align_up_ok and window_fits, so this
+# proof must discharge their contracts too, not merely assume them, the same
+# reason VERIFY_ELF appends VERIFY_UTILS_FCTS.
+#
+# MIN_GOALS is the complete count from a real run. Keep the floor at that count
+# so a future edit that quietly drops a contract or a runtime-error obligation
+# cannot turn a smaller proof into a pass.
+#
+# mmap_fastpath_pow2_clamped was originally the classic bit-smear
+# round-up-to-power-of-two; that form's bound and power-of-two properties
+# were confirmed unreachable by these provers (a single OR step already
+# times out), the same wall align_up_ok's own history describes one level
+# down. Rewritten to a doubling loop with an axiomatized power-of-two ghost
+# invariant -- same inputs, same outputs, linear arithmetic instead of
+# bitwise -- and it discharges completely; see the comment above it.
+VERIFY_MMAPFASTPATH_SRC  := src/proved/mmap-fastpath.h
+VERIFY_MMAPFASTPATH_FCTS := mmap_fastpath_request_fits mmap_fastpath_pow2_clamped \
+                            mmap_fastpath_window_max mmap_fastpath_arena_size \
+                            align_up_ok window_fits
+VERIFY_MMAPFASTPATH_MIN_GOALS ?= 93
+VERIFY_MMAPFASTPATH_MODEL := typed
+VERIFY_MMAPFASTPATH_SCAN := src/proved/mmap-fastpath.h src/proved/align.h
+VERIFY_MMAPFASTPATH_CLAIM := for ANY cursor/limit/len and ANY registration history
+VERIFY_MMAPFASTPATH_UNPROVED := mmap_fastpath_window_max reporting an actual array member \
+                                 rather than just an upper bound (the loop-invariant \
+                                 preservation step for that claim times out even with a \
+                                 ghost witness index, confirmed unreachable, see the comment \
+                                 above it); the atomic control-block bookkeeping around all \
+                                 four stays test-covered
 
 # Total versus conditional, per futex contract. Conditional means a requires
 # clause the caller discharges; each is deliberate, and the caller named here is
@@ -818,3 +847,43 @@ check-contracts:
 	@echo "  CONTRACT proved/gva.h call-site preconditions (5 of 9 clauses)"
 	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/contracts \
 	    EXTRA_CFLAGS="-DELFUSE_CONTRACT_ASSERT $(EXTRA_CFLAGS)" check
+
+## Model-check the TLA+ specs under tests/tla with TLC
+#
+# TLA2TOOLS is the path to tla2tools.jar from the TLA+ release page
+# (https://github.com/tlaplus/tlaplus/releases). Nothing in the tree fetches
+# it, so the target names what is missing rather than downloading. Each entry
+# of TLA_RUNS is spec:config, one TLC run over tests/tla/<spec>.tla with
+# tests/tla/<config>.cfg.
+#
+# The default holds the configurations that model the code as it is and pass.
+# Teardown.cfg also models the code as it is and fails: the fork quiesce
+# barrier can be bypassed. TeardownFix.cfg models the repair and passes, and
+# replaces it in the default once the repair lands. ArenaProtocolNoFlush.cfg
+# drops the arena TLB flush on refill and rewind and fails, which is what
+# shows ArenaProtocolTLB.cfg can reach that bug.
+TLA2TOOLS ?=
+TLA_RUNS ?= ArenaProtocol:ArenaProtocol ArenaProtocol:ArenaProtocolHelper \
+            ArenaProtocol:ArenaProtocolTLB
+
+verify-tla:
+	$(call require-tool,java,brew install --cask temurin)
+	@if [ -z "$(TLA2TOOLS)" ] || [ ! -f "$(TLA2TOOLS)" ]; then \
+		printf "  $(RED)tla2tools.jar not found$(RESET) (set TLA2TOOLS=/path/to/tla2tools.jar)\n"; \
+		exit 1; \
+	fi
+	@mkdir -p $(BUILD_DIR)/tla
+	@for run in $(TLA_RUNS); do \
+		spec=$${run%%:*}; cfg=$${run##*:}; \
+		echo "  TLC     $$spec ($$cfg)"; \
+		java -XX:+UseParallelGC -cp "$(TLA2TOOLS)" tlc2.TLC -workers auto -noGenerateSpecTE \
+		    -metadir $(BUILD_DIR)/tla/$$cfg -config tests/tla/$$cfg.cfg \
+		    tests/tla/$$spec.tla > $(BUILD_DIR)/tla/$$cfg.log 2>&1 || { \
+			printf "  $(RED)FAILED$(RESET)   %s, see %s\n" "$$cfg" \
+			    "$(BUILD_DIR)/tla/$$cfg.log"; \
+			grep -A40 "Error:" $(BUILD_DIR)/tla/$$cfg.log | head -60; \
+			exit 1; \
+		}; \
+		grep -E "^[0-9]+ states generated|No error" $(BUILD_DIR)/tla/$$cfg.log | \
+		    sed 's/^/          /'; \
+	done

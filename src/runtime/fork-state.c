@@ -855,7 +855,8 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
-                                bool regions_tracker_stale_snapshot)
+                                bool regions_tracker_stale_snapshot,
+                                const uint64_t *dirty_blocks_snapshot)
 {
     char cwd[LINUX_PATH_MAX] = {0};
     getcwd(cwd, sizeof(cwd));
@@ -905,6 +906,9 @@ int fork_ipc_send_process_state(int ipc_sock,
     if (num_guest_regions > 0 &&
         fork_ipc_write_all(ipc_sock, regions_snapshot,
                            num_guest_regions * sizeof(guest_region_t)) < 0)
+        return -1;
+    if (fork_ipc_write_all(ipc_sock, dirty_blocks_snapshot,
+                           GUEST_DIRTY_WORDS * sizeof(uint64_t)) < 0)
         return -1;
 
     /* The retired preannounced-region count, always zero. The child may be a
@@ -1129,6 +1133,12 @@ int fork_ipc_recv_process_state(int ipc_fd,
     guest_reseed_next_vma_id(g);
     g->regions_tracker_stale =
         (regions_tracker_stale != 0) || (num_guest_regions > recv_regions);
+
+    if (fork_ipc_read_all(ipc_fd, g->dirty_blocks,
+                          GUEST_DIRTY_WORDS * sizeof(uint64_t)) < 0) {
+        log_error("fork-child: failed to read dirty block bitmap");
+        return -1;
+    }
 
     /* The retired preannounced-region slot. Nothing produces those regions, so
      * the records a peer sends are discarded rather than restored. The bound is

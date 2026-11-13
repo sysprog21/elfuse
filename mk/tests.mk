@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-bench-report check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-sb-handshake check-thread-safety check-bench-report check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -143,7 +143,7 @@ define RUN_OPTIONAL_SKIP77
 	fi
 endef
 
-.PHONY: check-asan check-ubsan check-tsan check-sanitizer
+.PHONY: check-asan check-ubsan check-tsan check-sanitizer check-lockdep
 
 # Sanitizer builds target elfuse's own internals, not Linux syscall
 # compatibility -- the release lane already covers that via test-matrix. So the
@@ -186,6 +186,41 @@ check-ubsan:
 ## Run the sanitizer subset with ThreadSanitizer (TSAN)
 check-tsan:
 	TSAN_OPTIONS="halt_on_error=1" TEST_TIMEOUT="$${TEST_TIMEOUT:-60}" $(MAKE) EXTRA_CFLAGS="-fsanitize=thread -fno-omit-frame-pointer" check-sanitizer
+
+## Run the unit suite under the runtime lock-order validator (LOCKDEP=1)
+# The full suite rather than the sanitizer subset: the validator needs each
+# path to run once, not to race, so its coverage is the suite's path coverage.
+# The self-test runs first, so a validator that has stopped firing cannot
+# report a clean suite.
+check-lockdep:
+	$(MAKE) LOCKDEP=1 $(BUILD_DIR)/test-lockdep-host
+	$(BUILD_DIR)/test-lockdep-host
+	TEST_TIMEOUT="$${TEST_TIMEOUT:-30}" $(MAKE) LOCKDEP=1 check
+
+## Show the PT gate capability rejects page-table writes under the raw lock
+# Each REJECT_ shape in tests/thread-safety-reject.c must fail to compile with
+# the mmap_pt_gate diagnostic, and the ACCEPT_ shape must compile, so a build
+# that stopped running the analysis or lost an annotation fails here.
+check-thread-safety: $(GENERATED_HEADERS)
+	@echo "  TSA     tests/thread-safety-reject.c"
+	@$(CC) $(CFLAGS) -fsyntax-only -Isrc -I$(BUILD_DIR) -DACCEPT_GATED \
+	    tests/thread-safety-reject.c
+	@for shape in REJECT_RAW_PT_WRITE REJECT_RAW_REVOKE; do \
+		log=$(BUILD_DIR)/tsa-$$shape.log; \
+		if $(CC) $(CFLAGS) -fsyntax-only -Isrc -I$(BUILD_DIR) -D$$shape \
+		    tests/thread-safety-reject.c 2> $$log; then \
+			printf "  $(RED)FAILED$(RESET)   %s compiled\n" "$$shape"; \
+			exit 1; \
+		fi; \
+		grep -q "requires holding role 'mmap_pt_gate'" $$log || { \
+			printf "  $(RED)FAILED$(RESET)   %s failed for another reason\n" \
+			    "$$shape"; cat $$log; exit 1; }; \
+	done
+
+## Fail on a release/acquire store-buffering handshake
+check-sb-handshake:
+	@python3 scripts/check-sb-handshake.py --self-test
+	@python3 scripts/check-sb-handshake.py
 
 # Manifest sections that exercise elfuse-internal concurrency, memory, fork,
 # and signal machinery -- the highest-signal targets for ASAN/UBSAN/TSAN.
@@ -264,6 +299,12 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
         test-gdbstub-host)
 
+# Under LOCKDEP=1 every object carries calls into the validator, so a host unit
+# binary that links one needs it too.
+ifeq ($(LOCKDEP),1)
+$(CHECK_HOST_UNIT_BINS): $(BUILD_DIR)/debug/lockdep.o
+endif
+
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
 # build. check-sanitizer's coverage is exactly this prefix, kept as one
@@ -319,7 +360,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-bench-report check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-sb-handshake check-thread-safety check-bench-report check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
@@ -332,6 +373,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-shebang-host,shebang parser unit test)
 	$(call run-lane,test-shim-futex-stats,futex EL1 fast path is live)
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
+	$(call run-lane,test-materialize-host,lazy materialization and signal-frame boundaries)
+	$(call run-lane,test-pt-epoch-host,EL1 PT epoch retires host translation cache entries)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
 	$(call run-lane,test-rlimit-seed,guest rlimits seeded from host limits)
@@ -1488,6 +1531,14 @@ test-shim-futex-stats: $(ELFUSE_BIN) $(TEST_DIR)/test-shim-futex-fast \
 	@bash tests/test-shim-futex-stats.sh $(ELFUSE_BIN) \
 		$(TEST_DIR)/test-shim-futex-fast \
 		$(TEST_DIR)/test-futex-wake-nowaiter
+
+.PHONY: test-materialize-host
+test-materialize-host: $(BUILD_DIR)/test-materialize-host
+	@$(BUILD_DIR)/test-materialize-host
+
+.PHONY: test-pt-epoch-host
+test-pt-epoch-host: $(BUILD_DIR)/test-pt-epoch-host
+	@$(BUILD_DIR)/test-pt-epoch-host
 
 ## Run busybox applet smoke tests
 test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)

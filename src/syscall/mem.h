@@ -19,22 +19,36 @@
 typedef struct mmap_fork_anon_shared_txn mmap_fork_anon_shared_txn_t;
 
 /* brk: set/query program break */
-int64_t sys_brk(guest_t *g, uint64_t addr);
+int64_t sys_brk(guest_t *g, uint64_t addr) REQUIRES(mmap_pt_gate);
 
-/* mmap: map pages into guest address space */
+/* Prepare FUSE backing without mmap_lock held. On success the caller owns
+ * materialized_fd, or receives -1 when the ordinary fd path applies.
+ */
+int mmap_prepare_file(guest_t *g,
+                      uint64_t addr,
+                      uint64_t length,
+                      int flags,
+                      int fd,
+                      int64_t offset,
+                      int *materialized_fd);
+
+/* Borrows materialized_fd (-1 for ordinary mappings) with mmap_lock held. */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,
                  uint64_t length,
                  int prot,
                  int flags,
                  int fd,
-                 int64_t offset);
+                 int64_t offset,
+                 int materialized_fd) REQUIRES(mmap_pt_gate);
 
 /* munmap: unmap pages from guest address space */
-int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length);
+int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
+    REQUIRES(mmap_pt_gate);
 
 /* mprotect: change page permissions */
-int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot);
+int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
+    REQUIRES(mmap_pt_gate);
 
 /* mremap: remap/resize a mapping */
 int64_t sys_mremap(guest_t *g,
@@ -42,10 +56,11 @@ int64_t sys_mremap(guest_t *g,
                    uint64_t old_size,
                    uint64_t new_size,
                    int flags,
-                   uint64_t new_addr);
+                   uint64_t new_addr) REQUIRES(mmap_pt_gate);
 
 /* madvise: advise about memory usage */
-int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice);
+int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
+    REQUIRES(mmap_pt_gate);
 
 /* msync: synchronize file-backed mappings to disk */
 int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags);
@@ -70,7 +85,8 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t);
  * aborted.
  */
 int mmap_fork_prepare_anon_shared_locked(guest_t *g,
-                                         mmap_fork_anon_shared_txn_t **txn_out);
+                                         mmap_fork_anon_shared_txn_t **txn_out)
+    REQUIRES(mmap_pt_gate);
 
 /* Write all @len bytes of @src to @fd at @file_off, retrying EINTR and clamping
  * each write to SSIZE_MAX.

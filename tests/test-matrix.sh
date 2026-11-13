@@ -691,8 +691,9 @@ pipe_report()
 # exception recorded takes it for the whole rule and holds the next one out.
 # test-shim-sigreturn-x8 was run against this lane by hand when it was
 # registered, on the fixture kernel of the day (Alpine 6.18.52-0-virt), and
-# passes there. Contrast test-mremap-infra, which guards elfuse's guest-IPA
-# infra reserve, and test-oom-proc, documented in its own header.
+# passes there. Contrast test-mmap-fastpath, which probes elfuse's arena and
+# TLBI protocol, test-mremap-infra, which guards elfuse's guest-IPA infra
+# reserve, and test-oom-proc, documented in its own header.
 # test-mremap-tail-emfile is listed here as an elfuse-lane regression and marked
 # QEMU_SKIP because its host-reserve assertion has no Linux analogue. There is
 # no "core" vs "extended" split here; everything below runs in both
@@ -846,6 +847,7 @@ run_unit_tests()
     test_rc "$runner" "test-epoll-aba" 0 "$bindir/test-epoll-aba"
     test_rc "$runner" "test-epoll-epfd-reuse" 0 "$bindir/test-epoll-epfd-reuse"
     test_rc "$runner" "test-large-io-boundary" 0 "$bindir/test-large-io-boundary"
+    test_rc "$runner" "test-getdents64-lazy-span" 0 "$bindir/test-getdents64-lazy-span"
     test_rc "$runner" "test-ioctl-cloexec" 0 "$bindir/test-ioctl-cloexec"
     test_rc "$runner" "test-pty" 0 "$bindir/test-pty"
     test_rc "$runner" "test-ioctl-fioasync" 0 "$bindir/test-ioctl-fioasync"
@@ -940,6 +942,7 @@ run_unit_tests()
 
     test_rc "$runner" "test-mmap-sigbus-efault" 0 "$bindir/test-mmap-sigbus-efault"
     test_check "$runner" "test-brk-stack" "0 failed" "$bindir/test-brk-stack"
+    test_rc "$runner" "test-mmap-lazy" 0 "$bindir/test-mmap-lazy"
 
     printf "\nLow-base ET_EXEC memory regression\n"
     test_rc "$runner" "test-lowbase-mem-200000" 0 "$bindir/test-lowbase-mem-200000"

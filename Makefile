@@ -77,6 +77,7 @@ SRCS := \
     debug/gdbstub.c \
     debug/gdbstub-reg.c \
     debug/gdbstub-rsp.c \
+    debug/lockdep.c \
     debug/log.c \
     debug/syscall-hist.c
 
@@ -155,6 +156,21 @@ $(DISPATCH_HEADER): $(DISPATCH_MANIFEST) $(DISPATCH_GENERATOR) src/syscall/abi.h
 
 $(BUILD_DIR)/syscall/syscall.o: $(DISPATCH_HEADER)
 
+# The lock-order document as the table the LOCKDEP=1 validator reads.
+LOCKDEP_ORDER_HEADER := $(BUILD_DIR)/lockdep-order.h
+
+$(LOCKDEP_ORDER_HEADER): src/syscall/internal.h scripts/check-lock-order.py | $(BUILD_DIR)
+	@echo "  GEN     $@"
+	$(Q)python3 scripts/check-lock-order.py --emit-lockdep $@
+
+$(BUILD_DIR)/debug/lockdep.o: $(LOCKDEP_ORDER_HEADER)
+
+## Build the lock-order validator self-test (meaningful under LOCKDEP=1)
+$(BUILD_DIR)/test-lockdep-host: $(BUILD_DIR)/test-lockdep-host.o \
+		$(BUILD_DIR)/debug/lockdep.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 $(DEPARTED_HEADER): $(DEPARTED_MANIFEST) $(DEPARTED_GENERATOR) \
 		src/syscall/usbdev.c | $(BUILD_DIR)
 	@echo "  GEN     $@"
@@ -175,6 +191,14 @@ $(ELFUSE_BIN): $(OBJS) | $(BUILD_DIR)
 	$(call link-and-sign,$@,$(OBJS))
 
 # Native test binaries (macOS, Hypervisor.framework)
+
+$(BUILD_DIR)/test-materialize-host: $(BUILD_DIR)/test-materialize-host.o \
+        $(filter-out $(BUILD_DIR)/main.o,$(OBJS)) | $(BUILD_DIR)
+	$(call link-and-sign,$@,$^)
+
+$(BUILD_DIR)/test-pt-epoch-host: $(BUILD_DIR)/test-pt-epoch-host.o \
+        $(filter-out $(BUILD_DIR)/main.o,$(OBJS)) | $(BUILD_DIR)
+	$(call link-and-sign,$@,$^)
 
 ## Build the multi-vCPU HVF validation test (native macOS binary)
 $(BUILD_DIR)/test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu.o | $(BUILD_DIR)
@@ -564,6 +588,37 @@ $(BUILD_DIR)/test-process-lifecycle: tests/test-process-lifecycle.c src/utils.h 
 $(BUILD_DIR)/test-sigsuspend: tests/test-sigsuspend.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -Itests -o $@ $< -lpthread
+
+# bench-mmap has a multi-threaded mmap_lock-contention section; needs -lpthread.
+$(BUILD_DIR)/bench-mmap: tests/bench-mmap.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-mmap-lazy races concurrent first touch from several threads.
+$(BUILD_DIR)/test-mmap-lazy: tests/test-mmap-lazy.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+.PHONY: test-mmap-lazy
+test-mmap-lazy: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-lazy
+	@$(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-lazy
+	@sh tests/test-mmap-dirty-stats.sh $(ELFUSE_BIN) \
+		$(BUILD_DIR)/test-mmap-lazy
+
+# EL1 consumer-mmap integration/stress test.
+$(BUILD_DIR)/test-mmap-fastpath: tests/test-mmap-fastpath.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+$(BUILD_DIR)/test-mmap-fastpath-stress: tests/test-mmap-fastpath-stress.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+.PHONY: test-mmap-fastpath
+test-mmap-fastpath: $(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-fastpath
+	@$(ELFUSE_BIN) $(BUILD_DIR)/test-mmap-fastpath
+	@sh tests/test-mmap-fastpath-stats.sh $(ELFUSE_BIN) \
+		$(BUILD_DIR)/test-mmap-fastpath
 
 # test-thread-churn creates >64 threads to force thread-table slot reuse.
 $(BUILD_DIR)/test-thread-churn: tests/test-thread-churn.c | $(BUILD_DIR)

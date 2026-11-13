@@ -10,7 +10,8 @@
  * on Linux for a pid that no longer exists.
  *
  * Modes:
- *   hold     block until killed (the unrelated process)
+ *   hold     sleep until killed (the unrelated process), at most 300 s in
+ *            case the recipe shell dies without running its trap
  *   default  fork a child so the family registry exists, print READY, wait
  *            for a line on stdin, then print STALE=esrch or STALE=<errno>
  */
@@ -26,7 +27,7 @@ int main(int argc, char **argv)
 {
     char buf[16];
     if (argc > 1 && strcmp(argv[1], "hold") == 0) {
-        pause();
+        sleep(300);
         return 0;
     }
 

@@ -769,33 +769,36 @@ test-absock-cleanup: $(ELFUSE_BIN) $(BUILD_DIR)/test-absock-cleanup
 # Concurrent runners share the directory and a stale registry can carry a
 # reused pid, so select the registry that is new since the recipe started and
 # holds records for the family root and one of its children.
+# Neither elfuse runs under timeout(1), whose clock would also count the
+# recipe's own steps, and those are slow on CI runners. The two polls bound
+# only the guest's work, and the EXIT trap ends both processes.
+# The shell reaps an exited job before any wait, and its pid is then free for
+# reuse, so liveness checks test a saved pid against jobs -rp and the trap
+# kills only what jobs -rp lists.
 ## registry ignores a reused host pid, and is not named after one
 test-registry-stale-pid: $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid
-	@tmp=$$(mktemp -d); xpid=; fpid=; \
-	trap 'kill $$xpid $$fpid 2>/dev/null; rm -rf "$$tmp"' EXIT; \
+	@tmp=$$(mktemp -d); \
+	trap 'exec 2>/dev/null; kill $$(jobs -rp); wait; rm -rf "$$tmp"' EXIT; \
 	fail() { printf "FAIL: %s\n" "$$1"; exit 1; }; \
+	live() { for p in $$(jobs -rp); do [ "$$p" = "$$1" ] && return 0; done; return 1; }; \
 	regs() { (cd "$$dir" && ls) | grep '^elfuse-procs-' | sort; }; \
 	printf "  %-30s " "stale record on reused pid"; \
-	tmo=$$(command -v timeout 2>/dev/null \
-	    || command -v gtimeout 2>/dev/null || true); \
-	[ -n "$$tmo" ] || { printf "SKIP (timeout(1) missing)\n"; exit 0; }; \
 	secs=$${TEST_TIMEOUT:-10}; \
+	tries=$$((secs > 0 ? secs * 10 : 50)); \
 	dir=$$(getconf DARWIN_USER_TEMP_DIR); \
 	regs > "$$tmp/before" || true; \
 	mkfifo "$$tmp/go"; \
-	$$tmo "$$secs" $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid hold & \
-	xpid=$$!; \
-	$$tmo "$$secs" $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid \
+	$(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid hold & \
+	holder=$$!; \
+	$(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid \
 	    < "$$tmp/go" > "$$tmp/out" & \
-	fpid=$$!; \
+	root=$$!; \
 	exec 4> "$$tmp/go"; \
-	for i in $$(seq 1 $$((secs > 0 ? secs * 10 : 50))); do \
+	for i in $$(seq 1 $$tries); do \
 		grep -q READY "$$tmp/out" && break; \
 		sleep 0.1; \
 	done; \
 	grep -q READY "$$tmp/out" || fail "family never reported READY"; \
-	root=$$(pgrep -P "$$fpid" | head -1); \
-	[ -n "$$root" ] || fail "family root process not found"; \
 	kids=$$(pgrep -P "$$root" | paste -sd'|' -); \
 	[ -n "$$kids" ] || fail "family child process not found"; \
 	new=$$(regs | comm -13 "$$tmp/before" - | (cd "$$dir" \
@@ -805,16 +808,22 @@ test-registry-stale-pid: $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid
 	reg="$$dir$$new"; \
 	[ "$$new" != "elfuse-procs-$$root" ] \
 	    || fail "family id is the root pid $$root, which macOS recycles"; \
-	holder=$$(pgrep -P "$$xpid" | head -1); \
-	[ -n "$$holder" ] || fail "holder elfuse process not found"; \
+	live "$$holder" || fail "holder exited before the plant"; \
 	printf '%s 99 1 1\n' "$$holder" >> "$$reg" \
 	    || fail "cannot append to $$reg"; \
 	echo go >&4; \
 	exec 4>&-; \
-	wait $$fpid; \
+	i=0; \
+	while live "$$root"; do \
+		[ "$$secs" -gt 0 ] && [ $$i -ge $$tries ] \
+		    && fail "family still running $$secs s after go"; \
+		i=$$((i + 1)); \
+		sleep 0.1; \
+	done; \
+	wait $$root; \
 	rc=$$?; \
-	[ $$rc -eq 0 ] || fail "family exited rc=$$rc (124 means it hung)"; \
-	kill -0 "$$holder" 2>/dev/null || fail "holder exited before the lookup"; \
+	[ $$rc -eq 0 ] || fail "family exited rc=$$rc"; \
+	live "$$holder" || fail "holder exited before the lookup"; \
 	verdict=$$(sed -n 's/^STALE=//p' "$$tmp/out"); \
 	[ "$$verdict" = esrch ] || fail "kill(99, 0) $${verdict:-unreported}"; \
 	printf "OK\n"

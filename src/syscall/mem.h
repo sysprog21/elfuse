@@ -126,3 +126,18 @@ int mmap_fork_restore_overlays(guest_t *g,
  * marked active; the caller must not reset guest memory after a failure.
  */
 int mmap_exec_drop_overlays(guest_t *g);
+
+typedef enum {
+    OVERLAY_PAGE_NONE,    /* @ipa is not in a live host overlay */
+    OVERLAY_PAGE_GONE,    /* overlay page raises SIGBUS: file truncated */
+    OVERLAY_PAGE_PRESENT, /* overlay page reads fine again */
+} overlay_page_state_t;
+
+/* Classify a stage-2 abort at IPA @ipa against the MAP_SHARED host overlays.
+ * Once the file is truncated past an overlay page, the host page raises SIGBUS
+ * and HVF reports a guest access to it as a stage-2 abort. A file extended
+ * again after the abort reads fine, so the access can be retried.
+ *
+ * Takes mmap_lock.
+ */
+overlay_page_state_t mmap_overlay_page_state(guest_t *g, uint64_t ipa);

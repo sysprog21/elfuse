@@ -626,10 +626,9 @@ futex_uaddr_tag:
      * and returns EFAULT, matching what the host answers for an address it
      * cannot resolve.
      *
-     * A host-side SIGBUS (the truncated MAP_SHARED overlay HOST_SIGBUS_GUARD
-     * covers) is not a stage-1 fault and does not arrive here. Any FUTEX_WAIT
-     * caller already read this word in EL0 to learn the expected value, so it
-     * hits that case identically.
+     * A word on a truncated MAP_SHARED page takes a stage-2 fault instead,
+     * which exits to EL2; the host injects the EL1 data abort for it, so it
+     * reaches the same recovery.
      *
      * Relaxed, not the acquire it replaces: nothing orders a later access
      * against this load, and the path returns EAGAIN without ever enqueueing,
@@ -642,11 +641,10 @@ futex_uaddr_tag:
      * memory. SCTLR_RES1 sets SPAN (hvutil.h), so PAN stays clear on exception
      * entry, which the urandom path's EL1 strb already depends on.
      *
-     * Two fault classes bypass that recovery tail, neither newly exposed. A
-     * stage-2 fault exits to EL2 rather than these vectors, so guest.c answers
-     * a dangling entry over an unmapped IPA. And because LDTR is an
-     * unprivileged access, an EL0 GDB watchpoint (DBGWCR.PAC) can match it and
-     * report a stop at a shim PC.
+     * Two fault classes bypass that recovery tail, neither newly exposed. Any
+     * other stage-2 fault exits to EL2 and stays a crash report. And because
+     * LDTR is an unprivileged access, an EL0 GDB watchpoint (DBGWCR.PAC) can
+     * match it and report a stop at a shim PC.
      *
      * The recovery slot below keeps ELR/SPSR under the outer SVC frame so the
      * abort handler resumes EL0 at the original post-SVC PC.

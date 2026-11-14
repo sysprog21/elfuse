@@ -784,6 +784,10 @@ run_unit_tests()
         "$bindir/test-wait-process-signal"
     test_check "$runner" "test-wait-sigmask-signal" " - PASS" \
         "$bindir/test-wait-sigmask-signal"
+    test_check "$runner" "test-sigchld-after-wait" " - PASS" \
+        "$bindir/test-sigchld-after-wait"
+    test_check "$runner" "test-signal-backlog" " - PASS" \
+        "$bindir/test-signal-backlog"
     test_check "$runner" "test-shim-sigreturn-x8" "0 failed" \
         "$bindir/test-shim-sigreturn-x8"
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \

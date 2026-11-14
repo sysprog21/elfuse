@@ -742,11 +742,29 @@ static void signal_notify_waiters(int signum)
         wakeup_pipe_signal();
 }
 
-void signal_queue(int signum)
+/* True when Linux would discard @signum at generation (sig_ignored() in
+ * prepare_signal()): its disposition ignores it and no thread blocks it. A
+ * blocked signal stays pending, because a handler installed before the unblock
+ * still runs for it. Caller holds sig_lock.
+ */
+static bool signal_ignored_at_generation_locked(int signum)
+{
+    const linux_sigaction_t *act = &sig_state.actions[signum - 1];
+    bool ignored = act->sa_handler == LINUX_SIG_IGN ||
+                   (act->sa_handler == LINUX_SIG_DFL &&
+                    signal_default_disposition(signum) == SIG_DISP_IGN);
+    return ignored && !thread_signal_blocked_any(sig_bit(signum));
+}
+
+static void signal_queue_shared(int signum, bool drop_ignored)
 {
     if (signum < 1 || signum > LINUX_NSIG)
         return;
     pthread_mutex_lock(&sig_lock);
+    if (drop_ignored && signal_ignored_at_generation_locked(signum)) {
+        pthread_mutex_unlock(&sig_lock);
+        return;
+    }
     signal_enqueue_locked(&sig_state.shared, signum, NULL);
     /* Publish hint before releasing lock so vCPU hot path sees it. */
     refresh_pending_hint_locked();
@@ -772,6 +790,16 @@ void signal_queue(int signum)
      */
     if (signal_should_interrupt(signum))
         attention_raise();
+}
+
+void signal_queue(int signum)
+{
+    signal_queue_shared(signum, false);
+}
+
+void signal_queue_unless_ignored(int signum)
+{
+    signal_queue_shared(signum, true);
 }
 
 void signal_queue_info(int signum,

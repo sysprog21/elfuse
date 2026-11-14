@@ -86,6 +86,22 @@
  *                                     the slot under mmap_lock deadlocks
  *                                     against the leader, which needs that lock
  *                                     to run the request that frees the slot
+ *   transport_drain_lock (syscall/proc.c): serializes whole drains of this
+ *                                     process's signal transport; taken with
+ *                                     no other lock held. Beneath it,
+ *                                     sig_drain_cb takes sig_lock,
+ *                                     autoreap_lock, pid_lock and the
+ *                                     lifecycle registry flock (through
+ *                                     lifecycle_import_children and
+ *                                     lifecycle_publish_self). Two file locks
+ *                                     order across processes: the registry
+ *                                     flock comes before a transport flock,
+ *                                     because proc_process_exit appends to
+ *                                     peers' transports while it holds the
+ *                                     registry flock. Never take the registry
+ *                                     flock while holding a transport flock:
+ *                                     the drain releases its transport flock
+ *                                     before it hands records to sig_drain_cb
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)

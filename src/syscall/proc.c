@@ -52,6 +52,8 @@
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"
 #include "syscall/proc-state.h"
+#include "syscall/file-compact.h"
+#include "syscall/record-split.h"
 #include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
 
@@ -137,6 +139,7 @@ static void proc_registry_publish(pid_t host_pid,
                                   int64_t guest_pid_val,
                                   int64_t pgid);
 static int flock_retry(int fd, int op);
+static bool drain_signal_transport(void);
 static void lifecycle_publish_self(void);
 static int lifecycle_reserve_child(int64_t guest_pid,
                                    int64_t ppid,
@@ -1171,37 +1174,15 @@ static int flock_retry(int fd, int op)
 }
 
 /* Read @fd from its current offset and invoke @cb once per newline-terminated
- * record, passing a NUL-terminated copy. Records must fit in 159 bytes; both
- * the registry ("hostpid guestpid pgid startus") and signal/control transport
- * records use bounded numeric lines. Overlong records and an unterminated
- * trailing token are dropped -- every writer appends a whole record under an
- * exclusive lock, so a partial line only appears after a crash mid-write.
+ * record (see syscall/record-split.h).
  */
 static void for_each_record(int fd, void (*cb)(char *rec, void *ctx), void *ctx)
 {
     char chunk[8192];
-    char line[160];
-    size_t linelen = 0;
-    bool overlong = false;
+    record_splitter_t sp = {.len = 0};
     ssize_t r;
-    while ((r = read(fd, chunk, sizeof(chunk))) > 0) {
-        for (ssize_t i = 0; i < r; i++) {
-            char c = chunk[i];
-            if (c != '\n') {
-                if (linelen < sizeof(line) - 1)
-                    line[linelen++] = c;
-                else
-                    overlong = true;
-                continue;
-            }
-            if (!overlong) {
-                line[linelen] = '\0';
-                cb(line, ctx);
-            }
-            linelen = 0;
-            overlong = false;
-        }
-    }
+    while ((r = read(fd, chunk, sizeof(chunk))) > 0)
+        record_split(&sp, chunk, (size_t) r, cb, ctx);
 }
 
 typedef struct {
@@ -1473,7 +1454,12 @@ static int proc_open_transport(pid_t host_pid)
                 0600);
 }
 
-int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+/* Append one signal record to @host_pid's transport. The caller still owes the
+ * receiver a SIGUSR2.
+ */
+static int proc_append_guest_signal(pid_t host_pid,
+                                    int64_t target_guest_pid,
+                                    int signum)
 {
     int fd = proc_open_transport(host_pid);
     if (fd < 0)
@@ -1498,7 +1484,7 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
     /* Serialize the append against the receiver's read+truncate drain via an
      * exclusive lock. The receiver holds the same lock and never unlinks the
      * file, so this append either lands before its read (and is consumed) or
-     * after its truncate (and the SIGUSR2 below triggers the next drain).
+     * after its truncate (and the caller's SIGUSR2 triggers the next drain).
      * Neither side can route this write to an orphaned inode or discard it.
      */
     if (flock_retry(fd, LOCK_EX) != 0) {
@@ -1512,11 +1498,18 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
         return -1;
     }
 
-    /* The line is durably appended under the lock, so ring the doorbell even if
-     * close() reports an error; suppressing the kill would leave the queued
-     * line waiting for some later unrelated signal.
+    /* The line is durably appended under the lock, so the caller sends SIGUSR2
+     * even if close() reports an error; suppressing the kill would leave the
+     * queued line waiting for some later unrelated signal.
      */
     close(fd);
+    return 0;
+}
+
+int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+{
+    if (proc_append_guest_signal(host_pid, target_guest_pid, signum) < 0)
+        return -1;
     return kill(host_pid, SIGUSR2);
 }
 
@@ -1613,27 +1606,38 @@ void proc_process_exit(int wait_status)
 
     (void) lifecycle_save_locked(fd, registry);
     free(registry);
+
+    /* Append the SIGCHLD records before releasing the registry lock: a parent
+     * wait4 that sees this exit there then finds the signal in its transport
+     * (see sys_wait4). Linux generates SIGCHLD with the zombie, so it never
+     * trails the reap. The adopter gets one when an already-terminal child
+     * became waitable there; pending SIGCHLDs merge, so one record covers them
+     * all. SIGUSR2 and the reparent handshake, which polls the registry, wait
+     * until after the unlock.
+     */
+    bool adopter_has_zombie = false;
+    for (uint32_t i = 0; reparented && i < nreparented; i++)
+        adopter_has_zombie |= reparented[i].exited;
+    bool ring_adopter = adopter_has_zombie && adopter_host_pid > 0 &&
+                        proc_append_guest_signal(adopter_host_pid, adopter_pid,
+                                                 LINUX_SIGCHLD) == 0;
+    bool ring_parent =
+        parent_host_pid > 0 &&
+        proc_append_guest_signal(parent_host_pid, parent_guest_pid,
+                                 LINUX_SIGCHLD) == 0;
     lifecycle_unlock_close(fd);
 
+    if (ring_adopter)
+        (void) kill(adopter_host_pid, SIGUSR2);
     for (uint32_t i = 0; reparented && i < nreparented; i++) {
-        if (reparented[i].exited) {
-            /* The exiting process is not necessarily a child of the adopter, so
-             * its own SIGCHLD goes elsewhere. Notify the adopter explicitly for
-             * every already-terminal child that became waitable there.
-             */
-            if (adopter_host_pid > 0)
-                (void) proc_send_guest_signal(adopter_host_pid, adopter_pid,
-                                              LINUX_SIGCHLD);
-        } else {
+        if (!reparented[i].exited)
             proc_notify_reparent(reparented[i].host_pid,
                                  reparented[i].guest_pid, adopter_pid);
-        }
     }
     free(reparented);
 
-    if (parent_host_pid > 0)
-        (void) proc_send_guest_signal(parent_host_pid, parent_guest_pid,
-                                      LINUX_SIGCHLD);
+    if (ring_parent)
+        (void) kill(parent_host_pid, SIGUSR2);
 }
 
 static int proc_send_reparent(pid_t host_pid,
@@ -2477,11 +2481,11 @@ static int64_t proc_reap_exited_and_unlock(guest_t *g,
     return gpid;
 }
 
-int64_t sys_wait4(guest_t *g,
-                  int pid,
-                  uint64_t status_gva,
-                  int options,
-                  uint64_t rusage_gva)
+static int64_t wait4_once(guest_t *g,
+                          int pid,
+                          uint64_t status_gva,
+                          int options,
+                          uint64_t rusage_gva)
 {
     proc_deferred_reap_poll();
     lifecycle_import_children();
@@ -2628,13 +2632,13 @@ int64_t sys_wait4(guest_t *g,
                 int64_t external_gpid = proc_table[i].guest_pid;
                 pthread_mutex_unlock(&pid_lock);
                 if (proc_refresh_external_child(external_gpid))
-                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                    return wait4_once(g, pid, status_gva, options, rusage_gva);
                 if (mac_options & WNOHANG)
                     return 0;
                 if (thread_stop_requested())
                     return -LINUX_EINTR;
                 usleep(1000);
-                return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                return wait4_once(g, pid, status_gva, options, rusage_gva);
             }
 
             pid_t host_pid = proc_table[i].host_pid;
@@ -2679,8 +2683,8 @@ int64_t sys_wait4(guest_t *g,
                     pthread_mutex_lock(&pid_lock);
                     if (proc_guest_child_exited_locked(gpid)) {
                         pthread_mutex_unlock(&pid_lock);
-                        return sys_wait4(g, pid, status_gva, options,
-                                         rusage_gva);
+                        return wait4_once(g, pid, status_gva, options,
+                                          rusage_gva);
                     }
                     pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
                     pthread_mutex_unlock(&pid_lock);
@@ -2697,8 +2701,8 @@ int64_t sys_wait4(guest_t *g,
                      */
                     lifecycle_import_children();
                     if (proc_guest_child_exited(gpid))
-                        return sys_wait4(g, pid, status_gva, options,
-                                         rusage_gva);
+                        return wait4_once(g, pid, status_gva, options,
+                                          rusage_gva);
                 }
             }
             if (ret > 0) {
@@ -2720,7 +2724,7 @@ int64_t sys_wait4(guest_t *g,
             if (wait_errno == ECHILD) {
                 lifecycle_import_children();
                 if (proc_guest_child_exited(gpid))
-                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                    return wait4_once(g, pid, status_gva, options, rusage_gva);
             }
             errno = wait_errno;
             return linux_errno();
@@ -2763,11 +2767,12 @@ static int64_t waitid_zero_siginfo(guest_t *g, uint64_t infop_gva)
     return 0;
 }
 
-int64_t sys_waitid(guest_t *g,
-                   int idtype,
-                   int64_t id,
-                   uint64_t infop_gva,
-                   int options)
+static int64_t waitid_once(guest_t *g,
+                           int idtype,
+                           int64_t id,
+                           uint64_t infop_gva,
+                           int options,
+                           bool *reported)
 {
     /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2, WCONTINUED=8,
      * WNOWAIT=0x01000000
@@ -2907,6 +2912,7 @@ int64_t sys_waitid(guest_t *g,
             }
 
             /* Fill siginfo_t in guest memory */
+            *reported = true;
             if (infop_gva) {
                 uint8_t si[SIGINFO_SIZE];
                 memset(si, 0, sizeof(si));
@@ -3020,6 +3026,52 @@ int64_t sys_waitid(guest_t *g,
     }
 }
 
+/* A child's exit can reach wait4/waitid through the registry before this
+ * process has drained the SIGCHLD the child appended. Draining before the
+ * return reads it under the disposition the wait ran with, so the drain drops
+ * it under SIG_DFL or SIG_IGN unless a thread blocks it, as Linux does at the
+ * exit, and a handler installed after the wait never sees it. A return that
+ * reports no child leaves nothing to drain, so a WNOHANG poll skips it. wait4
+ * reaps before it writes status and rusage, so its EFAULT return drains too.
+ * Under SIG_IGN or SA_NOCLDWAIT the wait consumes exited children without
+ * reporting them, so every return drains.
+ *
+ * The child is already reaped by then, so a failed drain cannot fail the wait
+ * without losing its status. It retries once instead. If that fails too, the
+ * SIGALRM tick retries it later, and until then a handler the guest installs
+ * can still see the late SIGCHLD; under --timeout 0 no tick runs.
+ */
+static void drain_after_wait(void)
+{
+    if (!drain_signal_transport())
+        (void) drain_signal_transport();
+}
+
+int64_t sys_wait4(guest_t *g,
+                  int pid,
+                  uint64_t status_gva,
+                  int options,
+                  uint64_t rusage_gva)
+{
+    int64_t rc = wait4_once(g, pid, status_gva, options, rusage_gva);
+    if (rc > 0 || rc == -LINUX_EFAULT || signal_sigchld_autoreap())
+        drain_after_wait();
+    return rc;
+}
+
+int64_t sys_waitid(guest_t *g,
+                   int idtype,
+                   int64_t id,
+                   uint64_t infop_gva,
+                   int options)
+{
+    bool reported = false;
+    int64_t rc = waitid_once(g, idtype, id, infop_gva, options, &reported);
+    if (reported || signal_sigchld_autoreap())
+        drain_after_wait();
+    return rc;
+}
+
 /* vCPU run loop. */
 
 static _Thread_local bool hvc6_yield_requested;
@@ -3047,6 +3099,14 @@ void proc_request_hvc6_yield(void)
  * same-thread async signal handlers.
  */
 static _Atomic int g_timed_out, g_external_guest_signal;
+
+/* Set when a drain fails to open, lock or read the signal transport. The
+ * SIGALRM tick retries it, so a failure that persists costs one retry per tick,
+ * not one per vCPU exit. Until then the queued signals wait: up to the watchdog
+ * period (timeout_sec, 10 s by default), and under --timeout 0, which arms no
+ * tick, until the next SIGUSR2 or wait return.
+ */
+static _Atomic bool transport_retry;
 
 /* Watchdog progress word, written by the guest main thread's run loop and read
  * by preempt_thread_main. A Linux-style seqlock counter, the same shape the
@@ -3079,6 +3139,32 @@ static bool g_preempt_started;
 
 static void drain_external_guest_signal(void);
 
+/* Queue what the signal transport holds and wake whatever waits on it. */
+static void transport_doorbell(void)
+{
+    atomic_store_explicit(&g_external_guest_signal, 1, memory_order_release);
+    drain_external_guest_signal();
+
+    /* The doorbell is also how a fork child reports that it exited. sys_wait4
+     * and sys_waitid sleep on pid_cond between re-checks, and nothing on this
+     * path signaled it, so a waiting parent only re-checked when its 100 ms
+     * safety-net timeout expired: every fork/wait pair paid that timeout in
+     * full even though the child was already gone.
+     *
+     * Broadcast under pid_lock, not beside it. A sleeper holds the lock across
+     * its predicate check and only releases it inside pthread_cond_timedwait,
+     * so taking the lock here means the broadcast cannot land in the window
+     * between the two and be lost. pid_lock is a leaf (see the lock-order block
+     * in syscall/internal.h) and every critical section under it is a bounded
+     * table walk, so this cannot invert an order or park the sigwait thread on
+     * someone else's blocking call.
+     */
+    pthread_mutex_lock(&pid_lock);
+    pthread_cond_broadcast(&pid_cond);
+    pthread_mutex_unlock(&pid_lock);
+    wakeup_pipe_signal();
+}
+
 /* Dedicated sigwait consumer. SIGUSR2/SIGALRM are blocked on every other thread
  * (see proc_preempt_init), so they land here. thread_interrupt_all() kicks
  * every live vCPU off-thread; the signal/queue machinery in the vCPU loop sorts
@@ -3099,31 +3185,14 @@ static void *preempt_thread_main(void *arg)
         if (sigwait(&wait_set, &sig) != 0)
             continue;
         if (sig == SIGUSR2) {
-            atomic_store_explicit(&g_external_guest_signal, 1,
-                                  memory_order_release);
-            drain_external_guest_signal();
-
-            /* The doorbell is also how a fork child reports that it exited.
-             * sys_wait4 and sys_waitid sleep on pid_cond between re-checks, and
-             * nothing on this path signaled it, so a waiting parent only
-             * re-checked when its 100 ms safety-net timeout expired: every
-             * fork/wait pair paid that timeout in full even though the child
-             * was already gone.
-             *
-             * Broadcast under pid_lock, not beside it. A sleeper holds the lock
-             * across its predicate check and only releases it inside
-             * pthread_cond_timedwait, so taking the lock here means the
-             * broadcast cannot land in the window between the two and be lost.
-             * pid_lock is a leaf (see the lock-order block in
-             * syscall/internal.h) and every critical section under it is a
-             * bounded table walk, so this cannot invert an order or park the
-             * sigwait thread on someone else's blocking call.
-             */
-            pthread_mutex_lock(&pid_lock);
-            pthread_cond_broadcast(&pid_cond);
-            pthread_mutex_unlock(&pid_lock);
-            wakeup_pipe_signal();
+            transport_doorbell();
         } else if (sig == SIGALRM) {
+            if (atomic_exchange_explicit(&transport_retry, false,
+                                         memory_order_relaxed)) {
+                transport_doorbell();
+                thread_interrupt_all();
+            }
+
             /* sys_wait4's entry is the only other caller, so a guest that takes
              * its last child's status and never waits again strands that
              * child's host process as a zombie for the rest of the run. The
@@ -3317,10 +3386,174 @@ static void sig_drain_cb(char *rec, void *vctx)
         return;
     if (ns == c->my_ns && tgpid == c->my_guest_pid &&
         RANGE_CHECK(signum, 1, LINUX_NSIG)) {
-        if (signum == LINUX_SIGCHLD && signal_sigchld_autoreap())
+        if (signum != LINUX_SIGCHLD) {
+            signal_queue((int) signum);
+            return;
+        }
+        if (signal_sigchld_autoreap())
             proc_autoreap_exited_children();
-        signal_queue((int) signum);
+
+        /* Dropped here rather than at delivery, so a handler another thread
+         * installs before the delivery cannot run for a child already reaped.
+         */
+        signal_queue_unless_ignored(LINUX_SIGCHLD);
     }
+}
+
+/* Serializes whole drains, so a wait4 drain cannot find the file already
+ * emptied by one that has not yet queued what it read. Lock order: see
+ * syscall/internal.h.
+ */
+static pthread_mutex_t transport_drain_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Under transport_drain_lock. Bytes at the start of the transport that a drain
+ * has already handled, and the record a failed read cut short. Records only
+ * ever go on the end, so the file is truncated, and both are reset, only once a
+ * drain has handled everything the file holds. A compaction moves the rest to
+ * the front and resets only the offset.
+ */
+static off_t transport_drain_off;
+static record_splitter_t transport_drain_sp;
+
+/* Under transport_drain_lock. Only the first failed read in a run is logged. */
+static bool transport_read_failing;
+
+/* Under transport_drain_lock. Only the first failed truncate or compaction in a
+ * run is logged.
+ */
+static bool transport_truncate_failing;
+
+static void transport_truncate_warn(const char *what)
+{
+    if (!transport_truncate_failing)
+        log_warn("signal transport %s failed (%s)", what, strerror(errno));
+    transport_truncate_failing = true;
+}
+
+/* Handled bytes at which a drain that ends with records still past it moves
+ * them to the front of the file.
+ */
+#define TRANSPORT_COMPACT_AT ((off_t) 65536)
+
+/* Under transport_drain_lock. Read the next chunk of the transport after
+ * transport_drain_off, up to *end: the file size under the drain's first flock,
+ * which is a record boundary because every append is a whole record under the
+ * same flock. A record appended after that rings its own SIGUSR2, whose drain
+ * waits on transport_drain_lock and starts past it, so a drain ends however
+ * fast senders append. Once the drain reaches *end and the file holds nothing
+ * more, it is truncated rather than unlinked (see proc_append_guest_signal),
+ * which avoids the unlink-vs-append race; the process unlinks its own empty
+ * file at exit (unlink_own_transport). When the file holds more and the drain
+ * has handled TRANSPORT_COMPACT_AT bytes, the rest moves to the front instead,
+ * so a sender that never pauses cannot grow the file without bound.
+ */
+static ssize_t transport_read_chunk(int fd,
+                                    char *chunk,
+                                    size_t size,
+                                    off_t *end)
+{
+    if (flock_retry(fd, LOCK_EX) != 0)
+        return -1;
+    ssize_t r = -1;
+    struct stat st;
+    if (fstat(fd, &st) == 0) {
+        if (*end < 0)
+            *end = st.st_size;
+        r = 0;
+        if (transport_drain_off < *end) {
+            size_t want = (size_t) (*end - transport_drain_off);
+            if (want > size)
+                want = size;
+            do
+                r = pread(fd, chunk, want, transport_drain_off);
+            while (r < 0 && errno == EINTR);
+        } else if (st.st_size == transport_drain_off) {
+            /* On a failed truncate the offset stays at the end, so the records
+             * already handled are not handled again.
+             */
+            if (ftruncate(fd, 0) == 0) {
+                transport_drain_off = 0;
+                transport_drain_sp = (record_splitter_t) {.len = 0};
+                transport_truncate_failing = false;
+            } else {
+                transport_truncate_warn("truncate");
+            }
+        } else if (transport_drain_off >= TRANSPORT_COMPACT_AT) {
+            /* A sender appended inside every drain window, so the truncate
+             * above has not run. The splitter keeps its state: the bytes after
+             * the offset still follow the ones it has seen.
+             */
+            if (file_compact(fd, transport_drain_off, st.st_size, chunk,
+                             size) == 0) {
+                transport_drain_off = 0;
+                transport_truncate_failing = false;
+            } else if (errno != EAGAIN) {
+                transport_truncate_warn("compact");
+            }
+        }
+    }
+    int saved = errno;
+    flock_retry(fd, LOCK_UN);
+    errno = saved;
+    return r;
+}
+
+/* Read the transport in chunks and handle each chunk's records after releasing
+ * the flock: sig_drain_cb takes the registry flock, which proc_process_exit
+ * holds while it appends here. The chunk bounds the drain's memory however long
+ * the file grows, and transport_drain_sp carries a record cut by the chunk end
+ * into the next chunk.
+ *
+ * Returns false when the open or a read failed, which also leaves
+ * transport_retry set for the SIGALRM tick.
+ */
+static bool drain_signal_transport(void)
+{
+    char path[PATH_MAX];
+    if (!signal_transport_path(path, sizeof(path), getpid()))
+        return true;
+
+    pthread_mutex_lock(&transport_drain_lock);
+
+    /* O_RDWR (not O_RDONLY) so the drain can truncate under the lock. No
+     * O_CREAT: if no sender has written since the last drain, there is nothing
+     * to consume.
+     */
+    int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        bool ok = errno == ENOENT;
+        if (!ok)
+            atomic_store_explicit(&transport_retry, true, memory_order_relaxed);
+        pthread_mutex_unlock(&transport_drain_lock);
+        return ok;
+    }
+
+    sig_drain_ctx_t ctx = {.my_ns = absock_get_namespace_id(),
+                           .my_guest_pid = proc_get_pid()};
+    char chunk[8192];
+    off_t end = -1;
+    bool ok = true;
+    for (;;) {
+        ssize_t r = transport_read_chunk(fd, chunk, sizeof(chunk), &end);
+        if (r < 0) {
+            atomic_store_explicit(&transport_retry, true, memory_order_relaxed);
+            if (!transport_read_failing)
+                log_warn("signal transport lock or read failed (%s); retrying",
+                         strerror(errno));
+            transport_read_failing = true;
+            ok = false;
+            break;
+        }
+        transport_read_failing = false;
+        if (r == 0)
+            break;
+        transport_drain_off += (off_t) r;
+        record_split(&transport_drain_sp, chunk, (size_t) r, sig_drain_cb,
+                     &ctx);
+    }
+    close(fd);
+    pthread_mutex_unlock(&transport_drain_lock);
+    return ok;
 }
 
 static void drain_external_guest_signal(void)
@@ -3328,45 +3561,7 @@ static void drain_external_guest_signal(void)
     if (!atomic_exchange_explicit(&g_external_guest_signal, 0,
                                   memory_order_acquire))
         return;
-
-    char path[PATH_MAX];
-    if (!signal_transport_path(path, sizeof(path), getpid()))
-        return;
-
-    /* O_RDWR (not O_RDONLY) so the drain can truncate under the lock. No
-     * O_CREAT: if no sender has written since the last drain, there is nothing
-     * to consume.
-     */
-    int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0)
-        return;
-
-    /* Hold the exclusive lock across the whole read+truncate so a sender's
-     * locked append is atomic with respect to the drain. The file is truncated
-     * to empty rather than unlinked (see proc_send_guest_signal), which avoids
-     * reintroducing the unlink-vs-append race; the process unlinks its own
-     * empty file at exit (unlink_own_transport) so the temp dir stays clean.
-     */
-    if (flock_retry(fd, LOCK_EX) != 0) {
-        close(fd);
-        return;
-    }
-
-    sig_drain_ctx_t ctx = {.my_ns = absock_get_namespace_id(),
-                           .my_guest_pid = proc_get_pid()};
-    for_each_record(fd, sig_drain_cb, &ctx);
-
-    /* Report a failed truncate: the same records would re-drain on the next
-     * doorbell and re-queue already-delivered signals. Do not early-return --
-     * the lock still has to be released and the fd closed.
-     */
-    if (ftruncate(fd, 0) != 0)
-        log_warn(
-            "signal transport truncate failed (%s); queued signals may "
-            "re-deliver",
-            strerror(errno));
-    flock_retry(fd, LOCK_UN);
-    close(fd);
+    (void) drain_signal_transport();
 }
 
 /* HVC #4 (set sysreg) register index -> hv_sys_reg_t mapping. Index must match

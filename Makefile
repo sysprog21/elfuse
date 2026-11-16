@@ -710,6 +710,11 @@ $(BUILD_DIR)/test-fuse-exec-abs: tests/test-fuse-exec-abs.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-fuse-open-lock runs a guest daemon thread against a concurrent open/stat
+$(BUILD_DIR)/test-fuse-open-lock: tests/test-fuse-open-lock.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-fuse-reply runs a guest daemon thread against concurrent consumers
 $(BUILD_DIR)/test-fuse-reply: tests/test-fuse-reply.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

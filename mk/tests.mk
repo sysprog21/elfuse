@@ -50,7 +50,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-usbdev-ioctl-departed \
         test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
-        test-fstatfs-fd-identity \
+        test-fstatfs-fd-identity test-fuse-open-lock \
         test-dir-union-alias test-dir-primary-read-error \
         test-getdents64-small-buf \
         test-sysroot-symlink-target \
@@ -302,6 +302,7 @@ $(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host des
 $(call run-lane,test-dir-backing-drain-error,a lost union listing is reported not truncated)
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
 $(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
+$(call run-lane,test-fuse-open-lock,a FUSE open returns its slot and keeps the lock order)
 $(call run-lane,test-dir-union-alias,a dup shares one listing position and one union)
 $(call run-lane,test-dir-primary-read-error,a failed synthetic read is reported not ended)
 $(call run-lane,test-getdents64-small-buf,a getdents64 buffer too small for one entry)
@@ -2012,6 +2013,18 @@ test-fstatfs-fd-identity: $(ELFUSE_BIN) $(TEST_DIR)/test-fstatfs-fd-identity
 	ELFUSE_FD_IDENTITY_WINDOW_US=120000 ELFUSE_USB_FIXTURE=1 \
 		$(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-fstatfs-fd-identity /etc/hostname /sys/kernel
+## A FUSE open reserves its file slot first and keeps the lock order
+# slots fails each early return of the open more times than the slot table has
+# entries, then fills the table: every open reports ENFILE, a missing name
+# included, no FUSE_OPEN reaches the daemon, and every successful FUSE_OPEN is
+# followed by FUSE_RELEASE. order holds an open inside the session lock with
+# ELFUSE_FUSE_OPEN_LOCK_DELAY_US while a stat starts, which deadlocked every
+# time under the old lock order; the test reports a deadlock itself after ten
+# seconds, and fails if the stat never waited on the open.
+test-fuse-open-lock: $(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock
+	$(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock slots
+	ELFUSE_FUSE_OPEN_LOCK_DELAY_US=200000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock order
 ## A union directory fd must cost one host descriptor, like a plain one
 # The measurement only means something with the host limit at exactly what
 # elfuse asks for -- the same squeeze tests/manifest.txt puts on

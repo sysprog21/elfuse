@@ -47,6 +47,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -2077,6 +2078,30 @@ int fuse_fstat_fd(int fd, struct stat *st)
     return 0;
 }
 
+/* Hold an open inside session->lock for a while, off unless
+ * ELFUSE_FUSE_OPEN_LOCK_DELAY_US is set to a positive microsecond count.
+ *
+ * The open used to take fuse_lock at this point for its file slot, while a
+ * lookup takes fuse_lock and then session->lock, so the two could deadlock. A
+ * lookup starting inside the held window has taken fuse_lock and is waiting on
+ * the session lock, which turns that ordering into a hang every time.
+ * tests/test-fuse-open-lock drives it. Same shape as fd_identity_window_delay
+ * in syscall/fs-stat.c; no effect at all when unset.
+ */
+static void fuse_open_lock_delay(void)
+{
+    static _Atomic long cached = -1; /* -1 = unread */
+    long v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v < 0) {
+        const char *env = getenv("ELFUSE_FUSE_OPEN_LOCK_DELAY_US");
+        long long n = env ? strtoll(env, NULL, 10) : 0;
+        v = (n > 0 && n < 1000000) ? (long) n : 0;
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+    }
+    if (v > 0)
+        usleep((useconds_t) v);
+}
+
 int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
 {
     (void) g;
@@ -2100,6 +2125,20 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_ENOTCONN;
     }
+
+    /* The file slot is reserved before anything reaches the daemon, as Linux
+     * allocates the struct file in path_openat before the walk: FUSE_OPEN
+     * carries the open flags, O_TRUNC included, so an open that fails for want
+     * of a slot after it must not have run. It is taken under this fuse_lock,
+     * which is held above session->lock (fuse_path_lookup); reaching for
+     * fuse_lock later with the session lock held would close a cycle. The table
+     * does not grow with RLIMIT_NOFILE, hence ENFILE.
+     */
+    fuse_file_t *file = fuse_alloc_file_locked();
+    if (!file) {
+        pthread_mutex_unlock(&fuse_lock);
+        return -LINUX_ENFILE;
+    }
     fuse_session_t *session = mount->session;
     int mount_id = mount->mount_id;
     fuse_session_get_locked(session);
@@ -2112,6 +2151,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     if (rc < 0) {
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return rc;
@@ -2123,6 +2163,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_ENOTDIR;
@@ -2137,6 +2178,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_EACCES;
@@ -2148,24 +2190,12 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
+        fuse_file_put_locked(file);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_EMFILE;
     }
-
-    fuse_file_t *file = NULL;
-    pthread_mutex_lock(&fuse_lock);
-    file = fuse_alloc_file_locked();
-    pthread_mutex_unlock(&fuse_lock);
-    if (!file) {
-        fd_mark_closed(guest_fd);
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
-        pthread_mutex_unlock(&session->lock);
-        pthread_mutex_lock(&fuse_lock);
-        fuse_session_put_locked(session);
-        pthread_mutex_unlock(&fuse_lock);
-        return -LINUX_ENOMEM;
-    }
+    fuse_open_lock_delay();
 
     fuse_open_out_t out;
     memset(&out, 0, sizeof(out));

@@ -272,7 +272,6 @@ repo_url()
 # Refresh one repo's APKINDEX into a flattened "name version" file, falling back
 # to the cached copy so warm re-runs work offline. APKINDEX records are
 # blank-line separated; P: is the package name, V: its version.
-# Usage: refresh_index <repo-url> <index-tarball> <flattened-file>
 refresh_index()
 {
     local base="$1" idxtgz="$2" idxfile="$3"

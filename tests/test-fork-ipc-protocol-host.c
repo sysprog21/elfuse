@@ -24,9 +24,10 @@
 #define PREVIOUS_ELFP_MAGIC 0x454C4650U
 #define PREVIOUS_ELFQ_MAGIC 0x454C4651U
 #define PREVIOUS_ELFR_MAGIC 0x454C4652U
+#define PREVIOUS_ELFS_MAGIC 0x454C4653U
 
-_Static_assert(FORK_IPC_PROTOCOL_MAGIC == 0x454C4653U,
-               "fork IPC protocol magic must remain ELFS until the next "
+_Static_assert(FORK_IPC_PROTOCOL_MAGIC == 0x454C4654U,
+               "fork IPC protocol magic must remain ELFT until the next "
                "incompatible wire-format change");
 _Static_assert(IPC_MAGIC_HEADER == FORK_IPC_PROTOCOL_MAGIC,
                "header magic must be the protocol identity");
@@ -46,6 +47,8 @@ _Static_assert(FORK_IPC_PROTOCOL_MAGIC != PREVIOUS_ELFQ_MAGIC,
                "inherited pidfd state requires rejecting ELFQ peers");
 _Static_assert(FORK_IPC_PROTOCOL_MAGIC != PREVIOUS_ELFR_MAGIC,
                "the rlimit table in the header requires rejecting ELFR peers");
+_Static_assert(FORK_IPC_PROTOCOL_MAGIC != PREVIOUS_ELFS_MAGIC,
+               "the region shm_attach field requires rejecting ELFS peers");
 _Static_assert(IPC_MAGIC_SENTINEL != FORK_IPC_PROTOCOL_MAGIC,
                "process-state sentinel must not alias the header protocol");
 

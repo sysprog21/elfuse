@@ -1957,12 +1957,12 @@ int guest_get_used_regions(const guest_t *g,
  * Check whether two adjacent regions have merge-compatible layouts. An actual
  * merge additionally requires a shared vma_id; a new same-generation mapping
  * may adopt its compatible neighbor's ID below. Regions must be contiguous in
- * address space, have identical protection/flags/name, and have contiguous file
- * offsets (so the merged region still represents valid mapping). For anonymous
- * regions the offset is meaningless (always 0, but may become non-zero after
- * split/trim), so the contiguity check is skipped. Without this, adjacent
- * anonymous mmaps (common in megablock-style allocators) each create separate
- * entries that exhaust the region table.
+ * address space, have identical protection/flags/name/shm_attach, and have
+ * contiguous file offsets (so the merged region still represents valid
+ * mapping). For anonymous regions the offset is meaningless (always 0, but may
+ * become non-zero after split/trim), so the contiguity check is skipped.
+ * Without this, adjacent anonymous mmaps (common in megablock-style allocators)
+ * each create separate entries that exhaust the region table.
  */
 static bool regions_mergeable_layout(const guest_region_t *a,
                                      const guest_region_t *b)
@@ -1993,6 +1993,15 @@ static bool regions_mergeable_layout(const guest_region_t *a,
         return false;
     if (strcmp(a->name, b->name) != 0)
         return false;
+    if (a->shm_attach != b->shm_attach)
+        return false;
+
+    /* Pieces of one shm attach merge only where their offsets into the attach
+     * run on: a page mremap moved past another of the same attach is its own
+     * VMA on Linux, and a merged region would carry the wrong offset for it.
+     */
+    if (a->shm_attach)
+        return a->offset + (a->end - a->start) == b->offset;
 
     /* Anonymous regions have no file offset to preserve. The flags field
      * reliably distinguishes anonymous from file-backed because every
@@ -2163,12 +2172,15 @@ static uint64_t allocate_vma_id(guest_t *g)
 
 void guest_reseed_next_vma_id(guest_t *g)
 {
-    uint64_t max_id = g->next_vma_id;
+    uint64_t max_id = g->next_vma_id, max_attach = g->next_shm_attach;
     for (int i = 0; i < g->nregions; i++) {
         if (g->regions[i].vma_id > max_id)
             max_id = g->regions[i].vma_id;
+        if (g->regions[i].shm_attach > max_attach)
+            max_attach = g->regions[i].shm_attach;
     }
     g->next_vma_id = max_id;
+    g->next_shm_attach = max_attach;
 }
 
 int guest_region_add_ex_owned(guest_t *g,
@@ -2198,6 +2210,24 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   int owned_backing_fd,
                                   bool inherited_at_fork,
                                   uint64_t vma_id)
+{
+    return guest_region_add_attach_gpa(g, start, end, gpa_base, prot, flags,
+                                       offset, name, owned_backing_fd,
+                                       inherited_at_fork, vma_id, 0);
+}
+
+int guest_region_add_attach_gpa(guest_t *g,
+                                uint64_t start,
+                                uint64_t end,
+                                uint64_t gpa_base,
+                                int prot,
+                                int flags,
+                                uint64_t offset,
+                                const char *name,
+                                int owned_backing_fd,
+                                bool inherited_at_fork,
+                                uint64_t vma_id,
+                                uint64_t shm_attach)
 {
     if (g->nregions >= GUEST_MAX_REGIONS) {
         log_error(
@@ -2234,6 +2264,7 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     r->noreserve = (flags & LINUX_MAP_NORESERVE) != 0;
     r->backing_ro = false;
     r->inherited_at_fork = inherited_at_fork;
+    r->shm_attach = shm_attach;
     guest_region_clear_overlay(r);
     if (name) {
         str_copy_trunc(r->name, name, sizeof(r->name));

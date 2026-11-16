@@ -150,9 +150,8 @@
  *   log_mutex (debug/log.c)          rosettad_path_lock (rosetta.c)
  *   nl_lock (netlink.c)              session_lock (proc-identity.c)
  *   overlay_lock (chown-overlay.c)   shm_dir_lock (procemu.c)
- *   proc_scratch_lock (procemu.c)    shm_lock (sysvipc.c)
- *   removed_overlay_lock (fs.c)      syscpu_dir_lock (procemu.c)
- *                                    sysinfo_lock (sys.c)
+ *   proc_scratch_lock (procemu.c)    syscpu_dir_lock (procemu.c)
+ *   removed_overlay_lock (fs.c)      sysinfo_lock (sys.c)
  *                                    sysroot_lock (proc-state.c)
  *                                    usb_lock (runtime/usb-sysfs.c)
  *                                    usbdev_loop_lock (usbdev.c)
@@ -964,12 +963,45 @@ int mac_to_linux_status_flags(int mac_flags);
 /* Translate Linux status flags (F_SETFL arg) to macOS equivalents. */
 int linux_to_mac_status_flags(int linux_flags);
 
-/* Anonymous mmap for other modules. */
-
-/* Allocate anonymous guest memory. Wraps the static sys_mmap with
- * MAP_PRIVATE|MAP_ANONYMOUS. Caller must hold mmap_lock.
+/* Guest memory for a SysV shm attach of the segment with @key: shared
+ * anonymous, as a Linux attach is VM_SHARED. Its region carries a new serial,
+ * which is stored in *@attach. Caller must hold mmap_lock.
  */
-int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
+int64_t sys_mmap_shm(guest_t *g,
+                     uint64_t length,
+                     int prot,
+                     int32_t key,
+                     uint64_t *attach);
+
+/* The first part starting in [@gva, @end) whose region carries the shm attach
+ * serial @attach at the offset into the attach that an attach at @base would
+ * put there, as [*@lo, *@hi) in guest addresses. *@hi is the end of that region
+ * and can lie past @end. This is the part Linux shmdt at @base finds: a VMA of
+ * the segment whose page offset matches its distance from @base. When @host is
+ * not NULL, *@host is set to the host memory behind *@lo, which is readable
+ * whatever the guest page protection.
+ *
+ * Returns false when no part of the range carries it. Caller must hold
+ * mmap_lock.
+ */
+bool mem_attach_next(guest_t *g,
+                     uint64_t base,
+                     uint64_t gva,
+                     uint64_t end,
+                     uint64_t attach,
+                     uint64_t *lo,
+                     uint64_t *hi,
+                     void **host);
+
+/* Set @mapped[k] to whether any region carries the shm attach serial
+ * @attach[k], wherever the guest has moved it, for each of the @n serials. One
+ * walk over the regions answers all of them, and a region without a serial
+ * costs one test. Caller must hold mmap_lock.
+ */
+void mem_attach_mapped(const guest_t *g,
+                       const uint64_t *attach,
+                       bool *mapped,
+                       int n);
 
 /* Borrowed-or-pinned host fd reference.
  *

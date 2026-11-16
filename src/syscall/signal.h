@@ -130,6 +130,9 @@ typedef struct {
 #define LINUX_SEGV_MAPERR 1 /* Address not mapped to object */
 #define LINUX_SEGV_ACCERR 2 /* Invalid permissions for mapped object */
 
+/* si_code values for SIGBUS */
+#define LINUX_BUS_ADRERR 2 /* Nonexistent physical address */
+
 /* Linux sigcontext (aarch64). From arch/arm64/include/uapi/asm/sigcontext.h
  * Size of the sigcontext extension area, matching Linux. Named rather than
  * spelled inline because build_sigcontext_reserved's contract is stated against

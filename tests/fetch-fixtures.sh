@@ -269,6 +269,32 @@ repo_url()
     esac
 }
 
+# Refresh one repo's APKINDEX into a flattened "name version" file, falling back
+# to the cached copy so warm re-runs work offline. APKINDEX records are
+# blank-line separated; P: is the package name, V: its version.
+# Usage: refresh_index <repo-url> <index-tarball> <flattened-file>
+refresh_index()
+{
+    local base="$1" idxtgz="$2" idxfile="$3"
+    if curl -fsSL --retry 3 -o "${idxtgz}.partial" "${base}/APKINDEX.tar.gz"; then
+        mv "${idxtgz}.partial" "$idxtgz"
+        tar xzOf "$idxtgz" APKINDEX 2> /dev/null | awk '
+            /^P:/ { name = substr($0, 3) }
+            /^V:/ { ver  = substr($0, 3) }
+            /^$/  { if (name != "") print name, ver; name = ""; ver = "" }
+            END   { if (name != "") print name, ver }
+        ' > "${idxfile}.partial"
+        mv "${idxfile}.partial" "$idxfile"
+    else
+        rm -f "${idxtgz}.partial"
+        [ -s "$idxfile" ] || {
+            echo "error: cannot fetch APKINDEX from $base (mirror unreachable, no cache)" >&2
+            exit 1
+        }
+        log "offline: reusing cached APKINDEX ($base)"
+    fi
+}
+
 # Resolve the current version of every package in PKGS by parsing each
 # referenced repo's APKINDEX, populating PKG_RESOLVED with "repo:name:version"
 # tuples. Alpine prunes superseded builds from the mirror, so reading the live
@@ -295,27 +321,7 @@ resolve_versions()
         idxfile="${CACHE}/APKINDEX-${repo}.versions"
         log "resolve versions ($repo)"
 
-        # Always try to refresh the index -- tracking the live mirror is the
-        # point -- but fall back to a cached copy so warm re-runs work offline.
-        # APKINDEX records are blank-line separated; P: is the package name, V:
-        # its version. Flatten to "name version" lines.
-        if curl -fsSL --retry 3 -o "${idxtgz}.partial" "${base}/APKINDEX.tar.gz"; then
-            mv "${idxtgz}.partial" "$idxtgz"
-            tar xzOf "$idxtgz" APKINDEX 2> /dev/null | awk '
-                /^P:/ { name = substr($0, 3) }
-                /^V:/ { ver  = substr($0, 3) }
-                /^$/  { if (name != "") print name, ver; name = ""; ver = "" }
-                END   { if (name != "") print name, ver }
-            ' > "${idxfile}.partial"
-            mv "${idxfile}.partial" "$idxfile"
-        else
-            rm -f "${idxtgz}.partial"
-            [ -s "$idxfile" ] || {
-                echo "error: cannot fetch APKINDEX for $repo (mirror unreachable, no cache)" >&2
-                exit 1
-            }
-            log "offline: reusing cached APKINDEX ($repo)"
-        fi
+        refresh_index "$base" "$idxtgz" "$idxfile"
     done
 
     # Resolve each package against its repo's flattened index.
@@ -726,7 +732,7 @@ EOF
     stage_lmbench
 
     if [ "${INCLUDE_X86_64:-0}" = "1" ]; then
-        fetch_x86_64_userspace "$manifest"
+        fetch_x86_64_userspace
     fi
 
     # Record the resolved version set so the next run can detect a mirror bump
@@ -755,35 +761,56 @@ EOF
 # per-mode expected-count table stays consistent.
 fetch_x86_64_userspace()
 {
-    local manifest="$1"
     local x86_cache="${FIXTURES}/cache/x86_64"
     local x86_rootfs="${FIXTURES}/x86_64-musl/rootfs"
     local x86_staticbin="${FIXTURES}/x86_64-musl/staticbin/bin"
     local x86_dynbin="${FIXTURES}/x86_64-musl/dyn-bin"
     mkdir -p "$x86_cache" "$x86_rootfs" "$x86_staticbin" "$x86_dynbin"
 
-    # The shared versions.lock is rewritten by ARM-only runs too, so the x86_64
-    # tree keeps its own lock: a stale tree must rebuild even when the shared
-    # lock already matches the mirror.
-    local x86_lock="${FIXTURES}/x86_64-musl/versions.lock"
-    if [ ! -f "$x86_lock" ] || [ "$manifest" != "$(cat "$x86_lock")" ]; then
+    local entry repo name version x86_url x86_dest
+    local x86_main="${CDN_BASE}/main/x86_64"
+    local x86_releases="${CDN_BASE}/releases/x86_64"
+    local x86_minirootfs="alpine-minirootfs-${ALPINE_PATCH}-x86_64.tar.gz"
+
+    # Alpine publishes per-arch builds, so a package can be newer on aarch64
+    # than on x86_64 (and vice versa). Resolve versions against the x86_64 index
+    # rather than reusing the aarch64 PKG_RESOLVED, or the fetch 404s.
+    log "x86_64: resolve versions (main)"
+    local x86_idx="${x86_cache}/APKINDEX-main.versions"
+    refresh_index "$x86_main" "${x86_cache}/APKINDEX-main.tar.gz" "$x86_idx"
+    local X86_RESOLVED=() x86_ver
+    for entry in "${PKG_RESOLVED[@]}"; do
+        repo="${entry%%:*}"
+        name="${entry#*:}"
+        name="${name%:*}"
+        [ "$repo" = "main" ] || continue
+        x86_ver="$(awk -v n="$name" '$1 == n { print $2; exit }' "$x86_idx")"
+        if [ -z "$x86_ver" ]; then
+            echo "error: package main:${name} not present in x86_64 APKINDEX" >&2
+            exit 1
+        fi
+        X86_RESOLVED+=("main:${name}:${x86_ver}")
+    done
+
+    # The x86_64 tree keeps its own lock, built from its own versions: an
+    # x86_64-only package bump must rebuild the tree even when the aarch64
+    # manifest is unchanged.
+    local x86_lock="${FIXTURES}/x86_64-musl/versions.lock" x86_manifest
+    x86_manifest="$({
+        printf '%s\n' "${X86_RESOLVED[@]}" | LC_ALL=C sort
+        printf 'minirootfs=%s\n' "$x86_minirootfs"
+    })"
+    if [ ! -f "$x86_lock" ] || [ "$x86_manifest" != "$(cat "$x86_lock")" ]; then
         REBUILD=1
     fi
     # Drop it before touching the tree so a failed rebuild leaves no lock.
     rm -f "$x86_lock"
 
-    local x86_main="${CDN_BASE}/main/x86_64"
-    local x86_releases="${CDN_BASE}/releases/x86_64"
-    local x86_minirootfs="alpine-minirootfs-${ALPINE_PATCH}-x86_64.tar.gz"
-
     log "x86_64: fetch packages"
-    local entry repo name version x86_url x86_dest
-    for entry in "${PKG_RESOLVED[@]}"; do
-        repo="${entry%%:*}"
+    for entry in "${X86_RESOLVED[@]}"; do
         name="${entry#*:}"
         name="${name%:*}"
         version="${entry##*:}"
-        [ "$repo" = "main" ] || continue
         x86_url="${x86_main}/${name}-${version}.apk"
         x86_dest="${x86_cache}/${name}-${version}.apk"
         fetch "$x86_url" "$x86_dest"
@@ -795,13 +822,11 @@ fetch_x86_64_userspace()
         rm -rf "$x86_rootfs"
         mkdir -p "$x86_rootfs"
         tar xzf "${x86_cache}/${x86_minirootfs}" -C "$x86_rootfs" 2> /dev/null
-        local stage_entry stage_repo stage_name stage_version
-        for stage_entry in "${PKG_RESOLVED[@]}"; do
-            stage_repo="${stage_entry%%:*}"
+        local stage_entry stage_name stage_version
+        for stage_entry in "${X86_RESOLVED[@]}"; do
             stage_name="${stage_entry#*:}"
             stage_name="${stage_name%:*}"
             stage_version="${stage_entry##*:}"
-            [ "$stage_repo" = "main" ] || continue
             [ "$stage_name" = "linux-virt" ] && continue
             extract_apk_to "${x86_cache}/${stage_name}-${stage_version}.apk" "$x86_rootfs"
         done
@@ -812,7 +837,7 @@ fetch_x86_64_userspace()
     if [ ! -s "${x86_staticbin}/busybox" ] || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "x86_64: stage static-bin tree"
         local busybox_ver
-        busybox_ver="$(pkg_version "main:busybox-static")"
+        busybox_ver="$(awk '$1 == "busybox-static" { print $2; exit }' "$x86_idx")"
         rm -rf "$x86_staticbin"
         mkdir -p "$x86_staticbin"
         local stage
@@ -847,7 +872,7 @@ fetch_x86_64_userspace()
     ok "x86_64 dyn-bin: $(find "$x86_dynbin" -maxdepth 1 -type l 2> /dev/null \
         | wc -l | tr -d ' ') entries"
 
-    printf '%s\n' "$manifest" > "$x86_lock"
+    printf '%s\n' "$x86_manifest" > "$x86_lock"
 }
 
 main "$@"

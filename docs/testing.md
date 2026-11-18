@@ -206,7 +206,7 @@ What they do:
 - `make test-matrix`: cross-check `elfuse` (aarch64), QEMU (aarch64),
   and `elfuse` (x86_64-via-Rosetta) on overlapping corpora
 - `make bench`: performance benchmark suite (see Performance Benchmarks
-  below); `make bench-ci` is the strict CI variant
+  below); `make bench-ci` is the strict variant (`BENCH_STRICT=1`)
 - `make verify`: every Frama-C WP proof target, one `frama-c` process each
   and parallel by default (`VERIFY_JOBS=1` for serial). Each target names a
   function set and discharges its obligations under `-wp-rte`; `mk/verify.mk`
@@ -287,12 +287,7 @@ raw samples. `scripts/bench-compare.py` diffs the results against
 past the threshold (default +20%, `BENCH_REGRESSION_THRESHOLD`) or
 missing from the current run. `BENCH_REPORT_ONLY=1` downgrades both to a
 log-only signal; `--fail-on-missing` keeps a missing metric fatal even then.
-The CI `Benchmark` leg runs with both, so a regression only prints and a
-benchmark that errored or timed out fails the leg. The pull-request comment
-comes from `.github/workflows/bench-report.yml`, which takes only the measured
-values from the run and compares them with the default branch's baseline and
-default threshold, so a pull request that edits the baseline is still compared
-with the merged one.
+CI does not use the baseline. `.github/workflows/benchmark.yml` measures two builds in alternating rounds with `scripts/bench-paired.sh` (below): once when a pull request is opened as ready for review or a draft is marked ready, the merge ref against its first parent; after each push to `main`, the pushed commit against the one before it, plus Tier 3 on the head build; either only when the change touches `src/`, `mk/`, `Makefile`, `tests/bench-*`, `tests/lib/`, `tests/fetch-fixtures.sh`, `scripts/bench-*`, `scripts/elfuse-oci.py` (Tier 3 runs through it) or the workflow; and on `workflow_dispatch`, any two commits, or with `aa` one commit on both sides to measure the noise, or with `pr` the pull request's current merge ref against its first parent, after which the run updates that pull request's comment, so a maintainer can refresh it after a push. The threshold is the repository variable `BENCH_REGRESSION_THRESHOLD`; while it is unset no metric is judged slower or faster, and the run's job summary shows the ratios and intervals. A head build that loses a value still reads "lost on head" without a threshold, and that posts a comment, because it means the head failed where the base did not. A pull request's comment comes from `.github/workflows/bench-report.yml`, which takes only the measured values from the run and recomputes the verdicts with the default branch's reporter, so a pull request cannot change how it is judged; after a dispatch run with `pr`, the workflow's own comment job writes it, with the reporter of the ref the maintainer dispatched on. A push run comments on the merged pull request itself. Neither is a required check.
 
 CI measures only the `elfuse-aarch64` column. `qemu-aarch64` (a real
 Linux kernel on the same silicon) and the optional `orbstack` column
@@ -357,6 +352,14 @@ without a non-zero exit. Any file matching the schema in
 `tests/bench-suite.sh`'s header works, including one captured with
 `BENCH_ENV=qemu-aarch64`/`orbstack`/`native`.
 
+**Measure two builds in alternating rounds:**
+
+```sh
+scripts/bench-paired.sh build/base-elfuse build/elfuse build/bench-paired
+```
+
+It stages the Tier-2 sysroot once with the head build (`tests/bench-suite.sh -s`), or takes the one named by `BENCH_PAIRED_STAGE`, the file `-s` wrote (`benchmark.yml` stages it under the shared host lock), then runs one discarded round per side, then `BENCH_PAIRS` (default 6) pairs of base and head rounds of Tier 1 and Tier 2 at one sample each, and ends with the `bench-compare.py --paired` table below. The output directory gets `base-N.json`, `head-N.json` and `report.json`; `BENCH_PAIRED_OCI=1` adds `head-oci.json`, a Tier-3-only run of the head build that the comparison does not read. Odd pairs run base first and even pairs head first, so an effect of running second does not move every ratio the same way. Each round attaches the staged image with its own shadow file (`hdiutil attach -shadow`) and passes it through `BENCH_SYSROOT`, then discards the shadow file, so what one round's Tier-2 workloads write into the sysroot is gone in the next round. The script detaches and deletes the staged image on exit.
+
 **Compare two builds measured in alternating rounds:**
 
 ```sh
@@ -391,7 +394,14 @@ python3 scripts/bench-promote.py --results build/bench-results.json \
 | `BENCH_BIN_DIR` | `build/` | directory holding `bench-timeit`; the make targets pass `$(TEST_DIR)`, so a prebuilt `GUEST_TEST_BINARIES` tree has to ship `bin/bench-timeit` (`make bench` skips Tiers 2 and 3 without it, `make bench-ci` fails) |
 | `TEST_TIMEOUT` | `120` | per-invocation timeout in seconds |
 | `BENCH_PREP_TIMEOUT` | `900` | timeout in seconds for the untimed Tier-2 corpus preparation inside a guest or machine |
+| `BENCH_LMBENCH` | `1` | `0` skips Tier 1 |
+| `BENCH_APPS` | `1` | `0` skips Tier 2; `-s` stages the Tier-2 sysroot anyway |
 | `BENCH_OCI` | `1` | `0` skips Tier 3 |
+| `BENCH_SYSROOT` | unset | `elfuse-aarch64` only: a Tier-2 sysroot staged by `tests/bench-suite.sh -s`, used as is instead of staging a new one |
+| `BENCH_PAIRS` | `6` | pairs `scripts/bench-paired.sh` measures |
+| `BENCH_PAIRED_OCI` | `0` | `1` = `scripts/bench-paired.sh` also runs Tier 3 on the head build |
+| `BENCH_PAIRED_STAGE` | unset | a file written by `tests/bench-suite.sh -s`; `scripts/bench-paired.sh` uses its sysroot instead of staging one, then detaches it and removes the image |
+| `BENCH_PAIRED_SUITE` | `tests/bench-suite.sh` | suite `scripts/bench-paired.sh` runs; `tests/test-bench-paired.sh` points it at a stub |
 | `BENCH_OCI_PULL_TIMEOUT` | `900` | timeout in seconds for one untimed Tier-3 image pull |
 | `ELFUSE_OCI_STORE` | `~/.local/share/elfuse/oci` | image store Tier 3 pulls into |
 | `BENCH_QEMU_NULL_CEILING` | `180` | ns/op; the qemu boot-calibration probe reboots the VM above this (efficiency-core placement) |

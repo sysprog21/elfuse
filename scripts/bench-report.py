@@ -5,10 +5,12 @@ The input artifact comes from an unprivileged pull-request workflow. Treat it
 strictly as untrusted data: validate its schema and values, escape metric
 names, and never execute anything from the artifact.
 
-The artifact supplies only the measured values. The baseline and the threshold
-come from this checkout, which the workflow takes from the default branch, so a
-pull request that edits tests/bench-baseline.json is still compared with the
-baseline already merged. A baseline metric the artifact lacks is listed as a
+The artifact supplies only the measured values. The reporter and, for a
+schema 2 report, the baseline and the threshold come from this checkout, which
+the workflow takes from the default branch, so a pull request that edits
+tests/bench-baseline.json is still compared with the baseline already merged.
+A schema 3 (paired) report reads no baseline and takes its threshold from
+BENCH_REGRESSION_THRESHOLD. A baseline metric the artifact lacks is listed as a
 failure. The comment text always goes to --output; stdout gets "changes" when
 the comment lists anything, or "clean" when every metric was measured and is
 inside the threshold, in which case the caller only updates an earlier comment.

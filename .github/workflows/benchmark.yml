@@ -1,0 +1,492 @@
+# Paired benchmark: a base and a head elfuse build measured in alternating
+# rounds on the self-hosted host by scripts/bench-paired.sh.
+#
+#   pull_request  once, when a pull request is opened as ready for review or
+#                 a draft is marked ready: the merge ref against its first
+#                 parent, Tier 1 and Tier 2. bench-report.yml posts the
+#                 comment, because a fork's token here cannot.
+#   push to main  the pushed commit against github.event.before, Tier 1 and
+#                 Tier 2, then Tier 3 on the head build; the comment goes on
+#                 the merged pull request.
+#   dispatch      any two commits, or one commit on both sides (aa) to measure
+#                 the noise the threshold is set from; or, with pr, the pull
+#                 request's current merge ref against its first parent, after
+#                 which the run updates that pull request's comment, so a
+#                 maintainer can refresh it after a push.
+#
+# A pull_request or push run is skipped unless the change touches a path the
+# scope job lists.
+#
+# Neither run is a required check, so a merge never waits for one. The
+# threshold is the repository variable BENCH_REGRESSION_THRESHOLD; while it is
+# unset no metric is judged slower or faster, and the job summary shows the
+# ratios and intervals. A head build that loses a value still reads "lost on
+# head", and that posts a comment.
+name: Benchmark
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number; measures its merge ref against its first parent and updates its comment (head, base and aa are ignored)
+        required: false
+        type: string
+      head:
+        description: Head commit (full SHA); ignored when pr is set
+        required: false
+        type: string
+      base:
+        description: Base commit (full SHA); ignored when aa is set
+        required: false
+        type: string
+      aa:
+        description: Measure the head build on both sides
+        required: false
+        type: boolean
+        default: false
+
+# One group per measured commit and never cancelled, so two quick merges both
+# get measured: they queue on the host lock instead of replacing each other.
+concurrency:
+  group: >-
+    benchmark-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch'
+    && format('{0}-{1}-{2}-{3}', inputs.pr, inputs.base, inputs.head, inputs.aa)
+    || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    name: Decide what to measure
+    if: >-
+      github.repository == 'sysprog21/elfuse' &&
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.pick.outputs.run }}
+      base: ${{ steps.pick.outputs.base }}
+      head: ${{ steps.pick.outputs.head }}
+      aa: ${{ steps.pick.outputs.aa }}
+      pr: ${{ steps.pick.outputs.pr }}
+      pr_head: ${{ steps.pick.outputs.pr_head }}
+      pr_time: ${{ steps.pick.outputs.pr_time }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick base and head
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          IN_PR: ${{ inputs.pr }}
+          IN_HEAD: ${{ inputs.head }}
+          IN_BASE: ${{ inputs.base }}
+          IN_AA: ${{ inputs.aa }}
+        run: |
+          set -euo pipefail
+          is_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+          aa=false
+          pr=""
+          pr_head=""
+          pr_time=""
+          case "$EVENT" in
+            pull_request)
+              # The checkout is the merge ref; its first parent is the main
+              # the pull request would land on.
+              head="$SHA"
+              base="$(git rev-parse HEAD^1)"
+              ;;
+            push)
+              head="$SHA"
+              base="$BEFORE"
+              # After a force push, before names a commit the clone lacks.
+              git cat-file -e "$base^{commit}" 2> /dev/null || base=""
+              ;;
+            workflow_dispatch)
+              if [ -n "$IN_PR" ]; then
+                [[ "$IN_PR" =~ ^[1-9][0-9]*$ ]] || { echo "::error::pr must be a pull request number"; exit 1; }
+                # The same merge ref a pull_request run measures; a pull
+                # request that cannot merge has none, and the fetch fails.
+                git fetch --no-tags origin "refs/pull/$IN_PR/merge"
+                head="$(git rev-parse FETCH_HEAD)"
+                base="$(git rev-parse FETCH_HEAD^1)"
+                pr="$IN_PR"
+                pr_head="$(git rev-parse FETCH_HEAD^2)"
+                pr_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              else
+                is_sha "$IN_HEAD" || { echo "::error::head must be a full SHA"; exit 1; }
+                head="$IN_HEAD"
+                if [ "$IN_AA" = true ]; then
+                  aa=true
+                  base="$IN_HEAD"
+                else
+                  is_sha "$IN_BASE" || { echo "::error::base must be a full SHA unless aa is set"; exit 1; }
+                  base="$IN_BASE"
+                fi
+              fi
+              ;;
+            *)
+              echo "::error::unexpected event $EVENT"
+              exit 1
+              ;;
+          esac
+          run=true
+          if ! is_sha "$base" || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+            echo "No base commit to compare against"
+            run=false
+          elif [ "$EVENT" != workflow_dispatch ]; then
+            # Only a change that can move a benchmark is measured.
+            run=false
+            # A failed diff inside a process substitution would escape set -e
+            # and read as no change, so the list is taken first.
+            files="$(git diff --name-only "$base" "$head")"
+            while IFS= read -r f; do
+              case "$f" in
+                src/* | mk/* | Makefile | tests/bench-* | tests/lib/* | \
+                  tests/fetch-fixtures.sh | scripts/bench-* | \
+                  scripts/elfuse-oci.py | .github/workflows/benchmark.yml)
+                  run=true
+                  break
+                  ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "base $base, head $head, aa $aa, pr ${pr:-none}, run $run"
+          {
+            echo "run=$run"
+            echo "base=$base"
+            echo "head=$head"
+            echo "aa=$aa"
+            echo "pr=$pr"
+            echo "pr_head=$pr_head"
+            echo "pr_time=$pr_time"
+          } >> "$GITHUB_OUTPUT"
+
+  bench:
+    name: Benchmark (paired)
+    needs: scope
+    if: ${{ needs.scope.outputs.run == 'true' }}
+    runs-on: [self-hosted, macOS, arm64]
+    # The shared wait (75), setup and builds (20), the Tier-3 pulls (20), the
+    # exclusive wait (45) and the measurement (25), plus a margin.
+    timeout-minutes: 190
+    env:
+      BASE_SHA: ${{ needs.scope.outputs.base }}
+      HEAD_SHA: ${{ needs.scope.outputs.head }}
+      AA: ${{ needs.scope.outputs.aa }}
+      TIER3: ${{ github.event_name == 'push' && '1' || '0' }}
+      LINUX_TOOLCHAIN: /opt/toolchain/aarch64-linux-gnu
+      GNU_OBJCOPY: /opt/homebrew/opt/binutils/bin/objcopy
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      BREW_PKGS: binutils qemu
+      MAKEFLAGS: -j8
+    steps:
+      - name: Checkout head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.scope.outputs.head }}
+          persist-credentials: false
+
+      - name: Acquire shared host lock
+        # Every leg on this machine holds the shared lock while it loads the
+        # host; the measurement below trades it for the exclusive one.
+        run: CI_HOST_LOCK_WAIT_MIN=75 scripts/ci/host-lock.sh acquire shared
+
+      - name: Restore and verify test fixtures
+        # Same restore as build.yml: checkout's git clean wipes
+        # externals/test-fixtures, and the Release leg there keeps the cache.
+        run: |
+          cache="$HOME/.cache/elfuse-ci/test-fixtures"
+          if [ -d "$cache" ]; then
+            mkdir -p externals
+            rm -rf externals/test-fixtures
+            lockf -k "$cache.lock" cp -Rc "$cache" externals/test-fixtures
+          fi
+          bash tests/fetch-fixtures.sh
+
+      - name: Host info
+        run: |
+          sw_vers
+          uname -a
+          test "$(uname -m)" = "arm64"
+
+      - name: Install missing Homebrew packages
+        run: |
+          missing=()
+          for pkg in $BREW_PKGS; do
+            brew list --formula "$pkg" > /dev/null 2>&1 || missing+=("$pkg")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            brew install --quiet "${missing[@]}"
+          fi
+
+      - name: Set up Go
+        if: ${{ env.TIER3 == '1' }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: false
+
+      - name: Build crane and umoci
+        # Same pins as build.yml's OCI smoke job.
+        if: ${{ env.TIER3 == '1' }}
+        env:
+          CRANE_VERSION: v0.22.1
+          UMOCI_VERSION: v0.6.0
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/oci-tools"
+          GOBIN="$bin" go install \
+            "github.com/google/go-containerregistry/cmd/crane@$CRANE_VERSION"
+          umoci="github.com/opencontainers/umoci@$UMOCI_VERSION"
+          go mod download "$umoci"
+          go build -C "$(go env GOMODCACHE)/$umoci" -o "$bin/umoci" ./cmd/umoci
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Build head and base
+        run: |
+          set -euo pipefail
+          bins="$RUNNER_TEMP/bench-bin"
+          rm -rf "$bins"
+          mkdir -p "$bins"
+          make clean
+          make elfuse build/bench-timeit
+          cp build/elfuse "$bins/head-elfuse"
+          if [ "$AA" = true ]; then
+            cp build/elfuse "$bins/base-elfuse"
+          else
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            tree="$RUNNER_TEMP/bench-base"
+            git worktree remove --force "$tree" 2> /dev/null || rm -rf "$tree"
+            git worktree add --detach "$tree" "$BASE_SHA"
+            make -C "$tree" elfuse
+            cp "$tree/build/elfuse" "$bins/base-elfuse"
+          fi
+
+      - name: Pull Tier-3 images
+        # Untimed, so it runs under the shared lock. Each pull has its own
+        # 15 minute limit in the suite; this bounds the four together.
+        if: ${{ env.TIER3 == '1' }}
+        timeout-minutes: 20
+        run: |
+          ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-bench-$RUNNER_NAME" \
+            bash tests/bench-suite.sh -p
+
+      - name: Stage Tier-2 sysroot
+        # Under the shared lock, so the corpus prep (up to BENCH_PREP_TIMEOUT,
+        # 900 s) holds no other leg back and stays out of the Measure budget and
+        # BENCH_RERUN_DEADLINE. bench-paired.sh takes the image over.
+        timeout-minutes: 20
+        env:
+          BENCH_BIN_DIR: ${{ github.workspace }}/build
+        run: |
+          ELFUSE="$RUNNER_TEMP/bench-bin/head-elfuse" BENCH_STRICT=1 \
+            bash tests/bench-suite.sh -s "$RUNNER_TEMP/bench-stage"
+
+      - name: Acquire exclusive host lock
+        timeout-minutes: 50
+        run: |
+          scripts/ci/host-lock.sh release
+          CI_HOST_LOCK_WAIT_MIN=45 CI_HOST_LOCK_MAX_HOLD_MIN=30 \
+            scripts/ci/host-lock.sh acquire exclusive
+
+      - name: Measure
+        # Bounds the exclusive hold that every shared wait budgets for.
+        timeout-minutes: 25
+        env:
+          BENCH_BIN_DIR: ${{ github.workspace }}/build
+          BENCH_STRICT: 1
+          BENCH_PAIRED_OCI: ${{ env.TIER3 }}
+          BENCH_PAIRED_STAGE: ${{ runner.temp }}/bench-stage
+          BENCH_REGRESSION_THRESHOLD: ${{ vars.BENCH_REGRESSION_THRESHOLD }}
+        run: |
+          ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-bench-$RUNNER_NAME" \
+            scripts/bench-paired.sh "$RUNNER_TEMP/bench-bin/base-elfuse" \
+            "$RUNNER_TEMP/bench-bin/head-elfuse" build/bench-paired
+
+      - name: Release exclusive host lock
+        if: ${{ always() }}
+        run: scripts/ci/host-lock.sh release
+
+      - name: Summarize
+        if: ${{ !cancelled() && hashFiles('build/bench-paired/report.json') != '' }}
+        env:
+          BENCH_REGRESSION_THRESHOLD: ${{ vars.BENCH_REGRESSION_THRESHOLD }}
+        run: |
+          cp build/bench-paired/report.json build/bench-pr-report.json
+          python3 scripts/bench-report.py --report build/bench-pr-report.json \
+            --output build/bench-comment.md
+          cat build/bench-comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark report
+        # bench-report.yml and the comment job below read this artifact.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-pr-report
+          path: build/bench-pr-report.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload benchmark rounds
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-rounds
+          path: build/bench-paired/*.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Remove staged sysroot
+        # Only left when Measure did not run or was stopped before its cleanup.
+        if: ${{ always() }}
+        run: |
+          stage="$RUNNER_TEMP/bench-stage"
+          [ -f "$stage" ] || exit 0
+          hdiutil detach "$(sed -n 1p "$stage")" -force -quiet 2> /dev/null || true
+          img="$(sed -n 2p "$stage")"
+          rm -f "$img" "$img.shadow" "$stage"
+
+      - name: Remove base worktree
+        if: ${{ always() }}
+        run: git worktree remove --force "$RUNNER_TEMP/bench-base" 2> /dev/null || true
+
+      - name: Release host lock
+        if: ${{ always() }}
+        run: scripts/ci/host-lock.sh release
+
+  comment:
+    name: Comment on the pull request
+    needs: [scope, bench]
+    if: >-
+      ${{ (github.event_name == 'push' || needs.scope.outputs.pr != '') &&
+      !cancelled() && needs.bench.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download benchmark report
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: bench-pr-report
+          path: ${{ runner.temp }}/bench-pr-report
+
+      - name: Render benchmark comment
+        if: ${{ steps.download.outcome == 'success' }}
+        id: render
+        env:
+          BENCH_REGRESSION_THRESHOLD: ${{ vars.BENCH_REGRESSION_THRESHOLD }}
+        run: |
+          set -euo pipefail
+          status=$(python3 scripts/bench-report.py \
+            --report "$RUNNER_TEMP/bench-pr-report/bench-pr-report.json" \
+            --output "$RUNNER_TEMP/bench-comment.md")
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      # After a merge, a clean report posts nothing and a failed measurement
+      # says so, because nothing else would tell the merged pull request it
+      # was not measured. A dispatch run for a pull request always updates
+      # that pull request's comment, since a maintainer asked for it.
+      - name: Create or update the comment
+        if: >-
+          ${{ steps.render.outputs.status == 'changes' ||
+          steps.download.outcome != 'success' || needs.scope.outputs.pr != '' }}
+        uses: actions/github-script@v9
+        env:
+          COMMENT_PATH: ${{ runner.temp }}/bench-comment.md
+          FOUND: ${{ steps.download.outcome == 'success' }}
+          PR: ${{ needs.scope.outputs.pr }}
+          PR_HEAD: ${{ needs.scope.outputs.pr_head }}
+          PR_TIME: ${{ needs.scope.outputs.pr_time }}
+        with:
+          script: |
+            const fs = require('fs');
+            const found = process.env.FOUND === 'true';
+            const report = found
+              ? fs.readFileSync(process.env.COMMENT_PATH, 'utf8').trim()
+              : null;
+            let number, marker, text, commit, stamp = '';
+            if (process.env.PR) {
+              number = Number(process.env.PR);
+              // bench-report.yml's marker, so this replaces the comment the
+              // pull_request run left.
+              marker = '<!-- elfuse-benchmark-report -->';
+              text = report ||
+                'The benchmark did not complete at this commit, so it has no measurements.';
+              commit = process.env.PR_HEAD;
+              stamp = `<!-- elfuse-benchmark-ref-time: ${process.env.PR_TIME} -->\n`;
+            } else {
+              const {data: pulls} = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+              });
+              const pull = pulls.find(p => p.merged_at && p.merge_commit_sha === context.sha);
+              if (!pull) {
+                core.notice(`No merged pull request for ${context.sha}`);
+                return;
+              }
+              number = pull.number;
+              marker = '<!-- elfuse-benchmark-merge-report -->';
+              text = `After the merge:\n\n${report ||
+                'The benchmark of the merge did not complete, so it has no measurements.'}`;
+              commit = context.sha;
+            }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `${marker}\n${stamp}${text}\n\n[Workflow run](${runUrl}) · commit \`${commit.slice(0, 12)}\`\n`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              per_page: 100,
+            });
+            const previous = comments.find(c =>
+              c.user && c.user.login === 'github-actions[bot]' &&
+              typeof c.body === 'string' && c.body.includes(marker));
+            // bench-report.yml writes the same comment from a pull_request
+            // run that may finish later; neither writer replaces a report
+            // whose merge ref was taken after its own.
+            const prevTime = previous &&
+              (previous.body.match(/<!-- elfuse-benchmark-ref-time: (\S+) -->/) || [])[1];
+            if (stamp && prevTime && prevTime > process.env.PR_TIME) {
+              core.notice(`Comment ${previous.id} reports a merge ref from ${prevTime}`);
+              return;
+            }
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: number,
+                body,
+              });
+            }

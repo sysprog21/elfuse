@@ -55,6 +55,14 @@ DEFAULT_THRESHOLD = 0.20
 # make_ms samples jump between two levels inside one run (1.51 s to 2.36 s
 # in one CI run), so its ratio is shown without a verdict.
 NO_VERDICT = frozenset({"applications.make_ms"})
+# lat_fs times out in 25% to 50% of its CI attempts, and a round where both
+# attempts time out loses its value, so a run with no code change would often
+# read "lost on head". While some pair is left, its ratio is shown without a
+# verdict, checked before the lost head value, until those timeouts are fixed;
+# a head that lost it in every round the base measured still reads "lost on
+# head".
+NO_VERDICT_EVEN_LOST = frozenset({"lmbench.lat_fs.create",
+                                  "lmbench.lat_fs.delete"})
 # No interval of a median reaches 95% coverage from fewer pairs: the widest,
 # from the smallest to the largest of 5 ratios, covers 93.75%.
 MIN_PAIRS = 6
@@ -267,7 +275,9 @@ def paired_verdict(name: str, base: list[float | str | None],
     below MIN_PAIRS), and the verdict, one of VERDICTS. A head value lost
     in any round gives "lost on head", because the head build failed where
     the base did not, and the statistics of the remaining pairs stay in the
-    result. With no threshold, a metric that would get a verdict gets "no
+    result; a NO_VERDICT_EVEN_LOST metric reads "lost on head" only when no
+    pair is left.
+    With no threshold, a metric that would get a verdict gets "no
     threshold".
     """
     base_skipped = [b == SKIPPED for b in base]
@@ -294,7 +304,14 @@ def paired_verdict(name: str, base: list[float | str | None],
         interval = median_interval(ratios)
         if interval is not None:
             result["low"], result["high"] = interval
-    if result["head_lost"]:
+    # A head that loses lat_fs in every round the base measured is not the
+    # timeout noise.
+    if name in NO_VERDICT_EVEN_LOST and pairs:
+        if len(pairs) < MIN_PAIRS:
+            result["verdict"] = "too few pairs"
+        else:
+            result["verdict"] = "no verdict"
+    elif result["head_lost"]:
         result["verdict"] = "lost on head"
     elif not pairs:
         result["verdict"] = "no result"

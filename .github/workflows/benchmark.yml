@@ -21,7 +21,8 @@
 # threshold is the repository variable BENCH_REGRESSION_THRESHOLD; while it is
 # unset no metric is judged slower or faster, and the job summary shows the
 # ratios and intervals. A head build that loses a value still reads "lost on
-# head", and that posts a comment.
+# head", and that posts a comment; a lat_fs metric does so only when no pair is
+# left.
 name: Benchmark
 
 on:

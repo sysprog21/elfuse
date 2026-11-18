@@ -262,6 +262,12 @@ $(BUILD_DIR)/test-gva-contracts: $(BUILD_DIR)/test-gva-contracts.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the benchmark calibration loop (native macOS binary)
+# Standalone: it times the host CPU, so it links nothing from the project.
+$(BUILD_DIR)/bench-calib: $(BUILD_DIR)/bench-calib.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the volume naming probe (native macOS binary)
 # Standalone: it measures the filesystem, so it links nothing from the project.
 $(BUILD_DIR)/probe-volume-naming: $(BUILD_DIR)/probe-volume-naming.o \

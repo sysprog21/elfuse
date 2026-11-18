@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run scripts/bench-paired.sh against a stub suite and a stub hdiutil, so its
-# round order and exits are checked in seconds instead of a 12-minute A/A run.
+# Run scripts/bench-paired.sh against a stub suite, a stub hdiutil and a stub
+# calibration loop, so its round order, exits, reruns and deadline are checked
+# in seconds instead of an A/A run of 11 to 14 minutes.
 #
 # SPDX-License-Identifier: Apache-2.0
 set -u
@@ -32,9 +33,19 @@ case "$1" in
         ;;
 esac
 EOF
+# Call N prints 1200 when N is in STUB_HIGH, otherwise STUB_CALIB_OUT.
+cat > "$T/bin/calib" << 'EOF'
+#!/usr/bin/env bash
+n=$(($(cat "$STUB_DIR/calls") + 1))
+echo "$n" > "$STUB_DIR/calls"
+case " ${STUB_HIGH:-} " in
+    *" $n "*) echo 1200 ;;
+    *) echo "${STUB_CALIB_OUT:-1000}" ;;
+esac
+EOF
 
-# -s stages (and leaves attached, as the real suite does); -o writes one round
-# and logs which build ran it.
+# -s stages (and leaves attached, as the real suite does); -o writes one round,
+# logs which build ran it and takes STUB_ROUND_SECS.
 cat > "$T/suite.sh" << 'EOF'
 case "$1" in
     -s)
@@ -45,25 +56,35 @@ case "$1" in
         ;;
     -o)
         basename "$ELFUSE" >> "$STUB_DIR/order"
+        sleep "${STUB_ROUND_SECS:-0}"
         printf '{"meta": {"env": "elfuse-aarch64"}, "lmbench": {"x": {"median": 1.0}}}\n' > "$2"
         ;;
 esac
 EOF
 printf '#!/bin/sh\nexit 0\n' > "$T/base"
 cp "$T/base" "$T/head"
-chmod +x "$T/bin/hdiutil" "$T/base" "$T/head"
+chmod +x "$T/bin/hdiutil" "$T/bin/calib" "$T/base" "$T/head"
 
 # run [VAR=value ...]: one bench-paired.sh run on the stubs; sets rc.
 run()
 {
     rm -rf "$T/out" "$T/img" "$T/staged"
     echo "${mounts0:-0}" > "$T/mounts"
+    echo 0 > "$T/calls"
     : > "$T/order"
     rc=0
     env -u BENCH_REGRESSION_THRESHOLD -u BENCH_PAIRS PATH="$T/bin:$PATH" \
-        STUB_DIR="$T" BENCH_PAIRED_SUITE="$T/suite.sh" "$@" \
+        STUB_DIR="$T" BENCH_PAIRED_SUITE="$T/suite.sh" \
+        BENCH_CALIB="$T/bin/calib" BENCH_CALIB_GAP=0 "$@" \
         bash "$ROOT/scripts/bench-paired.sh" "$T/base" "$T/head" "$T/out" \
         > "$T/log" 2>&1 || rc=$?
+}
+
+# meta FILE KEY: print meta[KEY] of a round file.
+meta()
+{
+    python3 -I -c 'import json, sys
+print(json.load(open(sys.argv[1]))["meta"][sys.argv[2]])' "$1" "$2"
 }
 
 run
@@ -78,6 +99,32 @@ run STUB_DETACH_FAILS=1
 [ "$rc" != 0 ] || fail "a failed detach did not stop the run"
 grep -q 'cannot detach' "$T/log" || fail "a failed detach printed no message"
 
+# Calls 15 and 16 make the reading after pair 1's head round.
+run STUB_HIGH="15 16"
+[ "$rc" = 0 ] || fail "unsteady run exited $rc"
+[ "$(grep -c 'measuring pair' "$T/log")" = 1 ] || fail "one high reading did not give exactly one rerun"
+[ "$(meta "$T/out/head-1.json" reruns)" = 1 ] || fail "pair 1 meta.reruns is not 1"
+[ "$(meta "$T/out/base-1.json" calib_unsteady)" = False ] || fail "a rerun pair was marked unsteady"
+
+# One high call of the two behind a reading (15: the first after pair 1's head
+# round; 18: the second before pair 2's head round) is a spike and drops out.
+run STUB_HIGH="15 18"
+[ "$rc" = 0 ] || fail "single-spike run exited $rc"
+grep -q 'measuring pair' "$T/log" && fail "one high call of two gave a rerun"
+
+run STUB_HIGH="15 16" BENCH_RERUN_DEADLINE=0
+[ "$rc" = 0 ] || fail "deadline run exited $rc"
+grep -q 'measuring pair' "$T/log" && fail "a rerun ran past the deadline"
+[ "$(meta "$T/out/head-1.json" calib_unsteady)" = True ] || fail "a kept pair was not marked unsteady"
+# Calls 13 and 14 make the head round's reading before, 15 and 16 after.
+[ "$(meta "$T/out/head-1.json" calib_us)" = "[1000.0, 1200.0]" ] || fail "head-1 meta.calib_us is not the readings before and after its round"
+
+# 1 s rounds: pair 1 ends near 4 s, before the 10 s deadline, but a rerun and
+# the 5 pairs after it would end near 16 s.
+run STUB_HIGH="15 16" STUB_ROUND_SECS=1 BENCH_RERUN_DEADLINE=10
+[ "$rc" = 0 ] || fail "projected deadline run exited $rc"
+grep -q 'measuring pair' "$T/log" && fail "a rerun ran although the pairs after it would end past the deadline"
+
 # A sysroot staged before the run, as benchmark.yml stages it under the shared
 # host lock, is used without staging again, then detached and removed.
 printf '/Volumes/stub-bench\n%s\n' "$T/pre.img" > "$T/pre"
@@ -87,14 +134,23 @@ mounts0=1 run BENCH_PAIRED_STAGE="$T/pre"
 [ ! -e "$T/staged" ] || fail "a run given a staged sysroot staged another"
 [ "$(cat "$T/mounts")" = 0 ] || fail "a run given a staged sysroot left a mount"
 [ ! -e "$T/pre.img" ] && [ ! -e "$T/pre" ] || fail "a given staged image or its file was left behind"
-run BENCH_PAIRED_STAGE="$T/missing"
-[ "$rc" = 2 ] || fail "a missing BENCH_PAIRED_STAGE gave exit $rc, not 2"
-[ ! -e "$T/out" ] || fail "a missing BENCH_PAIRED_STAGE created the output directory"
+
+run STUB_CALIB_OUT=abc
+[ "$rc" = 1 ] || fail "a calibration tool that prints text gave exit $rc, not 1"
+[ "$(cat "$T/mounts")" = 0 ] || fail "a failed calibration left a mount"
+[ ! -e "$T/img" ] || fail "a failed calibration left the staged image"
 
 for pairs in 0 5 33 abc 18446744073709551622; do
     run BENCH_PAIRS="$pairs"
     [ "$rc" = 2 ] || fail "BENCH_PAIRS=$pairs gave exit $rc, not 2"
     [ ! -e "$T/out" ] || fail "BENCH_PAIRS=$pairs created the output directory"
+done
+for bad in BENCH_RERUN_DEADLINE=abc BENCH_RERUN_DEADLINE=18446744073709551616 \
+    BENCH_CALIB_GAP=abc BENCH_CALIB_SPREAD=abc BENCH_CALIB="$T/missing" \
+    BENCH_PAIRED_STAGE="$T/missing"; do
+    run "$bad"
+    [ "$rc" = 2 ] || fail "$bad gave exit $rc, not 2"
+    [ ! -e "$T/out" ] || fail "$bad created the output directory"
 done
 run BENCH_PAIRS=08
 [ "$rc" = 0 ] || fail "BENCH_PAIRS=08 gave exit $rc"

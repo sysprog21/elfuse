@@ -265,7 +265,7 @@ jobs:
           rm -rf "$bins"
           mkdir -p "$bins"
           make clean
-          make elfuse build/bench-timeit
+          make elfuse build/bench-timeit build/bench-calib
           cp build/elfuse "$bins/head-elfuse"
           if [ "$AA" = true ]; then
             cp build/elfuse "$bins/base-elfuse"

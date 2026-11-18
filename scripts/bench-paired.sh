@@ -18,6 +18,16 @@
 # head-oci.json, a Tier-3-only run of the head build at the suite's default
 # sample count that the comparison does not read.
 #
+# Around each round, BENCH_CALIB times a fixed single-threaded host loop. When
+# the four readings of a pair spread by more than BENCH_CALIB_SPREAD, the host
+# ran the two rounds at different speeds (a P-core slows down once three or more
+# are busy), so the pair is measured again, in the same order. A pair is not
+# measured again when that rerun and the pairs still to come, each taking as
+# long as this pair just did, would end at or past BENCH_RERUN_DEADLINE seconds
+# after the start; such a pair is kept and marked. Each round's meta records its
+# two readings (calib_us), how often its pair was measured again (reruns) and
+# that mark (calib_unsteady).
+#
 # Environment:
 #   BENCH_PAIRS       pairs to measure, 6 to 32 (default 6, the fewest that
 #                     bench-compare.py gives a verdict for)
@@ -27,6 +37,14 @@
 #                     detaches it and removes the image and the file
 #   BENCH_PAIRED_SUITE  the suite to run (default tests/bench-suite.sh); the
 #                     test in tests/test-bench-paired.sh points it at a stub
+#   BENCH_CALIB       calibration loop (default build/bench-calib)
+#   BENCH_CALIB_SPREAD  largest (max - min) / min of a pair's four readings
+#                     (default 0.06, half the 12% step seen on the CI M4)
+#   BENCH_RERUN_DEADLINE  seconds after the start by which the last pair is
+#                     expected to end; no rerun is made that would reach it
+#                     (default 900)
+#   BENCH_CALIB_GAP   seconds between the two calls of BENCH_CALIB that make
+#                     one reading (default 1)
 #   BENCH_REGRESSION_THRESHOLD, and the bench-suite.sh variables
 #   (BENCH_BIN_DIR, BENCH_STRICT, ELFUSE_OCI_STORE, ...), pass through.
 #
@@ -63,7 +81,34 @@ if [ "${#PAIRS}" -gt 2 ] || ((PAIRS < 6 || PAIRS > 32)); then
     echo "bench-paired: BENCH_PAIRS must be 6 to 32" >&2
     exit 2
 fi
-for bin in "$BASE" "$HEAD"; do
+CALIB="${BENCH_CALIB:-$ROOT/build/bench-calib}"
+SPREAD="${BENCH_CALIB_SPREAD:-0.06}"
+DEADLINE="${BENCH_RERUN_DEADLINE:-900}"
+case "$DEADLINE" in
+    '' | *[!0-9]*)
+        echo "bench-paired: BENCH_RERUN_DEADLINE must be a number" >&2
+        exit 2
+        ;;
+esac
+# As for BENCH_PAIRS: no octal, and no value long enough to wrap.
+DEADLINE="${DEADLINE#"${DEADLINE%%[!0]*}"}"
+DEADLINE="${DEADLINE:-0}"
+[ "${#DEADLINE}" -le 6 ] || {
+    echo "bench-paired: BENCH_RERUN_DEADLINE must be at most 999999" >&2
+    exit 2
+}
+GAP="${BENCH_CALIB_GAP:-1}"
+case "$GAP" in
+    '' | *[!0-9]*)
+        echo "bench-paired: BENCH_CALIB_GAP must be a number" >&2
+        exit 2
+        ;;
+esac
+[[ "$SPREAD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+    echo "bench-paired: BENCH_CALIB_SPREAD must be a number" >&2
+    exit 2
+}
+for bin in "$BASE" "$HEAD" "$CALIB"; do
     [ -x "$bin" ] || {
         echo "bench-paired: $bin is not an executable" >&2
         exit 2
@@ -80,6 +125,9 @@ rm -f "$OUT"/base-*.json "$OUT"/head-*.json "$OUT/report.json"
 
 IMG=""
 MNT=""
+# Each round leaves its two calibration readings in CAL_base or CAL_head.
+CAL_base=""
+CAL_head=""
 detach_mnt()
 {
     [ -n "$MNT" ] || return 0
@@ -118,17 +166,57 @@ round()
         echo "bench-paired: cannot attach $IMG with a shadow file" >&2
         exit 1
     }
+    local before after
+    before="$(calib)"
     ELFUSE="$bin" BENCH_SYSROOT="$MNT/rootfs" BENCH_ITERATIONS=1 \
         BENCH_WARMUP=0 BENCH_OCI=0 bash "$SUITE" -o "$out"
+    after="$(calib)"
     detach_mnt
     rm -f "$IMG.shadow"
+    printf -v "CAL_$side" '%s %s' "$before" "$after"
 }
 
-round base "$BASE" "$OUT/discard-base.json"
-round head "$HEAD" "$OUT/discard-head.json"
-bases=()
-heads=()
-for ((i = 1; i <= PAIRS; i++)); do
+# A reading is the lower of two calls GAP seconds apart, so a slowdown shorter
+# than GAP drops out while one long enough to move a round's numbers shows in
+# both. In local A/A runs, one call per reading reran 3 of 6 pairs, each for a
+# reading 7% to 9% high right after a round; two calls reran 1 of 6.
+calib()
+{
+    local a b
+    a="$("$CALIB")"
+    sleep "$GAP"
+    b="$("$CALIB")"
+    for v in "$a" "$b"; do
+        [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+            echo "bench-paired: $CALIB printed '$v', not a time" >&2
+            exit 1
+        }
+    done
+    awk -v a="$a" -v b="$b" 'BEGIN { print (a < b ? a : b) }'
+}
+
+# Record a round's readings, its pair's reruns and the unsteady mark in meta.
+annotate()
+{
+    python3 -I - "$@" << 'PY'
+import json, sys
+path, before, after, reruns, unsteady = sys.argv[1:]
+with open(path, encoding="utf-8") as f:
+    doc = json.load(f)
+meta = doc.setdefault("meta", {})
+meta["calib_us"] = [float(before), float(after)]
+meta["reruns"] = int(reruns)
+meta["calib_unsteady"] = unsteady == "1"
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(doc, f, indent=2)
+    f.write("\n")
+PY
+}
+
+# One pair: odd pairs run base first and even pairs head first.
+pair()
+{
+    local i="$1"
     if ((i % 2)); then
         round base "$BASE" "$OUT/base-$i.json"
         round head "$HEAD" "$OUT/head-$i.json"
@@ -136,6 +224,39 @@ for ((i = 1; i <= PAIRS; i++)); do
         round head "$HEAD" "$OUT/head-$i.json"
         round base "$BASE" "$OUT/base-$i.json"
     fi
+}
+
+round base "$BASE" "$OUT/discard-base.json"
+round head "$HEAD" "$OUT/discard-head.json"
+bases=()
+heads=()
+for ((i = 1; i <= PAIRS; i++)); do
+    reruns=0
+    unsteady=0
+    while :; do
+        start=$SECONDS
+        pair "$i"
+        took=$((SECONDS - start))
+        # shellcheck disable=SC2086 # each CAL_ holds two numbers
+        spread="$(printf '%s\n' $CAL_base $CAL_head | awk '
+            NR == 1 || $1 < lo { lo = $1 }
+            NR == 1 || $1 > hi { hi = $1 }
+            END { printf "%.4f", (hi - lo) / lo }')"
+        echo "bench-paired: pair $i calibration base $CAL_base, head $CAL_head us, spread $spread"
+        awk -v s="$spread" -v m="$SPREAD" 'BEGIN { exit !(s > m) }' || break
+        # The rerun and the PAIRS - i pairs after it, each as long as this one.
+        if ((SECONDS + took * (PAIRS - i + 1) >= DEADLINE)); then
+            echo "bench-paired: pair $i kept unsteady, a rerun would end at or past the $DEADLINE s deadline" >&2
+            unsteady=1
+            break
+        fi
+        reruns=$((reruns + 1))
+        echo "bench-paired: measuring pair $i again (rerun $reruns)"
+    done
+    # shellcheck disable=SC2086 # each CAL_ holds two numbers
+    annotate "$OUT/base-$i.json" $CAL_base "$reruns" "$unsteady"
+    # shellcheck disable=SC2086
+    annotate "$OUT/head-$i.json" $CAL_head "$reruns" "$unsteady"
     bases+=("$OUT/base-$i.json")
     heads+=("$OUT/head-$i.json")
 done

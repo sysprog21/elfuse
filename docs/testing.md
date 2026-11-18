@@ -358,7 +358,7 @@ without a non-zero exit. Any file matching the schema in
 scripts/bench-paired.sh build/base-elfuse build/elfuse build/bench-paired
 ```
 
-It stages the Tier-2 sysroot once with the head build (`tests/bench-suite.sh -s`), or takes the one named by `BENCH_PAIRED_STAGE`, the file `-s` wrote (`benchmark.yml` stages it under the shared host lock), then runs one discarded round per side, then `BENCH_PAIRS` (default 6) pairs of base and head rounds of Tier 1 and Tier 2 at one sample each, and ends with the `bench-compare.py --paired` table below. The output directory gets `base-N.json`, `head-N.json` and `report.json`; `BENCH_PAIRED_OCI=1` adds `head-oci.json`, a Tier-3-only run of the head build that the comparison does not read. Odd pairs run base first and even pairs head first, so an effect of running second does not move every ratio the same way. Each round attaches the staged image with its own shadow file (`hdiutil attach -shadow`) and passes it through `BENCH_SYSROOT`, then discards the shadow file, so what one round's Tier-2 workloads write into the sysroot is gone in the next round. The script detaches and deletes the staged image on exit.
+It stages the Tier-2 sysroot once with the head build (`tests/bench-suite.sh -s`), or takes the one named by `BENCH_PAIRED_STAGE`, the file `-s` wrote (`benchmark.yml` stages it under the shared host lock), then runs one discarded round per side, then `BENCH_PAIRS` (default 6) pairs of base and head rounds of Tier 1 and Tier 2 at one sample each, and ends with the `bench-compare.py --paired` table below. The output directory gets `base-N.json`, `head-N.json` and `report.json`; `BENCH_PAIRED_OCI=1` adds `head-oci.json`, a Tier-3-only run of the head build that the comparison does not read. Odd pairs run base first and even pairs head first, so an effect of running second does not move every ratio the same way. Each round attaches the staged image with its own shadow file (`hdiutil attach -shadow`) and passes it through `BENCH_SYSROOT`, then discards the shadow file, so what one round's Tier-2 workloads write into the sysroot is gone in the next round. Before and after each round, `build/bench-calib` (`make build/bench-calib`) times a fixed single-threaded loop on the host. A P-core slows down once three or more P-cores are busy (about 12% on the CI M4), so when the four readings of a pair spread by more than `BENCH_CALIB_SPREAD`, the pair is measured again in the same order, unless that rerun and the pairs still to come, each as long as this pair took, would end `BENCH_RERUN_DEADLINE` seconds or more after the start; such a pair is kept and marked. A reading is the lower of two calls of `BENCH_CALIB` `BENCH_CALIB_GAP` seconds apart, taken before and after each round. Each round's `meta` records `calib_us` (its two readings), `reruns` and `calib_unsteady`. The script detaches and deletes the staged image on exit.
 
 **Compare two builds measured in alternating rounds:**
 
@@ -398,10 +398,14 @@ python3 scripts/bench-promote.py --results build/bench-results.json \
 | `BENCH_APPS` | `1` | `0` skips Tier 2; `-s` stages the Tier-2 sysroot anyway |
 | `BENCH_OCI` | `1` | `0` skips Tier 3 |
 | `BENCH_SYSROOT` | unset | `elfuse-aarch64` only: a Tier-2 sysroot staged by `tests/bench-suite.sh -s`, used as is instead of staging a new one |
-| `BENCH_PAIRS` | `6` | pairs `scripts/bench-paired.sh` measures |
+| `BENCH_PAIRS` | `6` | pairs `scripts/bench-paired.sh` measures, 6 to 32: below `MIN_PAIRS` in `scripts/bench-compare.py` no metric gets a verdict, above `MAX_ROUNDS` it exits 2 |
 | `BENCH_PAIRED_OCI` | `0` | `1` = `scripts/bench-paired.sh` also runs Tier 3 on the head build |
 | `BENCH_PAIRED_STAGE` | unset | a file written by `tests/bench-suite.sh -s`; `scripts/bench-paired.sh` uses its sysroot instead of staging one, then detaches it and removes the image |
 | `BENCH_PAIRED_SUITE` | `tests/bench-suite.sh` | suite `scripts/bench-paired.sh` runs; `tests/test-bench-paired.sh` points it at a stub |
+| `BENCH_CALIB` | `build/bench-calib` | calibration loop `scripts/bench-paired.sh` runs around each round |
+| `BENCH_CALIB_SPREAD` | `0.06` | largest (max - min) / min of a pair's four calibration readings (one before and one after each round) before the pair is measured again |
+| `BENCH_RERUN_DEADLINE` | `900` | seconds after the start by which the last pair of `scripts/bench-paired.sh` is expected to end; no rerun is made that would reach it |
+| `BENCH_CALIB_GAP` | `1` | seconds between the two calls of `BENCH_CALIB` that make one reading |
 | `BENCH_OCI_PULL_TIMEOUT` | `900` | timeout in seconds for one untimed Tier-3 image pull |
 | `ELFUSE_OCI_STORE` | `~/.local/share/elfuse/oci` | image store Tier 3 pulls into |
 | `BENCH_QEMU_NULL_CEILING` | `180` | ns/op; the qemu boot-calibration probe reboots the VM above this (efficiency-core placement) |

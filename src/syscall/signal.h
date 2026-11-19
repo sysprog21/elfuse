@@ -568,6 +568,13 @@ void signal_get_state(signal_state_snapshot_t *state);
  */
 bool signal_sigchld_autoreap(void);
 
+/* Recompute whether a SIGCHLD generated now would be discarded and write it to
+ * this process's mapped sigchld flag file when it changed. Call after any
+ * action, mask, or thread-exit change that can flip it, with sig_lock or
+ * mmap_lock held, or with no lock.
+ */
+void signal_sigchld_republish(void);
+
 /* Refresh the shim identity cache after an asynchronous reparent message.
  * Returns false while a fork child is still bootstrapping and has not
  * registered its guest cache yet.

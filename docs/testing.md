@@ -654,6 +654,7 @@ environment hook, read once and with no effect at all when unset:
 | `ELFUSE_DIR_UNION_BACKING_DELAY_US=N` | widens the window between pinning a directory stream and looking its backing up | `test-dir-union-fd-reuse` |
 | `ELFUSE_FD_IDENTITY_WINDOW_US=N` | widens the window between reading a descriptor's stamp and pinning its host fd | `test-fstatfs-fd-identity` |
 | `ELFUSE_FUSE_OPEN_LOCK_DELAY_US=N` | holds a FUSE open inside its session lock after the descriptor is allocated, where a concurrent lookup waits on that lock with `fuse_lock` held | `test-fuse-open-lock` |
+| `ELFUSE_SIGNAL_DRAIN_DELAY_US=N` | holds each drain of the signal transport that a SIGUSR2 starts for N microseconds, N being the value's leading decimal number (no effect unless it is from 1 to 999999), as if the sender's SIGUSR2 arrived late | `test-sigchld-late-drain` |
 | `ELFUSE_USBDEV_OPEN_FAULT=info\|blob\|pipe` | fails one step of a usbdevfs open: the model lookup or the descriptor copy with `ENOMEM`, the readiness pipe with `ENFILE` | `test-usbdev-faults` |
 | `ELFUSE_USBDEV_PUBLISH_DELAY_US=N` | widens the window between `fd_alloc` publishing a usbdevfs fd and the side table binding it, where a close finds no entry | `test-usbdev-faults` |
 | `ELFUSE_USBDEV_RETIRE_DELAY_US=N` | widens the window between the side table binding a usbdevfs fd and the open's recheck, where a close can reap the entry and a sibling open can take its slot | `test-usbdev-faults` |
@@ -681,6 +682,7 @@ The lanes these drive:
 | `test-dir-fd-budget-union` | a union directory fd costs one host descriptor, like a plain one |
 | `test-fstatfs-fd-identity` | `fstatfs` answers for the descriptor it pinned, not for the fd number |
 | `test-fuse-open-lock` | a full FUSE file-slot table reports ENFILE before anything reaches the daemon, every failed open releases what it took, and an open and a lookup on one mount do not deadlock |
+| `test-sigchld-late-drain` | a SIGCHLD that the parent discards at the child's exit stays discarded when the parent installs a handler before it drains the record: with nothing before the exit, after an `SA_RESETHAND` run, a blocking thread's exit, a blocking `CLONE_VM` child's reap, and for an adopted child that had already exited |
 | `test-usbdev-faults` | an interface number wider than the table that indexes it, each open-time failure reported as itself, a close inside the fd publish window leaking nothing, and a reap that answers for the description it snapshotted rather than the fd number |
 | `test-usbdev-ioctl-departed` | every usbdevfs ioctl this layer names, on a device that has gone: the return, the `errno`, the stamp on the fd that asked and the stamp on a peer fd, against the Linux answer recorded for that request |
 

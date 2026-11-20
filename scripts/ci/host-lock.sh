@@ -2,12 +2,13 @@
 # Machine-wide reader-writer lock for the self-hosted CI host.
 #
 # Normal runtime legs hold a shared lock while they may load the host. The
-# benchmark leg acquires the exclusive lock immediately around make bench-ci,
-# keeping only the measurement window isolated. A detached holder owns flock;
-# release talks to that exact holder over a Unix socket rather than signaling a
-# possibly recycled PID. Each acquire binds a socket of its own (the prefix plus
-# a random suffix, recorded in the state file), so a holder that is still
-# cleaning up after a release can never remove its successor's socket.
+# benchmark job (.github/workflows/benchmark.yml) acquires the exclusive lock
+# immediately around its measurement, keeping only that window isolated. A
+# detached holder owns flock; release talks to that exact holder over a Unix
+# socket rather than signaling a possibly recycled PID. Each acquire binds a
+# socket of its own (the prefix plus a random suffix, recorded in the state
+# file), so a holder that is still cleaning up after a release can never remove
+# its successor's socket.
 #
 # Environment:
 #   CI_HOST_LOCK_FILE          machine-global lock file

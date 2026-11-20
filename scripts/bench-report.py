@@ -5,10 +5,12 @@ The input artifact comes from an unprivileged pull-request workflow. Treat it
 strictly as untrusted data: validate its schema and values, escape metric
 names, and never execute anything from the artifact.
 
-The artifact supplies only the measured values. The baseline and the threshold
-come from this checkout, which the workflow takes from the default branch, so a
-pull request that edits tests/bench-baseline.json is still compared with the
-baseline already merged. A baseline metric the artifact lacks is listed as a
+The artifact supplies only the measured values. The reporter and, for a
+schema 2 report, the baseline and the threshold come from this checkout, which
+the workflow takes from the default branch, so a pull request that edits
+tests/bench-baseline.json is still compared with the baseline already merged.
+A schema 3 (paired) report reads no baseline and takes its threshold from
+BENCH_REGRESSION_THRESHOLD. A baseline metric the artifact lacks is listed as a
 failure. The comment text always goes to --output; stdout gets "changes" when
 the comment lists anything, or "clean" when every metric was measured and is
 inside the threshold, in which case the caller only updates an earlier comment.
@@ -19,9 +21,9 @@ The reporter recomputes each verdict from those values with
 bench-compare.py's paired_verdict, so the comment and the job log agree, and
 renders one table of every metric. With no threshold set, the table carries
 ratios and intervals and no slower or faster verdict. Its stdout is "changes"
-when a metric is slower, faster or lost a head value in some round, and
-"clean" otherwise. A metric missing on both sides stays clean, because the
-head build did not cause it.
+when a metric is slower, faster or lost a head value in some round (a lat_fs
+metric only when no pair is left), and "clean" otherwise. A metric missing on
+both sides stays clean, because the head build did not cause it.
 """
 
 from __future__ import annotations
@@ -499,6 +501,16 @@ def paired_self_test() -> list[str]:
         failures.append("a slowdown got a verdict with no threshold")
     if verdict([20.0] * 8, name="applications.make_ms") != "no verdict":
         failures.append("make_ms got a verdict")
+    if verdict([13.0] * 7 + [None], name="applications.make_ms") \
+            != "lost on head":
+        failures.append("make_ms hid a lost head value")
+    for head, expected in (([20.0] * 8, "no verdict"),
+                           ([20.0] * 7 + [None], "no verdict"),
+                           ([20.0] * 3 + [None] * 5, "too few pairs"),
+                           ([None] * 8, "lost on head")):
+        got = verdict(head, name="lmbench.lat_fs.create")
+        if got != expected:
+            failures.append(f"lat_fs gave {got}, expected {expected}")
     if verdict([20.0], base=[10.0]) != "too few pairs":
         failures.append("one pair got a verdict")
     zero = compare.paired_verdict("x.y", [0.0] * 8, [20.0] * 8,

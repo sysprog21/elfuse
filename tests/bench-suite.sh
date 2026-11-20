@@ -52,9 +52,13 @@
 # times; warmups are discarded and the median plus raw timed samples are
 # reported.
 #
-# Usage: tests/bench-suite.sh [-o results.json] [-p]
+# Usage: tests/bench-suite.sh [-o results.json] [-p] [-s FILE]
 #   -p  pull the Tier-3 OCI images into $ELFUSE_OCI_STORE and exit; CI runs
 #       this before it takes the exclusive host lock
+#   -s  stage the elfuse-aarch64 Tier-2 sysroot, write its mount point and
+#       image path to FILE (one per line), leave it attached and exit; later
+#       runs reuse it through BENCH_SYSROOT=<mount point>/rootfs, and the
+#       caller detaches and deletes it (scripts/bench-paired.sh)
 #
 # Environment:
 #   BENCH_ENV         elfuse-aarch64 (default) | qemu-aarch64 | native |
@@ -129,7 +133,11 @@
 #   ELFUSE            elfuse binary (default build/elfuse)
 #   BENCH_BIN_DIR     dir with bench-timeit (default build/)
 #   TEST_TIMEOUT      per-invocation timeout in seconds (default 120)
+#   BENCH_LMBENCH     1 = run Tier 1 (default); 0 = skip it
+#   BENCH_APPS        1 = run Tier 2 (default); 0 = skip it
 #   BENCH_OCI         1 = run Tier 3 (default); 0 = skip it
+#   BENCH_SYSROOT     elfuse-aarch64 only: a Tier-2 sysroot staged by -s,
+#                     used as is instead of staging a new one
 #   BENCH_OCI_PULL_TIMEOUT  timeout in seconds for one untimed image pull
 #                     (default 900)
 #   BENCH_PREP_TIMEOUT  timeout in seconds for the untimed Tier-2 corpus
@@ -226,12 +234,14 @@ CORPUS="${REPO_ROOT}/tests/bench-corpus"
 
 OUT_JSON="${REPO_ROOT}/build/bench-results.json"
 PULL_ONLY=0
-while getopts "o:p" opt; do
+STAGE_FILE=""
+while getopts "o:ps:" opt; do
     case "$opt" in
         o) OUT_JSON="$OPTARG" ;;
         p) PULL_ONLY=1 ;;
+        s) STAGE_FILE="$OPTARG" ;;
         *)
-            echo "usage: $0 [-o results.json] [-p]" >&2
+            echo "usage: $0 [-o results.json] [-p] [-s FILE]" >&2
             exit 2
             ;;
     esac
@@ -274,6 +284,9 @@ T1_HELLO_CLAIM=""
 APPS_SKIPPED=""
 OCI_SKIPPED=""
 BENCH_OCI="${BENCH_OCI:-1}"
+BENCH_LMBENCH="${BENCH_LMBENCH:-1}"
+BENCH_APPS="${BENCH_APPS:-1}"
+BENCH_SYSROOT="${BENCH_SYSROOT:-}"
 BENCH_OCI_PULL_TIMEOUT="${BENCH_OCI_PULL_TIMEOUT:-900}"
 
 _QEMU_ACTIVE=0
@@ -671,6 +684,7 @@ claim_hello_s()
 # fails rather than overwrite the first one's copy).
 run_tier1_suite()
 {
+    [ "$BENCH_LMBENCH" = "1" ] || return 0
     local missing="" b
     for b in lat_syscall lat_proc lat_fs hello-s; do
         [ -x "${LMBENCH_DIR}/${b}" ] || missing="$missing $b"
@@ -1010,6 +1024,7 @@ make_clean_out()
 
 run_tier2_suite()
 {
+    [ "$BENCH_APPS" = "1" ] || [ -n "$STAGE_FILE" ] || return 0
     # Prerequisites per environment.
     case "$BENCH_ENV" in
         elfuse-aarch64)
@@ -1040,6 +1055,17 @@ run_tier2_suite()
                 return 0
             fi
 
+            GUEST_WORK="/bench-work"
+            if [ -n "$BENCH_SYSROOT" ]; then
+                [ -x "${BENCH_SYSROOT}/bench-timeit" ] \
+                    && [ -d "${BENCH_SYSROOT}${GUEST_WORK}/corpus/.git" ] \
+                    || bench_die "BENCH_SYSROOT=$BENCH_SYSROOT is not a sysroot staged by -s"
+                SYS="$BENCH_SYSROOT"
+                bench_note "reusing staged bench sysroot $SYS"
+                run_tier2_tools
+                return 0
+            fi
+
             bench_note "staging case-sensitive bench sysroot"
             IMG="$(mktemp -u "${TMPDIR:-/tmp}/elfuse-bench.XXXXXX").sparseimage"
 
@@ -1061,7 +1087,6 @@ run_tier2_suite()
             cp "${BENCH_BIN_DIR}/bench-timeit" "${SYS}/bench-timeit" \
                 || bench_die "failed to stage guest bench-timeit"
 
-            GUEST_WORK="/bench-work"
             mkdir -p "${SYS}${GUEST_WORK}" \
                 || bench_die "failed to create guest benchmark work area"
             prepare_corpus "${SYS}${GUEST_WORK}"
@@ -1157,6 +1182,21 @@ run_tier2_suite()
     tier2_run "${gitc[@]}" commit -q -m corpus-snapshot \
         > /dev/null 2>&1 || bench_die "git commit failed"
 
+    # -s keeps the staged sysroot for later runs, which pass it back through
+    # BENCH_SYSROOT; the caller detaches the image and removes it.
+    if [ -n "$STAGE_FILE" ]; then
+        printf '%s\n%s\n' "$MNT" "$IMG" > "$STAGE_FILE" \
+            || bench_die "cannot write $STAGE_FILE"
+        bench_note "staged bench sysroot ${SYS}"
+        MNT=""
+        IMG=""
+        return 0
+    fi
+    run_tier2_tools
+}
+
+run_tier2_tools()
+{
     run_startup_metric
     run_tier2_tool python_startup_ms "" python3 -c pass
     run_tier2_tool git_status_ms "" git -c 'safe.directory=*' \
@@ -1423,6 +1463,16 @@ fi
 
 if [ "$PULL_ONLY" = 1 ]; then
     BENCH_STRICT=1 run_tier3_suite
+    exit 0
+fi
+if [ -n "$STAGE_FILE" ] || [ -n "$BENCH_SYSROOT" ]; then
+    [ "$BENCH_ENV" = "elfuse-aarch64" ] \
+        || bench_die "-s and BENCH_SYSROOT apply to elfuse-aarch64 only"
+fi
+if [ -n "$STAGE_FILE" ]; then
+    [ -z "$BENCH_SYSROOT" ] || bench_die "-s stages a new sysroot; unset BENCH_SYSROOT"
+    BENCH_STRICT=1 run_tier2_suite
+    [ -s "$STAGE_FILE" ] || bench_die "no sysroot staged"
     exit 0
 fi
 

@@ -4,7 +4,7 @@ name: Benchmark PR report
 
 on:
   workflow_run:
-    workflows: [Build]
+    workflows: [Benchmark]
     types: [completed]
 
 permissions:
@@ -18,8 +18,8 @@ jobs:
     if: ${{ github.event.workflow_run.event == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    # One report job at a time per branch, so an older run cannot pass the
-    # head check and then overwrite a newer run's comment.
+    # One report job at a time per branch, so two runs for one pull request
+    # (marked ready twice) cannot both find no comment and both create one.
     concurrency:
       group: bench-report-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
       cancel-in-progress: false
@@ -48,8 +48,9 @@ jobs:
             }
             core.setOutput('found', report !== undefined);
 
-      # The reporter, the baseline and the threshold all come from the default
-      # branch; the artifact supplies only the measured values.
+      # The reporter comes from the default branch and the threshold from the
+      # BENCH_REGRESSION_THRESHOLD repository variable; the artifact supplies
+      # only the measured values.
       - name: Checkout trusted reporter and baseline
         if: ${{ steps.artifact.outputs.found == 'true' }}
         uses: actions/checkout@v7
@@ -72,6 +73,7 @@ jobs:
         env:
           COMMENT_PATH: ${{ runner.temp }}/bench-comment.md
           REPORT_PATH: ${{ runner.temp }}/bench-pr-report/bench-pr-report.json
+          BENCH_REGRESSION_THRESHOLD: ${{ vars.BENCH_REGRESSION_THRESHOLD }}
         run: |
           set -euo pipefail
           status=$(python3 scripts/bench-report.py \
@@ -79,11 +81,11 @@ jobs:
             --environment elfuse-aarch64)
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
-      # Runs on a clean report too: an earlier comment listing regressions
-      # has to be rewritten once a later commit brings every metric back
-      # inside the threshold, or it keeps reporting a regression the PR head
-      # no longer has. For the same reason a failed run with no report
-      # rewrites an earlier comment to say this head was not measured.
+      # Runs on a clean report too: a pull request marked ready again after a
+      # return to draft is measured again, and an earlier comment listing
+      # changes has to be rewritten when that run finds none. For the same
+      # reason a failed run with no report rewrites an earlier comment to say
+      # that commit was not measured.
       - name: Create or update benchmark comment
         if: >-
           ${{ steps.render.outcome == 'success' ||
@@ -115,8 +117,9 @@ jobs:
             }
 
             // workflow_run.pull_requests is empty for fork runs in this repo.
-            // Resolve the PR from trusted workflow-run identity fields, then
-            // require its current head to match before using the write token.
+            // Resolve the PR from trusted workflow-run identity fields. A pull
+            // request is measured once, so a run whose head has moved on still
+            // reports, naming the commit it measured.
             const candidates = await github.paginate(
               github.rest.pulls.list,
               {
@@ -129,7 +132,7 @@ jobs:
               }
             );
             const matches = candidates.filter(pull =>
-              pull.head && pull.head.sha === runHead && pull.head.repo &&
+              pull.head && pull.head.repo &&
               pull.head.repo.full_name === headRepository.full_name
             );
             if (matches.length !== 1) {
@@ -143,10 +146,9 @@ jobs:
               repo: context.repo.repo,
               pull_number: pullNumber,
             });
-            if (pull.head.sha !== runHead) {
-              core.notice(`Skipping stale benchmark for ${runHead}; current HEAD is ${pull.head.sha}`);
-              return;
-            }
+            const moved = pull.head.sha !== runHead
+              ? ` (the pull request has moved on to \`${pull.head.sha.slice(0, 12)}\`, which is not measured)`
+              : '';
 
             const found = process.env.REPORT_FOUND === 'true';
             const text = found
@@ -155,7 +157,10 @@ jobs:
             // Neither a clean report nor a missing one is worth a new comment.
             const quiet = !found || process.env.REPORT_STATUS === 'clean';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${run.id}`;
-            const body = `${marker}\n${text}\n\n[Workflow run](${runUrl}) · commit \`${runHead.slice(0, 12)}\`\n`;
+            // The pull_request run measured the merge ref of its event, which
+            // is when the run was created.
+            const refTime = run.created_at;
+            const body = `${marker}\n<!-- elfuse-benchmark-ref-time: ${refTime} -->\n${text}\n\n[Workflow run](${runUrl}) · commit \`${runHead.slice(0, 12)}\`${moved}\n`;
             const comments = await github.paginate(
               github.rest.issues.listComments,
               {
@@ -171,6 +176,14 @@ jobs:
             );
 
             if (quiet && !previous) {
+              return;
+            }
+            // A maintainer's pr dispatch may have reported a later merge ref
+            // before this run finished; its report stays.
+            const prevTime = previous &&
+              (previous.body.match(/<!-- elfuse-benchmark-ref-time: (\S+) -->/) || [])[1];
+            if (prevTime && prevTime > refTime) {
+              core.notice(`Comment ${previous.id} reports a merge ref from ${prevTime}`);
               return;
             }
             if (previous) {

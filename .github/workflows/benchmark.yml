@@ -7,7 +7,8 @@
 #                 comment, because a fork's token here cannot.
 #   push to main  the pushed commit against github.event.before, Tier 1 and
 #                 Tier 2, then Tier 3 on the head build; the comment goes on
-#                 the merged pull request.
+#                 the merged pull request, and the publish job adds the run
+#                 to the elfuse-bench dashboard.
 #   dispatch      any two commits, or one commit on both sides (aa) to measure
 #                 the noise the threshold is set from; or, with pr, the pull
 #                 request's current merge ref against its first parent, after
@@ -491,3 +492,91 @@ jobs:
                 body,
               });
             }
+
+  # Only a push to main reaches the dashboard, so its points follow main one
+  # push at a time; a pull request run measures code that has not landed, and
+  # a dispatch run two commits picked by hand. Two publishes need no
+  # concurrency group: the one that loses the race to push re-clones
+  # elfuse-bench and retries inside the action.
+  publish:
+    name: Publish to elfuse-bench
+    needs: bench
+    if: >-
+      ${{ github.event_name == 'push' && !cancelled() &&
+      needs.bench.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # ELFUSE_BENCH_TOKEN can push to sysprog21/elfuse-bench. Until a
+      # maintainer adds it, a push publishes nothing and the job passes.
+      - name: Check for the elfuse-bench token
+        id: token
+        env:
+          HAS_TOKEN: ${{ secrets.ELFUSE_BENCH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" = true ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ELFUSE_BENCH_TOKEN is not set, so nothing is published"
+          fi
+
+      - name: Checkout
+        if: ${{ steps.token.outputs.ready == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download benchmark rounds
+        if: ${{ steps.token.outputs.ready == 'true' }}
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: bench-rounds
+          path: ${{ runner.temp }}/bench-rounds
+
+      # report.json is written once every pair has run, so a run that stopped
+      # earlier adds no point; one whose Tier 3 failed still adds Tier 1 and
+      # Tier 2. The action appends an entry even for a commit it already
+      # holds, so the script leaves out the points data.js has for this
+      # commit, and a rerun adds only what an earlier attempt missed. A failed
+      # fetch, or a copy raw.githubusercontent.com cached before that attempt
+      # (it keeps one for up to 5 minutes), publishes those points again.
+      - name: Turn the rounds into points
+        if: ${{ steps.download.outcome == 'success' }}
+        id: points
+        run: |
+          set -euo pipefail
+          rounds="$RUNNER_TEMP/bench-rounds"
+          if [ ! -f "$rounds/report.json" ]; then
+            echo "::notice::The comparison did not complete, so nothing is published"
+            exit 0
+          fi
+          data="$RUNNER_TEMP/data.js"
+          curl -fsSL --connect-timeout 10 --max-time 60 -o "$data" \
+            https://raw.githubusercontent.com/sysprog21/elfuse-bench/main/data.js ||
+            echo "::warning::data.js was not fetched, so every point is published"
+          points="$RUNNER_TEMP/bench-points.json"
+          python3 scripts/bench-dashboard.py "$rounds" "$data" "$GITHUB_SHA" > "$points"
+          if [ "$(cat "$points")" = "[]" ]; then
+            echo "::notice::Every point of $GITHUB_SHA is already on the dashboard"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Store the points
+        if: ${{ steps.points.outputs.ready == 'true' }}
+        # A third-party action, so it is pinned to a commit and is the only
+        # step that gets the token.
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: Benchmarks
+          tool: customSmallerIsBetter
+          output-file-path: ${{ runner.temp }}/bench-points.json
+          github-token: ${{ secrets.ELFUSE_BENCH_TOKEN }}
+          gh-repository: github.com/sysprog21/elfuse-bench
+          gh-pages-branch: main
+          benchmark-data-dir-path: .
+          auto-push: true

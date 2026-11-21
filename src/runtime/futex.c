@@ -666,11 +666,23 @@ static int linux_timespec_is_valid(const linux_timespec_t *lts)
 /* Translate an absolute CLOCK_MONOTONIC deadline to the CLOCK_REALTIME deadline
  * the wait loops compare against (pthread_cond_timedwait uses CLOCK_REALTIME,
  * and macOS has no CLOCK_MONOTONIC condattr), so the wait lasts as long as the
- * guest asked. Minor wall-clock skew is accepted. lts->tv_sec is bounded by
- * FUTEX_TIMESPEC_SEC_MAX (linux_timespec_is_valid), so the subtraction and
- * addition stay inside int64_t / time_t range. A deadline already in the past
- * can land before the epoch; it is clamped to {0, 0} so every absolute deadline
- * keeps 0 <= tv_sec, as futex_remaining_ns and futex_quantum_deadline expect.
+ * guest asked. Minor wall-clock skew is accepted.
+ *
+ * The arithmetic runs in saturating nanoseconds, the same convention
+ * futex_remaining_ns uses, so it is total for every guest deadline and every
+ * clock reading rather than only for the ones linux_timespec_is_valid and the
+ * host clocks happen to produce. A deadline already in the past maps to {0, 0},
+ * and one past what INT64_MAX nanoseconds can name saturates there, which is
+ * also where futex_remaining_ns would saturate it. Either way the result keeps
+ * 0 <= tv_sec and a canonical tv_nsec, which futex_remaining_ns and
+ * futex_quantum_deadline require of every absolute deadline.
+ */
+/*@ requires \valid_read(lts);
+    requires \valid(out);
+    requires \separated(lts, out);
+    assigns *out, __fc_time;
+    ensures 0 <= out->tv_sec;
+    ensures 0 <= out->tv_nsec < TIMESPEC_NSEC_PER_SEC;
  */
 static void futex_mono_to_realtime(const linux_timespec_t *lts,
                                    struct timespec *out)
@@ -678,15 +690,17 @@ static void futex_mono_to_realtime(const linux_timespec_t *lts,
     struct timespec now, mono;
     clock_gettime(CLOCK_REALTIME, &now);
     clock_gettime(CLOCK_MONOTONIC, &mono);
-    int64_t delta_sec = lts->tv_sec - mono.tv_sec;
-    long delta_nsec = (long) lts->tv_nsec - mono.tv_nsec;
-    out->tv_sec = now.tv_sec + delta_sec;
-    out->tv_nsec = now.tv_nsec + delta_nsec;
-    timespec_normalize(out);
-    if (out->tv_sec < 0) {
-        out->tv_sec = 0;
-        out->tv_nsec = 0;
+    int64_t deadline_ns = timespec_to_ns_sat(lts->tv_sec, lts->tv_nsec);
+    int64_t mono_ns = timespec_to_ns_sat(mono.tv_sec, mono.tv_nsec);
+    int64_t now_ns = timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
+
+    int64_t at_ns = 0;
+    if (deadline_ns > mono_ns) {
+        int64_t rem = deadline_ns - mono_ns;
+        at_ns = now_ns > INT64_MAX - rem ? INT64_MAX : now_ns + rem;
     }
+    out->tv_sec = (time_t) (at_ns / TIMESPEC_NSEC_PER_SEC);
+    out->tv_nsec = (long) (at_ns % TIMESPEC_NSEC_PER_SEC);
 }
 
 /* Convert a Linux guest timespec to an absolute CLOCK_REALTIME deadline. For

@@ -355,10 +355,11 @@ their callers honor these preconditions stay test-covered
 # enough to matter.
 VERIFY_FUTEXDEADLINE_SRC  := src/runtime/futex.c
 VERIFY_FUTEXDEADLINE_FCTS := futex_remaining_ns futex_quantum_deadline \
+                             futex_mono_to_realtime \
                              linux_timespec_is_valid futex_uaddr_is_aligned \
                              timespec_valid timespec_valid_capped \
                              timespec_to_ns_sat timespec_to_poll_ms
-VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 130
+VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 160
 VERIFY_FUTEXDEADLINE_MODEL := typed
 VERIFY_FUTEXDEADLINE_SCAN := src/runtime/futex.c src/proved/timespec.h
 VERIFY_FUTEXDEADLINE_CLAIM := for ANY guest deadline and ANY cap the wait \

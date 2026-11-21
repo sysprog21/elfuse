@@ -343,8 +343,8 @@ def load_round(path: pathlib.Path
     values = flatten(document, source=str(path), errors=failed)
     if not values and not failed:
         raise BenchDataError(f"{path} holds no metric")
-    # tests/bench-suite.sh records a skipped tier only here; lmbench never
-    # skips, since a failure there stops the run.
+    # tests/bench-suite.sh marks only these two tiers skipped; a Tier-1
+    # metric that fails is recorded as ERR.
     skipped = {tier for tier in ("oci", "applications")
                if meta.get(f"{tier}_skipped")}
     return env.strip(), values, failed, skipped

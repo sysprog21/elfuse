@@ -397,6 +397,7 @@ python3 scripts/bench-promote.py --results build/bench-results.json \
 | `BENCH_LMBENCH` | `1` | `0` skips Tier 1 |
 | `BENCH_APPS` | `1` | `0` skips Tier 2; `-s` stages the Tier-2 sysroot anyway |
 | `BENCH_OCI` | `1` | `0` skips Tier 3 |
+| `BENCH_METRICS` | unset | space-separated metric names as the comparison flattens them (`lmbench.lat_syscall.null`, `applications.zstd_ms`, `oci.jvm_ms`); only those run, a tier with none of them is left out without a skipped mark, and an unknown name exits 2 |
 | `BENCH_SYSROOT` | unset | `elfuse-aarch64` only: a Tier-2 sysroot staged by `tests/bench-suite.sh -s`, used as is instead of staging a new one |
 | `BENCH_PAIRS` | `6` | pairs `scripts/bench-paired.sh` measures, 6 to 32: below `MIN_PAIRS` in `scripts/bench-compare.py` no metric gets a verdict, above `MAX_ROUNDS` it exits 2 |
 | `BENCH_PAIRED_OCI` | `0` | `1` = `scripts/bench-paired.sh` also runs Tier 3 on the head build |

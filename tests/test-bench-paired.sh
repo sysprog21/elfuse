@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Run scripts/bench-paired.sh against a stub suite, a stub hdiutil and a stub
 # calibration loop, so its round order, exits, reruns and deadline are checked
-# in seconds instead of an A/A run of 11 to 14 minutes.
+# in seconds instead of an A/A run of 11 to 14 minutes. The real
+# tests/bench-suite.sh runs only as far as its BENCH_METRICS check, which needs
+# no elfuse build.
 #
 # SPDX-License-Identifier: Apache-2.0
 set -u
@@ -156,6 +158,78 @@ run BENCH_PAIRS=08
 [ "$rc" = 0 ] || fail "BENCH_PAIRS=08 gave exit $rc"
 [ "$(ls "$T/out"/base-*.json 2> /dev/null | wc -l | tr -d ' ')" = 8 ] \
     || fail "BENCH_PAIRS=08 did not measure 8 pairs"
+
+# The suite checks the BENCH_METRICS names before it looks for elfuse.
+suite()
+{
+    rc=0
+    env -u BENCH_ENV ELFUSE="$T/missing" BENCH_METRICS="$1" \
+        bash "$ROOT/tests/bench-suite.sh" -o "$T/suite.json" > "$T/log" 2>&1 \
+        || rc=$?
+}
+suite 'lmbench.lat_syscall.null lmbench.nope'
+[ "$rc" = 2 ] || fail "an unknown BENCH_METRICS name gave exit $rc"
+grep -q "unknown metric 'lmbench.nope'" "$T/log" || fail "an unknown BENCH_METRICS name was not named"
+
+# Every metric of the baseline's elfuse column, so a name dropped from the
+# suite's list fails here rather than in a second set on CI.
+known="$(python3 - "$ROOT/tests/bench-baseline.json" << 'EOF'
+import json
+import sys
+
+
+def names(prefix, node):
+    if not isinstance(node, dict):
+        return [prefix]
+    return [n for key, sub in node.items() for n in names(f"{prefix}.{key}", sub)]
+
+
+column = json.load(open(sys.argv[1]))["environments"]["elfuse-aarch64"]
+print(" ".join(n for key, sub in column.items() for n in names(key, sub)))
+EOF
+)"
+[ "$(wc -w <<< "$known" | tr -d ' ')" -ge 15 ] || fail "the baseline gave too few metric names: $known"
+suite "$known oci.python_ms"
+[ "$rc" = 1 ] || fail "known BENCH_METRICS names gave exit $rc"
+grep -q 'elfuse binary missing' "$T/log" || fail "known BENCH_METRICS names did not reach the elfuse check"
+
+# KNOWN_METRICS lists the metrics that the lmbench_metric, run_tier2_tool and
+# want calls measure and no other, so a metric added through one of them without
+# a line there fails here rather than in every round of its second set on CI. A
+# call whose metric name it cannot read fails it too.
+python3 - "$ROOT/tests/bench-suite.sh" << 'EOF' || fail "KNOWN_METRICS and the suite's metric calls differ"
+import re
+import sys
+
+src = re.sub(r"^[ \t]*#.*$", "", open(sys.argv[1]).read(), flags=re.M)
+src = src.replace("\\\n", " ")
+helpers = {'"lmbench.$benchmark.$metric"', '"applications.$metric"', '"oci.$metric"'}
+calls, unread = set(), []
+
+
+def read(call, prefix, *args):
+    words = [arg.strip("\"'") for arg in args]
+    if all(re.fullmatch(r"[\w.]+", word) for word in words):
+        calls.add(prefix + ".".join(words))
+    else:
+        unread.append(" ".join((call,) + args))
+
+
+for args in re.findall(r"\blmbench_metric[ \t]+(\S+)[ \t]+(\S+)", src):
+    read("lmbench_metric", "lmbench.", *args)
+for arg in re.findall(r"\brun_tier2_tool[ \t]+(\S+)", src):
+    read("run_tier2_tool", "applications.", arg)
+for arg in re.findall(r"\bwant[ \t]+(\S+)", src):
+    if arg not in helpers:
+        read("want", "", arg)
+listed = set(re.search(r"^KNOWN_METRICS=\((.*?)^\)", src, re.M | re.S)[1].split())
+for name in sorted(calls ^ listed):
+    where = "KNOWN_METRICS" if name in listed else "a call"
+    print(f"test-bench-paired: {name} is only in {where}", file=sys.stderr)
+for call in unread:
+    print(f"test-bench-paired: cannot read {call}", file=sys.stderr)
+sys.exit(calls != listed or bool(unread))
+EOF
 
 if [ "$failures" -ne 0 ]; then
     echo "test-bench-paired: $failures failed" >&2

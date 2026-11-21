@@ -73,6 +73,11 @@ static _Atomic int futex_interrupt_requested = 0;
  */
 #define FUTEX_CMD_MASK 0x7F
 
+/* Selects CLOCK_REALTIME for a FUTEX_WAIT_BITSET deadline. Without it the
+ * deadline is on CLOCK_MONOTONIC.
+ */
+#define FUTEX_CLOCK_REALTIME 0x100
+
 /* core/shim.S futex_wait_fast decodes the same three values as immediates,
  * because assembly cannot see these defines. That leaves the shim serving a
  * shape the host would decode differently if one ever changes, with nothing to
@@ -658,15 +663,57 @@ static int linux_timespec_is_valid(const linux_timespec_t *lts)
                                  FUTEX_TIMESPEC_SEC_MAX);
 }
 
-/* Convert a Linux guest timespec to an absolute struct timespec deadline. For
+/* Translate an absolute CLOCK_MONOTONIC deadline to the CLOCK_REALTIME deadline
+ * the wait loops compare against (pthread_cond_timedwait uses CLOCK_REALTIME,
+ * and macOS has no CLOCK_MONOTONIC condattr), so the wait lasts as long as the
+ * guest asked. Minor wall-clock skew is accepted.
+ *
+ * The arithmetic runs in saturating nanoseconds, the same convention
+ * futex_remaining_ns uses, so it is total for every guest deadline and every
+ * clock reading rather than only for the ones linux_timespec_is_valid and the
+ * host clocks happen to produce. A deadline already in the past maps to {0, 0},
+ * and one past what INT64_MAX nanoseconds can name saturates there, which is
+ * also where futex_remaining_ns would saturate it. Either way the result keeps
+ * 0 <= tv_sec and a canonical tv_nsec, which futex_remaining_ns and
+ * futex_quantum_deadline require of every absolute deadline.
+ */
+/*@ requires \valid_read(lts);
+    requires \valid(out);
+    requires \separated(lts, out);
+    assigns *out, __fc_time;
+    ensures 0 <= out->tv_sec;
+    ensures 0 <= out->tv_nsec < TIMESPEC_NSEC_PER_SEC;
+ */
+static void futex_mono_to_realtime(const linux_timespec_t *lts,
+                                   struct timespec *out)
+{
+    struct timespec now, mono;
+    clock_gettime(CLOCK_REALTIME, &now);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    int64_t deadline_ns = timespec_to_ns_sat(lts->tv_sec, lts->tv_nsec);
+    int64_t mono_ns = timespec_to_ns_sat(mono.tv_sec, mono.tv_nsec);
+    int64_t now_ns = timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
+
+    int64_t at_ns = 0;
+    if (deadline_ns > mono_ns) {
+        int64_t rem = deadline_ns - mono_ns;
+        at_ns = now_ns > INT64_MAX - rem ? INT64_MAX : now_ns + rem;
+    }
+    out->tv_sec = (time_t) (at_ns / TIMESPEC_NSEC_PER_SEC);
+    out->tv_nsec = (long) (at_ns % TIMESPEC_NSEC_PER_SEC);
+}
+
+/* Convert a Linux guest timespec to an absolute CLOCK_REALTIME deadline. For
  * FUTEX_WAIT (relative timeout), adds the duration to the current time. For
- * FUTEX_WAIT_BITSET (absolute timeout), uses the value directly.
+ * FUTEX_WAIT_BITSET and FUTEX_LOCK_PI (absolute timeout), uses the value
+ * directly, after translating it from CLOCK_MONOTONIC when monotonic is set.
  * Returns 0 on success, -1 if the guest pointer is invalid, -2 if the guest
  * timespec is malformed.
  */
 static int futex_make_deadline(guest_t *g,
                                uint64_t timeout_gva,
                                int is_absolute,
+                               bool monotonic,
                                struct timespec *out)
 {
     linux_timespec_t lts;
@@ -675,7 +722,9 @@ static int futex_make_deadline(guest_t *g,
     if (!linux_timespec_is_valid(&lts))
         return -2;
 
-    if (is_absolute) {
+    if (is_absolute && monotonic) {
+        futex_mono_to_realtime(&lts, out);
+    } else if (is_absolute) {
         out->tv_sec = (time_t) lts.tv_sec;
         out->tv_nsec = (long) lts.tv_nsec;
     } else {
@@ -811,7 +860,8 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
                                 uint32_t expected,
                                 uint64_t timeout_gva,
                                 uint32_t bitset,
-                                int is_absolute)
+                                int is_absolute,
+                                bool monotonic)
 {
     if (bitset == 0)
         return -LINUX_EINVAL;
@@ -825,7 +875,8 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
     bool has_timeout = (timeout_gva != 0);
     struct timespec deadline;
     if (has_timeout) {
-        int rc = futex_make_deadline(g, timeout_gva, is_absolute, &deadline);
+        int rc = futex_make_deadline(g, timeout_gva, is_absolute, monotonic,
+                                     &deadline);
         if (rc == -1)
             return -LINUX_EFAULT;
         if (rc == -2)
@@ -1033,14 +1084,15 @@ static int64_t futex_wait(guest_t *g,
                           uint32_t expected,
                           uint64_t timeout_gva,
                           uint32_t bitset,
-                          int is_absolute)
+                          int is_absolute,
+                          bool monotonic)
 {
     unsigned idx = futex_hash(uaddr);
     unsigned pub = idx;
 
     shim_globals_futex_waiters_add(g, idx, +1);
     int64_t rc = futex_wait_inner(&pub, g, uaddr, expected, timeout_gva, bitset,
-                                  is_absolute);
+                                  is_absolute, monotonic);
     shim_globals_futex_waiters_add(g, pub, -1);
     return rc;
 }
@@ -1532,8 +1584,8 @@ static int64_t futex_lock_pi_inner(guest_t *g,
     bool has_timeout = (timeout_gva != 0);
     struct timespec deadline;
     if (has_timeout) {
-        int rc =
-            futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, &deadline);
+        int rc = futex_make_deadline(g, timeout_gva, /*is_absolute=*/1,
+                                     /*monotonic=*/false, &deadline);
         if (rc == -1)
             return -LINUX_EFAULT;
         if (rc == -2)
@@ -1859,7 +1911,7 @@ int64_t sys_futex(guest_t *g,
          * signal it could not claim. waiter.woken is what tells them apart.
          */
         return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
-                          /*is_absolute=*/0);
+                          /*is_absolute=*/0, /*monotonic=*/false);
 
     case FUTEX_WAKE:
         return futex_wake(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
@@ -1880,7 +1932,8 @@ int64_t sys_futex(guest_t *g,
                              val3);
 
     case FUTEX_WAIT_BITSET:
-        return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
+        return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1,
+                          !(op & FUTEX_CLOCK_REALTIME));
 
     case FUTEX_WAKE_BITSET:
         return futex_wake(g, uaddr, val, val3);
@@ -2025,27 +2078,12 @@ int64_t sys_futex_waitv(guest_t *g,
             return -LINUX_EINVAL;
 
         if (clockid == LINUX_CLOCK_MONOTONIC) {
-            /* Translate the monotonic absolute deadline to a CLOCK_REALTIME
-             * absolute deadline so pthread_cond_timedwait (which uses
-             * CLOCK_REALTIME) waits the right amount. macOS has no
-             * CLOCK_MONOTONIC condattr, so this conversion is unavoidable;
-             * minor wall-clock skew is accepted. lts.tv_sec is bounded by
-             * FUTEX_TIMESPEC_SEC_MAX (linux_timespec_is_valid), so the
-             * subtraction and addition stay inside int64_t / time_t range.
-             */
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            struct timespec mono;
-            clock_gettime(CLOCK_MONOTONIC, &mono);
-            int64_t delta_sec = lts.tv_sec - mono.tv_sec;
-            long delta_nsec = (long) lts.tv_nsec - mono.tv_nsec;
-            deadline.tv_sec = now.tv_sec + delta_sec;
-            deadline.tv_nsec = (long) now.tv_usec * 1000 + delta_nsec;
+            futex_mono_to_realtime(&lts, &deadline);
         } else {
             deadline.tv_sec = (time_t) lts.tv_sec;
             deadline.tv_nsec = (long) lts.tv_nsec;
+            timespec_normalize(&deadline);
         }
-        timespec_normalize(&deadline);
     }
 
     linux_futex_waitv_t elts[FUTEX_WAITV_MAX];

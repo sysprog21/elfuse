@@ -190,6 +190,15 @@ MUTATIONS = [
     (
         "futexdeadline",
         "src/runtime/futex.c",
+        "futex_mono_to_realtime",
+        "drop the past-deadline guard (a monotonic deadline already behind the "
+        "clock lands before the epoch)",
+        "    if (deadline_ns > mono_ns) {\n",
+        "    {\n",
+    ),
+    (
+        "futexdeadline",
+        "src/runtime/futex.c",
         "linux_timespec_is_valid",
         "drop both bounds (a full-second nsec and an over-cap tv_sec get through)",
         "    return timespec_valid_capped(lts->tv_sec, lts->tv_nsec,\n"

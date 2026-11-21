@@ -44,6 +44,38 @@ static long wait_to(int *word, int val, int op, const struct timespec *to)
                         FUTEX_BITSET_MATCH_ANY);
 }
 
+/* Wait on a word that does not move, with an absolute deadline 100 ms ahead on
+ * the given clock, and check the call slept until it rather than timing out at
+ * once. FUTEX_WAIT_BITSET reads the deadline on CLOCK_MONOTONIC unless the op
+ * carries FUTEX_CLOCK_REALTIME.
+ */
+static void expect_full_wait(int op, clockid_t clock)
+{
+    int word = 0;
+    struct timespec deadline, t0, t1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(clock, &deadline);
+    deadline.tv_nsec += 100 * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    long r = wait_to(&word, 0, op, &deadline);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    long elapsed_ms =
+        (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    if (r == -ETIMEDOUT && elapsed_ms >= 95 && elapsed_ms <= 2000) {
+        PASS();
+    } else {
+        printf("FAIL: r=%ld elapsed=%ldms (expected %d, 95<=elapsed<=2000)\n",
+               r, elapsed_ms, -ETIMEDOUT);
+        fails++;
+    }
+}
+
 int main(void)
 {
     /* The word is 1 everywhere below and every wait expects 0, so the value has
@@ -114,6 +146,12 @@ int main(void)
     TEST("expired absolute deadline times out when the word matches");
     EXPECT_RAW_ERRNO(wait_to(&word, 1, BITSET_OP, &zero), -ETIMEDOUT,
                      "expected ETIMEDOUT");
+
+    TEST("CLOCK_MONOTONIC bitset deadline waits until it passes");
+    expect_full_wait(BITSET_OP, CLOCK_MONOTONIC);
+
+    TEST("FUTEX_CLOCK_REALTIME bitset deadline waits until it passes");
+    expect_full_wait(BITSET_OP | FUTEX_CLOCK_REALTIME, CLOCK_REALTIME);
 
     /* An unaligned or tagged address is still the host's to reject, and the
      * timeout must not change that.

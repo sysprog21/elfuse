@@ -56,6 +56,8 @@ void exec_handoff_wake_waiters(void) {}
 
 void signal_refresh_pending_hint(void) {}
 
+void signal_sigchld_republish(void) {}
+
 void signal_release_claims(struct thread_entry *t)
 {
     (void) t;

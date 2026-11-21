@@ -86,6 +86,18 @@
  *                                     the slot under mmap_lock deadlocks
  *                                     against the leader, which needs that lock
  *                                     to run the request that frees the slot
+ *   sig_drain_lock (syscall/proc.c):  serializes signal transport drains;
+ *                                     taken with no lock held; holds the
+ *                                     transport flock and sig_lock beneath it
+ *                                     while it reads and queues records, then,
+ *                                     after releasing the transport flock, the
+ *                                     lifecycle registry flock, autoreap_lock
+ *                                     and pid_lock for the work they ask for
+ *   lifecycle registry flock (syscall/proc.c): proc_process_exit holds it
+ *                                     while it appends to the parent's and the
+ *                                     adopter's transport, so a transport flock
+ *                                     nests beneath it; no path takes it while
+ *                                     holding a transport flock
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
@@ -99,6 +111,11 @@
  *                                     the proc_cwd_refresh that runs with
  *                                     cwd_lock dropped
  *   pid_lock     (syscall/proc.c):    process table / wait state
+ *   sigchld_pub_lock (syscall/signal.c): publishes whether SIGCHLD is
+ *                                     ignored at generation; a leaf, taken
+ *                                     under sig_lock, under mmap_lock by
+ *                                     sys_clone's proc_registry_publish_self,
+ *                                     or alone
  *   pidfd_lock   (syscall/proc-pidfd.c): pidfd registry
  *   futex bucket (runtime/futex.c):   per-bucket, index-ordered if >1. Also
  *                                     taken alone by futex_kick, beneath

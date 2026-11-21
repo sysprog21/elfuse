@@ -14,6 +14,7 @@
  */
 
 #include <stdatomic.h>
+#include <sys/mman.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -610,6 +611,76 @@ static bool signal_transport_path(char *out, size_t out_size, pid_t host_pid)
 {
     return private_tmp_path(out, out_size, "sig",
                             (unsigned long long) host_pid);
+}
+
+/* Per-process file, mapped shared, that says whether a SIGCHLD generated now
+ * would be discarded. An exiting child reads its parent's copy with pread and
+ * decides at the exit; the parent decides only for records left undecided. The
+ * namespace and guest pid guard against a stale file whose host pid was
+ * recycled. Plain fields: only the holder of sigchld_pub_lock writes them, and
+ * the reader is another process, which no C atomic in this one pairs with.
+ */
+typedef struct {
+    uint64_t ns;
+    int64_t guest_pid;
+    uint32_t ignored;
+} sigchld_state_t;
+
+static sigchld_state_t *sigchld_state;
+
+static bool sigchld_state_path(char *out, size_t out_size, pid_t host_pid)
+{
+    return private_tmp_path(out, out_size, "sigchld",
+                            (unsigned long long) host_pid);
+}
+
+bool proc_publish_sigchld_ignored(bool ignored)
+{
+    if (!sigchld_state) {
+        char path[PATH_MAX];
+        if (!sigchld_state_path(path, sizeof(path), getpid()))
+            return false;
+        int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0)
+            return false;
+        void *map = MAP_FAILED;
+        if (ftruncate(fd, sizeof(sigchld_state_t)) == 0)
+            map = mmap(NULL, sizeof(sigchld_state_t), PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0);
+        close(fd);
+        if (map == MAP_FAILED) {
+            /* unlink_own_transport removes the file only once it is mapped. */
+            unlink(path);
+            return false;
+        }
+        sigchld_state = map;
+
+        /* Fixed for this process's life: a fork child sets its namespace before
+         * its first publish, and exec keeps both.
+         */
+        sigchld_state->ns = absock_get_namespace_id();
+        sigchld_state->guest_pid = proc_get_pid();
+    }
+    sigchld_state->ignored = ignored;
+    return true;
+}
+
+/* Whether @guest_pid at @host_pid would discard a SIGCHLD generated now. False
+ * when that cannot be read, which leaves the decision to the receiver.
+ */
+static bool sigchld_ignored_by(pid_t host_pid, int64_t guest_pid)
+{
+    char path[PATH_MAX];
+    if (host_pid <= 0 || !sigchld_state_path(path, sizeof(path), host_pid))
+        return false;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    sigchld_state_t st;
+    ssize_t r = pread(fd, &st, sizeof(st), 0);
+    close(fd);
+    return r == (ssize_t) sizeof(st) && st.ns == absock_get_namespace_id() &&
+           st.guest_pid == guest_pid && st.ignored;
 }
 
 static bool process_registry_path(char *out, size_t out_size)
@@ -1388,6 +1459,7 @@ void proc_registry_publish_self(void)
 {
     proc_registry_publish(getpid(), proc_get_pid(), proc_get_pgid());
     lifecycle_publish_self();
+    signal_sigchld_republish();
 }
 
 void proc_registry_sync_self_pgid(guest_t *g)
@@ -1474,7 +1546,15 @@ static int proc_open_transport(pid_t host_pid)
                 0600);
 }
 
-int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+/* Append a signal record to @host_pid's transport without ringing its doorbell.
+ * @ignored marks a signal the sender found ignored at generation; the receiver
+ * still handles what the record starts (the SIGCHLD auto-reap) but does not
+ * queue the signal.
+ */
+static int proc_append_guest_signal(pid_t host_pid,
+                                    int64_t target_guest_pid,
+                                    int signum,
+                                    bool ignored)
 {
     int fd = proc_open_transport(host_pid);
     if (fd < 0)
@@ -1487,9 +1567,10 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
      * applying it to the wrong process.
      */
     char line[64];
-    int len = snprintf(line, sizeof(line), "%llu %lld %d\n",
-                       (unsigned long long) absock_get_namespace_id(),
-                       (long long) target_guest_pid, signum);
+    int len =
+        snprintf(line, sizeof(line), "%llu %lld %d%s\n",
+                 (unsigned long long) absock_get_namespace_id(),
+                 (long long) target_guest_pid, signum, ignored ? " i" : "");
     if (len < 0 || (size_t) len >= sizeof(line)) {
         close(fd);
         errno = EINVAL;
@@ -1513,11 +1594,18 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
         return -1;
     }
 
-    /* The line is durably appended under the lock, so ring the doorbell even if
-     * close() reports an error; suppressing the kill would leave the queued
-     * line waiting for some later unrelated signal.
+    /* The line is durably appended under the lock, so the caller rings the
+     * doorbell even if close() reports an error; suppressing the kill would
+     * leave the queued line waiting for some later unrelated signal.
      */
     close(fd);
+    return 0;
+}
+
+int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+{
+    if (proc_append_guest_signal(host_pid, target_guest_pid, signum, false) < 0)
+        return -1;
     return kill(host_pid, SIGUSR2);
 }
 
@@ -1612,29 +1700,52 @@ void proc_process_exit(int wait_status)
     if (parent && !parent->exited)
         parent_host_pid = parent->host_pid;
 
-    (void) lifecycle_save_locked(fd, registry);
-    free(registry);
-    lifecycle_unlock_close(fd);
-
+    /* Decide each SIGCHLD now, under the registry lock, as Linux decides at the
+     * exit: a handler the parent installs later must not run for it.
+     */
+    bool adopter_ignored = false;
     for (uint32_t i = 0; reparented && i < nreparented; i++) {
         if (reparented[i].exited) {
-            /* The exiting process is not necessarily a child of the adopter, so
-             * its own SIGCHLD goes elsewhere. Notify the adopter explicitly for
-             * every already-terminal child that became waitable there.
-             */
-            if (adopter_host_pid > 0)
-                (void) proc_send_guest_signal(adopter_host_pid, adopter_pid,
-                                              LINUX_SIGCHLD);
-        } else {
+            adopter_ignored = sigchld_ignored_by(adopter_host_pid, adopter_pid);
+            break;
+        }
+    }
+    bool parent_ignored = sigchld_ignored_by(parent_host_pid, parent_guest_pid);
+
+    (void) lifecycle_save_locked(fd, registry);
+    free(registry);
+
+    /* Append the SIGCHLD records before releasing the registry lock: a parent
+     * wait that sees this exit there then finds the signal in its transport
+     * (see sys_wait4), as Linux generates SIGCHLD with the zombie. The adopter
+     * gets one record per already-terminal child that became waitable there,
+     * because the exiting process is not necessarily the adopter's child. The
+     * doorbells and the reparent handshake wait until after the unlock.
+     */
+    bool ring_adopter = false;
+    for (uint32_t i = 0; reparented && i < nreparented; i++) {
+        if (reparented[i].exited && adopter_host_pid > 0 &&
+            proc_append_guest_signal(adopter_host_pid, adopter_pid,
+                                     LINUX_SIGCHLD, adopter_ignored) == 0)
+            ring_adopter = true;
+    }
+    bool ring_parent =
+        parent_host_pid > 0 &&
+        proc_append_guest_signal(parent_host_pid, parent_guest_pid,
+                                 LINUX_SIGCHLD, parent_ignored) == 0;
+    lifecycle_unlock_close(fd);
+
+    if (ring_adopter)
+        (void) kill(adopter_host_pid, SIGUSR2);
+    for (uint32_t i = 0; reparented && i < nreparented; i++) {
+        if (!reparented[i].exited)
             proc_notify_reparent(reparented[i].host_pid,
                                  reparented[i].guest_pid, adopter_pid);
-        }
     }
     free(reparented);
 
-    if (parent_host_pid > 0)
-        (void) proc_send_guest_signal(parent_host_pid, parent_guest_pid,
-                                      LINUX_SIGCHLD);
+    if (ring_parent)
+        (void) kill(parent_host_pid, SIGUSR2);
 }
 
 static int proc_send_reparent(pid_t host_pid,
@@ -2478,11 +2589,11 @@ static int64_t proc_reap_exited_and_unlock(guest_t *g,
     return gpid;
 }
 
-int64_t sys_wait4(guest_t *g,
-                  int pid,
-                  uint64_t status_gva,
-                  int options,
-                  uint64_t rusage_gva)
+static int64_t wait4_once(guest_t *g,
+                          int pid,
+                          uint64_t status_gva,
+                          int options,
+                          uint64_t rusage_gva)
 {
     proc_deferred_reap_poll();
     lifecycle_import_children();
@@ -2629,13 +2740,13 @@ int64_t sys_wait4(guest_t *g,
                 int64_t external_gpid = proc_table[i].guest_pid;
                 pthread_mutex_unlock(&pid_lock);
                 if (proc_refresh_external_child(external_gpid))
-                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                    return wait4_once(g, pid, status_gva, options, rusage_gva);
                 if (mac_options & WNOHANG)
                     return 0;
                 if (thread_stop_requested())
                     return -LINUX_EINTR;
                 usleep(1000);
-                return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                return wait4_once(g, pid, status_gva, options, rusage_gva);
             }
 
             pid_t host_pid = proc_table[i].host_pid;
@@ -2680,8 +2791,8 @@ int64_t sys_wait4(guest_t *g,
                     pthread_mutex_lock(&pid_lock);
                     if (proc_guest_child_exited_locked(gpid)) {
                         pthread_mutex_unlock(&pid_lock);
-                        return sys_wait4(g, pid, status_gva, options,
-                                         rusage_gva);
+                        return wait4_once(g, pid, status_gva, options,
+                                          rusage_gva);
                     }
                     pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
                     pthread_mutex_unlock(&pid_lock);
@@ -2698,8 +2809,8 @@ int64_t sys_wait4(guest_t *g,
                      */
                     lifecycle_import_children();
                     if (proc_guest_child_exited(gpid))
-                        return sys_wait4(g, pid, status_gva, options,
-                                         rusage_gva);
+                        return wait4_once(g, pid, status_gva, options,
+                                          rusage_gva);
                 }
             }
             if (ret > 0) {
@@ -2721,7 +2832,7 @@ int64_t sys_wait4(guest_t *g,
             if (wait_errno == ECHILD) {
                 lifecycle_import_children();
                 if (proc_guest_child_exited(gpid))
-                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                    return wait4_once(g, pid, status_gva, options, rusage_gva);
             }
             errno = wait_errno;
             return linux_errno();
@@ -2764,11 +2875,12 @@ static int64_t waitid_zero_siginfo(guest_t *g, uint64_t infop_gva)
     return 0;
 }
 
-int64_t sys_waitid(guest_t *g,
-                   int idtype,
-                   int64_t id,
-                   uint64_t infop_gva,
-                   int options)
+static int64_t waitid_once(guest_t *g,
+                           int idtype,
+                           int64_t id,
+                           uint64_t infop_gva,
+                           int options,
+                           bool *reported)
 {
     /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2, WCONTINUED=8,
      * WNOWAIT=0x01000000
@@ -2908,6 +3020,7 @@ int64_t sys_waitid(guest_t *g,
             }
 
             /* Fill siginfo_t in guest memory */
+            *reported = true;
             if (infop_gva) {
                 uint8_t si[SIGINFO_SIZE];
                 memset(si, 0, sizeof(si));
@@ -3021,6 +3134,40 @@ int64_t sys_waitid(guest_t *g,
     }
 }
 
+static void drain_signal_transport(void);
+
+/* An exiting child appends its SIGCHLD before it releases the lifecycle
+ * registry lock, so by the time a wait can report the child the record is in
+ * the transport. Draining it before the return queues the signal while the wait
+ * is still in progress, so a handler runs before the wait returns, as on Linux.
+ * wait4 reaps before it writes status and rusage, so its EFAULT return drains
+ * too. Under auto-reap a wait reports no child, so every return drains.
+ */
+int64_t sys_wait4(guest_t *g,
+                  int pid,
+                  uint64_t status_gva,
+                  int options,
+                  uint64_t rusage_gva)
+{
+    int64_t rc = wait4_once(g, pid, status_gva, options, rusage_gva);
+    if (rc > 0 || rc == -LINUX_EFAULT || signal_sigchld_autoreap())
+        drain_signal_transport();
+    return rc;
+}
+
+int64_t sys_waitid(guest_t *g,
+                   int idtype,
+                   int64_t id,
+                   uint64_t infop_gva,
+                   int options)
+{
+    bool reported = false;
+    int64_t rc = waitid_once(g, idtype, id, infop_gva, options, &reported);
+    if (reported || signal_sigchld_autoreap())
+        drain_signal_transport();
+    return rc;
+}
+
 /* vCPU run loop. */
 
 static _Thread_local bool hvc6_yield_requested;
@@ -3080,6 +3227,19 @@ static bool g_preempt_started;
 
 static void drain_external_guest_signal(void);
 
+/* ELFUSE_SIGNAL_DRAIN_DELAY_US=N holds each drain that a SIGUSR2 starts for N
+ * microseconds, as if the sender's SIGUSR2 arrived late, so a test can change
+ * the parent's SIGCHLD state between a child's exit and the drain of its
+ * record. tests/test-sigchld-after-wait drives it. N is the value's leading
+ * decimal number; no effect unless it is from 1 to 999999.
+ */
+static useconds_t signal_drain_delay(void)
+{
+    const char *env = getenv("ELFUSE_SIGNAL_DRAIN_DELAY_US");
+    long long n = env ? strtoll(env, NULL, 10) : 0;
+    return (n > 0 && n < 1000000) ? (useconds_t) n : 0;
+}
+
 /* Dedicated sigwait consumer. SIGUSR2/SIGALRM are blocked on every other thread
  * (see proc_preempt_init), so they land here. thread_interrupt_all() kicks
  * every live vCPU off-thread; the signal/queue machinery in the vCPU loop sorts
@@ -3089,6 +3249,7 @@ static void *preempt_thread_main(void *arg)
 {
     (void) arg;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    useconds_t drain_delay = signal_drain_delay();
 
     sigset_t wait_set;
     sigemptyset(&wait_set);
@@ -3100,6 +3261,8 @@ static void *preempt_thread_main(void *arg)
         if (sigwait(&wait_set, &sig) != 0)
             continue;
         if (sig == SIGUSR2) {
+            if (drain_delay)
+                usleep(drain_delay);
             atomic_store_explicit(&g_external_guest_signal, 1,
                                   memory_order_release);
             drain_external_guest_signal();
@@ -3164,6 +3327,8 @@ static void unlink_own_transport(void)
 {
     char path[PATH_MAX];
     if (signal_transport_path(path, sizeof(path), getpid()))
+        unlink(path);
+    if (sigchld_state && sigchld_state_path(path, sizeof(path), getpid()))
         unlink(path);
 
     /* The namespace owner cleans the registry, but only once no other live
@@ -3262,10 +3427,22 @@ int proc_preempt_init(void)
     return 0;
 }
 
+/* Work a record asks for that takes the lifecycle registry lock. It runs after
+ * the drain releases the transport flock: an exiting child holds the registry
+ * lock while it appends here, so taking that lock under the flock would
+ * deadlock against it. Only the newest reparent record is applied.
+ */
 typedef struct {
     uint64_t my_ns;
     int64_t my_guest_pid;
+    bool autoreap;
+    int64_t reparent_ppid; /* 0: no reparent record */
 } sig_drain_ctx_t;
+
+/* Serializes drains, so the reparent record a later drain read is the one
+ * applied last.
+ */
+static pthread_mutex_t sig_drain_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Parse a signal record ("namespace target_guest_pid signum") or a reparent
  * control record ("R namespace target_guest_pid new_ppid"). Both are accepted
@@ -3290,13 +3467,8 @@ static void sig_drain_cb(char *rec, void *vctx)
         long long new_ppid = strtoll(p, &end, 10);
         if (end == p || errno == ERANGE || *end != '\0')
             return;
-        if (ns == c->my_ns && tgpid == c->my_guest_pid && new_ppid > 0) {
-            proc_set_ppid((int64_t) new_ppid);
-            if (signal_refresh_identity_cache()) {
-                lifecycle_publish_self();
-                lifecycle_ack_reparent((int64_t) tgpid, (int64_t) new_ppid);
-            }
-        }
+        if (ns == c->my_ns && tgpid == c->my_guest_pid && new_ppid > 0)
+            c->reparent_ppid = (int64_t) new_ppid;
         return;
     }
 
@@ -3310,26 +3482,32 @@ static void sig_drain_cb(char *rec, void *vctx)
         return;
     p = end;
     long signum = strtol(p, &end, 10);
+    if (end == p)
+        return;
+
+    /* " i": the sender found the signal ignored at generation. */
+    bool ignored = strcmp(end, " i") == 0;
 
     /* Reject any trailing garbage so a forged record like "<ns> <pid> 9junk"
      * from a same-user temp-dir writer cannot be accepted as a bare signal.
      */
-    if (end == p || *end != '\0')
+    if (*end != '\0' && !ignored)
         return;
     if (ns == c->my_ns && tgpid == c->my_guest_pid &&
         RANGE_CHECK(signum, 1, LINUX_NSIG)) {
         if (signum == LINUX_SIGCHLD && signal_sigchld_autoreap())
-            proc_autoreap_exited_children();
-        signal_queue((int) signum);
+            c->autoreap = true;
+        if (!ignored)
+            signal_queue((int) signum);
     }
 }
 
-static void drain_external_guest_signal(void)
+/* Read and truncate this process's signal transport under its flock, queue the
+ * signals, then run the registry work the records asked for. Caller holds
+ * sig_drain_lock.
+ */
+static void drain_signal_transport_locked(void)
 {
-    if (!atomic_exchange_explicit(&g_external_guest_signal, 0,
-                                  memory_order_acquire))
-        return;
-
     char path[PATH_MAX];
     if (!signal_transport_path(path, sizeof(path), getpid()))
         return;
@@ -3344,9 +3522,10 @@ static void drain_external_guest_signal(void)
 
     /* Hold the exclusive lock across the whole read+truncate so a sender's
      * locked append is atomic with respect to the drain. The file is truncated
-     * to empty rather than unlinked (see proc_send_guest_signal), which avoids
-     * reintroducing the unlink-vs-append race; the process unlinks its own
-     * empty file at exit (unlink_own_transport) so the temp dir stays clean.
+     * to empty rather than unlinked (see proc_append_guest_signal), which
+     * avoids reintroducing the unlink-vs-append race; the process unlinks its
+     * own empty file at exit (unlink_own_transport) so the temp dir stays
+     * clean.
      */
     if (flock_retry(fd, LOCK_EX) != 0) {
         close(fd);
@@ -3368,6 +3547,30 @@ static void drain_external_guest_signal(void)
             strerror(errno));
     flock_retry(fd, LOCK_UN);
     close(fd);
+
+    if (ctx.reparent_ppid) {
+        proc_set_ppid(ctx.reparent_ppid);
+        if (signal_refresh_identity_cache()) {
+            lifecycle_publish_self();
+            lifecycle_ack_reparent(ctx.my_guest_pid, ctx.reparent_ppid);
+        }
+    }
+    if (ctx.autoreap && signal_sigchld_autoreap())
+        proc_autoreap_exited_children();
+}
+
+static void drain_signal_transport(void)
+{
+    pthread_mutex_lock(&sig_drain_lock);
+    drain_signal_transport_locked();
+    pthread_mutex_unlock(&sig_drain_lock);
+}
+
+static void drain_external_guest_signal(void)
+{
+    if (atomic_exchange_explicit(&g_external_guest_signal, 0,
+                                 memory_order_acquire))
+        drain_signal_transport();
 }
 
 /* HVC #4 (set sysreg) register index -> hv_sys_reg_t mapping. Index must match

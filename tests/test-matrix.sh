@@ -785,6 +785,17 @@ run_unit_tests()
         "$bindir/test-wait-process-signal"
     test_check "$runner" "test-wait-sigmask-signal" " - PASS" \
         "$bindir/test-wait-sigmask-signal"
+    test_check "$runner" "test-sigchld-after-wait" " - PASS" \
+        "$bindir/test-sigchld-after-wait"
+
+    # One run per case: all five together take about 23 s on elfuse, close to
+    # run_elfuse's 30 s timeout.
+    local late_case
+    for late_case in none resethand thread vm adopted; do
+        ELFUSE_SIGNAL_DRAIN_DELAY_US=250000 \
+            test_check "$runner" "test-sigchld-after-wait late $late_case" \
+            " - PASS" "$bindir/test-sigchld-after-wait" late "$late_case"
+    done
     test_check "$runner" "test-shim-sigreturn-x8" "0 failed" \
         "$bindir/test-shim-sigreturn-x8"
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
@@ -1607,9 +1618,13 @@ run_suite()
 # its floor was left for a run that observed one; the second holds every
 # respelling of a path to the answer its canonical spelling gets. No fixture,
 # not in either skip list. 255 and 230, observed here at 297 and 275.
+#
+# Both went up by six for test-sigchld-after-wait and its five late cases, run
+# one per call. No fixture, not in either skip list. 261 and 236, observed here
+# at 324 and 298.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|255|0"
-    "qemu-aarch64|230|0"
+    "elfuse-aarch64|261|0"
+    "qemu-aarch64|236|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

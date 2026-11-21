@@ -443,6 +443,9 @@ void thread_deactivate(thread_entry_t *t)
      * thread_lock to honor sig_lock (4) before thread_lock (5).
      */
     signal_refresh_pending_hint();
+
+    /* This thread's mask no longer counts toward SIGCHLD being kept. */
+    signal_sigchld_republish();
 }
 
 thread_entry_t *thread_find(int64_t tid)
@@ -880,6 +883,16 @@ bool thread_signal_deliverable(uint64_t sigbit)
     THREAD_FOR_EACH_ACTIVE_RELAXED (t) {
         uint64_t mask = thread_blocked_load(t);
         if (sigbit & ~mask)
+            return true;
+    }
+    return false;
+}
+
+bool thread_signal_blocked_any(uint64_t sigbit)
+{
+    /* Lock-free scan, on the same terms as thread_signal_deliverable above. */
+    THREAD_FOR_EACH_ACTIVE_RELAXED (t) {
+        if (sigbit & thread_blocked_load(t))
             return true;
     }
     return false;
@@ -1844,6 +1857,11 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                  * before thread_lock (5).
                  */
                 signal_refresh_pending_hint();
+
+                /* The reaped child's mask no longer counts toward SIGCHLD being
+                 * kept.
+                 */
+                signal_sigchld_republish();
                 return tid;
             }
         }

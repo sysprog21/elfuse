@@ -527,6 +527,14 @@ void proc_registry_publish_self(void);
 /* Reap only children whose shared lifecycle entry is already terminal. */
 void proc_autoreap_exited_children(void);
 
+/* Write to this process's mapped sigchld flag file whether a SIGCHLD generated
+ * now would be discarded, so an exiting child decides at its exit. Called only
+ * by signal_sigchld_republish, under sigchld_pub_lock.
+ *
+ * Returns false when the file could not be created or mapped.
+ */
+bool proc_publish_sigchld_ignored(bool ignored);
+
 /* Pull authoritative PPID state into a newly bootstrapped fork child. */
 void proc_lifecycle_sync_self(guest_t *g);
 

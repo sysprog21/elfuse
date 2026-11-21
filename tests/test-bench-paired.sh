@@ -47,7 +47,9 @@ esac
 EOF
 
 # -s stages (and leaves attached, as the real suite does); -o writes one round,
-# logs which build ran it and takes STUB_ROUND_SECS.
+# logs which build ran it and its BENCH_METRICS, and takes STUB_ROUND_SECS. A
+# second-set round (BENCH_METRICS set) also takes STUB_CONFIRM_SECS and fails
+# when STUB_CONFIRM_FAILS is set. The head's value is STUB_HEAD.
 cat > "$T/suite.sh" << 'EOF'
 case "$1" in
     -s)
@@ -58,8 +60,15 @@ case "$1" in
         ;;
     -o)
         basename "$ELFUSE" >> "$STUB_DIR/order"
+        echo "${BENCH_METRICS:-all}" >> "$STUB_DIR/metrics"
         sleep "${STUB_ROUND_SECS:-0}"
-        printf '{"meta": {"env": "elfuse-aarch64"}, "lmbench": {"x": {"median": 1.0}}}\n' > "$2"
+        if [ -n "$BENCH_METRICS" ]; then
+            sleep "${STUB_CONFIRM_SECS:-0}"
+            [ -z "${STUB_CONFIRM_FAILS:-}" ] || exit 1
+        fi
+        value=1.0
+        [ "$(basename "$ELFUSE")" != head ] || value="${STUB_HEAD:-1.0}"
+        printf '{"meta": {"env": "elfuse-aarch64"}, "lmbench": {"x": {"median": %s}}}\n' "$value" > "$2"
         ;;
 esac
 EOF
@@ -70,10 +79,12 @@ chmod +x "$T/bin/hdiutil" "$T/bin/calib" "$T/base" "$T/head"
 # run [VAR=value ...]: one bench-paired.sh run on the stubs; sets rc.
 run()
 {
-    rm -rf "$T/out" "$T/img" "$T/staged"
+    rm -rf "$T/img" "$T/staged"
+    [ -n "${keep_out:-}" ] || rm -rf "$T/out"
     echo "${mounts0:-0}" > "$T/mounts"
     echo 0 > "$T/calls"
     : > "$T/order"
+    : > "$T/metrics"
     rc=0
     env -u BENCH_REGRESSION_THRESHOLD -u BENCH_PAIRS PATH="$T/bin:$PATH" \
         STUB_DIR="$T" BENCH_PAIRED_SUITE="$T/suite.sh" \
@@ -89,6 +100,14 @@ meta()
 print(json.load(open(sys.argv[1]))["meta"][sys.argv[2]])' "$1" "$2"
 }
 
+# confirm_rounds: the rounds of the report's second set, or none.
+confirm_rounds()
+{
+    python3 -I -c 'import json, sys
+print(json.load(open(sys.argv[1])).get("confirm", {}).get("rounds", "none"))' \
+        "$T/out/report.json"
+}
+
 run
 order="$(tr '\n' ' ' < "$T/order")"
 want="base head base head head base base head head base base head head base "
@@ -96,6 +115,56 @@ want="base head base head head base base head head base base head head base "
 [ "$order" = "$want" ] || fail "round order was '$order'"
 [ "$(cat "$T/mounts")" = 0 ] || fail "steady run left a mount"
 [ -s "$T/out/report.json" ] || fail "steady run wrote no report.json"
+[ "$(confirm_rounds)" = none ] || fail "an unchanged head was measured again"
+
+# A head 30% slower reads slower at a zero threshold, so with no threshold set
+# its one metric is measured again in 6 more pairs of only that metric, in the
+# same order.
+run STUB_HEAD=1.3
+[ "$rc" = 0 ] || fail "flagged run exited $rc"
+[ "$(cat "$T/out/flagged")" = lmbench.x ] || fail "flagged run listed '$(cat "$T/out/flagged")'"
+[ "$(grep -c '^lmbench.x$' "$T/metrics")" = 12 ] || fail "the second set did not run 12 rounds of the flagged metric alone"
+order="$(tr '\n' ' ' < "$T/order")"
+[ "$order" = "$want$(echo "$want" | cut -d' ' -f3-14) " ] || fail "flagged run order was '$order'"
+[ "$(confirm_rounds)" = 6 ] || fail "the report's second set has $(confirm_rounds) rounds"
+[ "$(cat "$T/mounts")" = 0 ] || fail "flagged run left a mount"
+
+# A run without a second set, into that output directory, keeps none of its
+# files.
+keep_out=1 run
+[ "$rc" = 0 ] || fail "a run over an earlier output directory exited $rc"
+[ ! -e "$T/out/confirm-base-1.json" ] || fail "a run kept the second set's base rounds of an earlier one"
+[ ! -e "$T/out/confirm-head-1.json" ] || fail "a run kept the second set's head rounds of an earlier one"
+[ ! -s "$T/out/flagged" ] || fail "a run kept the flagged list of an earlier one"
+[ "$(confirm_rounds)" = none ] || fail "a run over an earlier output directory reported an earlier second set"
+
+run STUB_HEAD=1.3 BENCH_CONFIRM_DEADLINE=0
+[ "$rc" = 0 ] || fail "a second set past its deadline exited $rc"
+grep -q 'stopped before pair 1,' "$T/log" || fail "a second set past its deadline was not stopped"
+[ "$(confirm_rounds)" = none ] || fail "a second set past its deadline reached the report"
+
+# A failing second-set round fails the run and leaves the first report.
+run STUB_HEAD=1.3 STUB_CONFIRM_FAILS=1
+[ "$rc" != 0 ] || fail "a failing second-set round did not fail the run"
+[ "$(confirm_rounds)" = none ] || fail "a failing second set left no first report"
+[ "$(cat "$T/mounts")" = 0 ] || fail "a failing second set left a mount"
+
+# Calls 63 and 64, after 14 rounds of 4 calls, make the reading after the head
+# round of the second set's pair 1. Its rerun is held to BENCH_CONFIRM_DEADLINE,
+# not to the first set's deadline of 0.
+run STUB_HEAD=1.3 STUB_HIGH="63 64" BENCH_RERUN_DEADLINE=0
+[ "$rc" = 0 ] || fail "a second set with a rerun exited $rc"
+[ "$(grep -c 'measuring pair 1 again' "$T/log")" = 1 ] || fail "an unsteady pair 1 of the second set was not measured again"
+[ "$(meta "$T/out/confirm-head-1.json" reruns)" = 1 ] || fail "confirm-head-1 meta.reruns is not 1"
+
+# The same pair 1, taking 6 s: a rerun and the 5 pairs after it would end past
+# 30 s, and so would pairs 2 to 6. The first set ends well before 30 s.
+run STUB_HEAD=1.3 STUB_HIGH="63 64" STUB_CONFIRM_SECS=3 BENCH_CONFIRM_DEADLINE=30
+[ "$rc" = 0 ] || fail "a cut second set exited $rc"
+grep -q 'measuring pair 1 again' "$T/log" && fail "a second-set rerun ran past BENCH_CONFIRM_DEADLINE"
+[ "$(meta "$T/out/confirm-head-1.json" calib_unsteady)" = True ] || fail "a kept second-set pair was not marked unsteady"
+grep -q 'stopped before pair 2,' "$T/log" || fail "a second set that would end past its deadline went on"
+[ "$(confirm_rounds)" = 1 ] || fail "a cut second set reported $(confirm_rounds) rounds, not 1"
 
 run STUB_DETACH_FAILS=1
 [ "$rc" != 0 ] || fail "a failed detach did not stop the run"
@@ -148,6 +217,7 @@ for pairs in 0 5 33 abc 18446744073709551622; do
     [ ! -e "$T/out" ] || fail "BENCH_PAIRS=$pairs created the output directory"
 done
 for bad in BENCH_RERUN_DEADLINE=abc BENCH_RERUN_DEADLINE=18446744073709551616 \
+    BENCH_CONFIRM_DEADLINE=abc BENCH_CONFIRM_DEADLINE=18446744073709551616 \
     BENCH_CALIB_GAP=abc BENCH_CALIB_SPREAD=abc BENCH_CALIB="$T/missing" \
     BENCH_PAIRED_STAGE="$T/missing"; do
     run "$bad"

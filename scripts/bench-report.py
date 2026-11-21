@@ -20,10 +20,15 @@ per-round values of a base build and a head build measured in the same job.
 The reporter recomputes each verdict from those values with
 bench-compare.py's paired_verdict, so the comment and the job log agree, and
 renders one table of every metric. With no threshold set, the table carries
-ratios and intervals and no slower or faster verdict. Its stdout is "changes"
-when a metric is slower, faster or lost a head value in some round (a lat_fs
-metric only when no pair is left), and "clean" otherwise. A metric missing on
-both sides stays clean, because the head build did not cause it.
+ratios and intervals and no slower or faster verdict. A slower or faster
+verdict stands only when the report's second set of pairs (its optional
+"confirm" block) gives it again, and otherwise reads "not confirmed", with
+the reason a report without one gives (confirm_missing); a metric whose second
+set lost a head value reads "lost on head", whatever the first set gave. Its
+stdout is "changes" when a metric is slower, faster or lost a head value in
+some round (a lat_fs metric only when no pair is left), or the second set
+failed, and "clean" otherwise. A metric missing on both sides stays clean,
+because the head build did not cause it.
 """
 
 from __future__ import annotations
@@ -186,10 +191,7 @@ def load_paired_report(document: dict, *, expected_environment: str
     compare.SKIPPED where it skipped the metric's tier."""
     check_header(document, version=3,
                  expected_environment=expected_environment)
-    rounds = document.get("rounds")
-    if isinstance(rounds, bool) or not isinstance(rounds, int) \
-            or not 1 <= rounds <= MAX_ROUNDS:
-        raise ReportError(f"rounds must be an integer from 1 to {MAX_ROUNDS}")
+    rounds = parse_rounds(document.get("rounds"), field="rounds")
     entries = document.get("metrics")
     if not isinstance(entries, dict) or not entries:
         raise ReportError("metrics must be a non-empty object")
@@ -198,45 +200,117 @@ def load_paired_report(document: dict, *, expected_environment: str
     metrics = {}
     for key, entry in entries.items():
         name = metric_name(key)
-        if not isinstance(entry, dict) or set(entry) != {"base", "head"}:
-            raise ReportError(f"{name} must hold exactly base and head")
-        sides = []
-        for side in ("base", "head"):
-            values = entry[side]
-            if not isinstance(values, list) or len(values) != rounds:
-                raise ReportError(
-                    f"{name}.{side} must list one value per round")
-            parsed = []
-            for value in values:
-                if value is None or value == compare.SKIPPED:
-                    parsed.append(value)
-                    continue
-                number = finite_number(value, field=f"{name}.{side}")
-                if number < 0:
-                    raise ReportError(f"{name}.{side} must be non-negative")
-                parsed.append(number)
-            sides.append(parsed)
-        metrics[name] = (sides[0], sides[1])
+        metrics[name] = parse_sides(name, entry, rounds)
     return metrics
+
+
+def parse_rounds(value: object, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) \
+            or not 1 <= value <= MAX_ROUNDS:
+        raise ReportError(f"{field} must be an integer from 1 to {MAX_ROUNDS}")
+    return value
+
+
+def parse_sides(name: str, entry: object, rounds: int
+                ) -> tuple[list[float | str | None], list[float | str | None]]:
+    """Return the base and head values of one metric entry."""
+    if not isinstance(entry, dict) or set(entry) != {"base", "head"}:
+        raise ReportError(f"{name} must hold exactly base and head")
+    sides = []
+    for side in ("base", "head"):
+        values = entry[side]
+        if not isinstance(values, list) or len(values) != rounds:
+            raise ReportError(f"{name}.{side} must list one value per round")
+        parsed = []
+        for value in values:
+            if value is None or value == compare.SKIPPED:
+                parsed.append(value)
+                continue
+            number = finite_number(value, field=f"{name}.{side}")
+            if number < 0:
+                raise ReportError(f"{name}.{side} must be non-negative")
+            parsed.append(number)
+        sides.append(parsed)
+    return sides[0], sides[1]
+
+
+def load_confirm(document: dict, metrics: dict
+                 ) -> dict[str, tuple[list[float | str | None],
+                                      list[float | str | None]]]:
+    """Return the second set of a schema 3 report in load_paired_report's
+    form, empty when the report has none: nothing was flagged, the set
+    stopped before its first pair, or a round or the comparison of it
+    failed. Every metric in it has to be in the first set."""
+    block = document.get("confirm")
+    if block is None:
+        return {}
+    if not isinstance(block, dict) or set(block) != {"rounds", "metrics"}:
+        raise ReportError("confirm must hold exactly rounds and metrics")
+    rounds = parse_rounds(block["rounds"], field="confirm.rounds")
+    entries = block["metrics"]
+    if not isinstance(entries, dict) or not entries:
+        raise ReportError("confirm.metrics must be a non-empty object")
+    confirm = {}
+    for key, entry in entries.items():
+        name = metric_name(key)
+        if name not in metrics:
+            raise ReportError(f"confirm lists {name}, which the first set "
+                              "does not")
+        confirm[name] = parse_sides(f"confirm.{name}", entry, rounds)
+    return confirm
+
+
+def load_confirm_missing(document: dict) -> str | None:
+    """Return why a schema 3 report has no second set, or None when it does
+    not say. Only a report without one can say why."""
+    missing = document.get("confirm_missing")
+    if missing is None:
+        return None
+    if missing not in compare.CONFIRM_MISSING:
+        raise ReportError("confirm_missing must be one of "
+                          + ", ".join(compare.CONFIRM_MISSING))
+    if "confirm" in document:
+        raise ReportError("a report with a second set has no "
+                          "confirm_missing")
+    return missing
 
 
 def percent(ratio: float) -> str:
     return f"{ratio - 1.0:+.1%}"
 
 
+def second_set(verdict: dict, missing: str | None) -> str:
+    """Describe the second set behind a slower or faster verdict, or "";
+    missing is why the metric has none (compare.missing_reason)."""
+    if "confirm" not in verdict:
+        return ""
+    second = verdict["confirm"]
+    if second is None:
+        return compare.missing_text(missing)
+    change = "-" if second["ratio"] is None else percent(second["ratio"])
+    return f" (second set {change}, {second['verdict']})"
+
+
 def render_paired(
     metrics: dict[str, tuple[list[float | str | None], list[float | str | None]]],
-    *, threshold: float | None, environment: str
+    *, threshold: float | None, environment: str,
+    confirm: dict[str, tuple[list[float | str | None],
+                             list[float | str | None]]] | None = None,
+    missing: str | None = None
 ) -> tuple[str, bool]:
-    """Return the paired comment text and whether it lists any change."""
+    """Return the paired comment text and whether it lists any change. A
+    failed second set is listed, so the comment shows it."""
+    confirm = confirm or {}
     judged = []
     for name, (base, head) in metrics.items():
-        verdict = compare.paired_verdict(name, base, head,
-                                         threshold=threshold)
+        verdict = compare.confirmed_verdict(name, base, head,
+                                            confirm.get(name),
+                                            threshold=threshold)
         judged.append((compare.VERDICTS.index(verdict["verdict"]), name,
                        verdict))
     judged.sort(key=lambda item: item[:2])
-    listed = any(v["verdict"] in compare.LISTED for _, _, v in judged)
+    listed = missing == "failed" or any(
+        v["verdict"] in compare.LISTED for _, _, v in judged)
     rounds = max((len(base) for base, _ in metrics.values()), default=0)
 
     if threshold is None:
@@ -245,7 +319,17 @@ def render_paired(
     else:
         rule = ("A metric is slower or faster only when the 95% interval "
                 "of its median head/base ratio excludes 1 and the median "
-                f"is past ±{compare.threshold_text(threshold)}.")
+                f"is past ±{compare.threshold_text(threshold)}, and a "
+                "second set of pairs of that metric, measured after the "
+                "first, gives the same verdict; a verdict the second set "
+                "does not repeat reads not confirmed. A metric whose second "
+                "set lost a head value reads lost on head.")
+    if missing == "failed":
+        rule += (" The second set of pairs failed, so no verdict is "
+                 "confirmed; the job log shows what failed.")
+    elif missing == "out of time":
+        rule += (" The second set of pairs was not started, because its "
+                 "deadline had passed.")
     verdicts = {v["verdict"] for _, _, v in judged}
     if listed:
         title = "## Benchmark: head vs base commit"
@@ -278,7 +362,8 @@ def render_paired(
             "-" if v["ratio"] is None else percent(v["ratio"]),
             "-" if v["low"] is None
             else f"{percent(v['low'])} to {percent(v['high'])}",
-            v["verdict"],
+            v["verdict"] + second_set(
+                v, compare.missing_reason(name, confirm, missing)),
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n", listed
@@ -549,6 +634,36 @@ def paired_self_test() -> list[str]:
                                   threshold=0.1)
     if lost["verdict"] != "lost on head" or lost["low"] is None:
         failures.append("a lost head value blanked the remaining pairs")
+    six = [10.0] * 6
+    seconds = {
+        "the same verdict": ((six, [13.0] * 6), "slower"),
+        "no significant change": ((six, [10.1] * 6), "not confirmed"),
+        "the opposite verdict": ((six, [7.0] * 6), "not confirmed"),
+        "too few pairs": ((six[:5], [13.0] * 5), "not confirmed"),
+        "a lost head value": ((six, [13.0] * 5 + [None]), "lost on head"),
+        "no second set": (None, "not confirmed"),
+    }
+    for label, (second, expected) in seconds.items():
+        got = compare.confirmed_verdict("x.y", base, [13.0] * 8, second,
+                                        threshold=0.1)
+        if got["verdict"] != expected or "confirm" not in got:
+            failures.append(f"a slower first set with {label} in the "
+                            f"second gave {got['verdict']}")
+    for second, expected in (((six, [7.0] * 6), "faster"),
+                             ((six, [13.0] * 6), "not confirmed")):
+        got = compare.confirmed_verdict("x.y", base, [7.0] * 8, second,
+                                        threshold=0.1)
+        if got["verdict"] != expected:
+            failures.append(f"a faster first set gave {got['verdict']}, "
+                            f"not {expected}")
+    for head, threshold, expected in (([10.0] * 8, 0.1,
+                                       "no significant change"),
+                                      ([13.0] * 8, None, "no threshold")):
+        got = compare.confirmed_verdict("x.y", base, head,
+                                        (six, [7.0] * 6),
+                                        threshold=threshold)
+        if got["verdict"] != expected or "confirm" in got:
+            failures.append(f"a second set changed {expected}")
 
     env = "elfuse-aarch64"
     head = ('{"schema_version": 3, "environment": "elfuse-aarch64", '
@@ -590,6 +705,77 @@ def paired_self_test() -> list[str]:
                 failures.append(f"paired nulls parsed as {parsed}")
         except ReportError as exc:
             failures.append(f"rejected paired nulls: {exc}")
+        first = head + '{"a.b": {"base": [1, 1], "head": [1, 1]}}'
+        # Each block is wrong in one way only.
+        one = {"a.b": {"base": [1], "head": [1]}}
+        many = [1] * (MAX_ROUNDS + 1)
+        bad_confirms = {
+            "a list": '[]',
+            "an extra key": json.dumps({"rounds": 1, "metrics": one, "x": 1}),
+            "zero rounds": json.dumps(
+                {"rounds": 0, "metrics": {"a.b": {"base": [], "head": []}}}),
+            "boolean rounds": json.dumps({"rounds": True, "metrics": one}),
+            "too many rounds": json.dumps(
+                {"rounds": MAX_ROUNDS + 1,
+                 "metrics": {"a.b": {"base": many, "head": many}}}),
+            "no metrics": '{"rounds": 1, "metrics": {}}',
+            "a metric the first set lacks":
+                '{"rounds": 1, "metrics": {"a.c": {"base": [1], '
+                '"head": [1]}}}',
+            "a short list":
+                '{"rounds": 2, "metrics": {"a.b": {"base": [1], '
+                '"head": [1, 1]}}}',
+            "a string value":
+                '{"rounds": 1, "metrics": {"a.b": {"base": ["1"], '
+                '"head": [1]}}}',
+        }
+        for label, block in bad_confirms.items():
+            path.write_text(f'{first}, "confirm": {block}}}',
+                            encoding="utf-8")
+            try:
+                document = read_report(path)
+                load_confirm(document, load_paired_report(
+                    document, expected_environment=env))
+                failures.append(f"accepted a second set with {label}")
+            except ReportError:
+                pass
+        path.write_text(first + '}', encoding="utf-8")
+        if load_confirm(read_report(path), {"a.b": ([1.0], [1.0])}) != {}:
+            failures.append("a report with no second set gave one")
+        text, listed = render_paired({"a.b": ([10.0] * 6, [13.0] * 6)},
+                                     threshold=0.1, environment=env)
+        if listed or "| not confirmed (no second set) |" not in text:
+            failures.append("a slower first set with no second set listed "
+                            "changes or hid why")
+        slow = {"a.b": ([10.0] * 6, [13.0] * 6)}
+        for missing, row, rule in (
+                ("not flagged", "(not flagged)", ""),
+                ("failed", "(second set failed)",
+                 "The second set of pairs failed"),
+                ("out of time", "(second set out of time)",
+                 "The second set of pairs was not started")):
+            text, listed = render_paired(slow, threshold=0.1,
+                                         environment=env, missing=missing)
+            if f"| not confirmed {row} |" not in text or rule not in text \
+                    or listed != (missing == "failed"):
+                failures.append(f"a second set missing as {missing} read "
+                                "otherwise")
+        text, _ = render_paired(
+            {**slow, "a.c": ([10.0] * 6, [10.0] * 6)}, threshold=0.1,
+            environment=env, confirm={"a.c": ([10.0] * 6, [10.0] * 6)})
+        if "| not confirmed (not flagged) |" not in text:
+            failures.append("a metric left out of a second set did not read "
+                            "not flagged")
+        for label, extra in (("an unknown reason", '"confirm_missing": "x"'),
+                             ("a reason next to a second set",
+                              '"confirm_missing": "failed", "confirm": '
+                              + json.dumps({"rounds": 1, "metrics": one}))):
+            path.write_text(f"{first}, {extra}}}", encoding="utf-8")
+            try:
+                load_confirm_missing(read_report(path))
+                failures.append(f"accepted {label} for a missing second set")
+            except ReportError:
+                pass
 
         # MAX_ROUNDS rounds per side through bench-compare.py:
         # lat_syscall.null 30% slower, lat_fs.create failed in every head
@@ -628,12 +814,27 @@ def paired_self_test() -> list[str]:
                 file = pathlib.Path(tmp) / f"{side}-{index}.json"
                 file.write_text(json.dumps(document), encoding="utf-8")
                 rounds[side].append(str(file))
+        # The second set holds only lat_syscall.null, the one metric the
+        # first set flags.
+        for index in range(compare.MIN_PAIRS):
+            for side, null in (("base", 0.20), ("head", 0.26)):
+                file = pathlib.Path(tmp) / f"confirm-{side}-{index}.json"
+                file.write_text(json.dumps({
+                    "meta": {"env": env},
+                    "lmbench": {"lat_syscall": {
+                        "null": {"median": null + index / 1000}}}}),
+                    encoding="utf-8")
+                rounds[f"confirm-{side}"] = rounds.get(
+                    f"confirm-{side}", []) + [str(file)]
         artifact = pathlib.Path(tmp) / "paired.json"
+        flagged = pathlib.Path(tmp) / "flagged"
         run = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "bench-compare.py"),
              "--paired", "--threshold", "0.1", "--report-json",
-             str(artifact), "--base", *rounds["base"],
-             "--head", *rounds["head"]],
+             str(artifact), "--flagged", str(flagged),
+             "--base", *rounds["base"], "--head", *rounds["head"],
+             "--confirm-base", *rounds["confirm-base"],
+             "--confirm-head", *rounds["confirm-head"]],
             capture_output=True, text=True, check=False)
         if run.returncode != 0:
             failures.append(f"bench-compare --paired exited "
@@ -641,10 +842,243 @@ def paired_self_test() -> list[str]:
         else:
             if artifact.stat().st_size > MAX_REPORT_BYTES:
                 failures.append("paired artifact is over the size limit")
+            document = read_report(artifact)
+            metrics = load_paired_report(document, expected_environment=env)
             text, listed = render_paired(
-                load_paired_report(read_report(artifact),
-                                   expected_environment=env),
+                metrics, confirm=load_confirm(document, metrics),
                 threshold=0.1, environment=env)
+            if flagged.read_text() != "lmbench.lat_syscall.null\n":
+                failures.append(f"--flagged wrote {flagged.read_text()!r}")
+            # A 2% slowdown and a 2% speedup are under any threshold set so
+            # far, but their intervals exclude 1, and a run from a fork may
+            # have no threshold.
+            sides = {}
+            for side, null, read in (("base", 0.200, 1.00),
+                                     ("head", 0.204, 0.98)):
+                sides[side] = pathlib.Path(tmp) / f"slight-{side}.json"
+                sides[side].write_text(json.dumps({
+                    "meta": {"env": env},
+                    "lmbench": {"lat_syscall": {
+                        "null": {"median": null},
+                        "read": {"median": read}}}}),
+                    encoding="utf-8")
+            unset_env = {key: value for key, value in os.environ.items()
+                         if key != "BENCH_REGRESSION_THRESHOLD"}
+            # The run above wrote the same list, so it must not be left over.
+            flagged.unlink()
+            slight = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "bench-compare.py"),
+                 "--paired", "--flagged", str(flagged),
+                 "--base", *[str(sides["base"])] * compare.MIN_PAIRS,
+                 "--head", *[str(sides["head"])] * compare.MIN_PAIRS],
+                capture_output=True, text=True, check=False, env=unset_env)
+            if slight.returncode != 0 or not flagged.exists() \
+                    or flagged.read_text() != ("lmbench.lat_syscall.null\n"
+                                               "lmbench.lat_syscall.read\n"):
+                failures.append("--flagged with no threshold left out a 2% "
+                                "slowdown or a 2% speedup")
+            # At a 10% flag threshold, at none, or at report with no
+            # threshold or one of 10%, they are not flagged, and the report
+            # records that nothing was.
+            for limit, extra in (("0.1", {}), ("none", {}), ("report", {}),
+                                 ("report",
+                                  {"BENCH_REGRESSION_THRESHOLD": "0.1"})):
+                flagged.unlink()
+                quiet = subprocess.run(
+                    [sys.executable,
+                     str(ROOT / "scripts" / "bench-compare.py"),
+                     "--paired", "--flagged", str(flagged),
+                     "--flag-threshold", limit,
+                     "--report-json", str(artifact.with_name("quiet.json")),
+                     "--base", *[str(sides["base"])] * compare.MIN_PAIRS,
+                     "--head", *[str(sides["head"])] * compare.MIN_PAIRS],
+                    capture_output=True, text=True, check=False,
+                    env={**unset_env, **extra})
+                if quiet.returncode != 0 or flagged.read_text() != "" \
+                        or read_report(artifact.with_name("quiet.json")).get(
+                            "confirm_missing") != "not flagged":
+                    threshold = extra.get("BENCH_REGRESSION_THRESHOLD",
+                                          "unset")
+                    failures.append(f"--flag-threshold {limit} (threshold "
+                                    f"{threshold}) flagged a 2% change or "
+                                    "recorded no reason")
+            # At 1%, as a number or as report with the threshold at " .01",
+            # both are flagged.
+            for limit, extra in (("0.01", {}),
+                                 ("report",
+                                  {"BENCH_REGRESSION_THRESHOLD": " .01"})):
+                flagged.unlink()
+                loud = subprocess.run(
+                    [sys.executable,
+                     str(ROOT / "scripts" / "bench-compare.py"),
+                     "--paired", "--flagged", str(flagged),
+                     "--flag-threshold", limit,
+                     "--base", *[str(sides["base"])] * compare.MIN_PAIRS,
+                     "--head", *[str(sides["head"])] * compare.MIN_PAIRS],
+                    capture_output=True, text=True, check=False,
+                    env={**unset_env, **extra})
+                if loud.returncode != 0 or flagged.read_text() != (
+                        "lmbench.lat_syscall.null\n"
+                        "lmbench.lat_syscall.read\n"):
+                    failures.append(f"--flag-threshold {limit} at 1% left "
+                                    "out a 2% change")
+            # The table in the job log names the reason too.
+            table = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "bench-compare.py"),
+                 "--paired", "--threshold", "0.01",
+                 "--confirm-missing", "out of time",
+                 "--base", *[str(sides["base"])] * compare.MIN_PAIRS,
+                 "--head", *[str(sides["head"])] * compare.MIN_PAIRS],
+                capture_output=True, text=True, check=False, env=unset_env)
+            row = "not confirmed (second set out of time)"
+            if table.returncode != 0 or row not in table.stdout:
+                failures.append("the bench-compare table hid why a second "
+                                "set is missing")
+            # A second set holds every flagged metric, so one that its rounds
+            # hold no value for reads no result there, in a tier they all
+            # skipped or one they left out. A metric not flagged stays out,
+            # next to a tier only the base rounds skipped and when it is past
+            # the threshold but under --flag-threshold.
+            tiers = {}
+            for label, null, apps, skip in (
+                    ("base", 0.20, {"startup_ms": 10.0, "grep_ms": 5.0}, 0),
+                    ("head", 0.26, {"startup_ms": 13.0, "grep_ms": 5.0}, 0),
+                    ("slow-head", 0.26,
+                     {"startup_ms": 13.0, "grep_ms": 5.75}, 0),
+                    ("skip-base", 0.20, {}, 1), ("skip-head", 0.26, {}, 1),
+                    ("ran-head", 0.26, {"startup_ms": 13.0}, 0),
+                    ("apps-base", None, {"startup_ms": 10.0}, 0),
+                    ("apps-head", None, {"startup_ms": 13.0}, 0)):
+                document = {"meta": {"env": env},
+                            "applications": {key: {"median": value}
+                                             for key, value in apps.items()}}
+                if null is not None:
+                    document["lmbench"] = {
+                        "lat_syscall": {"null": {"median": null}}}
+                if skip:
+                    document["meta"]["applications_skipped"] = "no hdiutil"
+                tiers[label] = pathlib.Path(tmp) / f"tier-{label}.json"
+                tiers[label].write_text(json.dumps(document),
+                                        encoding="utf-8")
+            tier_flagged = pathlib.Path(tmp) / "tier-flagged"
+            for case, head, confirm_base, confirm_head, extra, name, row in (
+                    ("a tier every second-set round skipped", "head",
+                     "skip-base", "skip-head", [], "applications.startup_ms",
+                     "| not confirmed (second set -, no result) |"),
+                    ("a tier only the base rounds of the second set skipped",
+                     "head", "skip-base", "ran-head", [],
+                     "applications.grep_ms", "| no significant change |"),
+                    ("a second set without Tier 1", "head", "apps-base",
+                     "apps-head", [], "lmbench.lat_syscall.null",
+                     "| not confirmed (second set -, no result) |"),
+                    ("a metric under --flag-threshold", "slow-head",
+                     "skip-base", "skip-head",
+                     ["--flagged", str(tier_flagged), "--flag-threshold",
+                      "0.2"], "applications.grep_ms",
+                     "| not confirmed (not flagged) |")):
+                tier_report = artifact.with_name("tier.json")
+                tier_run = subprocess.run(
+                    [sys.executable,
+                     str(ROOT / "scripts" / "bench-compare.py"),
+                     "--paired", "--threshold", "0.1", *extra,
+                     "--report-json", str(tier_report),
+                     "--base", *[str(tiers["base"])] * compare.MIN_PAIRS,
+                     "--head", *[str(tiers[head])] * compare.MIN_PAIRS,
+                     "--confirm-base",
+                     *[str(tiers[confirm_base])] * compare.MIN_PAIRS,
+                     "--confirm-head",
+                     *[str(tiers[confirm_head])] * compare.MIN_PAIRS],
+                    capture_output=True, text=True, check=False)
+                table_ok = tier_run.returncode == 0 and any(
+                    name in line and row.strip("| ") in line
+                    for line in tier_run.stdout.splitlines())
+                if tier_run.returncode == 0:
+                    tier_run = subprocess.run(
+                        [sys.executable,
+                         str(ROOT / "scripts" / "bench-report.py"),
+                         "--report", str(tier_report), "--threshold", "0.1",
+                         "--output", str(tier_report.with_suffix(".md"))],
+                        capture_output=True, text=True, check=False)
+                lines = [] if tier_run.returncode != 0 else [
+                    line for line in tier_report.with_suffix(".md")
+                    .read_text(encoding="utf-8").splitlines()
+                    if f"`{name}`" in line]
+                if not table_ok or len(lines) != 1 \
+                        or not lines[0].endswith(row):
+                    failures.append(f"{case} misread {name}")
+            # A second set that failed is listed with no threshold set,
+            # where no row shows a second set.
+            failed_report = artifact.with_name("failed.json")
+            failed_run = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "bench-compare.py"),
+                 "--paired", "--confirm-missing", "failed",
+                 "--report-json", str(failed_report),
+                 "--base", *[str(sides["base"])] * compare.MIN_PAIRS,
+                 "--head", *[str(sides["head"])] * compare.MIN_PAIRS],
+                capture_output=True, text=True, check=False, env=unset_env)
+            if failed_run.returncode == 0:
+                failed_run = subprocess.run(
+                    [sys.executable,
+                     str(ROOT / "scripts" / "bench-report.py"),
+                     "--report", str(failed_report),
+                     "--output", str(failed_report.with_suffix(".md"))],
+                    capture_output=True, text=True, check=False,
+                    env=unset_env)
+            if failed_run.returncode != 0 \
+                    or failed_run.stdout != "changes\n" \
+                    or "The second set of pairs failed" not in \
+                    failed_report.with_suffix(".md").read_text(
+                        encoding="utf-8"):
+                failures.append("a failed second set with no threshold was "
+                                "not listed")
+            # The same rounds with no threshold, and a second set whose last
+            # head round has ERR for lat_syscall.null.
+            lost_head = pathlib.Path(tmp) / "lost-head.json"
+            lost_head.write_text(json.dumps({
+                "meta": {"env": env},
+                "lmbench": {"lat_syscall": {
+                    "null": {"status": "ERR"},
+                    "read": {"median": 0.98}}}}),
+                encoding="utf-8")
+            lost_report = pathlib.Path(tmp) / "lost.json"
+            lost_comment = pathlib.Path(tmp) / "lost.md"
+            lost_run = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "bench-compare.py"),
+                 "--paired", "--report-json", str(lost_report),
+                 "--base", *[str(sides["base"])] * compare.MIN_PAIRS,
+                 "--head", *[str(sides["head"])] * compare.MIN_PAIRS,
+                 "--confirm-base", *[str(sides["base"])] * compare.MIN_PAIRS,
+                 "--confirm-head",
+                 *[str(sides["head"])] * (compare.MIN_PAIRS - 1),
+                 str(lost_head)],
+                capture_output=True, text=True, check=False, env=unset_env)
+            if lost_run.returncode == 0:
+                lost_run = subprocess.run(
+                    [sys.executable,
+                     str(ROOT / "scripts" / "bench-report.py"),
+                     "--report", str(lost_report),
+                     "--output", str(lost_comment)],
+                    capture_output=True, text=True, check=False,
+                    env=unset_env)
+            if lost_run.returncode != 0 or lost_run.stdout != "changes\n" \
+                    or "| lost on head (second set +2.0%, lost on head) |" \
+                    not in lost_comment.read_text(encoding="utf-8"):
+                failures.append("a head ERR in the second set, with no "
+                                "threshold, was not lost on head")
+            if "| slower (second set +29.6%, slower) |" not in text:
+                failures.append("a confirmed verdict not rendered with its "
+                                "second set")
+            comment = pathlib.Path(tmp) / "comment.md"
+            cli = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "bench-report.py"),
+                 "--report", str(artifact), "--output", str(comment),
+                 "--threshold", "0.1"],
+                capture_output=True, text=True, check=False)
+            if cli.returncode != 0 or cli.stdout != "changes\n" \
+                    or "| slower (second set +29.6%, slower) |" \
+                    not in comment.read_text(encoding="utf-8"):
+                failures.append("bench-report.py --report left out the "
+                                "second set")
             for row in (f"| `lmbench.lat_syscall.null` | {MAX_ROUNDS} | 0/0 |",
                         f"| `lmbench.lat_fs.create` | 0 | 0/{MAX_ROUNDS} |",
                         f"| `applications.make_ms` | {MAX_ROUNDS} | 0/0 |",
@@ -653,8 +1087,7 @@ def paired_self_test() -> list[str]:
                         "| 0/1 |"):
                 if row not in text:
                     failures.append(f"paired table lacks {row!r}")
-            if not listed or "| slower |" not in text \
-                    or "| lost on head |" not in text \
+            if not listed or "| lost on head |" not in text \
                     or "| no verdict |" not in text:
                 failures.append("paired verdicts not rendered as expected")
             if text.index("lat_syscall") > text.index("lat_fs"):
@@ -721,13 +1154,58 @@ def paired_self_test() -> list[str]:
                 ("unequal --base and --head counts",
                  ["--paired", "--base", *rounds["base"][:2],
                   "--head", rounds["head"][0]]),
-                ("--base and --head without --paired",
-                 ["--base", rounds["base"][0],
-                  "--head", rounds["head"][0]])):
+                ("unequal --confirm-base and --confirm-head counts",
+                 ["--paired", "--base", rounds["base"][0],
+                  "--head", rounds["head"][0],
+                  "--confirm-base", *rounds["confirm-base"][:2],
+                  "--confirm-head", rounds["confirm-head"][0]]),
+                ("a second set from another environment",
+                 ["--paired", "--base", rounds["base"][0],
+                  "--head", rounds["head"][0],
+                  "--confirm-base", str(native),
+                  "--confirm-head", str(native)]),
+                ("a second set with a metric the first lacks",
+                 ["--paired", "--base", rounds["confirm-base"][0],
+                  "--head", rounds["confirm-head"][0],
+                  "--confirm-base", rounds["base"][0],
+                  "--confirm-head", rounds["head"][0]]),
+                ("more second-set rounds than the reporter accepts",
+                 ["--paired", "--base", rounds["base"][0],
+                  "--head", rounds["head"][0],
+                  "--confirm-base",
+                  *[rounds["confirm-base"][0]] * (MAX_ROUNDS + 1),
+                  "--confirm-head",
+                  *[rounds["confirm-head"][0]] * (MAX_ROUNDS + 1)]),
+                ("a reason for a second set it has",
+                 ["--paired", "--base", rounds["base"][0],
+                  "--head", rounds["head"][0], "--confirm-missing", "failed",
+                  "--confirm-base", rounds["confirm-base"][0],
+                  "--confirm-head", rounds["confirm-head"][0]]),
+                ("--flag-threshold without --flagged",
+                 ["--paired", "--base", rounds["base"][0],
+                  "--head", rounds["head"][0], "--flag-threshold", "0"]),
+                ("a --flag-threshold that is no fraction",
+                 ["--paired", "--base", rounds["base"][0],
+                  "--head", rounds["head"][0], "--flagged", str(flagged),
+                  "--flag-threshold", "x"])):
             bad = subprocess.run([sys.executable, compare_py, *argv],
                                  capture_output=True, text=True, check=False)
             if bad.returncode != 2 or "Traceback" in bad.stderr:
                 failures.append(f"bench-compare took {label}")
+        # Without --paired, the static mode would also exit 2, on its missing
+        # results file, so only the message shows the refusal.
+        for argv in (["--base", rounds["base"][0],
+                      "--head", rounds["head"][0]],
+                     ["--confirm-base", rounds["confirm-base"][0],
+                      "--confirm-head", rounds["confirm-head"][0]],
+                     ["--flagged", str(flagged)],
+                     ["--flag-threshold", "0"],
+                     ["--confirm-missing", "failed"]):
+            bad = subprocess.run([sys.executable, compare_py, *argv],
+                                 capture_output=True, text=True, check=False)
+            if bad.returncode != 2 or "require --paired" not in bad.stderr:
+                failures.append(f"bench-compare took {argv[0]} without "
+                                "--paired")
         text, _ = render_paired(
             {"a.b": ([10.0] * 6, [10.0] * 6),
              "a.c": ([None] * 6, [None] * 6)},
@@ -886,9 +1364,10 @@ def main() -> int:
                         f"BENCH_REGRESSION_THRESHOLD {exc}") from exc
             metrics = load_paired_report(
                 document, expected_environment=args.environment)
-            comment, listed = render_paired(metrics,
-                                            threshold=args.threshold,
-                                            environment=args.environment)
+            comment, listed = render_paired(
+                metrics, confirm=load_confirm(document, metrics),
+                missing=load_confirm_missing(document),
+                threshold=args.threshold, environment=args.environment)
         else:
             if args.threshold is None:
                 args.threshold = compare.DEFAULT_THRESHOLD

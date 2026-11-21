@@ -668,20 +668,25 @@ static int linux_timespec_is_valid(const linux_timespec_t *lts)
  * and macOS has no CLOCK_MONOTONIC condattr), so the wait lasts as long as the
  * guest asked. Minor wall-clock skew is accepted. lts->tv_sec is bounded by
  * FUTEX_TIMESPEC_SEC_MAX (linux_timespec_is_valid), so the subtraction and
- * addition stay inside int64_t / time_t range.
+ * addition stay inside int64_t / time_t range. A deadline already in the past
+ * can land before the epoch; it is clamped to {0, 0} so every absolute deadline
+ * keeps 0 <= tv_sec, as futex_remaining_ns and futex_quantum_deadline expect.
  */
 static void futex_mono_to_realtime(const linux_timespec_t *lts,
                                    struct timespec *out)
 {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    struct timespec mono;
+    struct timespec now, mono;
+    clock_gettime(CLOCK_REALTIME, &now);
     clock_gettime(CLOCK_MONOTONIC, &mono);
     int64_t delta_sec = lts->tv_sec - mono.tv_sec;
     long delta_nsec = (long) lts->tv_nsec - mono.tv_nsec;
     out->tv_sec = now.tv_sec + delta_sec;
-    out->tv_nsec = (long) now.tv_usec * 1000 + delta_nsec;
+    out->tv_nsec = now.tv_nsec + delta_nsec;
     timespec_normalize(out);
+    if (out->tv_sec < 0) {
+        out->tv_sec = 0;
+        out->tv_nsec = 0;
+    }
 }
 
 /* Convert a Linux guest timespec to an absolute CLOCK_REALTIME deadline. For

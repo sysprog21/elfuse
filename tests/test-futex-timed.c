@@ -54,6 +54,7 @@ static void expect_full_wait(int op, clockid_t clock)
     int word = 0;
     struct timespec deadline, t0, t1;
 
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     clock_gettime(clock, &deadline);
     deadline.tv_nsec += 100 * 1000000L;
     if (deadline.tv_nsec >= 1000000000L) {
@@ -61,16 +62,15 @@ static void expect_full_wait(int op, clockid_t clock)
         deadline.tv_nsec -= 1000000000L;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     long r = wait_to(&word, 0, op, &deadline);
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
     long elapsed_ms =
         (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
-    if (r == -ETIMEDOUT && elapsed_ms >= 50 && elapsed_ms <= 2000) {
+    if (r == -ETIMEDOUT && elapsed_ms >= 95 && elapsed_ms <= 2000) {
         PASS();
     } else {
-        printf("FAIL: r=%ld elapsed=%ldms (expected %d, 50<=elapsed<=2000)\n",
+        printf("FAIL: r=%ld elapsed=%ldms (expected %d, 95<=elapsed<=2000)\n",
                r, elapsed_ms, -ETIMEDOUT);
         fails++;
     }

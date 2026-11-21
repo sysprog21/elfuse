@@ -18,6 +18,20 @@
 # head-oci.json, a Tier-3-only run of the head build at the suite's default
 # sample count that the comparison does not read.
 #
+# A metric that reads slower or faster at BENCH_FLAG_THRESHOLD (listed in
+# OUTDIR/flagged) is measured again in a second set of BENCH_PAIRS pairs of only
+# those metrics, confirm-base-N.json and confirm-head-N.json, and report.json is
+# written again with that set, which a slower or faster verdict has to agree
+# with. The second set is best effort: when a round of it or its comparison
+# fails, or it stops before its first pair, report.json records that instead
+# (confirm_missing), and the script goes on to Tier 3. A set cut after some
+# pairs is written with those, and below 6 pairs it confirms no verdict. No pair
+# of the second set is started that would end at or past BENCH_CONFIRM_DEADLINE
+# seconds after the start: pair 1 taking as long as the last pair of the first
+# set, which ran every metric, and a later pair with the pairs after it, each as
+# long as the last one. A pair of the second set is measured again as below,
+# against BENCH_CONFIRM_DEADLINE.
+#
 # Around each round, BENCH_CALIB times a fixed single-threaded host loop. When
 # the four readings of a pair spread by more than BENCH_CALIB_SPREAD, the host
 # ran the two rounds at different speeds (a P-core slows down once three or more
@@ -40,11 +54,20 @@
 #   BENCH_CALIB       calibration loop (default build/bench-calib)
 #   BENCH_CALIB_SPREAD  largest (max - min) / min of a pair's four readings
 #                     (default 0.06, half the 12% step seen on the CI M4)
-#   BENCH_RERUN_DEADLINE  seconds after the start by which the last pair is
-#                     expected to end; no rerun is made that would reach it
-#                     (default 900)
+#   BENCH_RERUN_DEADLINE  seconds after the start by which the last pair of
+#                     the first set is expected to end; no rerun is made that
+#                     would reach it (default 900)
 #   BENCH_CALIB_GAP   seconds between the two calls of BENCH_CALIB that make
 #                     one reading (default 1)
+#   BENCH_CONFIRM_DEADLINE  seconds after the start by which the second set is
+#                     expected to end (default 1080, so Tier 3 still fits in
+#                     the 25 minute measurement step of benchmark.yml)
+#   BENCH_FLAG_THRESHOLD  threshold at which a metric is measured again: a
+#                     fraction in digits such as 0.05 (default 0, every
+#                     verdict any threshold gives), none for no second set,
+#                     or report for the threshold of the verdicts, which
+#                     bench-compare.py reads from BENCH_REGRESSION_THRESHOLD
+#                     and which flags no metric while that is unset
 #   BENCH_REGRESSION_THRESHOLD, and the bench-suite.sh variables
 #   (BENCH_BIN_DIR, BENCH_STRICT, ELFUSE_OCI_STORE, ...), pass through.
 #
@@ -83,20 +106,27 @@ if [ "${#PAIRS}" -gt 2 ] || ((PAIRS < 6 || PAIRS > 32)); then
 fi
 CALIB="${BENCH_CALIB:-$ROOT/build/bench-calib}"
 SPREAD="${BENCH_CALIB_SPREAD:-0.06}"
-DEADLINE="${BENCH_RERUN_DEADLINE:-900}"
-case "$DEADLINE" in
-    '' | *[!0-9]*)
-        echo "bench-paired: BENCH_RERUN_DEADLINE must be a number" >&2
+
+# seconds NAME VALUE: print VALUE, a whole number of seconds, or exit 2. As for
+# BENCH_PAIRS: no octal, and no value long enough to wrap.
+seconds()
+{
+    case "$2" in
+        '' | *[!0-9]*)
+            echo "bench-paired: $1 must be a number" >&2
+            exit 2
+            ;;
+    esac
+    local value="${2#"${2%%[!0]*}"}"
+    [ "${#value}" -le 6 ] || {
+        echo "bench-paired: $1 must be at most 999999" >&2
         exit 2
-        ;;
-esac
-# As for BENCH_PAIRS: no octal, and no value long enough to wrap.
-DEADLINE="${DEADLINE#"${DEADLINE%%[!0]*}"}"
-DEADLINE="${DEADLINE:-0}"
-[ "${#DEADLINE}" -le 6 ] || {
-    echo "bench-paired: BENCH_RERUN_DEADLINE must be at most 999999" >&2
-    exit 2
+    }
+    echo "${value:-0}"
 }
+DEADLINE="$(seconds BENCH_RERUN_DEADLINE "${BENCH_RERUN_DEADLINE:-900}")"
+CONFIRM_DEADLINE="$(seconds BENCH_CONFIRM_DEADLINE \
+    "${BENCH_CONFIRM_DEADLINE:-1080}")"
 GAP="${BENCH_CALIB_GAP:-1}"
 case "$GAP" in
     '' | *[!0-9]*)
@@ -106,6 +136,11 @@ case "$GAP" in
 esac
 [[ "$SPREAD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
     echo "bench-paired: BENCH_CALIB_SPREAD must be a number" >&2
+    exit 2
+}
+FLAG_THRESHOLD="${BENCH_FLAG_THRESHOLD:-0}"
+[[ "$FLAG_THRESHOLD" =~ ^(none|report|[0-9]+(\.[0-9]+)?)$ ]] || {
+    echo "bench-paired: BENCH_FLAG_THRESHOLD must be a number, none or report" >&2
     exit 2
 }
 for bin in "$BASE" "$HEAD" "$CALIB"; do
@@ -121,7 +156,10 @@ if [ -n "$STAGE" ] && [ ! -f "$(sed -n 2p "$STAGE" 2> /dev/null)" ]; then
 fi
 mkdir -p "$OUT"
 # Rounds from an earlier run in OUTDIR must not join this comparison.
-rm -f "$OUT"/base-*.json "$OUT"/head-*.json "$OUT/report.json"
+rm -f "$OUT"/base-*.json "$OUT"/head-*.json "$OUT"/confirm-*.json \
+    "$OUT/report.json" "$OUT/flagged"
+# The metrics each round runs; the second set narrows them.
+METRICS="${BENCH_METRICS:-}"
 
 IMG=""
 MNT=""
@@ -169,7 +207,8 @@ round()
     local before after
     before="$(calib)"
     ELFUSE="$bin" BENCH_SYSROOT="$MNT/rootfs" BENCH_ITERATIONS=1 \
-        BENCH_WARMUP=0 BENCH_OCI=0 bash "$SUITE" -o "$out"
+        BENCH_WARMUP=0 BENCH_OCI=0 BENCH_METRICS="$METRICS" bash "$SUITE" \
+        -o "$out"
     after="$(calib)"
     detach_mnt
     rm -f "$IMG.shadow"
@@ -213,58 +252,112 @@ with open(path, "w", encoding="utf-8") as f:
 PY
 }
 
-# One pair: odd pairs run base first and even pairs head first.
+# One pair into OUT/PREFIXbase-N.json and OUT/PREFIXhead-N.json: odd pairs run
+# base first and even pairs head first.
 pair()
 {
-    local i="$1"
+    local i="$1" prefix="$2"
     if ((i % 2)); then
-        round base "$BASE" "$OUT/base-$i.json"
-        round head "$HEAD" "$OUT/head-$i.json"
+        round base "$BASE" "$OUT/${prefix}base-$i.json"
+        round head "$HEAD" "$OUT/${prefix}head-$i.json"
     else
-        round head "$HEAD" "$OUT/head-$i.json"
-        round base "$BASE" "$OUT/base-$i.json"
+        round head "$HEAD" "$OUT/${prefix}head-$i.json"
+        round base "$BASE" "$OUT/${prefix}base-$i.json"
     fi
+}
+
+# measure_set PREFIX DEADLINE [FIRST]: up to PAIRS pairs, listed in bases and
+# heads; PAIR_SECS is left at the length of the last pair. A pair is measured
+# again as the header says while that ends before DEADLINE. With FIRST given, a
+# pair 1 that would end at or past DEADLINE, taking FIRST seconds, is not
+# started, nor a later pair that would, with the pairs after it, each as long as
+# the last one, and the set ends there.
+measure_set()
+{
+    local prefix="$1" deadline="$2" first="${3:-}"
+    local i reruns unsteady start took=0 spread
+    bases=()
+    heads=()
+    for ((i = 1; i <= PAIRS; i++)); do
+        if [ -n "$first" ] &&
+            ((SECONDS + (i == 1 ? first : took * (PAIRS - i + 1)) >= deadline)); then
+            echo "bench-paired: second set stopped before pair $i, which would end at or past the $deadline s deadline" >&2
+            break
+        fi
+        reruns=0
+        unsteady=0
+        while :; do
+            start=$SECONDS
+            pair "$i" "$prefix"
+            took=$((SECONDS - start))
+            # shellcheck disable=SC2086 # each CAL_ holds two numbers
+            spread="$(printf '%s\n' $CAL_base $CAL_head | awk '
+                NR == 1 || $1 < lo { lo = $1 }
+                NR == 1 || $1 > hi { hi = $1 }
+                END { printf "%.4f", (hi - lo) / lo }')"
+            echo "bench-paired: pair $i calibration base $CAL_base, head $CAL_head us, spread $spread"
+            awk -v s="$spread" -v m="$SPREAD" 'BEGIN { exit !(s > m) }' || break
+
+            # The rerun and the PAIRS - i pairs after it, each as long as this
+            # one.
+            if ((SECONDS + took * (PAIRS - i + 1) >= deadline)); then
+                echo "bench-paired: pair $i kept unsteady, a rerun would end at or past the $deadline s deadline" >&2
+                unsteady=1
+                break
+            fi
+            reruns=$((reruns + 1))
+            echo "bench-paired: measuring pair $i again (rerun $reruns)"
+        done
+        # shellcheck disable=SC2086 # each CAL_ holds two numbers
+        annotate "$OUT/${prefix}base-$i.json" $CAL_base "$reruns" "$unsteady"
+        # shellcheck disable=SC2086
+        annotate "$OUT/${prefix}head-$i.json" $CAL_head "$reruns" "$unsteady"
+        bases+=("$OUT/${prefix}base-$i.json")
+        heads+=("$OUT/${prefix}head-$i.json")
+    done
+    PAIR_SECS=$took
 }
 
 round base "$BASE" "$OUT/discard-base.json"
 round head "$HEAD" "$OUT/discard-head.json"
-bases=()
-heads=()
-for ((i = 1; i <= PAIRS; i++)); do
-    reruns=0
-    unsteady=0
-    while :; do
-        start=$SECONDS
-        pair "$i"
-        took=$((SECONDS - start))
-        # shellcheck disable=SC2086 # each CAL_ holds two numbers
-        spread="$(printf '%s\n' $CAL_base $CAL_head | awk '
-            NR == 1 || $1 < lo { lo = $1 }
-            NR == 1 || $1 > hi { hi = $1 }
-            END { printf "%.4f", (hi - lo) / lo }')"
-        echo "bench-paired: pair $i calibration base $CAL_base, head $CAL_head us, spread $spread"
-        awk -v s="$spread" -v m="$SPREAD" 'BEGIN { exit !(s > m) }' || break
-        # The rerun and the PAIRS - i pairs after it, each as long as this one.
-        if ((SECONDS + took * (PAIRS - i + 1) >= DEADLINE)); then
-            echo "bench-paired: pair $i kept unsteady, a rerun would end at or past the $DEADLINE s deadline" >&2
-            unsteady=1
-            break
-        fi
-        reruns=$((reruns + 1))
-        echo "bench-paired: measuring pair $i again (rerun $reruns)"
-    done
-    # shellcheck disable=SC2086 # each CAL_ holds two numbers
-    annotate "$OUT/base-$i.json" $CAL_base "$reruns" "$unsteady"
-    # shellcheck disable=SC2086
-    annotate "$OUT/head-$i.json" $CAL_head "$reruns" "$unsteady"
-    bases+=("$OUT/base-$i.json")
-    heads+=("$OUT/head-$i.json")
-done
+measure_set "" "$DEADLINE"
 rm -f "$OUT"/discard-*.json
 
-# The comparison comes first, so a failed or timed-out Tier 3 cannot cost it.
-python3 "$ROOT/scripts/bench-compare.py" --paired --base "${bases[@]}" \
-    --head "${heads[@]}" --report-json "$OUT/report.json"
+# The comparison comes first, so a failed or timed-out second set or Tier 3
+# cannot cost it. Every later call takes the same flag threshold, because the
+# second set holds the metrics it flags.
+COMPARE=(python3 "$ROOT/scripts/bench-compare.py" --paired --base "${bases[@]}"
+    --head "${heads[@]}" --flagged "$OUT/flagged"
+    --flag-threshold "$FLAG_THRESHOLD")
+"${COMPARE[@]}" --report-json "$OUT/report.json"
+
+METRICS="$(paste -s -d ' ' - < "$OUT/flagged")"
+if [ -n "$METRICS" ]; then
+    echo "bench-paired: measuring $METRICS again"
+
+    # A subshell run as its own command keeps set -e inside it; after || or in
+    # an if, set -e would be off there, and a failed round would go on. It
+    # detaches its own mount, which the EXIT trap of this shell cannot see.
+    set +e
+    (
+        set -e
+        trap 'detach_mnt || true; rm -f "$IMG.shadow"' EXIT
+        measure_set confirm- "$CONFIRM_DEADLINE" "$PAIR_SECS"
+        if [ "${#bases[@]}" -gt 0 ]; then
+            "${COMPARE[@]}" --confirm-base "${bases[@]}" \
+                --confirm-head "${heads[@]}" --report-json "$OUT/report.json"
+        else
+            "${COMPARE[@]}" --confirm-missing "out of time" \
+                --report-json "$OUT/report.json"
+        fi
+    )
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        echo "bench-paired: the second set failed (exit $rc); report.json records it" >&2
+        "${COMPARE[@]}" --confirm-missing failed --report-json "$OUT/report.json"
+    fi
+fi
 
 if [ "${BENCH_PAIRED_OCI:-0}" = "1" ]; then
     ELFUSE="$HEAD" BENCH_LMBENCH=0 BENCH_APPS=0 BENCH_OCI=1 bash "$SUITE" \

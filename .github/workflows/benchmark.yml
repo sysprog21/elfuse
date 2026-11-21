@@ -79,6 +79,7 @@ jobs:
       pr: ${{ steps.pick.outputs.pr }}
       pr_head: ${{ steps.pick.outputs.pr_head }}
       pr_time: ${{ steps.pick.outputs.pr_time }}
+      flag_threshold: ${{ steps.pick.outputs.flag_threshold }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -165,7 +166,17 @@ jobs:
               esac
             done <<< "$files"
           fi
-          echo "base $base, head $head, aa $aa, pr ${pr:-none}, run $run"
+          # A pull_request run from a fork may not see the threshold, and an
+          # A/A run keeps its second set as threshold data, so those measure
+          # again every metric any threshold would judge. The others flag at
+          # report, the threshold the verdicts use, which bench-compare.py
+          # reads from BENCH_REGRESSION_THRESHOLD; bench-paired.sh checks a
+          # copied number more strictly and would refuse .05.
+          case "$EVENT/$aa" in
+            pull_request/* | */true) flag_threshold=0 ;;
+            *) flag_threshold=report ;;
+          esac
+          echo "base $base, head $head, aa $aa, pr ${pr:-none}, run $run, flag threshold $flag_threshold"
           {
             echo "run=$run"
             echo "base=$base"
@@ -174,6 +185,7 @@ jobs:
             echo "pr=$pr"
             echo "pr_head=$pr_head"
             echo "pr_time=$pr_time"
+            echo "flag_threshold=$flag_threshold"
           } >> "$GITHUB_OUTPUT"
 
   bench:
@@ -314,6 +326,7 @@ jobs:
           BENCH_PAIRED_OCI: ${{ env.TIER3 }}
           BENCH_PAIRED_STAGE: ${{ runner.temp }}/bench-stage
           BENCH_REGRESSION_THRESHOLD: ${{ vars.BENCH_REGRESSION_THRESHOLD }}
+          BENCH_FLAG_THRESHOLD: ${{ needs.scope.outputs.flag_threshold }}
         run: |
           ELFUSE_OCI_STORE="$HOME/.cache/elfuse-ci/oci-bench-$RUNNER_NAME" \
             scripts/bench-paired.sh "$RUNNER_TEMP/bench-bin/base-elfuse" \

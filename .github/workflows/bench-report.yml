@@ -19,9 +19,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # One report job at a time per branch, so two runs for one pull request
-    # (marked ready twice) cannot both find no comment and both create one.
+    # (marked ready twice) cannot both find no comment and both create one. A
+    # run whose jobs were all skipped changes no comment and gets a group of its
+    # own, since a third job queued in a group replaces the pending one.
     concurrency:
-      group: bench-report-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      group: >-
+        bench-report-${{ github.event.workflow_run.conclusion == 'skipped'
+        && format('skipped-{0}', github.run_id)
+        || format('{0}-{1}', github.event.workflow_run.head_repository.full_name,
+        github.event.workflow_run.head_branch) }}
       cancel-in-progress: false
     steps:
       - name: Find benchmark report artifact
@@ -82,15 +88,17 @@ jobs:
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
       # Runs on a clean report too: a pull request marked ready again after a
-      # return to draft is measured again, and an earlier comment listing
-      # changes has to be rewritten when that run finds none. For the same
-      # reason a failed run with no report rewrites an earlier comment to say
-      # that commit was not measured.
+      # return to draft or given the bench label is measured again, and an
+      # earlier comment listing changes has to be rewritten when that run finds
+      # none. For the same reason a failed run with no report rewrites an
+      # earlier comment to say that commit was not measured. A run whose jobs
+      # were all skipped (a draft, or a label other than bench) is not one.
       - name: Create or update benchmark comment
         if: >-
           ${{ steps.render.outcome == 'success' ||
           (steps.artifact.outputs.found == 'false' &&
-          github.event.workflow_run.conclusion != 'success') }}
+          github.event.workflow_run.conclusion != 'success' &&
+          github.event.workflow_run.conclusion != 'skipped') }}
         uses: actions/github-script@v9
         env:
           COMMENT_PATH: ${{ runner.temp }}/bench-comment.md
@@ -117,9 +125,9 @@ jobs:
             }
 
             // workflow_run.pull_requests is empty for fork runs in this repo.
-            // Resolve the PR from trusted workflow-run identity fields. A pull
-            // request is measured once, so a run whose head has moved on still
-            // reports, naming the commit it measured.
+            // Resolve the PR from trusted workflow-run identity fields. A run
+            // whose head has moved on still reports, naming the commit it
+            // measured, because a push to a pull request starts no run.
             const candidates = await github.paginate(
               github.rest.pulls.list,
               {
@@ -154,13 +162,47 @@ jobs:
             const text = found
               ? fs.readFileSync(process.env.COMMENT_PATH, 'utf8').trim()
               : 'The benchmark did not complete at this commit, so it has no measurements.';
-            // Neither a clean report nor a missing one is worth a new comment.
-            const quiet = !found || process.env.REPORT_STATUS === 'clean';
+            // Neither a clean report nor a missing one is worth a new comment,
+            // unless the bench label asked for this run. The workflow_run
+            // payload does not say which action (labeled, opened or
+            // ready_for_review) started it, so a run is asked for while the
+            // label is on, when it was created at or after the label was last
+            // added. A run created before, such as an opened run still
+            // measuring then, reports ahead of the run the label started. The
+            // label is taken off below, so it asks for one run.
+            let asked = (pull.labels || []).some(label => label.name === 'bench');
+            if (asked) {
+              const events = await github.paginate(
+                github.rest.issues.listEvents,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullNumber,
+                  per_page: 100,
+                }
+              );
+              const added = events
+                .filter(event => event.event === 'labeled' &&
+                  event.label && event.label.name === 'bench')
+                .map(event => Date.parse(event.created_at));
+              asked = added.length === 0 ||
+                Date.parse(run.created_at) >= Math.max(...added);
+            }
+            const quiet = !asked &&
+              (!found || process.env.REPORT_STATUS === 'clean');
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${run.id}`;
             // The pull_request run measured the merge ref of its event, which
             // is when the run was created.
             const refTime = run.created_at;
-            const body = `${marker}\n<!-- elfuse-benchmark-ref-time: ${refTime} -->\n${text}\n\n[Workflow run](${runUrl}) · commit \`${runHead.slice(0, 12)}\`${moved}\n`;
+            // Only a cancelled run without a report leaves out the ref time,
+            // so its comment keeps out no report: a run replaced while
+            // pending (the bench label taken off and added again) is
+            // cancelled before the run ahead of it reports. A failed run's
+            // comment keeps it, so the report of an earlier merge ref cannot
+            // replace that failure.
+            const stamp = found || run.conclusion !== 'cancelled'
+              ? `<!-- elfuse-benchmark-ref-time: ${refTime} -->\n` : '';
+            const body = `${marker}\n${stamp}${text}\n\n[Workflow run](${runUrl}) · commit \`${runHead.slice(0, 12)}\`${moved}\n`;
             const comments = await github.paginate(
               github.rest.issues.listComments,
               {
@@ -178,15 +220,14 @@ jobs:
             if (quiet && !previous) {
               return;
             }
-            // A maintainer's pr dispatch may have reported a later merge ref
-            // before this run finished; its report stays.
+            // A maintainer's pr dispatch or a later bench label run may have
+            // reported a later merge ref before this run finished; its report
+            // stays.
             const prevTime = previous &&
               (previous.body.match(/<!-- elfuse-benchmark-ref-time: (\S+) -->/) || [])[1];
             if (prevTime && prevTime > refTime) {
               core.notice(`Comment ${previous.id} reports a merge ref from ${prevTime}`);
-              return;
-            }
-            if (previous) {
+            } else if (previous) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -200,4 +241,23 @@ jobs:
                 issue_number: pullNumber,
                 body,
               });
+            }
+            // Taking the label off makes it ask for one run, since labeled
+            // fires only when it is added. It comes off when a later merge
+            // ref's report stays too: that merge ref was taken after this run
+            // was created, so after the label was added, and its report
+            // answers the label. A label already taken off by hand is a 404.
+            if (asked) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullNumber,
+                  name: 'bench',
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
             }

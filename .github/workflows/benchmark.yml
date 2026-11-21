@@ -2,9 +2,10 @@
 # rounds on the self-hosted host by scripts/bench-paired.sh.
 #
 #   pull_request  once, when a pull request is opened as ready for review or
-#                 a draft is marked ready: the merge ref against its first
-#                 parent, Tier 1 and Tier 2. bench-report.yml posts the
-#                 comment, because a fork's token here cannot.
+#                 a draft is marked ready, and again each time the bench label
+#                 is added to an open one, draft or not: the merge ref against
+#                 its first parent, Tier 1 and Tier 2. bench-report.yml posts
+#                 the comment, because a fork's token here cannot.
 #   push to main  the pushed commit against github.event.before, Tier 1 and
 #                 Tier 2, then Tier 3 on the head build; the comment goes on
 #                 the merged pull request.
@@ -13,9 +14,14 @@
 #                 request's current merge ref against its first parent, after
 #                 which the run updates that pull request's comment, so a
 #                 maintainer can refresh it after a push.
+#   schedule      nightly, the main tip on both sides (A/A), the data the
+#                 thresholds are set from; weekly, the main tip against the main
+#                 of 4 weeks earlier, which shows a drift that each merge stays
+#                 under. Tier 1 and Tier 2, no comment; the artifacts are kept
+#                 90 days.
 #
-# A pull_request or push run is skipped unless the change touches a path the
-# scope job lists.
+# A push run, and a pull_request run other than a bench label one, is skipped
+# unless the change touches a path the scope job lists.
 #
 # Neither run is a required check, so a merge never waits for one. The
 # threshold is the repository variable BENCH_REGRESSION_THRESHOLD; while it is
@@ -28,9 +34,13 @@ name: Benchmark
 on:
   pull_request:
     branches: [main]
-    types: [opened, ready_for_review]
+    types: [opened, ready_for_review, labeled]
   push:
     branches: [main]
+  # The scope job tells the two apart by these cron lines.
+  schedule:
+    - cron: '17 18 * * *'
+    - cron: '47 18 * * 0'
   workflow_dispatch:
     inputs:
       pr:
@@ -52,12 +62,15 @@ on:
         default: false
 
 # One group per measured commit and never cancelled, so two quick merges both
-# get measured: they queue on the host lock instead of replacing each other.
+# get measured: they queue on the host lock instead of replacing each other. A
+# run for another label measures nothing and gets a group of its own, since a
+# third run queued in a group replaces the pending one.
 concurrency:
   group: >-
     benchmark-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch'
     && format('{0}-{1}-{2}-{3}', inputs.pr, inputs.base, inputs.head, inputs.aa)
-    || github.sha }}
+    || github.event.action == 'labeled' && github.event.label.name != 'bench'
+    && format('label-{0}', github.run_id) || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -68,7 +81,10 @@ jobs:
     name: Decide what to measure
     if: >-
       github.repository == 'sysprog21/elfuse' &&
-      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+      (github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'bench' &&
+      github.event.pull_request.state == 'open') ||
+      (github.event.action != 'labeled' && !github.event.pull_request.draft))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -91,8 +107,10 @@ jobs:
         id: pick
         env:
           EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
           SHA: ${{ github.sha }}
           BEFORE: ${{ github.event.before }}
+          SCHEDULE: ${{ github.event.schedule }}
           IN_PR: ${{ inputs.pr }}
           IN_HEAD: ${{ inputs.head }}
           IN_BASE: ${{ inputs.base }}
@@ -116,6 +134,24 @@ jobs:
               base="$BEFORE"
               # After a force push, before names a commit the clone lacks.
               git cat-file -e "$base^{commit}" 2> /dev/null || base=""
+              ;;
+            schedule)
+              head="$SHA"
+              case "$SCHEDULE" in
+                '17 18 * * *')
+                  aa=true
+                  base="$SHA"
+                  ;;
+                '47 18 * * 0')
+                  # --first-parent leaves out the commits of a branch
+                  # merged later.
+                  base="$(git rev-list -1 --first-parent --before='4 weeks ago' "$SHA")"
+                  ;;
+                *)
+                  echo "::error::unexpected schedule $SCHEDULE"
+                  exit 1
+                  ;;
+              esac
               ;;
             workflow_dispatch)
               if [ -n "$IN_PR" ]; then
@@ -145,12 +181,19 @@ jobs:
               exit 1
               ;;
           esac
+          # Only a change that can move a benchmark is measured; the bench
+          # label asks for a run whatever the change touches.
+          filter=false
+          case "$EVENT/$ACTION" in
+            push/* | pull_request/opened | pull_request/ready_for_review)
+              filter=true
+              ;;
+          esac
           run=true
           if ! is_sha "$base" || [ "$base" = 0000000000000000000000000000000000000000 ]; then
             echo "No base commit to compare against"
             run=false
-          elif [ "$EVENT" != workflow_dispatch ]; then
-            # Only a change that can move a benchmark is measured.
+          elif [ "$filter" = true ]; then
             run=false
             # A failed diff inside a process substitution would escape set -e
             # and read as no change, so the list is taken first.
@@ -168,12 +211,14 @@ jobs:
           fi
           # A pull_request run from a fork may not see the threshold, and an
           # A/A run keeps its second set as threshold data, so those measure
-          # again every metric any threshold would judge. The others flag at
-          # report, the threshold the verdicts use, which bench-compare.py
-          # reads from BENCH_REGRESSION_THRESHOLD; bench-paired.sh checks a
-          # copied number more strictly and would refuse .05.
+          # again every metric any threshold would judge, and so does the
+          # weekly run, so that its report, kept 90 days, can be judged at a
+          # threshold set later. The others flag at report, the threshold the
+          # verdicts use, which bench-compare.py reads from
+          # BENCH_REGRESSION_THRESHOLD; bench-paired.sh checks a copied
+          # number more strictly and would refuse .05.
           case "$EVENT/$aa" in
-            pull_request/* | */true) flag_threshold=0 ;;
+            pull_request/* | schedule/* | */true) flag_threshold=0 ;;
             *) flag_threshold=report ;;
           esac
           echo "base $base, head $head, aa $aa, pr ${pr:-none}, run $run, flag threshold $flag_threshold"
@@ -353,7 +398,7 @@ jobs:
         with:
           name: bench-pr-report
           path: build/bench-pr-report.json
-          retention-days: 14
+          retention-days: ${{ github.event_name == 'schedule' && 90 || 14 }}
           if-no-files-found: ignore
 
       - name: Upload benchmark rounds
@@ -362,7 +407,7 @@ jobs:
         with:
           name: bench-rounds
           path: build/bench-paired/*.json
-          retention-days: 14
+          retention-days: ${{ github.event_name == 'schedule' && 90 || 14 }}
           if-no-files-found: warn
 
       - name: Remove staged sysroot

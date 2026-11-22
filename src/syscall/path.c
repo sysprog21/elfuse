@@ -604,7 +604,7 @@ static void path_fold_components(const char *path, char *out)
  * leave in @name the guest name that results. As on Linux, the '..' fails
  * unless @name is a directory the guest's IDs and groups may search, and a
  * symbolic link is followed first: its target takes its place, with the '..'
- * and the rest after it. @links counts the links this function follows across
+ * and the rest after it. @walk records the links this function follows across
  * the calls for one guest path, up to MAXSYMLINKS.
  *
  * Returns 0, or -1 with errno set.
@@ -612,7 +612,7 @@ static void path_fold_components(const char *path, char *out)
 static int path_backing_dotdot(char *name,
                                size_t namesz,
                                const char *dotdot,
-                               unsigned *links)
+                               path_walk_t *walk)
 {
     char host[LINUX_PATH_MAX], next[LINUX_PATH_MAX];
     struct stat st;
@@ -637,7 +637,7 @@ static int path_backing_dotdot(char *name,
     size_t parent_len = (size_t) (strrchr(name, '/') - name);
     if (S_ISLNK(st.st_mode)) {
         char target[LINUX_PATH_MAX];
-        if (++*links > MAXSYMLINKS) {
+        if (++walk->links > MAXSYMLINKS) {
             errno = ELOOP;
             return -1;
         }
@@ -645,6 +645,8 @@ static int path_backing_dotdot(char *name,
         if (n < 0)
             return -1;
         target[n] = '\0';
+        if (target[0] != '/')
+            walk->relative = true;
         if (path_splice_link_target(name, parent_len + 1, target, dotdot, next,
                                     sizeof(next)) < 0)
             return -1;
@@ -684,13 +686,12 @@ static int path_backing_dotdot(char *name,
  * device number. A '..' after a /dev/bus name outside /dev/bus/usb is the
  * backing's to apply. What follows can climb out again, as in
  * /dev/bus/../bus/../null; each pass applies a '..' or follows a link, and
- * MAXSYMLINKS bounds the links.
+ * @walk records the links followed, up to MAXSYMLINKS.
  *
  * Returns 0, or -1 with errno set.
  */
-static int path_rewrite_dev_climb(path_translation_t *tx)
+static int path_rewrite_dev_climb(path_translation_t *tx, path_walk_t *walk)
 {
-    unsigned links = 0;
     while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
         char resolved[LINUX_PATH_MAX];
         const char *dotdot = NULL;
@@ -701,8 +702,8 @@ static int path_rewrite_dev_climb(path_translation_t *tx)
         case DEV_CLIMB_NONE:
             return 0;
         case DEV_CLIMB_BACKING_DOTDOT:
-            if (path_backing_dotdot(resolved, sizeof(resolved), dotdot,
-                                    &links) < 0)
+            if (path_backing_dotdot(resolved, sizeof(resolved), dotdot, walk) <
+                0)
                 return -1;
             break;
         case DEV_CLIMB_REWRITTEN:
@@ -717,13 +718,14 @@ static int path_rewrite_dev_climb(path_translation_t *tx)
 
 /* Rewrite a /dev/bus or /sys/bus/usb path into the canonical guest spelling of
  * where it lands, in tx->guest_buf, before anything decides whose name it is.
- * The /dev/bus climb runs first because a climb can land in /sys.
+ * The /dev/bus climb runs first because a climb can land in /sys, and records
+ * in @walk the links it follows.
  *
  * Returns 0, or -1 with errno set.
  */
-static int path_rewrite_usb_aliases(path_translation_t *tx)
+static int path_rewrite_usb_aliases(path_translation_t *tx, path_walk_t *walk)
 {
-    if (path_rewrite_dev_climb(tx) < 0)
+    if (path_rewrite_dev_climb(tx, walk) < 0)
         return -1;
 
     /* A /sys walk that passes through one of the synthetic USB `subsystem`
@@ -839,7 +841,11 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    if (path_rewrite_usb_aliases(tx) < 0)
+    /* The links the rewrite follows are part of the walk the sysroot resolvers
+     * below go on with.
+     */
+    path_walk_t walk = {0};
+    if (path_rewrite_usb_aliases(tx, &walk) < 0)
         return -1;
 
     /* /dev/shm/<leaf> maps into the per-UID host backing dir, through the same
@@ -925,13 +931,13 @@ int path_translate_at(guest_fd_t dirfd,
     if (lookup_flags & PATH_TR_CREATE) {
         tx->host_path = path_resolve_sysroot_create_path(
             tx->guest_path, tx->host_buf, sizeof(tx->host_buf),
-            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0, NULL);
+            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0, &walk);
     } else if (lookup_flags & PATH_TR_NOFOLLOW) {
         tx->host_path = path_resolve_sysroot_nofollow_path(
-            tx->guest_path, tx->host_buf, sizeof(tx->host_buf), NULL);
+            tx->guest_path, tx->host_buf, sizeof(tx->host_buf), &walk);
     } else {
         tx->host_path = path_resolve_sysroot_path(tx->guest_path, tx->host_buf,
-                                                  sizeof(tx->host_buf), NULL);
+                                                  sizeof(tx->host_buf), &walk);
     }
 
     /* The resolvers above key off guest_path[0] == '/': a relative path is

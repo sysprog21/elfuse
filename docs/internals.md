@@ -1721,6 +1721,12 @@ not root. A relative name is folded only through `/dev/bus` and `/dev/bus/usb`,
 so `099/../001/001` from a `/dev/bus/usb` cwd and `other/f/../../../null` from a
 `/dev/bus` cwd go through the same steps.
 
+The links the path layer follows before a `..` go on to the sysroot resolver
+with the name they lead to, so they count toward one `MAXSYMLINKS` with the
+links it follows after them, and one with a relative target keeps a host
+fallback for that name refused, as after a relative link the resolver follows
+itself.
+
 A name that enters `/dev/bus` through a `..` from outside it is not checked this
 way: `/etc/../dev/bus/usb/099/001` reaches a `dev/bus/usb/099/001` the sysroot
 plants, where Linux answers `ENOENT`. Only the name right before a `..` has its
@@ -1728,15 +1734,12 @@ link followed in the guest namespace: a link earlier in a `/dev/bus` name is
 followed in the sysroot alone, which does not hold the layer's `/dev/bus/usb`,
 so with a sysroot link from `/dev/bus/link` to `usb`,
 `/dev/bus/link/001/../001/001` and `/dev/bus/link/001/001` are `ENOENT` where
-Linux serves the node. Nor do the links followed for it count toward the
-`MAXSYMLINKS` the sysroot resolver applies once a target leaves `/dev/bus`, so a
-chain split between the two can follow more links than Linux allows before
-`ELOOP`. Only the search on the name before a `..` uses the guest's IDs; the
-host walks every other name with the host user's credentials, as for any sysroot
-path. With `mine` at mode `700` and owned by the host user, the default guest
-uid 1000 reaches `/dev/bus/mine/f`, where Linux answers `EACCES`, and gets
-`EACCES`, as on Linux, for `/dev/bus/mine/../usb/001/001`. Under `--fakeroot`,
-with `other` at mode `000` and a host user other than root,
+Linux serves the node. Only the search on the name before a `..` uses the
+guest's IDs; the host walks every other name with the host user's credentials,
+as for any sysroot path. With `mine` at mode `700` and owned by the host user,
+the default guest uid 1000 reaches `/dev/bus/mine/f`, where Linux answers
+`EACCES`, and gets `EACCES`, as on Linux, for `/dev/bus/mine/../usb/001/001`.
+Under `--fakeroot`, with `other` at mode `000` and a host user other than root,
 `/dev/bus/other/f/../../usb/001/001` is `EACCES` for a file `f`, where Linux
 answers `ENOTDIR`. The search check and the lookup of the rewritten name are two
 steps, and the rewritten name drops the name checked, so the walk goes on when

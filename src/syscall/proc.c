@@ -1474,7 +1474,10 @@ static int proc_open_transport(pid_t host_pid)
                 0600);
 }
 
-int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+/* Append a signal record to @host_pid's transport without sending SIGUSR2. */
+static int proc_append_guest_signal(pid_t host_pid,
+                                    int64_t target_guest_pid,
+                                    int signum)
 {
     int fd = proc_open_transport(host_pid);
     if (fd < 0)
@@ -1499,7 +1502,7 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
     /* Serialize the append against the receiver's read+truncate drain via an
      * exclusive lock. The receiver holds the same lock and never unlinks the
      * file, so this append either lands before its read (and is consumed) or
-     * after its truncate (and the SIGUSR2 below triggers the next drain).
+     * after its truncate (and the caller's SIGUSR2 triggers the next drain).
      * Neither side can route this write to an orphaned inode or discard it.
      */
     if (flock_retry(fd, LOCK_EX) != 0) {
@@ -1513,11 +1516,18 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
         return -1;
     }
 
-    /* The line is durably appended under the lock, so ring the doorbell even if
-     * close() reports an error; suppressing the kill would leave the queued
-     * line waiting for some later unrelated signal.
+    /* The line is durably appended under the lock, so the caller sends SIGUSR2
+     * even if close() reports an error; suppressing the kill would leave the
+     * queued line waiting for some later unrelated signal.
      */
     close(fd);
+    return 0;
+}
+
+int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+{
+    if (proc_append_guest_signal(host_pid, target_guest_pid, signum) < 0)
+        return -1;
     return kill(host_pid, SIGUSR2);
 }
 
@@ -2478,11 +2488,11 @@ static int64_t proc_reap_exited_and_unlock(guest_t *g,
     return gpid;
 }
 
-int64_t sys_wait4(guest_t *g,
-                  int pid,
-                  uint64_t status_gva,
-                  int options,
-                  uint64_t rusage_gva)
+static int64_t wait4_once(guest_t *g,
+                          int pid,
+                          uint64_t status_gva,
+                          int options,
+                          uint64_t rusage_gva)
 {
     proc_deferred_reap_poll();
     lifecycle_import_children();
@@ -2629,13 +2639,13 @@ int64_t sys_wait4(guest_t *g,
                 int64_t external_gpid = proc_table[i].guest_pid;
                 pthread_mutex_unlock(&pid_lock);
                 if (proc_refresh_external_child(external_gpid))
-                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                    return wait4_once(g, pid, status_gva, options, rusage_gva);
                 if (mac_options & WNOHANG)
                     return 0;
                 if (thread_stop_requested())
                     return -LINUX_EINTR;
                 usleep(1000);
-                return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                return wait4_once(g, pid, status_gva, options, rusage_gva);
             }
 
             pid_t host_pid = proc_table[i].host_pid;
@@ -2680,26 +2690,26 @@ int64_t sys_wait4(guest_t *g,
                     pthread_mutex_lock(&pid_lock);
                     if (proc_guest_child_exited_locked(gpid)) {
                         pthread_mutex_unlock(&pid_lock);
-                        return sys_wait4(g, pid, status_gva, options,
-                                         rusage_gva);
+                        return wait4_once(g, pid, status_gva, options,
+                                          rusage_gva);
                     }
                     pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
                     pthread_mutex_unlock(&pid_lock);
 
-                    /* The doorbell reports the guest exit about a millisecond
+                    /* The SIGUSR2 reports the guest exit about a millisecond
                      * before the child's host process becomes reapable, so the
                      * poll above still says "running" when the wakeup arrives.
                      * The registry carries the exit by then, so importing it
                      * copies the status across and flags the host reap for
                      * proc_deferred_reap_poll(), after which the table lookup
-                     * at the top of sys_wait4 answers without waiting for the
+                     * at the top of wait4_once answers without waiting for the
                      * host process at all. Without this the wakeup is wasted
                      * and the wait costs the full 100 ms timeout.
                      */
                     lifecycle_import_children();
                     if (proc_guest_child_exited(gpid))
-                        return sys_wait4(g, pid, status_gva, options,
-                                         rusage_gva);
+                        return wait4_once(g, pid, status_gva, options,
+                                          rusage_gva);
                 }
             }
             if (ret > 0) {
@@ -2721,7 +2731,7 @@ int64_t sys_wait4(guest_t *g,
             if (wait_errno == ECHILD) {
                 lifecycle_import_children();
                 if (proc_guest_child_exited(gpid))
-                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                    return wait4_once(g, pid, status_gva, options, rusage_gva);
             }
             errno = wait_errno;
             return linux_errno();
@@ -2764,11 +2774,11 @@ static int64_t waitid_zero_siginfo(guest_t *g, uint64_t infop_gva)
     return 0;
 }
 
-int64_t sys_waitid(guest_t *g,
-                   int idtype,
-                   int64_t id,
-                   uint64_t infop_gva,
-                   int options)
+static int64_t waitid_once(guest_t *g,
+                           int idtype,
+                           int64_t id,
+                           uint64_t infop_gva,
+                           int options)
 {
     /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2, WCONTINUED=8,
      * WNOWAIT=0x01000000
@@ -3021,6 +3031,24 @@ int64_t sys_waitid(guest_t *g,
     }
 }
 
+int64_t sys_wait4(guest_t *g,
+                  int pid,
+                  uint64_t status_gva,
+                  int options,
+                  uint64_t rusage_gva)
+{
+    return wait4_once(g, pid, status_gva, options, rusage_gva);
+}
+
+int64_t sys_waitid(guest_t *g,
+                   int idtype,
+                   int64_t id,
+                   uint64_t infop_gva,
+                   int options)
+{
+    return waitid_once(g, idtype, id, infop_gva, options);
+}
+
 /* vCPU run loop. */
 
 static _Thread_local bool hvc6_yield_requested;
@@ -3125,8 +3153,8 @@ static void *preempt_thread_main(void *arg)
             pthread_mutex_unlock(&pid_lock);
             wakeup_pipe_signal();
         } else if (sig == SIGALRM) {
-            /* sys_wait4's entry is the only other caller, so a guest that takes
-             * its last child's status and never waits again strands that
+            /* wait4_once's entry is the only other caller, so a guest that
+             * takes its last child's status and never waits again strands that
              * child's host process as a zombie for the rest of the run. The
              * tick already exists and already runs on this thread, so sweeping
              * from it bounds the strand to a period or two without adding a

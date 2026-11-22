@@ -224,6 +224,16 @@ int path_translate_at(guest_fd_t dirfd,
 #define MAXSYMLINKS 40
 #endif
 
+/* The part of one walk a caller made before handing a name to a sysroot
+ * resolver: the links it followed, which count toward MAXSYMLINKS with the
+ * resolver's, and whether one had a relative target, after which the resolver
+ * refuses a host fallback as it does after a relative link of its own.
+ */
+typedef struct path_walk {
+    unsigned links;
+    bool relative;
+} path_walk_t;
+
 /* Splice a symlink target back into a path being resolved: @target followed by
  * whatever of the original path was left unconsumed. @prefix is prepended for a
  * relative target only, and names the directory holding the link; pass NULL
@@ -299,14 +309,17 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path);
 
 const char *path_resolve_sysroot_path(const char *path,
                                       char *buf,
-                                      size_t bufsz);
+                                      size_t bufsz,
+                                      const path_walk_t *walked);
 const char *path_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz);
+                                               size_t bufsz,
+                                               const path_walk_t *walked);
 const char *path_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents);
+                                             bool create_parents,
+                                             const path_walk_t *walked);
 
 bool path_openat2_stays_beneath(const char *path, bool clamp_at_root);
 int path_openat2_normalize_in_root(const char *path, char *out, size_t outsz);

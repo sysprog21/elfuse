@@ -619,7 +619,7 @@ static int path_backing_dotdot(char *name,
 
     errno = 0;
     const char *hp =
-        path_resolve_sysroot_nofollow_path(name, host, sizeof(host));
+        path_resolve_sysroot_nofollow_path(name, host, sizeof(host), NULL);
     if (!hp) {
         if (errno == 0)
             errno = ENOENT;
@@ -925,13 +925,13 @@ int path_translate_at(guest_fd_t dirfd,
     if (lookup_flags & PATH_TR_CREATE) {
         tx->host_path = path_resolve_sysroot_create_path(
             tx->guest_path, tx->host_buf, sizeof(tx->host_buf),
-            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0);
+            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0, NULL);
     } else if (lookup_flags & PATH_TR_NOFOLLOW) {
         tx->host_path = path_resolve_sysroot_nofollow_path(
-            tx->guest_path, tx->host_buf, sizeof(tx->host_buf));
+            tx->guest_path, tx->host_buf, sizeof(tx->host_buf), NULL);
     } else {
         tx->host_path = path_resolve_sysroot_path(tx->guest_path, tx->host_buf,
-                                                  sizeof(tx->host_buf));
+                                                  sizeof(tx->host_buf), NULL);
     }
 
     /* The resolvers above key off guest_path[0] == '/': a relative path is
@@ -1170,24 +1170,30 @@ static size_t path_lexical_depth(const char *path)
  */
 static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz);
 
-const char *path_resolve_sysroot_path(const char *path, char *buf, size_t bufsz)
+const char *path_resolve_sysroot_path(const char *path,
+                                      char *buf,
+                                      size_t bufsz,
+                                      const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_path(path, buf, bufsz);
+    return proc_resolve_sysroot_path(path, buf, bufsz, walked);
 }
 
 const char *path_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz)
+                                               size_t bufsz,
+                                               const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_nofollow_path(path, buf, bufsz);
+    return proc_resolve_sysroot_nofollow_path(path, buf, bufsz, walked);
 }
 
 const char *path_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents)
+                                             bool create_parents,
+                                             const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_create_path(path, buf, bufsz, create_parents);
+    return proc_resolve_sysroot_create_path(path, buf, bufsz, create_parents,
+                                            walked);
 }
 
 int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
@@ -1232,7 +1238,7 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             }
         }
         const char *host_path = path_resolve_sysroot_nofollow_path(
-            path, sysroot_buf, sizeof(sysroot_buf));
+            path, sysroot_buf, sizeof(sysroot_buf), NULL);
         if (!host_path) {
             errno = ENAMETOOLONG;
             return -1;
@@ -2284,13 +2290,13 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
          */
         bool create_parents = climbed && (flags & PATH_TR_CREATE_PARENTS) != 0;
         checked = path_resolve_sysroot_create_path(
-            abs_path, host_buf, sizeof(host_buf), create_parents);
+            abs_path, host_buf, sizeof(host_buf), create_parents, NULL);
     } else if (flags & PATH_TR_NOFOLLOW) {
         checked = path_resolve_sysroot_nofollow_path(abs_path, host_buf,
-                                                     sizeof(host_buf));
+                                                     sizeof(host_buf), NULL);
     } else {
-        checked =
-            path_resolve_sysroot_path(abs_path, host_buf, sizeof(host_buf));
+        checked = path_resolve_sysroot_path(abs_path, host_buf,
+                                            sizeof(host_buf), NULL);
     }
 
     char fallback_buf[LINUX_PATH_MAX];

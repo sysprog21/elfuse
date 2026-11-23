@@ -613,15 +613,17 @@ static bool signal_transport_path(char *out, size_t out_size, pid_t host_pid)
                             (unsigned long long) host_pid);
 }
 
-/* Per-process file, mapped shared, whose word says whether a SIGCHLD that an
- * exit generated now would be discarded (bit 0) and how many times rt_sigaction
- * has dropped pending SIGCHLD (the rest; see signal_sigchld_republish). An
- * exiting child maps its parent's copy and decides at the exit; the parent
- * decides only for records left undecided. The namespace and guest pid guard
- * against a stale file whose host pid was recycled; both are set before the
- * first store to the word. One word, so a reader never pairs a count with
- * another call's flag. It is lock-free (core/guest.h asserts it), so the
- * reader's acquire load in its own mapping pairs with the release store here.
+/* Per-process file, mapped shared, whose word says whether a SIGCHLD generated
+ * now would be discarded, by an exit (bit 0) or by a kill (bit 1), and how many
+ * times rt_sigaction has dropped pending SIGCHLD (the rest; see
+ * signal_sigchld_republish). An exiting child maps its parent's copy and
+ * decides at the exit, as a kill of SIGCHLD from another process does for its
+ * target; the parent decides only for records left undecided. The namespace and
+ * guest pid guard against a stale file whose host pid was recycled; both are
+ * set before the first store to the word. One word, so a reader never pairs a
+ * count with another call's flag. It is lock-free (core/guest.h asserts it), so
+ * the reader's acquire load in its own mapping pairs with the release store
+ * here.
  */
 typedef struct {
     uint64_t ns;
@@ -700,13 +702,14 @@ typedef struct {
     uint64_t drops;
 } sigchld_decision_t;
 
-/* Decide the SIGCHLD of an exit to @guest_pid at @host_pid from the word it
- * published. False when the word cannot be read, which leaves the decision to
- * the receiver. The size check comes first because a load past the end of a
- * shorter file raises SIGBUS.
+/* Decide a SIGCHLD to @guest_pid at @host_pid from the word it published, by
+ * the kill rule when @by_kill, else by the exit rule. False when the word
+ * cannot be read, which leaves the decision to the receiver. The size check
+ * comes first because a load past the end of a shorter file raises SIGBUS.
  */
 static bool sigchld_decide(pid_t host_pid,
                            int64_t guest_pid,
+                           bool by_kill,
                            sigchld_decision_t *out)
 {
     char path[PATH_MAX];
@@ -727,8 +730,8 @@ static bool sigchld_decide(pid_t host_pid,
         map->ns == absock_get_namespace_id() && map->guest_pid == guest_pid;
     munmap(map, sizeof(*map));
     if (ok) {
-        out->discarded = w & 1;
-        out->drops = w >> 1;
+        out->discarded = (w >> (by_kill ? 1 : 0)) & 1;
+        out->drops = w >> 2;
     }
     return ok;
 }
@@ -1658,11 +1661,28 @@ static int proc_append_guest_signal(pid_t host_pid,
     return 0;
 }
 
-int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+/* Append @signum and send SIGUSR2. Linux decides a SIGCHLD at generation, so
+ * decide it here from the target's word: by the kill rule when @by_kill
+ * (sig_ignored, kernel/signal.c), else by the exit rule (do_notify_parent,
+ * kernel/exit.c).
+ */
+static int send_guest_signal(pid_t host_pid,
+                             int64_t target_guest_pid,
+                             int signum,
+                             bool by_kill)
 {
-    if (proc_append_guest_signal(host_pid, target_guest_pid, signum, NULL) < 0)
+    sigchld_decision_t d = {0};
+    bool decided = signum == LINUX_SIGCHLD &&
+                   sigchld_decide(host_pid, target_guest_pid, by_kill, &d);
+    if (proc_append_guest_signal(host_pid, target_guest_pid, signum,
+                                 decided ? &d : NULL) < 0)
         return -1;
     return kill(host_pid, SIGUSR2);
+}
+
+int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+{
+    return send_guest_signal(host_pid, target_guest_pid, signum, true);
 }
 
 /* The leading decimal number of environment variable @name, as microseconds; 0
@@ -1695,15 +1715,9 @@ void proc_process_exit(int wait_status)
          */
         int64_t parent_guest_pid = proc_get_ppid();
         pid_t parent_host_pid = getppid();
-        sigchld_decision_t d = {0};
-        if (parent_guest_pid > 0 && parent_host_pid > 1) {
-            bool decided =
-                sigchld_decide(parent_host_pid, parent_guest_pid, &d);
-            if (proc_append_guest_signal(parent_host_pid, parent_guest_pid,
-                                         LINUX_SIGCHLD,
-                                         decided ? &d : NULL) == 0)
-                (void) kill(parent_host_pid, SIGUSR2);
-        }
+        if (parent_guest_pid > 0 && parent_host_pid > 1)
+            (void) send_guest_signal(parent_host_pid, parent_guest_pid,
+                                     LINUX_SIGCHLD, false);
         return;
     }
 
@@ -1788,13 +1802,13 @@ void proc_process_exit(int wait_status)
     bool adopter_read = false;
     for (uint32_t i = 0; reparented && i < nreparented; i++) {
         if (reparented[i].exited) {
-            adopter_read = sigchld_decide(adopter_host_pid, adopter_pid,
+            adopter_read = sigchld_decide(adopter_host_pid, adopter_pid, false,
                                           &adopter_decision);
             break;
         }
     }
-    bool parent_read =
-        sigchld_decide(parent_host_pid, parent_guest_pid, &parent_decision);
+    bool parent_read = sigchld_decide(parent_host_pid, parent_guest_pid, false,
+                                      &parent_decision);
 
     /* ELFUSE_SIGCHLD_DECIDE_DELAY_US=N holds this exit N microseconds between
      * the flag file reads and the appends, so a test can change the parent's
@@ -3595,8 +3609,8 @@ static void sig_drain_cb(char *rec, void *vctx)
     if (end == p)
         return;
 
-    /* " i": the sender found the signal discarded at generation. " k<n>": an
-     * exiting child found SIGCHLD kept after n drops of pending SIGCHLD.
+    /* " i": the sender found the signal discarded at generation. " k<n>": the
+     * sender found SIGCHLD kept after n drops of pending SIGCHLD.
      */
     bool discarded = strcmp(end, " i") == 0;
     bool kept = false;

@@ -530,9 +530,10 @@ void proc_registry_publish_self(void);
 void proc_autoreap_exited_children(void);
 
 /* Write @word to this process's mapped sigchld flag file, so an exiting child
- * decides at its exit: bit 0 says whether a SIGCHLD that an exit generated now
- * would be discarded, and the bits from 1 up count rt_sigaction's drops of
- * pending SIGCHLD. Called only by signal.c, under sigchld_pub_lock.
+ * or a kill sender decides at generation: bit 0 says whether a SIGCHLD that an
+ * exit generated now would be discarded, bit 1 whether one sent with kill would
+ * be, and the bits from 2 up count rt_sigaction's drops of pending SIGCHLD.
+ * Called only by signal.c, under sigchld_pub_lock.
  *
  * Returns false when the file could not be created or mapped.
  */

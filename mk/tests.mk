@@ -306,7 +306,7 @@ $(call run-lane,test-dir-backing-drain-error,a lost union listing is reported no
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
 $(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
 $(call run-lane,test-fuse-open-lock,a FUSE open returns its slot and keeps the lock order)
-$(call run-lane,test-sigchld-late-drain,SIGCHLD decided at the exit survives a late drain)
+$(call run-lane,test-sigchld-late-drain,SIGCHLD decided at exit or kill survives a late drain)
 $(call run-lane,test-sigchld-exit-race,SIG_IGN or SIG_DFL during an exit drops its SIGCHLD)
 $(call run-lane,test-sigchld-exit-fallback,an exit without the registry decides its SIGCHLD)
 $(call run-lane,test-dir-union-alias,a dup shares one listing position and one union)
@@ -2047,7 +2047,7 @@ test-fuse-open-lock: $(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock
 	$(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock slots
 	ELFUSE_FUSE_OPEN_LOCK_DELAY_US=200000 \
 		$(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock order
-## A SIGCHLD decided at the child's exit survives a late drain
+## A SIGCHLD decided at the child's exit or at a kill survives a late drain
 # ELFUSE_SIGNAL_DRAIN_DELAY_US keeps the record undrained until the test, 100
 # ms after the exit or the kill, installs its handler, or SIG_IGN or SIG_DFL,
 # or until its wait returns. Without the delay, a build that lacks the part a

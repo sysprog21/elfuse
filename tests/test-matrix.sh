@@ -792,7 +792,7 @@ run_unit_tests()
     # timeout on elfuse.
     local late_case exit_case
     for late_case in none resethand thread vm adopted ign dfl unblock kill \
-        waitpid waitid wnohang wnohangbusy; do
+        killdfl killchild waitpid waitid wnohang wnohangbusy; do
         ELFUSE_SIGNAL_DRAIN_DELAY_US=250000 \
             test_check "$runner" "test-sigchld-after-wait late $late_case" \
             " - PASS" "$bindir/test-sigchld-after-wait" late "$late_case"
@@ -1628,12 +1628,12 @@ run_suite()
 # respelling of a path to the answer its canonical spelling gets. No fixture,
 # not in either skip list. 255 and 230, observed here at 297 and 275.
 #
-# Both went up by eighteen for test-sigchld-after-wait, its thirteen late cases,
+# Both went up by twenty for test-sigchld-after-wait, its fifteen late cases,
 # its three exiting cases and its fallback case, run one per call. No fixture,
-# not in either skip list. 273 and 248, observed here at 336 and 310.
+# not in either skip list. 275 and 250, observed here at 338 and 312.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|273|0"
-    "qemu-aarch64|248|0"
+    "elfuse-aarch64|275|0"
+    "qemu-aarch64|250|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

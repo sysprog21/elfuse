@@ -356,6 +356,12 @@ void signal_reset_for_exec(void);
  */
 void signal_queue(int signum);
 
+/* signal_queue for kill or pidfd_send_signal of @signum to this process. A
+ * SIGCHLD that sig_ignored (kernel/signal.c) would discard now is dropped here,
+ * at generation, so a handler installed before its delivery does not run.
+ */
+void signal_queue_kill(int signum);
+
 /* Queue a thread-directed signal (tgkill/tkill semantics): lands in the target
  * thread's private pending set so only that thread consumes it, and standard
  * signals do not coalesce across threads. The target is resolved by guest tid
@@ -374,7 +380,8 @@ bool signal_queue_thread_info(int64_t tid,
                               uint64_t si_ptr);
 
 /* Queue a signal with explicit siginfo metadata. Standard signals preserve one
- * payload while coalesced; RT signals enqueue every instance.
+ * payload while coalesced; RT signals enqueue every instance. A SIGCHLD is
+ * decided as signal_queue_kill decides it.
  */
 void signal_queue_info(int signum,
                        int32_t si_code,
@@ -575,8 +582,9 @@ bool signal_sigchld_autoreap(void);
  */
 void signal_sigchld_republish(void);
 
-/* Queue the SIGCHLD of a record that an exiting child kept after @drops drops
- * of pending SIGCHLD, unless rt_sigaction has dropped pending SIGCHLD since.
+/* Queue the SIGCHLD of a record whose sender, an exiting child or a kill, kept
+ * it after @drops drops of pending SIGCHLD, unless rt_sigaction has dropped
+ * pending SIGCHLD since.
  */
 void signal_queue_sigchld_kept(uint64_t drops);
 

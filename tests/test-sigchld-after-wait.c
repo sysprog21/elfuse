@@ -5,9 +5,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Linux decides whether a SIGCHLD is discarded when it generates it, at the
- * child's exit: a handler installed later never runs for a discarded one, and a
- * kept one stays pending. lmbench's benchmp relies on this between its two
- * lat_fs phases.
+ * child's exit or at a kill: a handler installed later never runs for a
+ * discarded one, and a kept one stays pending. lmbench's benchmp relies on this
+ * between its two lat_fs phases.
  *
  * "late [case]" runs the cases that need ELFUSE_SIGNAL_DRAIN_DELAY_US on
  * elfuse, which keeps the child's record undrained when the parent acts, or
@@ -19,6 +19,7 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdbool.h>
@@ -27,6 +28,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -432,21 +434,29 @@ static int waited_rounds(bool use_waitid)
     return bad;
 }
 
-/* One child sends SIGCHLD with kill once per round while this process blocks
- * SIGCHLD under the handler; one watch window later, SIG_DFL, the handler again
- * and an unblock follow, ROUNDS times: do_sigaction drops the pending SIGCHLD.
- * The child exits after the last round, under SIG_DFL, so no exit's record is
- * in flight during a round.
+enum kill_mode {
+    KILL_FLUSHED, /* blocked under the handler, then SIG_DFL drops it */
+    KILL_IGNORED, /* under SIG_DFL, unblocked: discarded at the kill */
+    KILL_KEPT,    /* under SIG_IGN, blocked: sig_ignored keeps it pending */
+};
+
+/* One child sends SIGCHLD with kill once per round, ROUNDS times, in @mode; one
+ * watch window later, KILL_FLUSHED installs SIG_DFL, then each mode installs
+ * the handler, and the blocked modes unblock. The handler runs only for
+ * KILL_KEPT. The child exits after the last round, under SIG_DFL, so no exit's
+ * record is in flight during a round.
  *
- * Returns the number of rounds in which the handler ran, or -1 on a setup
+ * Returns the number of rounds with the wrong handler count, or -1 on a setup
  * failure.
  */
-static int kill_rounds(void)
+static int kill_rounds(enum kill_mode mode)
 {
-    struct sigaction catch, dfl;
+    struct sigaction catch, dfl, ign;
     memset(&dfl, 0, sizeof(dfl));
     sigemptyset(&dfl.sa_mask);
     dfl.sa_handler = SIG_DFL;
+    ign = dfl;
+    ign.sa_handler = SIG_IGN;
     catch = dfl;
     catch.sa_handler = on_sigchld;
     catch.sa_flags = SA_RESTART;
@@ -477,8 +487,12 @@ static int kill_rounds(void)
         handler_runs = 0;
         char c;
         ssize_t got;
-        if (sigaction(SIGCHLD, &catch, NULL) != 0 ||
-            sigprocmask(SIG_BLOCK, &chld, NULL) != 0 ||
+        const struct sigaction *first = mode == KILL_FLUSHED   ? &catch
+                                        : mode == KILL_IGNORED ? &dfl
+                                                               : &ign;
+        bool blocked = mode != KILL_IGNORED;
+        if (sigaction(SIGCHLD, first, NULL) != 0 ||
+            (blocked && sigprocmask(SIG_BLOCK, &chld, NULL) != 0) ||
             write(go[1], "x", 1) != 1)
             return -1;
         while ((got = read(sent[0], &c, 1)) < 0 && errno == EINTR)
@@ -486,13 +500,13 @@ static int kill_rounds(void)
         if (got != 1)
             return -1;
         watch_window();
-        if (sigaction(SIGCHLD, &dfl, NULL) != 0 ||
+        if ((mode == KILL_FLUSHED && sigaction(SIGCHLD, &dfl, NULL) != 0) ||
             sigaction(SIGCHLD, &catch, NULL) != 0 ||
-            sigprocmask(SIG_UNBLOCK, &chld, NULL) != 0)
+            (blocked && sigprocmask(SIG_UNBLOCK, &chld, NULL) != 0))
             return -1;
         for (int w = 0; w < 3; w++)
             watch_window();
-        if (handler_runs)
+        if (handler_runs != (mode == KILL_KEPT))
             bad++;
     }
     if (sigaction(SIGCHLD, &dfl, NULL) != 0)
@@ -500,6 +514,135 @@ static int kill_rounds(void)
     close(go[1]);
     close(sent[0]);
     return waitpid(pid, NULL, 0) == pid ? bad : -1;
+}
+
+/* A fork child inherits the handler with SIGCHLD blocked and changes neither,
+ * so it has no flag file and a kill to it is decided when it drains the record.
+ * Once the parent's kill has returned, the child installs SIG_IGN, which drops
+ * the pending SIGCHLD (do_sigaction), then the handler, and unblocks. A fresh
+ * child per round, ROUNDS times.
+ *
+ * Returns the number of rounds in which the child's handler ran, or -1 on a
+ * setup failure.
+ */
+static int child_kill_rounds(void)
+{
+    struct sigaction catch, ign;
+    memset(&catch, 0, sizeof(catch));
+    sigemptyset(&catch.sa_mask);
+    catch.sa_handler = on_sigchld;
+    ign = catch;
+    ign.sa_handler = SIG_IGN;
+    sigset_t chld, old;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+
+    int bad = 0;
+    for (int round = 0; round < ROUNDS; round++) {
+        int sent[2];
+        if (pipe(sent) != 0 || sigaction(SIGCHLD, &catch, NULL) != 0 ||
+            sigprocmask(SIG_BLOCK, &chld, &old) != 0)
+            return -1;
+        pid_t pid = fork();
+        if (pid < 0)
+            return -1;
+        if (pid == 0) {
+            char c;
+            handler_runs = 0;
+            close(sent[1]);
+            if (read(sent[0], &c, 1) != 1 ||
+                sigaction(SIGCHLD, &ign, NULL) != 0 ||
+                sigaction(SIGCHLD, &catch, NULL) != 0 ||
+                sigprocmask(SIG_UNBLOCK, &chld, NULL) != 0)
+                _exit(126);
+            for (int w = 0; w < 4; w++)
+                watch_window();
+            _exit(handler_runs != 0);
+        }
+        close(sent[0]);
+        bool sent_ok = kill(pid, SIGCHLD) == 0 && write(sent[1], "x", 1) == 1;
+        close(sent[1]);
+        int status;
+        if (waitpid(pid, &status, 0) != pid || !sent_ok || !WIFEXITED(status) ||
+            WEXITSTATUS(status) > 1 || signal(SIGCHLD, SIG_DFL) == SIG_ERR ||
+            sigprocmask(SIG_SETMASK, &old, NULL) != 0)
+            return -1;
+        bad += WEXITSTATUS(status);
+    }
+    return bad;
+}
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
+
+static long send_self_sigchld(int how, int pidfd)
+{
+    switch (how) {
+    case 0:
+        return kill(getpid(), SIGCHLD);
+    case 1:
+        return kill(0, SIGCHLD);
+    case 2:
+        return syscall(SYS_pidfd_send_signal, pidfd, SIGCHLD, NULL, 0);
+    default: {
+        /* Raw, because musl's sigqueue blocks signals around the call. */
+        siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        si.si_signo = SIGCHLD;
+        si.si_code = SI_QUEUE;
+        si.si_pid = getpid();
+        si.si_uid = getuid();
+        return syscall(SYS_rt_sigqueueinfo, getpid(), SIGCHLD, &si);
+    }
+    }
+}
+
+/* A child in its own process group sends itself SIGCHLD with kill(getpid()),
+ * kill(0), pidfd_send_signal and rt_sigqueueinfo under @disp with SIGCHLD
+ * unblocked, ROUNDS times: sig_ignored (kernel/signal.c) discards each at
+ * generation, so a signalfd for SIGCHLD never becomes readable.
+ *
+ * Returns the rounds where one did, or -1.
+ */
+static int self_kill_rounds(void (*disp)(int))
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        sigset_t chld;
+        sigemptyset(&chld);
+        sigaddset(&chld, SIGCHLD);
+        int pidfd = (int) syscall(SYS_pidfd_open, getpid(), 0);
+        int sfd = signalfd(-1, &chld, SFD_NONBLOCK);
+        if (setpgid(0, 0) != 0 || pidfd < 0 || sfd < 0 ||
+            signal(SIGCHLD, disp) == SIG_ERR ||
+            sigprocmask(SIG_UNBLOCK, &chld, NULL) != 0)
+            _exit(126);
+        int bad = 0;
+        for (int round = 0; round < ROUNDS; round++) {
+            bool woke = false;
+            for (int how = 0; how < 4; how++) {
+                long rc = send_self_sigchld(how, pidfd);
+                struct pollfd pfd = {.fd = sfd, .events = POLLIN};
+                int ready = poll(&pfd, 1, 10);
+                if (rc != 0 || ready < 0)
+                    _exit(126);
+                woke |= ready > 0;
+            }
+            bad += woke;
+        }
+        _exit(bad);
+    }
+    int status;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+        WEXITSTATUS(status) > ROUNDS)
+        return -1;
+    return WEXITSTATUS(status);
 }
 
 /* A SIGCHLD sent to this thread while it blocks SIGCHLD under the handler, then
@@ -915,9 +1058,18 @@ int main(int argc, char **argv)
             report(labels[ev], late_rounds((enum event) ev));
             ran = true;
         }
-        if (argc <= 2 || strcmp(argv[2], "kill") == 0) {
-            report("no SIGCHLD from kill after SIG_DFL drops it pending",
-                   kill_rounds());
+        static const char *const kills[] = {"kill", "killdfl"};
+        for (int k = 0; k < 2; k++) {
+            if (argc > 2 && strcmp(argv[2], kills[k]) != 0)
+                continue;
+            report(k ? "no SIGCHLD from kill under SIG_DFL for a later handler"
+                     : "no SIGCHLD from kill after SIG_DFL drops it pending",
+                   kill_rounds(k ? KILL_IGNORED : KILL_FLUSHED));
+            ran = true;
+        }
+        if (argc <= 2 || strcmp(argv[2], "killchild") == 0) {
+            report("no SIGCHLD from kill to a fork child after SIG_IGN",
+                   child_kill_rounds());
             ran = true;
         }
         static const char *const nohangs[] = {"wnohang", "wnohangbusy"};
@@ -968,6 +1120,12 @@ int main(int argc, char **argv)
     report("a SIGCHLD timer fires again after SIG_IGN drops it",
            timer_rounds());
     report("SIG_DFL keeps a blocked SIGCHLD pending", kept_rounds());
+    report("a kill under SIG_IGN keeps a blocked SIGCHLD pending",
+           kill_rounds(KILL_KEPT));
+    report("no signalfd wake for a SIGCHLD sent to self under SIG_IGN",
+           self_kill_rounds(SIG_IGN));
+    report("no signalfd wake for a SIGCHLD sent to self under SIG_DFL",
+           self_kill_rounds(SIG_DFL));
     signal(SIGCHLD, SIG_DFL);
 
     SUMMARY("test-sigchld-after-wait");

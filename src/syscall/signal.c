@@ -806,21 +806,32 @@ static uint64_t sigchld_published = UINT64_MAX; /* under sigchld_pub_lock */
  */
 static uint64_t sigchld_drops;
 
+/* sig_ignored (kernel/signal.c) never discards a blocked signal, so a SIGCHLD
+ * sent with kill is discarded under SIG_IGN or SIG_DFL only when no thread
+ * blocks it.
+ */
+static bool sigchld_kill_discards(int disp, bool blocked)
+{
+    return disp != SIGCHLD_DISP_HANDLER && !blocked;
+}
+
 /* Caller holds sigchld_pub_lock. */
 static void sigchld_publish_locked(void)
 {
-    /* do_notify_parent drops SIGCHLD under SIG_IGN whatever the mask; under
-     * SIG_DFL, prepare_signal keeps it when the target thread blocks it. That
-     * target is the thread that forked or, once it exits, the thread that
-     * find_new_reaper (kernel/exit.c) makes the child's parent; this reads
-     * every thread's mask, so it keeps a SIGCHLD that only another thread
-     * blocks, which Linux discards.
+    /* Bit 0 is for an exit: do_notify_parent drops SIGCHLD under SIG_IGN
+     * whatever the mask; under SIG_DFL, prepare_signal keeps it when the target
+     * thread blocks it. That target is the thread that forked or, once it
+     * exits, the thread that find_new_reaper (kernel/exit.c) makes the child's
+     * parent; this reads every thread's mask, so it keeps a SIGCHLD that only
+     * another thread blocks, which Linux discards. Bit 1 is for a kill.
      */
     int disp = atomic_load_explicit(&sigchld_disp, memory_order_relaxed);
-    bool discarded = disp == SIGCHLD_DISP_IGN ||
-                     (disp == SIGCHLD_DISP_DFL &&
-                      !thread_signal_blocked_any(sig_bit(LINUX_SIGCHLD)));
-    uint64_t word = sigchld_drops << 1 | discarded;
+    bool blocked = thread_signal_blocked_any(sig_bit(LINUX_SIGCHLD));
+    bool exit_discarded =
+        disp == SIGCHLD_DISP_IGN || (disp == SIGCHLD_DISP_DFL && !blocked);
+    bool kill_discarded = sigchld_kill_discards(disp, blocked);
+    uint64_t word =
+        sigchld_drops << 2 | (uint64_t) kill_discarded << 1 | exit_discarded;
     if (sigchld_published != word && proc_publish_sigchld_state(word))
         sigchld_published = word;
 }
@@ -833,9 +844,9 @@ void signal_sigchld_republish(void)
 }
 
 /* do_sigaction's flush_sigqueue_mask for SIGCHLD, after the new action is
- * stored: count the drop in the same word as the new flag, so a record that an
- * exiting child decided before it is dropped at the drain, then drop what is
- * already pending. Caller holds sig_lock.
+ * stored: count the drop in the same word as the new flags, so a record that an
+ * exiting child or a kill sender decided before it is dropped at the drain,
+ * then drop what is already pending. Caller holds sig_lock.
  */
 static void sigchld_drop_and_republish_locked(void)
 {
@@ -857,16 +868,35 @@ static void sigchld_mask_changed(uint64_t old_mask, uint64_t new_mask)
 
 static void signal_queued_wake(int signum);
 
-void signal_queue(int signum)
+static void queue_process_signal(int signum,
+                                 const signal_rt_info_t *info,
+                                 bool by_kill)
 {
     if (signum < 1 || signum > LINUX_NSIG)
         return;
     pthread_mutex_lock(&sig_lock);
-    signal_enqueue_locked(&sig_state.shared, signum, NULL);
+    if (by_kill && signum == LINUX_SIGCHLD &&
+        sigchld_kill_discards(
+            atomic_load_explicit(&sigchld_disp, memory_order_relaxed),
+            thread_signal_blocked_any(sig_bit(LINUX_SIGCHLD)))) {
+        pthread_mutex_unlock(&sig_lock);
+        return;
+    }
+    signal_enqueue_locked(&sig_state.shared, signum, info);
     /* Publish hint before releasing lock so vCPU hot path sees it. */
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
     signal_queued_wake(signum);
+}
+
+void signal_queue(int signum)
+{
+    queue_process_signal(signum, NULL, false);
+}
+
+void signal_queue_kill(int signum)
+{
+    queue_process_signal(signum, NULL, true);
 }
 
 void signal_queue_sigchld_kept(uint64_t drops)
@@ -914,9 +944,6 @@ void signal_queue_info(int signum,
                        int32_t si_int,
                        uint64_t si_ptr)
 {
-    if (signum < 1 || signum > LINUX_NSIG)
-        return;
-    pthread_mutex_lock(&sig_lock);
     signal_rt_info_t info = {
         .signum = signum,
         .si_code = si_code,
@@ -925,16 +952,7 @@ void signal_queue_info(int signum,
         .si_int = si_int,
         .si_ptr = si_ptr,
     };
-    signal_enqueue_locked(&sig_state.shared, signum, &info);
-    refresh_pending_hint_locked();
-    pthread_mutex_unlock(&sig_lock);
-    signal_notify_waiters(signum);
-
-    /* Same shim-globals attention raise as signal_queue: force the fast path
-     * off only when the queued signal can reach signal_deliver.
-     */
-    if (signal_should_interrupt(signum))
-        attention_raise();
+    queue_process_signal(signum, &info, true);
 }
 
 /* Thread-directed queueing (tgkill/tkill/pthread_kill). The signal lands in the
@@ -2098,8 +2116,8 @@ int64_t signal_rt_sigaction(guest_t *g,
         return -LINUX_EFAULT;
 
     /* do_sigaction discards a pending SIGCHLD that the new action ignores.
-     * Drain first, so a record left undecided (a kill from another process, or
-     * an exit that could not read the flag file) is pending when that runs.
+     * Drain first, so a record whose sender could not read the flag file is
+     * pending when that runs.
      */
     bool flush_sigchld =
         act_gva && signum == LINUX_SIGCHLD &&

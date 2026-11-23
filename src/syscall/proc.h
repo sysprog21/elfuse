@@ -524,8 +524,26 @@ pid_t proc_resolve_guest_pid(int64_t guest_pid);
 /* Publish the caller's current guest pid/pgid to the fork-family registry. */
 void proc_registry_publish_self(void);
 
-/* Reap only children whose shared lifecycle entry is already terminal. */
+/* Reap only children whose shared lifecycle entry is already terminal, waiting
+ * for each one's host process to exit.
+ */
 void proc_autoreap_exited_children(void);
+
+/* Write @word to this process's mapped sigchld flag file, so an exiting child
+ * decides at its exit: bit 0 says whether a SIGCHLD that an exit generated now
+ * would be discarded, and the bits from 1 up count rt_sigaction's drops of
+ * pending SIGCHLD. Called only by signal.c, under sigchld_pub_lock.
+ *
+ * Returns false when the file could not be created or mapped.
+ */
+bool proc_publish_sigchld_state(uint64_t word);
+
+/* Queue the signals in this process's signal transport and run the registry
+ * work its records ask for. A drain on a guest syscall passes false for
+ * @may_block, so its auto-reap skips a child whose host process has not exited
+ * rather than wait for it. Takes sig_drain_lock; call with no lock held.
+ */
+void proc_drain_signal_transport(bool may_block);
 
 /* Pull authoritative PPID state into a newly bootstrapped fork child. */
 void proc_lifecycle_sync_self(guest_t *g);

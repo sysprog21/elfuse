@@ -2153,13 +2153,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * barrier, so without the lock its munmap could rewrite the region table
      * during the overlay sync, the clone snapshot, the header, or the region
      * copy, or close a backing fd before it is sent. Everything taken beneath
-     * it (fd_lock, pty_keepalive_lock, elf_path_lock, sysroot_lock, sig_lock)
-     * follows mmap_lock in the order in syscall/internal.h. The IPC writes
-     * under it cannot deadlock: the child only reads until admission, and a
-     * child that dies turns the next write into EPIPE (SO_NOSIGPIPE above). The
-     * cost lands on a straggler waiting in pthread_mutex_lock for the whole
-     * send, where no teardown wake reaches it, so an exit_group join during a
-     * slow fork can time out on it.
+     * it (fd_lock, pty_keepalive_lock, elf_path_lock, sysroot_lock, sig_lock,
+     * sigchld_pub_lock) follows mmap_lock in the order in syscall/internal.h.
+     * The IPC writes under it cannot deadlock: the child only reads until
+     * admission, and a child that dies turns the next write into EPIPE
+     * (SO_NOSIGPIPE above). The cost lands on a straggler waiting in
+     * pthread_mutex_lock for the whole send, where no teardown wake reaches it,
+     * so an exit_group join during a slow fork can time out on it.
      *
      * The prepare call below converts MAP_SHARED|MAP_ANONYMOUS regions with no
      * backing fd into memfd-backed overlays that the child re-installs from the

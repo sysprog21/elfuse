@@ -16,6 +16,9 @@
  * 6. X7 survives delivery and rt_sigreturn (aarch64: the host uses X7 on the
  *    HVC #5 return to ask the shim for a ptrace detour, and the tails that
  *    rebuild EL0 state never restore it from the saved frame)
+ * 7. rt_sigaction reads act before it writes oldact: one buffer can be both,
+ *    and a faulting act leaves oldact unwritten. Raw syscalls, because libc
+ *    copies each into its own kernel struct.
  */
 
 #include <errno.h>
@@ -25,6 +28,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
 
 static volatile sig_atomic_t handler_called = 0;
@@ -287,6 +291,34 @@ int main(void)
         }
     }
 #endif
+
+    printf("test-signal: 7. rt_sigaction reads act before oldact... ");
+    {
+        struct {
+            void *handler;
+            unsigned long flags;
+            void *restorer;
+            unsigned long mask;
+        } both = {.handler = (void *) sigusr1_handler}, now, kept, fill;
+        memset(&now, 0, sizeof(now));
+        long shared = syscall(SYS_rt_sigaction, SIGUSR2, &both, &both, 8);
+        long query = syscall(SYS_rt_sigaction, SIGUSR2, NULL, &now, 8);
+        memset(&kept, 0x5a, sizeof(kept));
+        memset(&fill, 0x5a, sizeof(fill));
+        errno = 0;
+        long bad = syscall(SYS_rt_sigaction, SIGUSR2, (void *) 8, &kept, 8);
+        int bad_errno = errno;
+        signal(SIGUSR2, SIG_DFL);
+        if (shared == 0 && both.handler == SIG_DFL && query == 0 &&
+            now.handler == (void *) sigusr1_handler && bad == -1 &&
+            bad_errno == EFAULT && memcmp(&kept, &fill, sizeof(kept)) == 0) {
+            printf("PASS\n");
+        } else {
+            printf("FAIL (shared=%ld old=%p now=%p bad=%ld errno=%d)\n", shared,
+                   both.handler, now.handler, bad, bad_errno);
+            failures++;
+        }
+    }
 
     if (failures == 0) {
         printf("test-signal: all tests passed -- PASS\n");

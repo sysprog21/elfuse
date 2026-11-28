@@ -111,10 +111,11 @@ check-atomics:
 	@python3 scripts/check-atomics.py --self-test
 	@python3 scripts/check-atomics.py
 
-## Check the benchmark PR reporter and baseline promoter on fixed inputs,
-## and the paired round runner on stubs
+## Check the benchmark PR reporter, dashboard points and baseline promoter on
+## fixed inputs, and the paired round runner on stubs
 check-bench-report:
 	@python3 scripts/bench-report.py --self-test
+	@python3 scripts/bench-dashboard.py --self-test
 	@python3 scripts/bench-promote.py --self-test
 	@bash tests/test-bench-paired.sh
 

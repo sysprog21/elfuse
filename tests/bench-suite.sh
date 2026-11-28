@@ -136,6 +136,11 @@
 #   BENCH_LMBENCH     1 = run Tier 1 (default); 0 = skip it
 #   BENCH_APPS        1 = run Tier 2 (default); 0 = skip it
 #   BENCH_OCI         1 = run Tier 3 (default); 0 = skip it
+#   BENCH_METRICS     space-separated metric names as the comparison
+#                     flattens them (lmbench.lat_syscall.null,
+#                     applications.zstd_ms, ...); only those run, and a
+#                     tier with none of them is left out without a skipped
+#                     mark (default: every metric)
 #   BENCH_SYSROOT     elfuse-aarch64 only: a Tier-2 sysroot staged by -s,
 #                     used as is instead of staging a new one
 #   BENCH_OCI_PULL_TIMEOUT  timeout in seconds for one untimed image pull
@@ -288,6 +293,31 @@ BENCH_LMBENCH="${BENCH_LMBENCH:-1}"
 BENCH_APPS="${BENCH_APPS:-1}"
 BENCH_SYSROOT="${BENCH_SYSROOT:-}"
 BENCH_OCI_PULL_TIMEOUT="${BENCH_OCI_PULL_TIMEOUT:-900}"
+read -ra METRIC_LIST <<< "${BENCH_METRICS:-}"
+
+# The names BENCH_METRICS may hold, besides oci.<metric> of OCI_WORKLOADS.
+# tests/test-bench-paired.sh fails when they differ from the lmbench_metric,
+# run_tier2_tool and want calls below.
+KNOWN_METRICS=(
+    lmbench.lat_syscall.null lmbench.lat_syscall.read lmbench.lat_syscall.write
+    lmbench.lat_syscall.stat lmbench.lat_syscall.open lmbench.lat_proc.fork
+    lmbench.lat_proc.exec lmbench.lat_fs.create lmbench.lat_fs.delete
+    applications.startup_ms applications.python_startup_ms
+    applications.git_status_ms applications.ripgrep_ms applications.zstd_ms
+    applications.make_ms
+)
+
+# want NAME: NAME is measured, because BENCH_METRICS is empty or lists it.
+want()
+{
+    [ "${#METRIC_LIST[@]}" -eq 0 ] || [[ " ${METRIC_LIST[*]} " == *" $1 "* ]]
+}
+
+# want_tier SECTION: some metric of SECTION is measured.
+want_tier()
+{
+    [ "${#METRIC_LIST[@]}" -eq 0 ] || [[ " ${METRIC_LIST[*]}" == *" $1."* ]]
+}
 
 _QEMU_ACTIVE=0
 
@@ -516,6 +546,7 @@ lmbench_metric()
 {
     local benchmark="$1" metric="$2" label="$3" binary="$4"
     shift 4
+    want "lmbench.$benchmark.$metric" || return 0
     local sample=0 total=$((BENCH_WARMUP + BENCH_ITERATIONS))
     local attempt out value rc=0
     for ((sample = 0; sample < total; sample++)); do
@@ -554,6 +585,8 @@ lmbench_metric()
 lmbench_lat_fs()
 {
     local dir="$1"
+    # One run times both; emit_json drops the one BENCH_METRICS leaves out.
+    want lmbench.lat_fs.create || want lmbench.lat_fs.delete || return 0
     local sample=0 total=$((BENCH_WARMUP + BENCH_ITERATIONS))
     local attempt out row rc=0
     for ((sample = 0; sample < total; sample++)); do
@@ -684,7 +717,9 @@ claim_hello_s()
 # fails rather than overwrite the first one's copy).
 run_tier1_suite()
 {
-    [ "$BENCH_LMBENCH" = "1" ] || return 0
+    if [ "$BENCH_LMBENCH" != "1" ] || ! want_tier lmbench; then
+        return 0
+    fi
     local missing="" b
     for b in lat_syscall lat_proc lat_fs hello-s; do
         [ -x "${LMBENCH_DIR}/${b}" ] || missing="$missing $b"
@@ -761,7 +796,11 @@ run_tier1_suite()
     local ok_rows err_rows
     ok_rows=$(awk '$3 != "ERR"' "$LMROWS" | wc -l | tr -d ' ')
     err_rows=$(awk '$3 == "ERR" { print $1 "." $2 }' "$LMROWS")
-    [ "$ok_rows" -gt 0 ] || bench_die "lmbench produced no results"
+
+    # Every metric failing says the environment is broken; one chosen metric
+    # failing is a result, recorded as ERR like any other.
+    [ "$ok_rows" -gt 0 ] || [ "${#METRIC_LIST[@]}" -gt 0 ] \
+        || bench_die "lmbench produced no results"
     if [ -n "$err_rows" ]; then
         {
             echo "bench-suite: WARNING: Tier-1 metrics errored in this environment:"
@@ -931,6 +970,7 @@ run_tier2_tool()
 {
     local metric="$1"
     shift
+    want "applications.$metric" || return 0
     local pre_each="${1:-}"
     shift
     local cmd=()
@@ -960,6 +1000,7 @@ run_tier2_tool()
 # from the guest-side bench-timeit workload metrics.
 run_startup_metric()
 {
+    want applications.startup_ms || return 0
     local total=$((BENCH_WARMUP + BENCH_ITERATIONS))
     local i start end rc
     for ((i = 0; i < total; i++)); do
@@ -1024,7 +1065,8 @@ make_clean_out()
 
 run_tier2_suite()
 {
-    [ "$BENCH_APPS" = "1" ] || [ -n "$STAGE_FILE" ] || return 0
+    { [ "$BENCH_APPS" = "1" ] && want_tier applications; } \
+        || [ -n "$STAGE_FILE" ] || return 0
     # Prerequisites per environment.
     case "$BENCH_ENV" in
         elfuse-aarch64)
@@ -1239,7 +1281,8 @@ oci_skip()
 
 run_tier3_suite()
 {
-    if [ "$BENCH_ENV" != "elfuse-aarch64" ] || [ "$BENCH_OCI" != "1" ]; then
+    if [ "$BENCH_ENV" != "elfuse-aarch64" ] || [ "$BENCH_OCI" != "1" ] \
+        || ! want_tier oci; then
         return 0
     fi
     local tool
@@ -1253,6 +1296,7 @@ run_tier3_suite()
     local entry metric image cmd ref
     for entry in "${OCI_WORKLOADS[@]}"; do
         IFS='|' read -r metric image cmd <<< "$entry"
+        want "oci.$metric" || continue
         ref="${OCI_REGISTRY}/${image}"
         if ! timeout "$BENCH_OCI_PULL_TIMEOUT" "$oci" pull "$ref" > /dev/null; then
             oci_skip "image pull failed: $ref"
@@ -1273,6 +1317,7 @@ run_tier3_suite()
     local i out rc
     for entry in "${OCI_WORKLOADS[@]}"; do
         IFS='|' read -r metric image cmd <<< "$entry"
+        want "oci.$metric" || continue
         ref="${OCI_REGISTRY}/${image}"
         cmd="${timeit} ${cmd//@W@/$dir}"
         for ((i = 0; i < total; i++)); do
@@ -1345,6 +1390,7 @@ emit_json()
         BENCH_META_WARMUP="$BENCH_WARMUP" \
         BENCH_META_SKIPPED="$APPS_SKIPPED" \
         BENCH_META_OCI_SKIPPED="$OCI_SKIPPED" \
+        BENCH_META_METRICS="${BENCH_METRICS:-}" \
         python3 - "$SAMPLES" "$OUT_JSON" << 'PYEOF'
 import json
 import os
@@ -1441,6 +1487,14 @@ for metric, vals in sorted(data.get("oci", {}).items()):
 if not result["oci"]:
     del result["oci"]
 
+# One lat_fs run times both create and delete; BENCH_METRICS may name one.
+chosen = set(os.environ["BENCH_META_METRICS"].split())
+if chosen:
+    for benchmark, metrics in result["lmbench"].items():
+        for metric in list(metrics):
+            if f"lmbench.{benchmark}.{metric}" not in chosen:
+                del metrics[metric]
+
 with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(result, fh, indent=2, sort_keys=False)
     fh.write("\n")
@@ -1449,6 +1503,17 @@ PYEOF
 }
 
 # Main
+
+for metric in "${OCI_WORKLOADS[@]}"; do
+    KNOWN_METRICS+=("oci.${metric%%|*}")
+done
+# A name no tier knows would otherwise give a results file without it.
+for metric in ${METRIC_LIST[@]+"${METRIC_LIST[@]}"}; do
+    [[ " ${KNOWN_METRICS[*]} " == *" $metric "* ]] || {
+        echo "bench-suite: unknown metric '$metric' in BENCH_METRICS" >&2
+        exit 2
+    }
+done
 
 if [ "$BENCH_ENV" = "elfuse-aarch64" ] && [ ! -x "$ELFUSE" ]; then
     bench_die "elfuse binary missing at $ELFUSE (run 'make elfuse')"

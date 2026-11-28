@@ -14,16 +14,26 @@ the median of the head/base ratios of the pairs and a distribution-free
 95% interval of that median, and calls the metric slower or faster only
 when the interval excludes 1 and the median is past the threshold. Paired mode
 has no default threshold: without --threshold or BENCH_REGRESSION_THRESHOLD
-it shows ratios and intervals with no verdict. It is advisory and exits 0
-on valid input; it exits 2 when an input is unusable or the --report-json
-report would exceed 64 KiB, in which case it is not written.
+it shows ratios and intervals with no verdict. A slower or faster verdict
+holds only when a second set of pairs, --confirm-base and --confirm-head,
+gives it again. --flagged writes the metrics that read slower or faster at
+--flag-threshold, to be measured again in a second set: a fraction (default 0,
+which flags every verdict any threshold gives), none for no metric, or report
+for the threshold of the verdicts, which flags no metric while that is unset.
+--confirm-missing, or an empty --flagged list, records in the report why it
+has no second set. It is advisory and exits 0 on valid input; it exits 2 when
+an input is unusable or the --report-json report would exceed 64 KiB, in which
+case it is not written.
 
 Usage:
     scripts/bench-compare.py [--results PATH] [--baseline PATH]
                              [--threshold FRACTION] [--report-only]
                              [--fail-on-missing] [--report-json PATH]
     scripts/bench-compare.py --paired --base PATH... --head PATH...
+                             [--confirm-base PATH... --confirm-head PATH...]
+                             [--confirm-missing REASON]
                              [--threshold FRACTION] [--report-json PATH]
+                             [--flagged PATH [--flag-threshold FRACTION]]
 
 Environment:
     BENCH_REGRESSION_THRESHOLD  threshold when --threshold is not given
@@ -73,13 +83,19 @@ MAX_REPORT_BYTES = 64 * 1024
 MAX_METRICS = 256
 MAX_METRIC_NAME = 160
 
-VERDICTS = ("slower", "lost on head", "faster", "too few pairs",
-            "no threshold", "no verdict", "no result",
+VERDICTS = ("slower", "lost on head", "faster", "not confirmed",
+            "too few pairs", "no threshold", "no verdict", "no result",
             "no significant change")
 # The verdicts that make bench-report.py post a new comment.
 LISTED = frozenset({"slower", "lost on head", "faster"})
+# The verdicts a second set of pairs has to give again.
+CONFIRMED = frozenset({"slower", "faster"})
 # A round value for a tier the round's meta records as skipped.
 SKIPPED = "skipped"
+# Why a report has no second set: nothing was flagged, a round or the
+# comparison of the set failed, or the set would have started at or past
+# its deadline.
+CONFIRM_MISSING = ("not flagged", "failed", "out of time")
 
 
 class BenchDataError(ValueError):
@@ -237,6 +253,20 @@ def env_threshold(*, blank_is_unset: bool) -> float | None:
     return non_negative_finite_fraction(value)
 
 
+def missing_reason(name: str, confirm: dict, missing: str | None
+                   ) -> str | None:
+    """Return why the metric has no second set, or None when the reason is
+    not recorded: a second set without it means it was not flagged."""
+    return "not flagged" if confirm and name not in confirm else missing
+
+
+def missing_text(reason: str | None) -> str:
+    """Return the verdict suffix for a metric without a second set."""
+    return {None: " (no second set)", "not flagged": " (not flagged)",
+            "failed": " (second set failed)",
+            "out of time": " (second set out of time)"}[reason]
+
+
 def threshold_text(threshold: float) -> str:
     """Format a threshold as a percentage without rounding it away: an A/A
     threshold is likely sub-percent, and 0.004 would print as 0%."""
@@ -330,6 +360,33 @@ def paired_verdict(name: str, base: list[float | str | None],
     return result
 
 
+def confirmed_verdict(name: str, base: list[float | str | None],
+                      head: list[float | str | None],
+                      confirm: tuple[list, list] | None, *,
+                      threshold: float | None) -> dict:
+    """Judge one metric with paired_verdict, then check it against confirm,
+    the base and head values of a second set of pairs measured after the
+    first, or None when no second set measured the metric. Any verdict
+    becomes "lost on head" when the second set's head lost a value. A slower
+    or faster verdict otherwise stays when the second set gives it too, and
+    is "not confirmed" when it does not. Such a verdict's result, and a lost
+    one's, holds the second set's paired_verdict, or None, under "confirm".
+    """
+    result = paired_verdict(name, base, head, threshold=threshold)
+    second = (None if confirm is None
+              else paired_verdict(name, *confirm, threshold=threshold))
+    if second is not None and second["verdict"] == "lost on head":
+        result["confirm"] = second
+        result["verdict"] = "lost on head"
+        return result
+    if result["verdict"] not in CONFIRMED:
+        return result
+    result["confirm"] = second
+    if second is None or second["verdict"] != result["verdict"]:
+        result["verdict"] = "not confirmed"
+    return result
+
+
 def load_round(path: pathlib.Path
                ) -> tuple[str, dict[str, float], list[str], set[str]]:
     """Return the environment, the measured metrics, the failed metrics and
@@ -343,46 +400,22 @@ def load_round(path: pathlib.Path
     values = flatten(document, source=str(path), errors=failed)
     if not values and not failed:
         raise BenchDataError(f"{path} holds no metric")
-    # tests/bench-suite.sh records a skipped tier only here; lmbench never
-    # skips, since a failure there stops the run.
+    # tests/bench-suite.sh marks only these two tiers skipped; a Tier-1
+    # metric that fails is recorded as ERR.
     skipped = {tier for tier in ("oci", "applications")
                if meta.get(f"{tier}_skipped")}
     return env.strip(), values, failed, skipped
 
 
-def run_paired(args: argparse.Namespace) -> int:
-    try:
-        bases = [load_round(path) for path in args.base]
-        heads = [load_round(path) for path in args.head]
-    except BenchDataError as exc:
-        print(f"bench-compare: invalid benchmark data: {exc}",
-              file=sys.stderr)
-        return 2
-    envs = {env for env, _, _, _ in bases + heads}
-    if len(envs) != 1:
-        print("bench-compare: rounds come from different environments: "
-              f"{', '.join(sorted(envs))}", file=sys.stderr)
-        return 2
-    env = envs.pop()
+def round_values(names: set[str], bases: list, heads: list) -> dict:
+    """Return {name: {"base": [...], "head": [...]}}, one value per round.
 
-    names = set()
-    for _, values, failed, _ in bases + heads:
-        names.update(values, failed)
-    # bench-report.py rejects a schema 3 report that breaks these.
-    if len(names) > MAX_METRICS:
-        print(f"bench-compare: {len(names)} metrics, over the "
-              f"{MAX_METRICS}-metric limit", file=sys.stderr)
-        return 2
-    for name in sorted(names):
-        error = metric_name_error(name)
-        if error is not None:
-            print(f"bench-compare: {error}", file=sys.stderr)
-            return 2
-    # A round's values in a tier it records as skipped are replaced by
-    # SKIPPED, so contradictory data cannot count as a loss on the other
-    # side, and paired_verdict counts a head-only skip as a lost head value:
-    # bench-suite.sh skips a tier when build/bench-timeit is missing or the
-    # OCI pull fails, and the head checkout can cause either.
+    A round's values in a tier it records as skipped are replaced by
+    SKIPPED, so contradictory data cannot count as a loss on the other
+    side, and paired_verdict counts a head-only skip as a lost head value:
+    bench-suite.sh skips a tier when build/bench-timeit is missing or the
+    OCI pull fails, and the head checkout can cause either.
+    """
     metrics = {}
     for name in sorted(names):
         tier = name.split(".", 1)[0]
@@ -392,6 +425,64 @@ def run_paired(args: argparse.Namespace) -> int:
                 sides[side].append(SKIPPED if tier in skipped
                                    else values.get(name))
         metrics[name] = sides
+    return metrics
+
+
+def run_paired(args: argparse.Namespace) -> int:
+    try:
+        bases = [load_round(path) for path in args.base]
+        heads = [load_round(path) for path in args.head]
+        confirm_bases = [load_round(path) for path in args.confirm_base]
+        confirm_heads = [load_round(path) for path in args.confirm_head]
+    except BenchDataError as exc:
+        print(f"bench-compare: invalid benchmark data: {exc}",
+              file=sys.stderr)
+        return 2
+    rounds = bases + heads + confirm_bases + confirm_heads
+    envs = {env for env, _, _, _ in rounds}
+    if len(envs) != 1:
+        print("bench-compare: rounds come from different environments: "
+              f"{', '.join(sorted(envs))}", file=sys.stderr)
+        return 2
+    env = envs.pop()
+
+    names = set()
+    for _, values, failed, _ in bases + heads:
+        names.update(values, failed)
+    confirm_names = set()
+    for _, values, failed, _ in confirm_bases + confirm_heads:
+        confirm_names.update(values, failed)
+    # bench-report.py rejects a schema 3 report that breaks these.
+    if confirm_names - names:
+        print("bench-compare: the second set measured metrics the first did "
+              f"not: {', '.join(sorted(confirm_names - names))}",
+              file=sys.stderr)
+        return 2
+    if len(names) > MAX_METRICS:
+        print(f"bench-compare: {len(names)} metrics, over the "
+              f"{MAX_METRICS}-metric limit", file=sys.stderr)
+        return 2
+    for name in sorted(names):
+        error = metric_name_error(name)
+        if error is not None:
+            print(f"bench-compare: {error}", file=sys.stderr)
+            return 2
+    metrics = round_values(names, bases, heads)
+    flagged = [] if args.flag_threshold is None else [
+        name for name, sides in metrics.items()
+        if paired_verdict(name, sides["base"], sides["head"],
+                          threshold=args.flag_threshold)["verdict"]
+        in CONFIRMED]
+    # A second set holds every flagged metric, so one that its rounds hold
+    # no value for, as in a tier they all skipped, reads no result there
+    # instead of not flagged.
+    if confirm_bases:
+        confirm_names.update(flagged)
+    confirm = round_values(confirm_names, confirm_bases, confirm_heads)
+    missing = args.confirm_missing
+    if missing is None and args.flagged is not None and not flagged \
+            and not confirm_bases:
+        missing = "not flagged"
     if args.report_json is not None:
         report = {
             "schema_version": 3,
@@ -400,6 +491,11 @@ def run_paired(args: argparse.Namespace) -> int:
             "rounds": len(bases),
             "metrics": metrics,
         }
+        if confirm_bases:
+            report["confirm"] = {"rounds": len(confirm_bases),
+                                 "metrics": confirm}
+        if missing is not None:
+            report["confirm_missing"] = missing
         try:
             text = json.dumps(report, sort_keys=True, allow_nan=False) + "\n"
             if len(text.encode("utf-8")) > MAX_REPORT_BYTES:
@@ -410,16 +506,38 @@ def run_paired(args: argparse.Namespace) -> int:
             print(f"bench-compare: cannot write report {args.report_json}: "
                   f"{exc}", file=sys.stderr)
             return 2
+    if args.flagged is not None:
+        try:
+            args.flagged.write_text("".join(f"{name}\n" for name in flagged),
+                                    encoding="utf-8")
+        except OSError as exc:
+            print(f"bench-compare: cannot write {args.flagged}: {exc}",
+                  file=sys.stderr)
+            return 2
 
     shown = ("none" if args.threshold is None
              else f"+-{threshold_text(args.threshold)}")
     print(f"bench-compare: paired, environment '{env}', {len(bases)} "
-          f"pair(s), threshold {shown}")
+          f"pair(s), threshold {shown}"
+          + (f", second set {len(confirm_bases)} pair(s)"
+             if confirm_bases else ""))
     rows = [("metric", "pairs", "lost base/head", "base median",
              "head median", "ratio", "95% interval", "")]
     for name, sides in metrics.items():
-        v = paired_verdict(name, sides["base"], sides["head"],
-                           threshold=args.threshold)
+        second = confirm.get(name)
+        v = confirmed_verdict(
+            name, sides["base"], sides["head"],
+            None if second is None else (second["base"], second["head"]),
+            threshold=args.threshold)
+        verdict = v["verdict"]
+        if "confirm" in v:
+            c = v["confirm"]
+            verdict += (missing_text(missing_reason(name, confirm, missing))
+                        if c is None
+                        else " (second set "
+                        + ("-" if c["ratio"] is None
+                           else f"{c['ratio']:.3f}x")
+                        + f", {c['verdict']})")
         rows.append((
             name, str(v["pairs"]), f"{v['base_lost']}/{v['head_lost']}",
             "-" if v["base"] is None else f"{v['base']:g}",
@@ -427,7 +545,7 @@ def run_paired(args: argparse.Namespace) -> int:
             "-" if v["ratio"] is None else f"{v['ratio']:.3f}x",
             "-" if v["low"] is None
             else f"{v['low']:.3f}x to {v['high']:.3f}x",
-            v["verdict"]))
+            verdict))
     print_table(rows)
     return 0
 
@@ -484,6 +602,25 @@ def main() -> int:
                         help="one results file per base round")
     parser.add_argument("--head", type=pathlib.Path, nargs="+",
                         help="one results file per head round")
+    parser.add_argument("--confirm-base", type=pathlib.Path, nargs="+",
+                        default=[],
+                        help="one results file per base round of the "
+                             "second set")
+    parser.add_argument("--confirm-head", type=pathlib.Path, nargs="+",
+                        default=[],
+                        help="one results file per head round of the "
+                             "second set")
+    parser.add_argument("--confirm-missing", choices=CONFIRM_MISSING[1:],
+                        help="record why the report has no second set")
+    parser.add_argument("--flagged", type=pathlib.Path,
+                        help="write the metrics of the first set that read "
+                             "slower or faster at --flag-threshold, one per "
+                             "line")
+    parser.add_argument("--flag-threshold",
+                        help="threshold of --flagged as a fraction (default "
+                             "0), none to flag nothing, or report for the "
+                             "threshold of the verdicts, which flags nothing "
+                             "while that is unset")
     args = parser.parse_args()
     if args.threshold is None:
         try:
@@ -502,12 +639,34 @@ def main() -> int:
         if len(args.base) != len(args.head):
             parser.error(f"--base has {len(args.base)} file(s), --head "
                          f"has {len(args.head)}")
-        if len(args.base) > MAX_ROUNDS:
+        if args.confirm_missing is not None and args.confirm_base:
+            parser.error("--confirm-missing does not take --confirm-base")
+        if args.flag_threshold is not None and args.flagged is None:
+            parser.error("--flag-threshold requires --flagged")
+        # report is the verdicts' threshold, so a workflow can pass
+        # BENCH_REGRESSION_THRESHOLD on without a second parser of it.
+        named = {None: 0.0, "none": None, "report": args.threshold}
+        if args.flag_threshold in named:
+            args.flag_threshold = named[args.flag_threshold]
+        else:
+            try:
+                args.flag_threshold = non_negative_finite_fraction(
+                    args.flag_threshold)
+            except argparse.ArgumentTypeError as exc:
+                parser.error(f"--flag-threshold {exc}")
+        if len(args.confirm_base) != len(args.confirm_head):
+            parser.error(f"--confirm-base has {len(args.confirm_base)} "
+                         f"file(s), --confirm-head has "
+                         f"{len(args.confirm_head)}")
+        if max(len(args.base), len(args.confirm_base)) > MAX_ROUNDS:
             parser.error(f"--paired takes at most {MAX_ROUNDS} rounds per "
                          "side")
         return run_paired(args)
-    if args.base or args.head:
-        parser.error("--base and --head require --paired")
+    if args.base or args.head or args.confirm_base or args.confirm_head \
+            or args.confirm_missing or args.flagged or args.flag_threshold:
+        parser.error("--base, --head, --confirm-base, --confirm-head, "
+                     "--confirm-missing, --flagged and --flag-threshold "
+                     "require --paired")
     if args.threshold is None:
         args.threshold = DEFAULT_THRESHOLD
 

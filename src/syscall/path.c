@@ -600,26 +600,102 @@ static void path_fold_components(const char *path, char *out)
     out[w] = '\0';
 }
 
-/* Apply the '..' at @dotdot to @name, a /dev/bus name the backing owns, and
- * leave in @name the guest name that results. As on Linux, the '..' fails
- * unless @name is a directory the guest's IDs and groups may search, and a
- * symbolic link is followed first: its target takes its place, with the '..'
- * and the rest after it. @links counts the links this function follows across
- * the calls for one guest path, up to MAXSYMLINKS.
+/* Follow the first symbolic link among the backing's names in @name, a /dev/bus
+ * name, in the guest's namespace, as Linux does: its target takes its place,
+ * with the rest of @name and then @dotdot, when set, after it. Left to the
+ * backing, a link to the layer's /dev/bus/usb would find nothing there. The
+ * last name is followed only when @follow_final. @walk records the links
+ * followed for one guest path, up to MAXSYMLINKS.
+ *
+ * Returns 1 when a link was followed, 0 when none was, or -1 with errno set.
+ */
+static int path_dev_bus_follow_link(char *name,
+                                    size_t namesz,
+                                    const char *dotdot,
+                                    bool follow_final,
+                                    path_walk_t *walk)
+{
+    char prefix[LINUX_PATH_MAX], host[LINUX_PATH_MAX];
+    const char *hp = NULL;
+    const char *p = name + 8 + strspn(name + 8, "/");
+    const char *end;
+    struct stat st;
+
+    if (!strncmp(p, "usb", 3) && (p[3] == '\0' || p[3] == '/'))
+        return 0;
+    for (;; p = end + strspn(end, "/")) {
+        end = p + strcspn(p, "/");
+        if (!*p || (end - p == 2 && p[0] == '.' && p[1] == '.'))
+            return 0;
+        if (!end[strspn(end, "/")] && !follow_final)
+            return 0;
+        memcpy(prefix, name, (size_t) (end - name));
+        prefix[end - name] = '\0';
+        hp = path_resolve_sysroot_nofollow_path(prefix, host, sizeof(host),
+                                                NULL);
+        if (!hp || lstat(hp, &st) < 0)
+            return 0;
+        if (S_ISLNK(st.st_mode))
+            break;
+        if (!S_ISDIR(st.st_mode))
+            return 0;
+    }
+
+    char target[LINUX_PATH_MAX], tail[LINUX_PATH_MAX], out[LINUX_PATH_MAX];
+    if (++walk->links > MAXSYMLINKS) {
+        errno = ELOOP;
+        return -1;
+    }
+    ssize_t n = readlink(hp, target, sizeof(target) - 1);
+    if (n < 0)
+        return -1;
+    target[n] = '\0';
+    if (target[0] != '/')
+        walk->relative = true;
+
+    int tn = snprintf(tail, sizeof(tail), "%s%s%s", end, dotdot ? "/" : "",
+                      dotdot ? dotdot : "");
+    if (tn < 0 || (size_t) tn >= sizeof(tail)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (path_splice_link_target(name, (size_t) (p - name), target, tail, out,
+                                sizeof(out)) < 0)
+        return -1;
+
+    /* A trailing slash asks for a directory, so it stays. */
+    size_t len = strlen(out);
+    if (!dotdot && *end && !end[strspn(end, "/")] && out[len - 1] != '/') {
+        if (len + 1 >= sizeof(out)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        out[len++] = '/';
+        out[len] = '\0';
+    }
+    path_fold_components(out, out);
+    if (str_copy_trunc(name, out, namesz) >= namesz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 1;
+}
+
+/* Apply the '..' at @dotdot to @name, a /dev/bus name the backing owns with no
+ * link left to follow, and leave in @name the guest name that results. As on
+ * Linux, the '..' fails unless @name is a directory the guest's IDs and groups
+ * may search.
  *
  * Returns 0, or -1 with errno set.
  */
-static int path_backing_dotdot(char *name,
-                               size_t namesz,
-                               const char *dotdot,
-                               unsigned *links)
+static int path_backing_dotdot(char *name, size_t namesz, const char *dotdot)
 {
     char host[LINUX_PATH_MAX], next[LINUX_PATH_MAX];
     struct stat st;
 
     errno = 0;
     const char *hp =
-        path_resolve_sysroot_nofollow_path(name, host, sizeof(host));
+        path_resolve_sysroot_nofollow_path(name, host, sizeof(host), NULL);
     if (!hp) {
         if (errno == 0)
             errno = ENOENT;
@@ -634,25 +710,11 @@ static int path_backing_dotdot(char *name,
      */
     chown_overlay_apply(&st);
 
-    size_t parent_len = (size_t) (strrchr(name, '/') - name);
-    if (S_ISLNK(st.st_mode)) {
-        char target[LINUX_PATH_MAX];
-        if (++*links > MAXSYMLINKS) {
-            errno = ELOOP;
-            return -1;
-        }
-        ssize_t n = readlink(hp, target, sizeof(target) - 1);
-        if (n < 0)
-            return -1;
-        target[n] = '\0';
-        if (path_splice_link_target(name, parent_len + 1, target, dotdot, next,
-                                    sizeof(next)) < 0)
-            return -1;
-        path_fold_components(next, next);
-    } else if (!S_ISDIR(st.st_mode)) {
+    if (!S_ISDIR(st.st_mode)) {
         errno = ENOTDIR;
         return -1;
-    } else if (proc_get_euid() != 0 && exec_check_permission(&st) < 0) {
+    }
+    if (proc_get_euid() != 0 && exec_check_permission(&st) < 0) {
         /* A search reads the x bits as an exec does, supplementary groups
          * included, and root may search any directory (generic_permission in
          * fs/namei.c), where exec_check_permission passes root only when an x
@@ -660,49 +722,65 @@ static int path_backing_dotdot(char *name,
          */
         errno = EACCES;
         return -1;
-    } else {
-        /* A final '..' leaves '.', as the climb rewrite does. */
-        const char *rest = dotdot + 2;
-        while (*rest == '/')
-            rest++;
-        int n = snprintf(next, sizeof(next), "%.*s/%s", (int) parent_len, name,
-                         *rest ? rest : ".");
-        if (n < 0 || (size_t) n >= sizeof(next)) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
     }
-    if (str_copy_trunc(name, next, namesz) >= namesz) {
+
+    /* A final '..' leaves '.', as the climb rewrite does. */
+    size_t parent_len = (size_t) (strrchr(name, '/') - name);
+    const char *rest = dotdot + 2;
+    while (*rest == '/')
+        rest++;
+    int n = snprintf(next, sizeof(next), "%.*s/%s", (int) parent_len, name,
+                     *rest ? rest : ".");
+    if (n < 0 || (size_t) n >= sizeof(next) ||
+        str_copy_trunc(name, next, namesz) >= namesz) {
         errno = ENAMETOOLONG;
         return -1;
     }
     return 0;
 }
 
-/* Rewrite a /dev/bus name whose '..' climbs out of it, and fail one whose '..'
- * follows a bus no device has or a name under /dev/bus/usb that is not a bus or
- * device number. A '..' after a /dev/bus name outside /dev/bus/usb is the
- * backing's to apply. What follows can climb out again, as in
- * /dev/bus/../bus/../null; each pass applies a '..' or follows a link, and
- * MAXSYMLINKS bounds the links.
+/* Rewrite a /dev/bus name whose '..' climbs out of it or whose link the backing
+ * holds, and fail one whose '..' follows a bus no device has or a name under
+ * /dev/bus/usb that is not a bus or device number. A '..' or a link among the
+ * names outside /dev/bus/usb is the backing's. What follows can climb out
+ * again, as in /dev/bus/../bus/../null; each pass applies a '..' or follows a
+ * link, and @walk records the links followed, up to MAXSYMLINKS. @flags decide
+ * whether a link that ends the name is followed.
  *
  * Returns 0, or -1 with errno set.
  */
-static int path_rewrite_dev_climb(path_translation_t *tx)
+static int path_rewrite_dev_climb(path_translation_t *tx,
+                                  unsigned int flags,
+                                  path_walk_t *walk)
 {
-    unsigned links = 0;
     while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
         char resolved[LINUX_PATH_MAX];
         const char *dotdot = NULL;
+        int rc;
         switch (usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
                                             sizeof(resolved), &dotdot)) {
         case DEV_CLIMB_ERROR:
             return -1;
-        case DEV_CLIMB_NONE:
-            return 0;
+        case DEV_CLIMB_NONE: {
+            /* As the sysroot resolvers below decide for the last name: a
+             * trailing slash follows it, and a create does not.
+             */
+            bool follow = !(flags & PATH_TR_CREATE) &&
+                          (!(flags & PATH_TR_NOFOLLOW) ||
+                           path_has_trailing_slash(tx->guest_path));
+            str_copy_trunc(resolved, tx->guest_path, sizeof(resolved));
+            rc = path_dev_bus_follow_link(resolved, sizeof(resolved), NULL,
+                                          follow, walk);
+            if (rc <= 0)
+                return rc;
+            break;
+        }
         case DEV_CLIMB_BACKING_DOTDOT:
-            if (path_backing_dotdot(resolved, sizeof(resolved), dotdot,
-                                    &links) < 0)
+            rc = path_dev_bus_follow_link(resolved, sizeof(resolved), dotdot,
+                                          true, walk);
+            if (rc < 0 ||
+                (rc == 0 &&
+                 path_backing_dotdot(resolved, sizeof(resolved), dotdot) < 0))
                 return -1;
             break;
         case DEV_CLIMB_REWRITTEN:
@@ -717,13 +795,16 @@ static int path_rewrite_dev_climb(path_translation_t *tx)
 
 /* Rewrite a /dev/bus or /sys/bus/usb path into the canonical guest spelling of
  * where it lands, in tx->guest_buf, before anything decides whose name it is.
- * The /dev/bus climb runs first because a climb can land in /sys.
+ * The /dev/bus climb runs first because a climb can land in /sys. @flags and
+ * @walk are as for path_rewrite_dev_climb.
  *
  * Returns 0, or -1 with errno set.
  */
-static int path_rewrite_usb_aliases(path_translation_t *tx)
+static int path_rewrite_usb_aliases(path_translation_t *tx,
+                                    unsigned int flags,
+                                    path_walk_t *walk)
 {
-    if (path_rewrite_dev_climb(tx) < 0)
+    if (path_rewrite_dev_climb(tx, flags, walk) < 0)
         return -1;
 
     /* A /sys walk that passes through one of the synthetic USB `subsystem`
@@ -839,8 +920,16 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    if (path_rewrite_usb_aliases(tx) < 0)
+    /* The walk the rewrite starts goes on in the sysroot resolvers below once
+     * it has left /dev/bus. A name it leaves there holds no link left to follow
+     * and is answered as the same name typed, so a create through a link to
+     * /dev/bus/usb fails as one under /dev/bus/usb does.
+     */
+    path_walk_t walk = {0};
+    if (path_rewrite_usb_aliases(tx, flags, &walk) < 0)
         return -1;
+    const path_walk_t *walked =
+        path_prefix_match(tx->guest_path, "/dev/bus", 8) ? NULL : &walk;
 
     /* /dev/shm/<leaf> maps into the per-UID host backing dir, through the same
      * validated resolver as the open and stat intercepts. Only a non-empty flat
@@ -925,13 +1014,13 @@ int path_translate_at(guest_fd_t dirfd,
     if (lookup_flags & PATH_TR_CREATE) {
         tx->host_path = path_resolve_sysroot_create_path(
             tx->guest_path, tx->host_buf, sizeof(tx->host_buf),
-            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0);
+            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0, walked);
     } else if (lookup_flags & PATH_TR_NOFOLLOW) {
         tx->host_path = path_resolve_sysroot_nofollow_path(
-            tx->guest_path, tx->host_buf, sizeof(tx->host_buf));
+            tx->guest_path, tx->host_buf, sizeof(tx->host_buf), walked);
     } else {
         tx->host_path = path_resolve_sysroot_path(tx->guest_path, tx->host_buf,
-                                                  sizeof(tx->host_buf));
+                                                  sizeof(tx->host_buf), walked);
     }
 
     /* The resolvers above key off guest_path[0] == '/': a relative path is
@@ -1170,24 +1259,30 @@ static size_t path_lexical_depth(const char *path)
  */
 static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz);
 
-const char *path_resolve_sysroot_path(const char *path, char *buf, size_t bufsz)
+const char *path_resolve_sysroot_path(const char *path,
+                                      char *buf,
+                                      size_t bufsz,
+                                      const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_path(path, buf, bufsz);
+    return proc_resolve_sysroot_path(path, buf, bufsz, walked);
 }
 
 const char *path_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz)
+                                               size_t bufsz,
+                                               const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_nofollow_path(path, buf, bufsz);
+    return proc_resolve_sysroot_nofollow_path(path, buf, bufsz, walked);
 }
 
 const char *path_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents)
+                                             bool create_parents,
+                                             const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_create_path(path, buf, bufsz, create_parents);
+    return proc_resolve_sysroot_create_path(path, buf, bufsz, create_parents,
+                                            walked);
 }
 
 int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
@@ -1232,7 +1327,7 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             }
         }
         const char *host_path = path_resolve_sysroot_nofollow_path(
-            path, sysroot_buf, sizeof(sysroot_buf));
+            path, sysroot_buf, sizeof(sysroot_buf), NULL);
         if (!host_path) {
             errno = ENAMETOOLONG;
             return -1;
@@ -2284,13 +2379,13 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
          */
         bool create_parents = climbed && (flags & PATH_TR_CREATE_PARENTS) != 0;
         checked = path_resolve_sysroot_create_path(
-            abs_path, host_buf, sizeof(host_buf), create_parents);
+            abs_path, host_buf, sizeof(host_buf), create_parents, NULL);
     } else if (flags & PATH_TR_NOFOLLOW) {
         checked = path_resolve_sysroot_nofollow_path(abs_path, host_buf,
-                                                     sizeof(host_buf));
+                                                     sizeof(host_buf), NULL);
     } else {
-        checked =
-            path_resolve_sysroot_path(abs_path, host_buf, sizeof(host_buf));
+        checked = path_resolve_sysroot_path(abs_path, host_buf,
+                                            sizeof(host_buf), NULL);
     }
 
     char fallback_buf[LINUX_PATH_MAX];

@@ -313,6 +313,8 @@ bool proc_sysroot_snapshot(char *out, size_t outsz);
 void proc_set_sysroot_casefold(bool enabled);
 bool proc_sysroot_casefold_enabled(void);
 
+struct path_walk;
+
 /* Resolve an absolute guest path through the stored sysroot.
  *
  * Returns buf when a sysroot-backed file exists, and also when the path names a
@@ -322,10 +324,14 @@ bool proc_sysroot_casefold_enabled(void);
  * Returns path unchanged when no sysroot applies or when any other
  * sysroot-backed path does not exist, or NULL if sysroot path construction
  * would truncate or escape containment checks.
+ *
+ * @walked, when set, is the part of the walk the caller made to reach @path,
+ * and the resolver goes on from it as from links it followed itself.
  */
 const char *proc_resolve_sysroot_path(const char *path,
                                       char *buf,
-                                      size_t bufsz);
+                                      size_t bufsz,
+                                      const struct path_walk *walked);
 
 /* Resolve an absolute guest path through the stored sysroot for operations that
  * must not follow the final path component (readlinkat, O_NOFOLLOW,
@@ -333,7 +339,8 @@ const char *proc_resolve_sysroot_path(const char *path,
  */
 const char *proc_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz);
+                                               size_t bufsz,
+                                               const struct path_walk *walked);
 
 /* Resolve an absolute guest path through the stored sysroot for operations that
  * may create the final path. Unlike proc_resolve_sysroot_path(), this prefixes
@@ -342,7 +349,8 @@ const char *proc_resolve_sysroot_nofollow_path(const char *path,
 const char *proc_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents);
+                                             bool create_parents,
+                                             const struct path_walk *walked);
 
 /* execve. */
 

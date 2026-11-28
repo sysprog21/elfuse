@@ -86,19 +86,43 @@
  *                                     the slot under mmap_lock deadlocks
  *                                     against the leader, which needs that lock
  *                                     to run the request that frees the slot
+ *   sig_drain_lock (syscall/proc.c):  serializes signal transport drains;
+ *                                     taken with no lock held; holds the
+ *                                     transport flock and sig_lock beneath it
+ *                                     while it reads and queues records, then,
+ *                                     after releasing the transport flock, the
+ *                                     lifecycle registry lock, autoreap_lock
+ *                                     and pid_lock for the work they ask for
+ *   autoreap_lock (syscall/proc.c):   serializes the whole no-zombie reap
+ *                                     sequence against rt_sigaction; holds
+ *                                     the lifecycle registry lock, pid_lock
+ *                                     and, through proc_pidfd_notify_exit,
+ *                                     pidfd_lock
+ *   lifecycle registry lock (syscall/proc.c): a flock; holds pid_lock
+ *                                     beneath it through
+ *                                     lifecycle_import_children.
+ *                                     proc_process_exit holds it while it
+ *                                     appends to the parent's and the
+ *                                     adopter's transport, so a transport
+ *                                     flock, and the sig_lock that a drain
+ *                                     takes under that flock, nest beneath
+ *                                     it; no path takes it while holding a
+ *                                     transport flock or sig_lock
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
- *   autoreap_lock (syscall/proc.c):   serializes the whole no-zombie reap
- *                                     sequence against rt_sigaction; holds
- *                                     pid_lock and, through
- *                                     proc_pidfd_notify_exit, pidfd_lock
  *   elf_path_lock (syscall/proc-state.c): cached /proc/self/exe path; holds
  *                                     cwd_lock beneath it through
  *                                     proc_get_cwd, and sysroot_lock through
  *                                     the proc_cwd_refresh that runs with
  *                                     cwd_lock dropped
  *   pid_lock     (syscall/proc.c):    process table / wait state
+ *   sigchld_pub_lock (syscall/signal.c): publishes the sigchld flag file
+ *                                     word; taken under sig_lock, under
+ *                                     mmap_lock by sys_clone's
+ *                                     proc_registry_publish_self, or alone;
+ *                                     holds only log_mutex beneath it, through
+ *                                     the flag file's log_warn
  *   pidfd_lock   (syscall/proc-pidfd.c): pidfd registry
  *   futex bucket (runtime/futex.c):   per-bucket, index-ordered if >1. Also
  *                                     taken alone by futex_kick, beneath

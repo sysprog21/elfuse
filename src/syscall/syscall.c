@@ -1141,7 +1141,7 @@ static int64_t sc_kill(guest_t *g,
         int first_errno;
         int delivered = kill_deliver_targets(targets, count, sig, &first_errno);
         if (proc_get_pgid() == target_pgid) {
-            signal_queue(sig);
+            signal_queue_kill(sig);
             delivered++;
         }
         if (delivered > 0)
@@ -1150,7 +1150,7 @@ static int64_t sc_kill(guest_t *g,
         return count > 0 ? linux_errno() : -LINUX_ESRCH;
     }
     if (pid == (int) our_pid) {
-        signal_queue(sig);
+        signal_queue_kill(sig);
         return 0;
     }
     pid_t hpid = proc_resolve_guest_pid((int64_t) pid);
@@ -1308,7 +1308,7 @@ static int64_t rt_sigqueueinfo_impl(guest_t *g,
         signal_queue_info(sig, info.si_code, info.si_pid,
                           (uint32_t) info.si_uid, si_int, si_ptr);
     else
-        signal_queue(sig);
+        signal_queue_kill(sig);
     return 0;
 }
 

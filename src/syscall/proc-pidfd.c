@@ -434,7 +434,7 @@ int64_t sys_pidfd_send_signal(guest_t *g,
 
     if (pid == proc_get_pid()) {
         if (sig != 0)
-            signal_queue(sig);
+            signal_queue_kill(sig);
         return 0;
     }
 

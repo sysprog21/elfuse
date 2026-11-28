@@ -540,6 +540,35 @@ static void posix_timer_discard_pending_locked(signal_pending_t *p, int id)
     }
 }
 
+/* Discard as a dequeue does, so a POSIX timer whose signal it was fires again.
+ */
+static void sigchld_discard_locked(signal_pending_t *p)
+{
+    if (!(pending_load(&p->pending) & sig_bit(LINUX_SIGCHLD)))
+        return;
+    signal_rt_info_t info = signal_standard_peek_locked(p, LINUX_SIGCHLD);
+    posix_timer_dequeued_locked(&info);
+    p->std_info_valid[LINUX_SIGCHLD - 1] = false;
+    pending_clear(&p->pending, sig_bit(LINUX_SIGCHLD));
+}
+
+static void sigchld_discard_thread_cb(thread_entry_t *t, void *ctx)
+{
+    (void) ctx;
+    sigchld_discard_locked(&t->tpending);
+}
+
+/* flush_sigqueue_mask for SIGCHLD: drop it from the shared set and from every
+ * thread's. Caller holds sig_lock.
+ */
+static void sigchld_flush_pending_locked(void)
+{
+    sigchld_discard_locked(&sig_state.shared);
+    shared_claim_release_locked(LINUX_SIGCHLD);
+    thread_for_each(sigchld_discard_thread_cb, NULL);
+    refresh_pending_hint_locked();
+}
+
 /* The shared set as the current thread may take it. */
 static uint64_t shared_visible_locked(void)
 {
@@ -683,6 +712,8 @@ static inline bool signal_should_interrupt(int signum)
            thread_signal_deliverable(sig_bit(signum));
 }
 
+static void sigchld_disp_refresh_locked(void);
+
 void signal_reset_for_exec(void)
 {
     thread_entry_t *t = current_thread;
@@ -706,6 +737,9 @@ void signal_reset_for_exec(void)
             sig_state.actions[i].sa_mask = 0;
         }
     }
+    sigchld_disp_refresh_locked();
+    signal_sigchld_republish();
+
     /* Clear saved sigsuspend state (both global and per-thread) */
     sig_state.saved_blocked_valid = false;
 
@@ -742,16 +776,145 @@ static void signal_notify_waiters(int signum)
         wakeup_pipe_signal();
 }
 
-void signal_queue(int signum)
+enum { SIGCHLD_DISP_HANDLER, SIGCHLD_DISP_DFL, SIGCHLD_DISP_IGN };
+
+/* SIGCHLD's disposition class, written under sig_lock. Relaxed: the writer then
+ * republishes under sigchld_pub_lock, which orders this store before the load
+ * of whichever publisher runs last. signal_set_state does not; it runs in a
+ * fork child before a second thread exists, so the child's own first republish
+ * loads it.
+ */
+static _Atomic int sigchld_disp = SIGCHLD_DISP_DFL;
+
+static void sigchld_disp_refresh_locked(void)
+{
+    uint64_t handler = sig_state.actions[LINUX_SIGCHLD - 1].sa_handler;
+    int disp = handler == LINUX_SIG_IGN   ? SIGCHLD_DISP_IGN
+               : handler == LINUX_SIG_DFL ? SIGCHLD_DISP_DFL
+                                          : SIGCHLD_DISP_HANDLER;
+    atomic_store_explicit(&sigchld_disp, disp, memory_order_relaxed);
+}
+
+/* Serializes recompute-and-publish, so the last publisher has seen every action
+ * and mask store before it. See the lock order in syscall/internal.h.
+ */
+static pthread_mutex_t sigchld_pub_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t sigchld_published = UINT64_MAX; /* under sigchld_pub_lock */
+
+/* How many times rt_sigaction has dropped pending SIGCHLD. Written under both
+ * sig_lock and sigchld_pub_lock, so either one is enough to read it.
+ */
+static uint64_t sigchld_drops;
+
+/* sig_ignored (kernel/signal.c) never discards a blocked signal, so a SIGCHLD
+ * sent with kill is discarded under SIG_IGN or SIG_DFL only when no thread
+ * blocks it.
+ */
+static bool sigchld_kill_discards(int disp, bool blocked)
+{
+    return disp != SIGCHLD_DISP_HANDLER && !blocked;
+}
+
+/* Caller holds sigchld_pub_lock. */
+static void sigchld_publish_locked(void)
+{
+    /* Bit 0 is for an exit: do_notify_parent drops SIGCHLD under SIG_IGN
+     * whatever the mask; under SIG_DFL, prepare_signal keeps it when the target
+     * thread blocks it. That target is the thread that forked or, once it
+     * exits, the thread that find_new_reaper (kernel/exit.c) makes the child's
+     * parent; this reads every thread's mask, so it keeps a SIGCHLD that only
+     * another thread blocks, which Linux discards. Bit 1 is for a kill.
+     */
+    int disp = atomic_load_explicit(&sigchld_disp, memory_order_relaxed);
+    bool blocked = thread_signal_blocked_any(sig_bit(LINUX_SIGCHLD));
+    bool exit_discarded =
+        disp == SIGCHLD_DISP_IGN || (disp == SIGCHLD_DISP_DFL && !blocked);
+    bool kill_discarded = sigchld_kill_discards(disp, blocked);
+    uint64_t word =
+        sigchld_drops << 2 | (uint64_t) kill_discarded << 1 | exit_discarded;
+    if (sigchld_published != word && proc_publish_sigchld_state(word))
+        sigchld_published = word;
+}
+
+void signal_sigchld_republish(void)
+{
+    pthread_mutex_lock(&sigchld_pub_lock);
+    sigchld_publish_locked();
+    pthread_mutex_unlock(&sigchld_pub_lock);
+}
+
+/* do_sigaction's flush_sigqueue_mask for SIGCHLD, after the new action is
+ * stored: count the drop in the same word as the new flags, so a record that an
+ * exiting child or a kill sender decided before it is dropped at the drain,
+ * then drop what is already pending. Caller holds sig_lock.
+ */
+static void sigchld_drop_and_republish_locked(void)
+{
+    pthread_mutex_lock(&sigchld_pub_lock);
+    sigchld_drops++;
+    sigchld_publish_locked();
+    pthread_mutex_unlock(&sigchld_pub_lock);
+    sigchld_flush_pending_locked();
+}
+
+/* This thread's mask enters the published value only through its SIGCHLD bit,
+ * so a mask store that leaves the bit alone cannot flip it.
+ */
+static void sigchld_mask_changed(uint64_t old_mask, uint64_t new_mask)
+{
+    if ((old_mask ^ new_mask) & sig_bit(LINUX_SIGCHLD))
+        signal_sigchld_republish();
+}
+
+static void signal_queued_wake(int signum);
+
+static void queue_process_signal(int signum,
+                                 const signal_rt_info_t *info,
+                                 bool by_kill)
 {
     if (signum < 1 || signum > LINUX_NSIG)
         return;
     pthread_mutex_lock(&sig_lock);
-    signal_enqueue_locked(&sig_state.shared, signum, NULL);
+    if (by_kill && signum == LINUX_SIGCHLD &&
+        sigchld_kill_discards(
+            atomic_load_explicit(&sigchld_disp, memory_order_relaxed),
+            thread_signal_blocked_any(sig_bit(LINUX_SIGCHLD)))) {
+        pthread_mutex_unlock(&sig_lock);
+        return;
+    }
+    signal_enqueue_locked(&sig_state.shared, signum, info);
     /* Publish hint before releasing lock so vCPU hot path sees it. */
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
+    signal_queued_wake(signum);
+}
 
+void signal_queue(int signum)
+{
+    queue_process_signal(signum, NULL, false);
+}
+
+void signal_queue_kill(int signum)
+{
+    queue_process_signal(signum, NULL, true);
+}
+
+void signal_queue_sigchld_kept(uint64_t drops)
+{
+    pthread_mutex_lock(&sig_lock);
+    bool current = drops == sigchld_drops;
+    if (current) {
+        signal_enqueue_locked(&sig_state.shared, LINUX_SIGCHLD, NULL);
+        refresh_pending_hint_locked();
+    }
+    pthread_mutex_unlock(&sig_lock);
+    if (current)
+        signal_queued_wake(LINUX_SIGCHLD);
+}
+
+/* Wake what waits for @signum, which the caller has just queued. */
+static void signal_queued_wake(int signum)
+{
     /* Notify any signalfd instances whose mask includes this signal. This makes
      * the signalfd pipe readable so poll/epoll sees it.
      */
@@ -781,9 +944,6 @@ void signal_queue_info(int signum,
                        int32_t si_int,
                        uint64_t si_ptr)
 {
-    if (signum < 1 || signum > LINUX_NSIG)
-        return;
-    pthread_mutex_lock(&sig_lock);
     signal_rt_info_t info = {
         .signum = signum,
         .si_code = si_code,
@@ -792,16 +952,7 @@ void signal_queue_info(int signum,
         .si_int = si_int,
         .si_ptr = si_ptr,
     };
-    signal_enqueue_locked(&sig_state.shared, signum, &info);
-    refresh_pending_hint_locked();
-    pthread_mutex_unlock(&sig_lock);
-    signal_notify_waiters(signum);
-
-    /* Same shim-globals attention raise as signal_queue: force the fast path
-     * off only when the queued signal can reach signal_deliver.
-     */
-    if (signal_should_interrupt(signum))
-        attention_raise();
+    queue_process_signal(signum, &info, true);
 }
 
 /* Thread-directed queueing (tgkill/tkill/pthread_kill). The signal lands in the
@@ -1088,6 +1239,7 @@ void signal_set_state(const signal_state_snapshot_t *state)
         return;
     pthread_mutex_lock(&sig_lock);
     memcpy(sig_state.actions, state->actions, sizeof(sig_state.actions));
+    sigchld_disp_refresh_locked();
     atomic_store_explicit(&sig_state.shared.pending, state->shared.pending,
                           memory_order_relaxed);
     memcpy(sig_state.shared.std_info_valid, state->shared.std_info_valid,
@@ -1299,8 +1451,11 @@ void signal_set_blocked(uint64_t mask)
 {
     uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
     pthread_mutex_lock(&sig_lock);
+    uint64_t old_mask =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_relaxed);
     atomic_store_explicit(thread_blocked_ptr(), mask & ~unmaskable,
                           memory_order_release);
+    sigchld_mask_changed(old_mask, mask & ~unmaskable);
     pthread_mutex_unlock(&sig_lock);
 }
 
@@ -1308,8 +1463,11 @@ void signal_restore_blocked(uint64_t saved)
 {
     uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
     pthread_mutex_lock(&sig_lock);
+    uint64_t old_mask =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_relaxed);
     atomic_store_explicit(thread_blocked_ptr(), saved & ~unmaskable,
                           memory_order_release);
+    sigchld_mask_changed(old_mask, saved & ~unmaskable);
     pthread_mutex_unlock(&sig_lock);
 }
 
@@ -1334,8 +1492,11 @@ void signal_restore_saved_blocked(void)
 
     pthread_mutex_lock(&sig_lock);
     if (*valid) {
+        uint64_t old_mask =
+            atomic_load_explicit(thread_blocked_ptr(), memory_order_relaxed);
         atomic_store_explicit(thread_blocked_ptr(), *thread_saved_blocked_ptr(),
                               memory_order_release);
+        sigchld_mask_changed(old_mask, *thread_saved_blocked_ptr());
         *valid = false;
     }
     pthread_mutex_unlock(&sig_lock);
@@ -1947,6 +2108,23 @@ int64_t signal_rt_sigaction(guest_t *g,
 
     int idx = signum - 1;
 
+    /* Read the new action before writing the old one, as Linux does, so the two
+     * may share a buffer.
+     */
+    linux_sigaction_t act;
+    if (act_gva && guest_read_small(g, act_gva, &act, sizeof(act)) < 0)
+        return -LINUX_EFAULT;
+
+    /* do_sigaction discards a pending SIGCHLD that the new action ignores.
+     * Drain first, so a record whose sender could not read the flag file is
+     * pending when that runs.
+     */
+    bool flush_sigchld =
+        act_gva && signum == LINUX_SIGCHLD &&
+        (act.sa_handler == LINUX_SIG_IGN || act.sa_handler == LINUX_SIG_DFL);
+    if (flush_sigchld)
+        proc_drain_signal_transport(false);
+
     bool reap_exited_sigchld = false;
     pthread_mutex_lock(&sig_lock);
 
@@ -1961,12 +2139,6 @@ int64_t signal_rt_sigaction(guest_t *g,
 
     /* Install new action if provided */
     if (act_gva) {
-        linux_sigaction_t act;
-        if (guest_read_small(g, act_gva, &act, sizeof(act)) < 0) {
-            pthread_mutex_unlock(&sig_lock);
-            return -LINUX_EFAULT;
-        }
-
         log_debug(
             "rt_sigaction(%d): handler=0x%llx flags=0x%llx "
             "restorer=0x%llx mask=0x%llx%s%s%s%s",
@@ -1989,6 +2161,13 @@ int64_t signal_rt_sigaction(guest_t *g,
             signum == LINUX_SIGCHLD &&
             sigaction_autoreaps_sigchld(&sig_state.actions[idx]);
         sig_state.actions[idx] = act;
+        if (signum == LINUX_SIGCHLD) {
+            sigchld_disp_refresh_locked();
+            if (flush_sigchld)
+                sigchld_drop_and_republish_locked();
+            else
+                signal_sigchld_republish();
+        }
     }
 
     pthread_mutex_unlock(&sig_lock);
@@ -2059,6 +2238,7 @@ int64_t signal_rt_sigprocmask(guest_t *g,
          * is a C data race (UB).
          */
         atomic_store_explicit(blocked, new_mask, memory_order_release);
+        sigchld_mask_changed(old_blocked, new_mask);
 
         /* If this mask change makes a queued signal deliverable on the current
          * thread, refresh the global hint. The caller is already returning
@@ -2181,6 +2361,7 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
         uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
         atomic_store_explicit(blocked, mask & ~unmaskable,
                               memory_order_release);
+        sigchld_mask_changed(saved_blocked, mask & ~unmaskable);
         pthread_mutex_unlock(&sig_lock);
 
         /* Suspend until a signal that will actually reach the guest becomes
@@ -2241,8 +2422,11 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
              * signal_pending() and thread_signal_deliverable() read this field
              * lock-free, so store it the same way rt_sigprocmask does.
              */
+            uint64_t old_mask = atomic_load_explicit(thread_blocked_ptr(),
+                                                     memory_order_relaxed);
             atomic_store_explicit(thread_blocked_ptr(), saved_blocked,
                                   memory_order_release);
+            sigchld_mask_changed(old_mask, saved_blocked);
         }
         pthread_mutex_unlock(&sig_lock);
     }
@@ -3153,7 +3337,8 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * thread and, before its pthread exists, the parent that cloned it, so the
      * two can never overlap.
      */
-    uint64_t new_blocked = atomic_load_explicit(blocked, memory_order_relaxed);
+    uint64_t old_blocked = atomic_load_explicit(blocked, memory_order_relaxed);
+    uint64_t new_blocked = old_blocked;
     if (!(act->sa_flags & LINUX_SA_NODEFER))
         new_blocked |= sig_bit(signum);
     new_blocked |= act->sa_mask;
@@ -3169,7 +3354,12 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     if (act->sa_flags & LINUX_SA_RESETHAND) {
         act->sa_handler = LINUX_SIG_DFL;
         act->sa_flags &= ~LINUX_SA_SIGINFO;
+        if (signum == LINUX_SIGCHLD) {
+            sigchld_disp_refresh_locked();
+            signal_sigchld_republish();
+        }
     }
+    sigchld_mask_changed(old_blocked, new_blocked);
 
     /* If delivery happens while returning from the syscall HVC path, the shim
      * still has the interrupted syscall frame on its EL1 stack. Tell it to drop
@@ -3360,6 +3550,7 @@ int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
              */
             atomic_store_explicit(blocked, cur & ~sig_bit(signum),
                                   memory_order_release);
+            sigchld_mask_changed(cur, cur & ~sig_bit(signum));
         }
     }
 
@@ -3471,7 +3662,9 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
      */
     uint64_t restored_mask = frame.uc.uc_sigmask &
                              ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
+    uint64_t old_mask = atomic_load_explicit(blocked, memory_order_relaxed);
     atomic_store_explicit(blocked, restored_mask, memory_order_release);
+    sigchld_mask_changed(old_mask, restored_mask);
     if (current_thread) {
         uint64_t restored_sp = frame.uc.uc_mcontext.sp;
         if (current_thread->altstack_sp &&

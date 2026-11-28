@@ -50,7 +50,8 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-usbdev-ioctl-departed \
         test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
-        test-fstatfs-fd-identity test-fuse-open-lock \
+        test-fstatfs-fd-identity test-fuse-open-lock test-sigchld-late-drain \
+        test-sigchld-exit-race test-sigchld-exit-fallback \
         test-dir-union-alias test-dir-primary-read-error \
         test-getdents64-small-buf \
         test-sysroot-symlink-target \
@@ -306,6 +307,9 @@ $(call run-lane,test-dir-backing-drain-error,a lost union listing is reported no
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
 $(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
 $(call run-lane,test-fuse-open-lock,a FUSE open returns its slot and keeps the lock order)
+$(call run-lane,test-sigchld-late-drain,SIGCHLD decided at exit or kill survives a late drain)
+$(call run-lane,test-sigchld-exit-race,SIG_IGN or SIG_DFL during an exit drops its SIGCHLD)
+$(call run-lane,test-sigchld-exit-fallback,an exit without the registry decides its SIGCHLD)
 $(call run-lane,test-dir-union-alias,a dup shares one listing position and one union)
 $(call run-lane,test-dir-primary-read-error,a failed synthetic read is reported not ended)
 $(call run-lane,test-getdents64-small-buf,a getdents64 buffer too small for one entry)
@@ -2044,6 +2048,29 @@ test-fuse-open-lock: $(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock
 	$(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock slots
 	ELFUSE_FUSE_OPEN_LOCK_DELAY_US=200000 \
 		$(ELFUSE_BIN) $(TEST_DIR)/test-fuse-open-lock order
+## A SIGCHLD decided at the child's exit or at a kill survives a late drain
+# ELFUSE_SIGNAL_DRAIN_DELAY_US keeps the record undrained until the test, 100
+# ms after the exit or the kill, installs its handler, or SIG_IGN or SIG_DFL,
+# or until its wait returns. Without the delay, a build that lacks the part a
+# case covers passes that case, except a build that never drops a pending
+# SIGCHLD.
+test-sigchld-late-drain: $(ELFUSE_BIN) $(TEST_DIR)/test-sigchld-after-wait
+	ELFUSE_SIGNAL_DRAIN_DELAY_US=250000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-sigchld-after-wait late
+## SIG_IGN or SIG_DFL during a child's exit drops the SIGCHLD of that exit
+# ELFUSE_SIGCHLD_DECIDE_DELAY_US holds the exiting child between reading the
+# parent's flag file and appending its record, so the test's action change,
+# 100 ms after the child's last write, lands in between. Without the delay, a
+# build whose drain ignores the drop count in the record passes.
+test-sigchld-exit-race: $(ELFUSE_BIN) $(TEST_DIR)/test-sigchld-after-wait
+	ELFUSE_SIGCHLD_DECIDE_DELAY_US=300000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-sigchld-after-wait exiting
+## An exit that cannot take the lifecycle registry decides its SIGCHLD too
+# ELFUSE_EXIT_SKIP_REGISTRY sends each exit's record without the registry, as
+# when it cannot be opened.
+test-sigchld-exit-fallback: $(ELFUSE_BIN) $(TEST_DIR)/test-sigchld-after-wait
+	ELFUSE_EXIT_SKIP_REGISTRY=1 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-sigchld-after-wait fallback
 ## A union directory fd must cost one host descriptor, like a plain one
 # The measurement only means something with the host limit at exactly what
 # elfuse asks for -- the same squeeze tests/manifest.txt puts on

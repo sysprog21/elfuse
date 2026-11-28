@@ -785,6 +785,26 @@ run_unit_tests()
         "$bindir/test-wait-process-signal"
     test_check "$runner" "test-wait-sigmask-signal" " - PASS" \
         "$bindir/test-wait-sigmask-signal"
+    test_check "$runner" "test-sigchld-after-wait" " - PASS" \
+        "$bindir/test-sigchld-after-wait"
+
+    # One run per case: all of them together take longer than run_elfuse's 30 s
+    # timeout on elfuse.
+    local late_case exit_case
+    for late_case in none resethand thread vm adopted ign dfl unblock kill \
+        killdfl killchild waitpid waitid wnohang wnohangbusy; do
+        ELFUSE_SIGNAL_DRAIN_DELAY_US=250000 \
+            test_check "$runner" "test-sigchld-after-wait late $late_case" \
+            " - PASS" "$bindir/test-sigchld-after-wait" late "$late_case"
+    done
+    for exit_case in ign dfl unblock; do
+        ELFUSE_SIGCHLD_DECIDE_DELAY_US=300000 \
+            test_check "$runner" "test-sigchld-after-wait exiting $exit_case" \
+            " - PASS" "$bindir/test-sigchld-after-wait" exiting "$exit_case"
+    done
+    ELFUSE_EXIT_SKIP_REGISTRY=1 \
+        test_check "$runner" "test-sigchld-after-wait fallback" " - PASS" \
+        "$bindir/test-sigchld-after-wait" fallback
     test_check "$runner" "test-shim-sigreturn-x8" "0 failed" \
         "$bindir/test-shim-sigreturn-x8"
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
@@ -1607,9 +1627,13 @@ run_suite()
 # its floor was left for a run that observed one; the second holds every
 # respelling of a path to the answer its canonical spelling gets. No fixture,
 # not in either skip list. 255 and 230, observed here at 297 and 275.
+#
+# Both went up by twenty for test-sigchld-after-wait, its fifteen late cases,
+# its three exiting cases and its fallback case, run one per call. No fixture,
+# not in either skip list. 275 and 250, observed here at 338 and 312.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|255|0"
-    "qemu-aarch64|230|0"
+    "elfuse-aarch64|275|0"
+    "qemu-aarch64|250|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

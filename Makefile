@@ -596,6 +596,12 @@ $(BUILD_DIR)/test-exec-handoff: tests/test-exec-handoff.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-sigchld-after-wait's late cases include a thread that blocks SIGCHLD,
+# and one default case arms a POSIX timer.
+$(BUILD_DIR)/test-sigchld-after-wait: tests/test-sigchld-after-wait.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lrt -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lrt -lpthread
+
 # test-cntvct-thread verifies cloned vCPUs inherit EL0 timer access.
 $(BUILD_DIR)/test-cntvct-thread: tests/test-cntvct-thread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
